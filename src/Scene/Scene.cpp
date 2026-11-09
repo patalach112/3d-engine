@@ -21,6 +21,18 @@ void Scene::destroyEntity(Entity entity) {
     --m_entityCount;
 }
 
+void Scene::reserveCapacity(size_t entityCount) {
+    if (entityCount == 0) {
+        return;
+    }
+    m_registry.storage<entt::entity>().reserve(entityCount);
+    m_registry.storage<TransformComponent>().reserve(entityCount);
+    m_registry.storage<MeshComponent>().reserve(entityCount);
+    m_registry.storage<CameraComponent>().reserve(entityCount);
+    m_registry.storage<SpinComponent>().reserve(entityCount);
+    ENGINE_LOG_DEBUG("Scene: reserved component storage for " << entityCount << " entities");
+}
+
 bool Scene::isValid(Entity entity) const {
     return entity.handle() != entt::null && m_registry.valid(entity.handle());
 }

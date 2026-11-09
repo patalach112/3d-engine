@@ -77,6 +77,8 @@ add_executable(3d-engine
     src/main.cpp
     src/Core/Application.cpp
     src/Core/Camera.cpp
+    src/Core/Jobs/JobSystem.cpp
+    src/Core/Memory/PoolAllocator.cpp
     src/Scene/Scene.cpp
     src/Scene/Components.cpp
     src/Scene/Systems/CameraSystem.cpp
@@ -88,7 +90,9 @@ add_executable(3d-engine
     src/Core/GameLoop.cpp
     src/Platform/Input.cpp
     src/Platform/Window.cpp
+    src/Geometry/Bounds.cpp
     src/Geometry/Cube.cpp
+    src/Graphics/Frustum.cpp
     src/Graphics/VulkanContext.cpp
     src/Graphics/VulkanHelpers.cpp
     src/Graphics/Swapchain.cpp
@@ -212,12 +216,16 @@ if(BUILD_TESTING)
         tests/CoreTests.cpp
         src/Core/Camera.cpp
         src/Core/EngineConfig.cpp
+        src/Core/Jobs/JobSystem.cpp
+        src/Core/Memory/PoolAllocator.cpp
         src/Core/Logger.cpp
         src/Core/Time.cpp
         src/Core/GameLoop.cpp
         src/Platform/Input.cpp
         src/Platform/Window.cpp
+        src/Geometry/Bounds.cpp
         src/Geometry/Cube.cpp
+        src/Graphics/Frustum.cpp
         src/Scene/Scene.cpp
         src/Scene/Components.cpp
         src/Scene/Systems/CameraSystem.cpp

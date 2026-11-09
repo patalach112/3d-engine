@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Camera.h"
+#include "Geometry/Bounds.h"
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
@@ -46,6 +47,9 @@ struct CameraComponent {
 struct MeshComponent {
     std::string assetId = "cube";
     bool visible = true;
+    // Local-space bounds used for frustum culling. Matches the built-in
+    // unit cube; real mesh assets will supply their own bounds later.
+    AABB localBounds{glm::vec3{-0.5f}, glm::vec3{0.5f}};
 
     MeshComponent() = default;
     explicit MeshComponent(std::string assetId_) : assetId(std::move(assetId_)) {}

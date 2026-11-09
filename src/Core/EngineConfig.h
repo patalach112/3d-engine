@@ -24,6 +24,19 @@ struct RenderConfig {
     // true  -> present with FIFO (vsync: tear-free, paced to refresh rate)
     // false -> prefer IMMEDIATE, then MAILBOX (lowest latency, may tear)
     bool vsync = true;
+    // Skip drawing entities whose bounds are outside the view frustum.
+    bool frustumCulling = true;
+};
+
+// Performance & memory tuning (see config/engine.ini, [Performance]).
+struct PerformanceConfig {
+    // JobSystem worker threads. 0 = automatic (hardware threads - 1).
+    uint32_t jobWorkerCount = 0;
+    // Component storage reserved up front in the scene's memory pool.
+    uint32_t entityReserve = 1024;
+    // Minimum visible meshes before render preparation parallelizes
+    // (below this, sequential evaluation is cheaper than dispatching).
+    uint32_t parallelMinDrawItems = 128;
 };
 
 // ---------------------------------------------------------------------------
@@ -48,6 +61,7 @@ struct EngineConfig {
     RenderConfig render;
     CameraConfig camera;
     InputConfig input;
+    PerformanceConfig performance;
 
     // File the values were actually loaded from; empty when defaults were used.
     std::string sourcePath;

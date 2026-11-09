@@ -226,6 +226,28 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
     if (section == "render") {
         if (key == "vsync") {
             reader.apply(value, config.render.vsync);
+        } else if (key == "frustumculling") {
+            reader.apply(value, config.render.frustumCulling);
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    // --- [Performance] -----------------------------------------------------------
+    if (section == "performance") {
+        if (key == "jobworkercount") {
+            if (reader.applyInteger(value, intField, 0, 256)) {
+                config.performance.jobWorkerCount = static_cast<uint32_t>(intField);
+            }
+        } else if (key == "entityreserve") {
+            if (reader.applyInteger(value, intField, 0, 1000000)) {
+                config.performance.entityReserve = static_cast<uint32_t>(intField);
+            }
+        } else if (key == "parallelmindrawitems") {
+            if (reader.applyInteger(value, intField, 1, 1000000)) {
+                config.performance.parallelMinDrawItems = static_cast<uint32_t>(intField);
+            }
         } else {
             return false;
         }

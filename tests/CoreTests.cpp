@@ -16,8 +16,15 @@
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
+#include "Core/Jobs/JobSystem.h"
+#include "Core/Memory/PoolAllocator.h"
+#include "Graphics/Frustum.h"
+
+#include <atomic>
+
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -69,7 +76,9 @@ void testConfigLoading() {
              << "bogusKey = 1\n"
              << "[Loop]\nmaxFrameSeconds = not_a_number\n"
              << "[Camera]\nmovementSpeed = 7.5\nmouseSensitivity = 0.25\npositionZ = 5\n"
-             << "[Input]\ncaptureMouseOnStart = false\n";
+             << "[Input]\ncaptureMouseOnStart = false\n"
+             << "[Render]\nfrustumCulling = false\n"
+             << "[Performance]\njobWorkerCount = 2\nentityReserve = 4096\n";
     }
 
     const engine::EngineConfig config = engine::EngineConfig::loadFromFile(path);
@@ -87,6 +96,9 @@ void testConfigLoading() {
     check(nearlyEqual(config.camera.mouseSensitivity, 0.25), "camera mouse sensitivity parsed");
     check(nearlyEqual(config.camera.startPosition.z, 5.0), "camera start position parsed");
     check(!config.input.captureMouseOnStart, "input capture flag parsed");
+    check(!config.render.frustumCulling, "frustum culling flag parsed");
+    check(config.performance.jobWorkerCount == 2, "job worker count parsed");
+    check(config.performance.entityReserve == 4096, "entity reserve parsed");
     check(config.loadWarnings.size() >= 2, "unknown/invalid keys produce warnings");
 
     const engine::EngineConfig missing = engine::EngineConfig::loadFromFile(dir / "does_not_exist.ini");
@@ -272,14 +284,19 @@ void testSceneAndSystems() {
     check(nearlyEqual(cube.getComponent<engine::TransformComponent>().rotationDegrees.y, 45.0),
           "rotation system integrates spin at the fixed rate");
 
-    const engine::PreparedFrame before = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f);
+    // Culling disabled here: this test isolates transform/render data flow
+    // (the test cube sits behind the default camera). Culling itself is
+    // covered by the dedicated frustum tests below.
+    engine::FramePrepareOptions noCulling;
+    noCulling.frustumCulling = false;
+    const engine::PreparedFrame before = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, noCulling);
     check(before.hasCamera, "render prep finds the active camera");
     check(before.drawItems.size() == 1, "render prep collects visible mesh entities");
 
     // This is what CameraSystem does with input each frame (look + move);
     // exercised through the camera's window-free API here.
     playerCamera.camera.translate(glm::vec3{0.0f, 0.0f, 1.0f}, 1.0); // 3 units forward
-    const engine::PreparedFrame after = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f);
+    const engine::PreparedFrame after = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, noCulling);
     check(!nearlyEqual(after.view[3][2], before.view[3][2], 1e-6),
           "render prep after camera update uses the new view matrix");
     check(nearlyEqual(after.drawItems[0].model[3][0], before.drawItems[0].model[3][0]),
@@ -290,7 +307,7 @@ void testSceneAndSystems() {
     hidden.addComponent<engine::TransformComponent>();
     auto& hiddenMesh = hidden.addComponent<engine::MeshComponent>("cube");
     hiddenMesh.visible = false;
-    check(engine::RenderSystem::prepareFrame(scene, 1.0f).drawItems.size() == 1,
+    check(engine::RenderSystem::prepareFrame(scene, 1.0f, noCulling).drawItems.size() == 1,
           "invisible entities are skipped by render prep");
 
     // --- Lifetime -------------------------------------------------------------
@@ -302,6 +319,179 @@ void testSceneAndSystems() {
     check(scene.entityCount() == countBeforeDestroy - 1, "entity count tracks destruction");
     scene.destroyEntity(doomed); // stale handle: must be a safe no-op
     check(scene.entityCount() == countBeforeDestroy - 1, "double destroy is a no-op");
+}
+
+void testPoolAllocator() {
+    std::cout << "PoolAllocator\n";
+    engine::memory::PoolCore core;
+
+    void* first = core.allocate(64, 8);
+    check(first != nullptr, "pool hands out memory");
+    std::memset(first, 0xAB, 64);
+    core.deallocate(first, 64, 8);
+
+    void* second = core.allocate(64, 8);
+    check(second == first, "freed block is reused (no heap round-trip)");
+    core.deallocate(second, 64, 8);
+
+    const engine::memory::PoolStats stats = core.stats();
+    check(stats.pageCount >= 1, "allocation carved a page");
+    check(stats.blocksInUse == 0, "block accounting returns to zero after frees");
+    check(stats.blocksReserved > 0, "page blocks are tracked as reserved");
+
+    // Over-aligned requests take the aligned fallback path and stay aligned.
+    void* aligned = core.allocate(32, 64);
+    check(reinterpret_cast<uintptr_t>(aligned) % 64 == 0, "over-aligned allocation honors alignment");
+    core.deallocate(aligned, 32, 64);
+
+    // Oversized requests also fall back and remain writable.
+    void* big = core.allocate(64 * 1024, 8);
+    check(big != nullptr, "oversized allocation succeeds via fallback");
+    std::memset(big, 0xCD, 64 * 1024);
+    core.deallocate(big, 64 * 1024, 8);
+
+    // STL allocator facade: rebound types share one core.
+    engine::memory::PoolAllocator<int> intAllocator;
+    engine::memory::PoolAllocator<double> doubleAllocator(intAllocator);
+    check(intAllocator == doubleAllocator, "rebound allocators share the pool core");
+    int* numbers = intAllocator.allocate(4);
+    numbers[0] = 42;
+    check(numbers[0] == 42, "facade allocation is usable memory");
+    intAllocator.deallocate(numbers, 4);
+}
+
+void testJobSystem() {
+    std::cout << "JobSystem\n";
+    engine::JobSystem jobs(engine::JobSystem::Config{4});
+    check(jobs.workerCount() == 4, "job system starts the requested workers");
+
+    // Fire-and-forget + barrier.
+    std::atomic<int> counter{0};
+    constexpr int kJobs = 500;
+    for (int i = 0; i < kJobs; ++i) {
+        jobs.submit([&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
+    }
+    jobs.waitForAll();
+    check(counter.load() == kJobs, "waitForAll barrier completes every submitted job");
+
+    // parallelFor covers every index exactly once.
+    constexpr size_t kItems = 10000;
+    std::vector<std::atomic<int>> hits(kItems);
+    for (auto& hit : hits) {
+        hit.store(0);
+    }
+    jobs.parallelFor(kItems, 0, [&hits](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            hits[i].fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    bool allOnce = true;
+    for (const auto& hit : hits) {
+        allOnce = allOnce && hit.load() == 1;
+    }
+    check(allOnce, "parallelFor covers the range exactly once");
+
+    std::atomic<long long> sum{0};
+    jobs.parallelFor(1000, 100, [&sum](size_t begin, size_t end) {
+        long long local = 0;
+        for (size_t i = begin; i < end; ++i) {
+            local += static_cast<long long>(i);
+        }
+        sum.fetch_add(local, std::memory_order_relaxed);
+    });
+    check(sum.load() == 1000LL * 999 / 2, "parallelFor reduction result is correct");
+
+    // A throwing job is contained: counted, logged, workers keep going.
+    jobs.submit([] { throw std::runtime_error("expected test failure"); });
+    std::atomic<bool> afterThrow{false};
+    jobs.submit([&afterThrow] { afterThrow.store(true); });
+    jobs.waitForAll();
+    check(afterThrow.load(), "workers survive a throwing job");
+    check(jobs.failedJobCount() >= 1, "throwing job is counted as failed");
+}
+
+void testFrustumCulling() {
+    std::cout << "Frustum culling\n";
+    engine::CameraConfig cameraConfig;
+    cameraConfig.startPosition = glm::vec3{0.0f, 0.0f, 0.0f};
+    const engine::Camera camera(cameraConfig); // at origin, looking down -Z
+    const engine::Frustum frustum{camera.projectionMatrix(16.0f / 9.0f) * camera.viewMatrix()};
+
+    const engine::AABB inFront{glm::vec3{-0.5f, -0.5f, -3.5f}, glm::vec3{0.5f, 0.5f, -2.5f}};
+    const engine::AABB behind{glm::vec3{-0.5f, -0.5f, 2.5f}, glm::vec3{0.5f, 0.5f, 3.5f}};
+    const engine::AABB farAway{glm::vec3{-0.5f, -0.5f, -500.0f}, glm::vec3{0.5f, 0.5f, -499.0f}};
+    const engine::AABB farRight{glm::vec3{50.0f, -0.5f, -3.5f}, glm::vec3{51.0f, 0.5f, -2.5f}};
+    const engine::AABB crossingNear{glm::vec3{-0.5f, -0.5f, -0.2f}, glm::vec3{0.5f, 0.5f, 0.2f}};
+
+    check(frustum.intersects(inFront), "box in front of the camera is visible");
+    check(!frustum.intersects(behind), "box behind the camera is culled");
+    check(!frustum.intersects(farAway), "box beyond the far plane is culled");
+    check(!frustum.intersects(farRight), "box outside the right plane is culled");
+    check(frustum.intersects(crossingNear), "box crossing the near plane stays visible");
+    check(frustum.intersectsSphere(glm::vec3{0.0f, 0.0f, -5.0f}, 1.0f), "sphere in view intersects");
+    check(!frustum.intersectsSphere(glm::vec3{0.0f, 0.0f, 5.0f}, 1.0f), "sphere behind is culled");
+
+    // World bounds of a rotated box must grow (rotation is accounted for).
+    const glm::mat4 rotated = glm::rotate(glm::mat4{1.0f}, glm::radians(45.0f), glm::vec3{0.0f, 0.0f, 1.0f});
+    const engine::AABB unitBounds{glm::vec3{-0.5f}, glm::vec3{0.5f}};
+    const engine::AABB worldBounds = unitBounds.transformed(rotated);
+    check(worldBounds.extents().x > 0.7f && worldBounds.extents().x < 0.71f,
+          "rotated AABB expands to the diagonal extent");
+}
+
+void testParallelSystemsAndCulling() {
+    std::cout << "Parallel systems + culling integration\n";
+    engine::JobSystem jobs(engine::JobSystem::Config{4});
+    engine::Scene scene;
+    scene.reserveCapacity(256);
+    check(scene.memoryStats().blocksReserved > 0, "scene reserve allocates pooled storage up front");
+
+    engine::CameraConfig cameraConfig;
+    cameraConfig.startPosition = glm::vec3{0.0f, 0.0f, 3.0f};
+    engine::Entity player = scene.createEntity("Player");
+    player.addComponent<engine::CameraComponent>(cameraConfig);
+
+    // 100 spinning cubes arranged in front of the camera.
+    constexpr int kCubes = 100;
+    for (int i = 0; i < kCubes; ++i) {
+        engine::Entity cube = scene.createEntity("Cube" + std::to_string(i));
+        auto& transform = cube.addComponent<engine::TransformComponent>(
+            glm::vec3{static_cast<float>(i % 10) - 4.5f, static_cast<float>(i / 10) - 4.5f, -5.0f});
+        transform.scale = glm::vec3{0.3f};
+        cube.addComponent<engine::MeshComponent>("cube");
+        cube.addComponent<engine::SpinComponent>(glm::vec3{0.0f, 90.0f, 0.0f});
+    }
+    // One cube behind the camera: must be frustum-culled.
+    engine::Entity behind = scene.createEntity("BehindCamera");
+    behind.addComponent<engine::TransformComponent>(glm::vec3{0.0f, 0.0f, 10.0f});
+    behind.addComponent<engine::MeshComponent>("cube");
+
+    // Parallel fixed-step rotation: every cube turns exactly 45 degrees.
+    engine::RotationSystem::update(scene, 0.5, jobs);
+    bool allRotated = true;
+    scene.registry().view<engine::TransformComponent, engine::SpinComponent>().each(
+        [&allRotated](const engine::TransformComponent& transform, const engine::SpinComponent&) {
+            allRotated = allRotated && nearlyEqual(transform.rotationDegrees.y, 45.0);
+        });
+    check(allRotated, "parallel rotation updates every entity exactly once");
+
+    // Parallel render preparation (threshold lowered to force the path).
+    engine::FramePrepareOptions options;
+    options.jobs = &jobs;
+    options.frustumCulling = true;
+    options.parallelMinItems = 1;
+    const engine::PreparedFrame frame = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+    check(frame.hasCamera, "render prep finds camera in populated scene");
+    check(frame.meshCount == static_cast<uint32_t>(kCubes) + 1, "render prep counts all visible meshes");
+    check(frame.culledCount >= 1, "behind-camera cube is frustum-culled");
+    check(frame.drawItems.size() + frame.culledCount == frame.meshCount,
+          "drawn + culled accounts for every mesh");
+
+    // Without culling, everything is drawn.
+    options.frustumCulling = false;
+    const engine::PreparedFrame unculled = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+    check(unculled.culledCount == 0 && unculled.drawItems.size() == frame.meshCount,
+          "disabling culling draws every mesh");
 }
 
 void testTime() {
@@ -353,6 +543,10 @@ int main() {
     testLogger();
     testCamera();
     testSceneAndSystems();
+    testPoolAllocator();
+    testJobSystem();
+    testFrustumCulling();
+    testParallelSystemsAndCulling();
     testFixedTimestep();
     testTime();
     testGameLoop();

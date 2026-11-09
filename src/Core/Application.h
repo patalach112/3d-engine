@@ -2,6 +2,7 @@
 
 #include "Core/EngineConfig.h"
 #include "Core/GameLoop.h"
+#include "Core/Jobs/JobSystem.h"
 #include "Graphics/GraphicsPipeline.h"
 #include "Graphics/Renderer.h"
 #include "Graphics/Swapchain.h"
@@ -20,8 +21,8 @@ namespace engine {
 // on member declaration order for both construction and destruction:
 //
 //   construct:  config -> Window -> Input -> VulkanContext -> swapchain ->
-//               GraphicsPipeline -> Renderer -> GameLoop -> Scene ->
-//               RenderSystem
+//               GraphicsPipeline -> Renderer -> GameLoop -> JobSystem ->
+//               Scene -> RenderSystem
 //   destruct:   exact reverse, so GPU resources are always released before
 //               the device, surface, instance and window they depend on.
 //               (Input unregisters itself from the Window while the Window
@@ -56,6 +57,7 @@ private:
     GraphicsPipeline m_pipeline;
     Renderer m_renderer;
     GameLoop m_gameLoop;
+    JobSystem m_jobSystem;
     Scene m_scene;
     RenderSystem m_renderSystem;
 

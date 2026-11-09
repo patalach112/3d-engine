@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Core/Memory/PoolAllocator.h"
 #include "Scene/Components.h"
 
 #include <entt/entt.hpp>
@@ -81,13 +82,27 @@ public:
     [[nodiscard]] CameraComponent* findActiveCamera();
     [[nodiscard]] const CameraComponent* findActiveCamera() const;
 
+    // Pre-allocates component storage for the given number of entities
+    // (entities, transforms, meshes, cameras, spins) so scene building
+    // and hot-path iteration don't pay heap growth costs. Call before
+    // creating entities; harmless to call again later.
+    void reserveCapacity(size_t entityCount);
+
+    // Memory pool backing all component storage of this scene.
+    [[nodiscard]] memory::PoolStats memoryStats() const { return m_registry.get_allocator().stats(); }
+
+    // The registry type: EnTT backed by the engine's paginated pool
+    // allocator — every storage draws blocks from one shared pool
+    // instead of fragmenting the global heap.
+    using Registry = entt::basic_registry<entt::entity, memory::PoolAllocator<entt::entity>>;
+
     // Direct registry access for engine systems. Prefer Entity handles in
     // gameplay-facing code; systems legitimately need views/queries.
-    [[nodiscard]] entt::registry& registry() { return m_registry; }
-    [[nodiscard]] const entt::registry& registry() const { return m_registry; }
+    [[nodiscard]] Registry& registry() { return m_registry; }
+    [[nodiscard]] const Registry& registry() const { return m_registry; }
 
 private:
-    entt::registry m_registry;
+    Registry m_registry;
     size_t m_entityCount = 0; // Scene-created, still-alive entities
 };
 

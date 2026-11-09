@@ -19,7 +19,11 @@ Application::Application(EngineConfig config)
       m_pipeline(m_context, m_swapchain),
       m_renderer(m_context, m_window, m_swapchain, m_pipeline),
       m_gameLoop(m_config.loop),
-      m_renderSystem(m_renderer, m_swapchain) {
+      m_jobSystem(JobSystem::Config{m_config.performance.jobWorkerCount}),
+      m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
+                     m_config.performance.parallelMinDrawItems) {
+    // Reserve pooled component storage before populating the scene.
+    m_scene.reserveCapacity(m_config.performance.entityReserve);
     buildScene();
     if (m_config.input.captureMouseOnStart) {
         m_input.setMouseCaptured(true);
@@ -77,9 +81,11 @@ void Application::run() {
         m_input.beginFrame();
         m_window.pollEvents();
     };
-    // Deterministic simulation systems run at the fixed rate.
+    // Deterministic simulation systems run at the fixed rate; rotation
+    // integration is data-parallel across worker threads, and
+    // parallelFor()'s return is the barrier before the variable update.
     callbacks.fixedUpdate = [this](double fixedDeltaSeconds) {
-        RotationSystem::update(m_scene, fixedDeltaSeconds);
+        RotationSystem::update(m_scene, fixedDeltaSeconds, m_jobSystem);
     };
     // Player control is frame-rate dependent by nature (mouse look), so
     // the camera system lives in the variable update.
@@ -133,11 +139,16 @@ void Application::logLoopStats(const char* context) const {
                             std::to_string(activeCamera->camera.yawDegrees()) + ", pitch " +
                             std::to_string(activeCamera->camera.pitchDegrees());
     }
+    const memory::PoolStats pool = m_scene.memoryStats();
     ENGINE_LOG_INFO(context << ": " << stats.frames << " frames in " << stats.elapsedSeconds << "s (avg "
                             << stats.averageFramesPerSecond() << " FPS, smoothed "
                             << m_gameLoop.time().framesPerSecond() << " FPS), " << stats.fixedSteps
                             << " fixed steps, " << stats.droppedSeconds * 1000.0 << " ms dropped, "
-                            << m_scene.entityCount() << " entities, " << cameraDescription);
+                            << m_scene.entityCount() << " entities (drew " << m_renderSystem.lastDrawnCount()
+                            << ", frustum-culled " << m_renderSystem.lastCulledCount() << "), jobs completed "
+                            << m_jobSystem.completedJobCount() << ", memory pool " << pool.blocksInUse << "/"
+                            << pool.blocksReserved << " blocks in " << pool.pageCount << " pages, "
+                            << cameraDescription);
 }
 
 } // namespace engine

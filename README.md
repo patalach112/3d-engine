@@ -164,11 +164,56 @@ player camera entity, the original cube at the origin, and two spinning
 companion cubes — fly around and watch them rotate at a fixed 60 Hz
 regardless of frame rate.
 
+## Phase 4 — Performance & Memory Optimization ✅
+
+### Pooled memory for the ECS (`src/Core/Memory/PoolAllocator.*`)
+
+The scene's EnTT registry no longer allocates component storage from the
+global heap. It is instantiated with a custom STL allocator backed by a
+**paginated pool**: 64 KiB pages carved into size-classed blocks
+(16 B–4 KiB) with intrusive free lists, so high-frequency component
+storage is reused predictably and stays cache-friendly. Oversized or
+over-aligned requests fall back to aligned allocation, everything is
+thread-safe and RAII (pages die with the scene), and usage statistics
+(pages, blocks in use/reserved, peaks) feed the loop log. `Scene::
+reserveCapacity()` pre-allocates storage for transforms/meshes/cameras/
+spins — set `[Performance] entityReserve` to your expected entity count.
+
+### Work-stealing job system (`src/Core/Jobs/JobSystem.*`)
+
+A thread pool using `hardware_concurrency - 1` workers by default
+(`[Performance] jobWorkerCount` overrides). Each worker owns a deque —
+LIFO pops for itself, FIFO steals for thieves — and `parallelFor()` is a
+synchronous data-parallel loop whose return acts as a **barrier**: the
+calling thread helps execute batches, so it is deadlock-safe even from
+workers. Job exceptions are caught, counted and logged; workers drain on
+shutdown. Systems use it under a strict thread-safety contract: work is
+snapshotted on the main thread, jobs write only to disjoint components,
+and no structural registry changes happen concurrently.
+
+- `RotationSystem` integrates spins in parallel during fixed updates
+- `RenderSystem` computes model matrices/world bounds in parallel
+  (above `[Performance] parallelMinDrawItems`), with deterministic
+  sequential compaction afterwards
+
+### Frustum culling (`src/Graphics/Frustum.*`, `src/Geometry/Bounds.*`)
+
+View frustum planes are extracted from the view-projection matrix
+(Gribb–Hartmann, with Vulkan's [0, w] near plane). Every `MeshComponent`
+carries local AABB bounds; per frame they are transformed to world space
+(exact 8-corner re-bounding) and tested with the p-vertex method.
+Entities outside the frustum never reach the GPU. Toggle with
+`[Render] frustumCulling`; the periodic loop stats now report
+**drawn vs. culled** counts, pool usage and completed jobs.
+
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`) covers configuration
-parsing/fallbacks, log filtering and rotation, fixed-timestep math, the
-frame clock and loop dispatch — everything verifiable without a GPU.
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 100+ checks) covers
+configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
+math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
+behavior (block reuse, alignment, fallback), job system correctness
+(barriers, exactly-once parallel coverage, exception containment), and
+frustum/AABB math — everything verifiable without a GPU.
 
 ## Configuration
 
@@ -250,6 +295,8 @@ mouse (press again to quit).
     ├── Core/
     │   ├── Application.h/.cpp  # Composition root, wires loop callbacks
     │   ├── Camera.h/.cpp       # First-person yaw/pitch camera (GLM)
+    │   ├── Jobs/JobSystem.*    # Work-stealing thread pool, parallelFor
+    │   ├── Memory/PoolAllocator.* # Paginated pool allocator for the ECS
     │   ├── EngineConfig.h/.cpp # INI loading, validation, fallback chain
     │   ├── Logger.h/.cpp       # Levels, console/file/async sinks, macros
     │   ├── Time.h/.cpp         # steady_clock frame timing, delta, FPS
@@ -266,6 +313,7 @@ mouse (press again to quit).
     │       └── RenderSystem.*  # Scene -> view/projection + draw items
     ├── Geometry/
     │   ├── Vertex.h            # Interleaved position+color vertex layout
+    │   ├── Bounds.h/.cpp       # AABB + world-space transformation
     │   └── Cube.h/.cpp         # Colored cube geometry (24 verts, 36 indices)
     └── Graphics/
         ├── VulkanContext.h/.cpp  # Instance, devices, queues, command pool
@@ -273,6 +321,7 @@ mouse (press again to quit).
         ├── Buffer.h/.cpp         # RAII VkBuffer + staging uploads
         ├── Swapchain.h/.cpp      # Swapchain, depth, render pass, framebuffers
         ├── GraphicsPipeline.h/.cpp # Shader modules, pipeline state, UBO layout
+        ├── Frustum.h/.cpp        # View frustum extraction + AABB/sphere tests
         └── Renderer.h/.cpp       # Frames-in-flight, command recording, present
 ```
 
@@ -291,6 +340,8 @@ what it depends on.
 - **Phase 3, Step 2 — ECS architecture ✅:** EnTT-backed Scene/Entity,
   foundation components, camera/rotation/render systems, multi-entity
   rendering via push constants
+- **Phase 4 — Performance & memory ✅:** paginated pool allocator for ECS
+  storage, work-stealing job system with parallel systems, frustum culling
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.
