@@ -5,6 +5,7 @@
 
 #include "Core/Camera.h"
 #include "Core/EngineConfig.h"
+#include "Platform/Window.h"
 #include "Core/GameLoop.h"
 #include "Core/Logger.h"
 #include "Core/Time.h"
@@ -85,6 +86,7 @@ void testConfigLoading() {
              << "bogusKey = 1\n"
              << "[Loop]\nmaxFrameSeconds = not_a_number\n"
              << "[Camera]\nmovementSpeed = 7.5\nmouseSensitivity = 0.25\npositionZ = 5\n"
+             << "lookSmoothingSeconds = 0.04\nmovementSmoothingSeconds = 0.09\n"
              << "[Input]\ncaptureMouseOnStart = false\n"
              << "[Render]\nfrustumCulling = false\n"
              << "[Performance]\njobWorkerCount = 2\nentityReserve = 4096\nparallelBatchSize = 512\n"
@@ -106,6 +108,8 @@ void testConfigLoading() {
     check(nearlyEqual(config.camera.movementSpeed, 7.5), "camera movement speed parsed");
     check(nearlyEqual(config.camera.mouseSensitivity, 0.25), "camera mouse sensitivity parsed");
     check(nearlyEqual(config.camera.startPosition.z, 5.0), "camera start position parsed");
+    check(nearlyEqual(config.camera.lookSmoothingSeconds, 0.04f, 1e-6), "camera look smoothing parsed");
+    check(nearlyEqual(config.camera.movementSmoothingSeconds, 0.09f, 1e-6), "camera movement smoothing parsed");
     check(!config.input.captureMouseOnStart, "input capture flag parsed");
     check(!config.render.frustumCulling, "frustum culling flag parsed");
     check(config.performance.jobWorkerCount == 2, "job worker count parsed");
@@ -210,6 +214,8 @@ bool nearlyVec3(const glm::vec3& value, const glm::vec3& expected, float epsilon
 void testCamera() {
     std::cout << "Camera\n";
     engine::CameraConfig config;
+    config.lookSmoothingSeconds = 0.0f;
+    config.movementSmoothingSeconds = 0.0f;
     engine::Camera camera(config);
 
     check(nearlyVec3(camera.position(), glm::vec3(0.0f, 0.0f, 3.0f)), "camera starts at configured position");
@@ -253,6 +259,88 @@ void testCamera() {
     check(nearlyVec3(camera.position(), config.startPosition) &&
               nearlyEqual(camera.yawDegrees(), config.startYawDegrees, 1e-4),
           "reset restores start position and orientation");
+
+    // Splitting one second of translation into different frame counts
+    // must travel the same distance: speed is units/second, not units/frame.
+    camera.reset();
+    for (int frame = 0; frame < 30; ++frame) {
+        camera.translate(glm::vec3(0.0f, 0.0f, 1.0f), 1.0 / 30.0);
+    }
+    const glm::vec3 positionAt30Fps = camera.position();
+    camera.reset();
+    for (int frame = 0; frame < 120; ++frame) {
+        camera.translate(glm::vec3(0.0f, 0.0f, 1.0f), 1.0 / 120.0);
+    }
+    check(nearlyVec3(camera.position(), positionAt30Fps, 1e-4f),
+          "translation distance is independent of frame rate");
+
+    // Mouse look consumes total pixels travelled, not pixels * frame
+    // time. Deliver the same 600 px over one simulated second at two
+    // frame rates, then settle: both cameras must reach the same yaw.
+    engine::CameraConfig lookConfig;
+    lookConfig.lookSmoothingSeconds = 0.05f;
+    lookConfig.movementSmoothingSeconds = 0.0f;
+    engine::Camera lookAt30Fps(lookConfig);
+    engine::Camera lookAt120Fps(lookConfig);
+    for (int frame = 0; frame < 30; ++frame) {
+        lookAt30Fps.processLook({20.0f, 0.0f});
+        lookAt30Fps.update(1.0 / 30.0);
+    }
+    for (int frame = 0; frame < 120; ++frame) {
+        lookAt120Fps.processLook({5.0f, 0.0f});
+        lookAt120Fps.update(1.0 / 120.0);
+    }
+    check(nearlyEqual(lookAt30Fps.targetYawDegrees(), lookAt120Fps.targetYawDegrees(), 1e-4),
+          "mouse target accumulates pixels independent of frame rate");
+    lookAt30Fps.update(10.0);
+    lookAt120Fps.update(10.0);
+    check(nearlyEqual(lookAt30Fps.yawDegrees(), lookAt120Fps.yawDegrees(), 1e-3) &&
+              nearlyEqual(lookAt30Fps.yawDegrees(), lookAt30Fps.targetYawDegrees(), 1e-3),
+          "smoothed look converges to the same orientation at any frame rate");
+
+    // One smoothed frame should move towards the target without applying
+    // the whole flick instantly (that instant application was the visible
+    // judder when GLFW delivered uneven cursor samples).
+    engine::Camera smoothedLook(lookConfig);
+    smoothedLook.processLook({100.0f, 0.0f});
+    smoothedLook.update(1.0 / 60.0);
+    check(smoothedLook.yawDegrees() > lookConfig.startYawDegrees &&
+              smoothedLook.yawDegrees() < smoothedLook.targetYawDegrees(),
+          "look smoothing partially converges in one frame");
+
+    // Smoothed movement: hold forward for one second, then release for
+    // two seconds so acceleration and glide both settle. Different frame
+    // rates should produce nearly the same total travel and stop.
+    engine::CameraConfig moveConfig;
+    moveConfig.lookSmoothingSeconds = 0.0f;
+    moveConfig.movementSmoothingSeconds = 0.07f;
+    engine::Camera moveAt30Fps(moveConfig);
+    engine::Camera moveAt240Fps(moveConfig);
+    for (int frame = 0; frame < 30; ++frame) {
+        moveAt30Fps.updateMovement({0.0f, 0.0f, 1.0f}, 1.0 / 30.0);
+    }
+    for (int frame = 0; frame < 60; ++frame) {
+        moveAt30Fps.updateMovement({0.0f, 0.0f, 0.0f}, 1.0 / 30.0);
+    }
+    for (int frame = 0; frame < 240; ++frame) {
+        moveAt240Fps.updateMovement({0.0f, 0.0f, 1.0f}, 1.0 / 240.0);
+    }
+    for (int frame = 0; frame < 480; ++frame) {
+        moveAt240Fps.updateMovement({0.0f, 0.0f, 0.0f}, 1.0 / 240.0);
+    }
+    const float moveDistance30 = glm::length(moveAt30Fps.position() - moveConfig.startPosition);
+    const float moveDistance240 = glm::length(moveAt240Fps.position() - moveConfig.startPosition);
+    check(std::abs(moveDistance30 - moveDistance240) < 0.05f,
+          "smoothed movement distance is frame-rate independent");
+    check(glm::length(moveAt30Fps.velocity()) < 1e-3f && glm::length(moveAt240Fps.velocity()) < 1e-3f,
+          "smoothed movement velocity settles to zero after release");
+
+    // Cursor capture maps to GLFW's disabled-cursor mode, which is the
+    // mode that provides unbounded virtual mouse movement for free look.
+    check(engine::Window::cursorModeForCapture(true) == GLFW_CURSOR_DISABLED,
+          "captured cursor uses GLFW_CURSOR_DISABLED");
+    check(engine::Window::cursorModeForCapture(false) == GLFW_CURSOR_NORMAL,
+          "released cursor uses GLFW_CURSOR_NORMAL");
 }
 
 void testSceneAndSystems() {

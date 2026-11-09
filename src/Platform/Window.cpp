@@ -6,7 +6,7 @@
 
 namespace engine {
 
-Window::Window(int width, int height, const char* title, bool resizable)
+Window::Window(int width, int height, const char* title, bool resizable, bool captureCursor)
     : m_width(width), m_height(height) {
     if (glfwInit() != GLFW_TRUE) {
         throw std::runtime_error("Window: failed to initialize GLFW");
@@ -23,6 +23,13 @@ Window::Window(int width, int height, const char* title, bool resizable)
     }
 
     glfwSetWindowUserPointer(m_window, this);
+
+    // Capture the cursor during window initialisation. In disabled-cursor
+    // mode GLFW reports unbounded virtual mouse movement, which is what
+    // permits unrestricted 360-degree free look without the pointer being
+    // stopped by an OS window border.
+    setCursorCaptured(captureCursor);
+
     glfwSetFramebufferSizeCallback(m_window, &Window::framebufferResizeCallback);
     glfwSetKeyCallback(m_window, &Window::keyCallback);
     glfwSetMouseButtonCallback(m_window, &Window::mouseButtonCallback);
@@ -48,6 +55,13 @@ void Window::requestClose() {
 
 void Window::pollEvents() const {
     glfwPollEvents();
+}
+
+void Window::setCursorCaptured(bool captured) {
+    m_cursorCaptured = captured;
+    if (m_window != nullptr) {
+        glfwSetInputMode(m_window, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+    }
 }
 
 void Window::waitEvents() {

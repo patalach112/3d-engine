@@ -103,9 +103,12 @@ outside the Platform layer:
 - Per-frame transitions: `wasKeyPressed()`, `wasMouseButtonReleased()`, …
 - Mouse motion for look controls: `mouseDelta()` (pixels per frame),
   `mousePosition()`, `scrollDelta()`
-- Cursor capture (hidden, unbounded) for mouse look, cleared state on
-  focus loss, and a strict frame protocol: `beginFrame()` → `pollEvents()`
-  → systems query state
+- Cursor capture (hidden, unbounded) for mouse look: when
+  `captureMouseOnStart` is enabled, `Window` applies
+  `GLFW_CURSOR_DISABLED` during window creation, before Vulkan or scene
+  setup begins. Capture transitions also clear accumulated cursor samples
+  to prevent first-frame jumps. State is cleared on focus loss, and the
+  frame protocol is `beginFrame()` → `pollEvents()` → systems query state
 
 ### First-person camera (`src/Core/Camera.*`)
 
@@ -125,11 +128,15 @@ vector — no gimbal lock, no view flipping. Yaw wraps to [-180°, 180°).
 | Esc         | Release mouse, again to quit |
 
 Movement is integrated with the variable update's delta time (diagonal
-movement normalized), sensitivity/speed/boost/clip planes are all
-configurable under `[Camera]`/`[Input]` in `engine.ini`, and the camera's
-view/projection matrices feed the existing UBO each frame — the cube is
-static now and the player flies around it. Periodic loop statistics now
-also report camera position/yaw/pitch.
+movement normalized). Mouse look accumulates GLFW cursor distances in
+pixels rather than incorrectly multiplying them by frame time. Orientation
+and movement velocity nevertheless use `1-exp(-dt/tau)` exponential
+smoothing, so uneven cursor samples and key presses/releases ramp over
+the same wall-clock time at any frame rate. Sensitivity, speed, boost,
+smoothing time constants, and clip planes are configurable under
+`[Camera]`/`[Input]` in `engine.ini`, and the camera's view/projection
+matrices feed the existing UBO each frame. Periodic loop statistics also
+report camera position/yaw/pitch.
 
 ## Phase 3, Step 2 — ECS Architecture (EnTT) ✅
 

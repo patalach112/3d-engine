@@ -307,6 +307,14 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             if (reader.applyDouble(value, doubleField, 0.0, 10.0)) {
                 config.camera.mouseSensitivity = static_cast<float>(doubleField);
             }
+        } else if (key == "looksmoothingseconds") {
+            if (reader.applyDouble(value, doubleField, 0.0, 10.0)) {
+                config.camera.lookSmoothingSeconds = static_cast<float>(doubleField);
+            }
+        } else if (key == "movementsmoothingseconds") {
+            if (reader.applyDouble(value, doubleField, 0.0, 10.0)) {
+                config.camera.movementSmoothingSeconds = static_cast<float>(doubleField);
+            }
         } else if (key == "inverty") {
             reader.apply(value, config.camera.invertY);
         } else if (key == "pitchlimitdegrees") {

@@ -51,6 +51,11 @@ MouseButton translateMouseButton(int glfwButton) {
 
 Input::Input(Window& window) : m_window(window) {
     m_window.setInputHandler(this);
+    // Window applies the requested GLFW cursor mode during construction;
+    // adopt that state without re-sending the mode or losing the fact that
+    // the cursor is already captured at startup.
+    m_mouseCaptured = m_window.isCursorCaptured();
+    m_hasMousePosition = false;
 }
 
 Input::~Input() {
@@ -100,14 +105,16 @@ bool Input::wasMouseButtonReleased(MouseButton button) const {
 }
 
 void Input::setMouseCaptured(bool captured) {
-    if (m_mouseCaptured == captured) {
+    if (m_mouseCaptured == captured && m_window.isCursorCaptured() == captured) {
         return;
     }
     m_mouseCaptured = captured;
-    glfwSetInputMode(m_window.handle(), GLFW_CURSOR,
-                     captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
-    // The first cursor event after (un)capturing only sets the baseline,
-    // so the camera doesn't jump by the accumulated offset.
+    m_window.setCursorCaptured(captured);
+    // A mode change can make previously accumulated cursor samples stale.
+    // In particular, absolute positions reported just before GLFW switches
+    // to its virtual captured cursor must not be replayed as one large
+    // look jump on the next frame. The next event only sets the baseline.
+    m_mouseDelta = glm::vec2{0.0f};
     m_hasMousePosition = false;
 }
 

@@ -23,7 +23,7 @@ class Input;
 // ---------------------------------------------------------------------------
 class Window {
 public:
-    Window(int width, int height, const char* title, bool resizable = true);
+    Window(int width, int height, const char* title, bool resizable = true, bool captureCursor = true);
     ~Window();
 
     Window(const Window&) = delete;
@@ -46,6 +46,15 @@ public:
 
     [[nodiscard]] bool wasFramebufferResized() const { return m_framebufferResized; }
     void resetFramebufferResizedFlag() { m_framebufferResized = false; }
+
+    // Applies GLFW's captured/free cursor modes. Capture is established
+    // during window creation when requested, rather than being deferred
+    // until the rest of the application has finished constructing.
+    void setCursorCaptured(bool captured);
+    [[nodiscard]] bool isCursorCaptured() const { return m_cursorCaptured; }
+    [[nodiscard]] static constexpr int cursorModeForCapture(bool captured) {
+        return captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL;
+    }
 
     // Registers the input system that GLFW key/mouse callbacks are
     // forwarded to (nullptr detaches). Owned by the caller; the Window
@@ -72,6 +81,7 @@ private:
     int m_width = 0;
     int m_height = 0;
     bool m_framebufferResized = false;
+    bool m_cursorCaptured = false;
 };
 
 } // namespace engine

@@ -14,7 +14,7 @@ namespace engine {
 Application::Application(EngineConfig config)
     : m_config(std::move(config)),
       m_window(m_config.window.width, m_config.window.height, m_config.window.title.c_str(),
-               m_config.window.resizable),
+               m_config.window.resizable, m_config.input.captureMouseOnStart),
       m_input(m_window),
       m_context(m_window),
       m_swapchain(m_context, m_window, m_config.render.vsync),
@@ -37,9 +37,9 @@ Application::Application(EngineConfig config)
     // Reserve pooled component storage before populating the scene.
     m_scene.reserveCapacity(m_config.performance.entityReserve);
     buildScene();
-    if (m_config.input.captureMouseOnStart) {
-        m_input.setMouseCaptured(true);
-    }
+    // No late cursor-capture call is needed here: Window already applied
+    // GLFW_CURSOR_DISABLED during construction when captureMouseOnStart
+    // was enabled, and Input adopted that state.
 }
 
 Application::~Application() {
