@@ -424,10 +424,11 @@ Physics is ECS-native and data-oriented, not an external object hierarchy:
   scalar plus anisotropic friction, gravity scale, and static/gravity flags.
   Automatic inertia is derived from the collider (box/OBB, sphere, capsule,
   or convex-hull bounds); explicit principal/full tensors can replace it.
-- `ColliderComponent` is a dense, 144-byte value supporting **Box, Sphere,
+- `ColliderComponent` is a dense, 160-byte value supporting **Box, Sphere,
   Plane, OBB, Capsule, and ConvexHull** (up to eight hull points). Local
-  dimensions are scaled by `TransformComponent::scale`; the derived world
-  geometry carries oriented axes, swept bounds, capsule axes, and hull points.
+  dimensions and the local `centerOffset` are scaled by
+  `TransformComponent::scale`; the derived world geometry carries oriented
+  axes, swept bounds, capsule axes, and hull points.
 - `GravityFieldComponent` attaches a localized radial field
   (`mu = G*M`, optional finite radius with smooth falloff) to any entity
   with a transform — planets do not need rigid bodies. `PhysicsSettings`
@@ -768,6 +769,59 @@ clamping, the 120 m/s anti-tunneling A/B, sleeping stacks waking under
 a dropped heavy ball, momentum exchange, penetration clamping and the
 player jump landing: 350 checks, all passing.
 
+## Phase 12 — Automated 3D Asset Import, Auto-Scale & 1:1 Hitboxes ✅
+
+External models now enter the engine through one automated path:
+`AssetManager::loadObj` → `MeshAsset` (with `MeshBounds`) →
+`Scene::spawnImportedModel` → a renderable, physical entity whose
+hitbox is derived from the same numbers as its visuals.
+
+### OBJ import (`AssetManager::loadObj`)
+
+A strict Wavefront OBJ importer (no third-party dependency) parses
+`v`/`vt`/`vn` records and fan-triangulates polygon faces into the
+registry's indexed vertex/index buffers. It accepts all four face
+forms (`v`, `v/vt`, `v//vn`, `v/vt/vn`), resolves negative relative
+indices, shares duplicate attribute tuples, generates flat Newell
+normals for faces that carry none, and rejects malformed files
+(bad numbers, out-of-range indices, no faces) without registering a
+half-parsed mesh. Imported UVs land in the interleaved `Vertex`
+format's new `texCoord` attribute (location 3), so geometry is
+texture-ready; the built-in cube carries matching per-face UVs.
+
+### AABB bounds & auto-scale normalization
+
+Every registered mesh — imported or programmatic — gets a
+`MeshBounds` computed once from its raw vertices: AABB `min`/`max`,
+`center`, half-`extents`, full `size`, and
+`autoScaleFactor = 1 / max(size)`. The longest raw dimension therefore
+normalizes to 1.0 whether the source file was authored in
+millimetres, inches or metres; raw vertices are never rescaled, so
+the registry keeps one true copy of the file geometry.
+
+### 1:1 hitbox spawning (`Scene::spawnImportedModel`)
+
+Spawning wires the whole entity from those bounds:
+
+- `TransformComponent.scale = userScale * bounds.autoScaleFactor`
+- `MeshComponent` references the asset and adopts its raw AABB as
+  local culling bounds
+- `RigidBodyComponent` carries the requested mass
+- `ColliderComponent::box(bounds.extents, bounds.center)` — half
+  extents and center offset straight from the AABB
+
+Physics honours the new `ColliderComponent::centerOffset` when it
+derives world geometry (scaled, then rotated into world space) and
+adds the parallel-axis term to automatic box inertia, so the
+collision volume sits exactly on the rendered volume even when a
+model's origin is far from its geometric center. Because mesh and
+collider both consume the raw bounds through the same transform
+scale, the rendered world AABB and the physics world box are equal
+by construction at any user scale — verified numerically in tests,
+including a landing test where an off-center imported crate comes to
+rest with its *visual* bottom exactly on the floor. Phase 12 adds 23
+checks (373 total, all passing).
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
@@ -946,6 +1000,11 @@ what it depends on.
   constants), plus Phase 9's distinct palette and directional lighting,
   and Phase 10's shadow mapping, depth/winding contract tests, and 1:1
   quaternion rotation sync
-  constants, depth-write/back-cull defaults)
+- **Phase 11 — Sub-stepped physics ✅:** internal physics sub-stepping,
+  multi-point contact manifolds with centroid-reduced sequential
+  impulses, non-linear position correction, and resting-body sleep
+- **Phase 12 — Asset import pipeline ✅:** dependency-free OBJ import
+  into the asset registry, AABB/MeshBounds auto-scale normalization,
+  and one-call ECS spawning with a 1:1 offset box hitbox
 - Later phases build the real engine core on top of this foundation —
   editors and visual tooling only arrive once the core is complete.

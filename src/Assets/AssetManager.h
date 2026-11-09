@@ -28,12 +28,40 @@ using ShaderId = uint32_t;
 using MaterialId = uint32_t;
 inline constexpr uint32_t kInvalidAssetId = 0;
 
+// Import/normalization bounds for one mesh, computed once from its raw
+// (unscaled, file-space) vertices at registration time.
+//
+// min/max are the raw AABB corners; center and extents are the AABB
+// center and *half* extents (so a box collider can consume extents
+// directly as its halfExtents); size is the full extent per axis.
+// autoScaleFactor normalizes the mesh's longest full dimension to 1.0
+// (1 / max(size)), which makes models exported in millimetres, inches
+// or metres spawn at the same baseline size: a spawner applies
+// userScale * autoScaleFactor as the transform scale and the raw
+// center/extents as the collider offset/half-extents, and the world
+// hitbox then matches the rendered bounds exactly.
+struct MeshBounds {
+    glm::vec3 min{-0.5f};
+    glm::vec3 max{0.5f};
+    glm::vec3 center{0.0f};
+    glm::vec3 extents{0.5f}; // half extents
+    glm::vec3 size{1.0f};    // full extents (max - min)
+    float autoScaleFactor = 1.0f;
+
+    [[nodiscard]] AABB aabb() const { return AABB{min, max}; }
+};
+
+// Computes MeshBounds from vertex positions (unit-cube defaults for an
+// empty span). Shared by programmatic registration and file import so
+// every mesh in the registry carries consistent bounds.
+[[nodiscard]] ENGINE_ASSETS_API MeshBounds computeMeshBounds(std::span<const Vertex> vertices);
+
 struct MeshAsset {
     MeshId id = kInvalidAssetId;
     std::string name;
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
-    AABB bounds{};
+    MeshBounds bounds{};
     uint64_t vramBytes = 0; // device-local bytes this mesh will occupy
 };
 
@@ -124,6 +152,14 @@ public:
     // Registers geometry (idempotent by name). Returns kInvalidAssetId
     // when the VRAM or staging budget would be exceeded.
     MeshId registerMesh(std::string name, std::span<const Vertex> vertices, std::span<const uint32_t> indices);
+    // Imports a Wavefront OBJ model (positions, UVs, normals; polygon
+    // faces are fan-triangulated, negative relative indices are
+    // resolved, missing normals are generated flat per face) and
+    // registers it under `name`. The mesh keeps its raw file-space
+    // vertices; normalization lives in MeshAsset::bounds (see
+    // MeshBounds) and is applied by the spawner, never baked into the
+    // geometry. Returns kInvalidAssetId on I/O or parse failure.
+    MeshId loadObj(const std::string& name, const std::filesystem::path& path);
     ShaderId registerShader(std::string name, std::span<const uint32_t> spirvCode);
     // Loads SPIR-V from a file and registers it. Invalid id on I/O failure.
     ShaderId loadShader(const std::string& name, const std::filesystem::path& path);

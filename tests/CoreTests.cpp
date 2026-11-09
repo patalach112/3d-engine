@@ -411,7 +411,7 @@ void testPhysics() {
     using engine::TransformComponent;
 
     check(sizeof(RigidBodyComponent) == 208, "rigid body remains a dense 208-byte component");
-    check(sizeof(ColliderComponent) == 144, "collider remains a dense 144-byte component");
+    check(sizeof(ColliderComponent) == 160, "collider remains a dense 160-byte component");
     {
         RigidBodyComponent inertiaBody(2.0f);
         inertiaBody.setPrincipalInertia(glm::vec3{2.0f, 4.0f, 6.0f});
@@ -1122,7 +1122,7 @@ void testDynamicModulesAndMaterials() {
         windingOutward = glm::dot(glm::cross(p1 - p0, p2 - p0), centroid) > 0.0f;
     }
     check(windingOutward, "cube triangles wind outward so back-face culling keeps visible faces");
-    check(sizeof(engine::Vertex) == 36, "vertex format is position+normal+color (36 bytes)");
+    check(sizeof(engine::Vertex) == 44, "vertex format is position+normal+color+uv (44 bytes)");
 
     // Sandbox palette: every scene category gets its own solid material,
     // with distinct base colors and lighting responses.
@@ -1982,7 +1982,7 @@ void testAssetManagement() {
         check(cubeId == 1, "first mesh gets stable id 1");
         const engine::MeshAsset* cube = assets.mesh("cube");
         check(cube != nullptr && cube->vramBytes > 0, "mesh VRAM footprint accounted");
-        check(cube != nullptr && nearlyEqual(cube->bounds.extents().x, 0.5, 1e-4),
+        check(cube != nullptr && nearlyEqual(cube->bounds.extents.x, 0.5, 1e-4),
               "mesh bounds computed from vertices");
         check(vram.usedBytes() == cube->vramBytes, "mesh registration reserves VRAM budget");
         check(assets.registerMesh("cube", engine::Cube::vertices(), engine::Cube::indices()) == cubeId &&
@@ -2099,6 +2099,188 @@ void testAssetManagement() {
                                           material->desc.lighting.ambientStrength});
     }
     check(lightingOk, "render items carry packed material colors and lighting parameters");
+}
+
+void testImportedModelPipeline() {
+    std::cout << "Phase 12: OBJ import, auto-scale normalization & 1:1 hitboxes\n";
+
+    const auto dir = makeTempDir("engine_test_obj_import");
+    const auto cratePath = dir / "millimetre_crate.obj";
+    {
+        std::ofstream file(cratePath);
+        // A 2000 x 1000 x 500 crate exported in millimetres, origin at a
+        // bottom corner's center plane — deliberately neither centred
+        // nor metre-scale, like real DCC exports.
+        file << "# millimetre crate\n"
+             << "v -1000 0 -250\n"
+             << "v 1000 0 -250\n"
+             << "v 1000 1000 -250\n"
+             << "v -1000 1000 -250\n"
+             << "v -1000 0 250\n"
+             << "v 1000 0 250\n"
+             << "v 1000 1000 250\n"
+             << "v -1000 1000 250\n"
+             << "vt 0 0\n"
+             << "vt 1 0\n"
+             << "vt 1 1\n"
+             << "vt 0 1\n"
+             << "vn 0 0 1\n"
+             << "vn 0 0 -1\n"
+             << "vn 0 1 0\n"
+             << "vn 0 -1 0\n"
+             << "vn 1 0 0\n"
+             << "vn -1 0 0\n"
+             << "f 5/1/1 6/2/1 7/3/1 8/4/1\n"
+             << "f 2/1/2 1/2/2 4/3/2 3/4/2\n"
+             << "f 8/1/3 7/2/3 3/3/3 4/4/3\n"
+             << "f 1/1/4 2/2/4 6/3/4 5/4/4\n"
+             << "f 6/1/5 2/2/5 3/3/5 7/4/5\n"
+             << "f 1/1/6 5/2/6 8/3/6 4/4/6\n";
+    }
+    const auto triPath = dir / "relative_triangle.obj";
+    {
+        std::ofstream file(triPath);
+        // No vt/vn at all and negative (relative) face indices: the
+        // importer must generate a flat normal and default UVs.
+        file << "v 0 0 0\n"
+             << "v 2 0 0\n"
+             << "v 0 1 0\n"
+             << "f -3 -2 -1\n";
+    }
+    const auto badPath = dir / "broken.obj";
+    {
+        std::ofstream file(badPath);
+        file << "v 0 0 0\n"
+             << "v 1 0 0\n"
+             << "v 0 1 0\n"
+             << "f 1 2 99\n"; // index 99 does not exist
+    }
+
+    engine::VramBudget vram(1024 * 1024);
+    engine::VramBudget staging(1024 * 1024);
+    engine::AssetManager assets(vram, staging);
+
+    // --- OBJ parsing: buffers, triangulation, UVs/normals --------------
+    const engine::MeshId crateId = assets.loadObj("millimetreCrate", cratePath);
+    check(crateId != engine::kInvalidAssetId, "OBJ crate imports successfully");
+    const engine::MeshAsset* crate = assets.mesh(crateId);
+    check(crate != nullptr && crate->vertices.size() == 24 && crate->indices.size() == 36,
+          "OBJ quads fan-triangulate into an indexed 24-vertex/12-triangle mesh");
+    bool importedUvAndNormal = false;
+    if (crate != nullptr) {
+        for (const engine::Vertex& vertex : crate->vertices) {
+            importedUvAndNormal = importedUvAndNormal ||
+                                  (nearlyVec3(vertex.position, glm::vec3{1000.0f, 1000.0f, 250.0f}, 1e-4) &&
+                                   nearlyEqual(vertex.texCoord.x, 1.0, 1e-6) &&
+                                   nearlyEqual(vertex.texCoord.y, 1.0, 1e-6) &&
+                                   nearlyEqual(glm::length(vertex.normal), 1.0, 1e-4));
+        }
+    }
+    check(importedUvAndNormal, "OBJ vertices carry file positions, UVs and unit normals");
+    check(assets.loadObj("millimetreCrate", cratePath) == crateId && assets.meshCount() == 1,
+          "OBJ import is idempotent by name");
+
+    const engine::MeshId triId = assets.loadObj("relativeTriangle", triPath);
+    const engine::MeshAsset* tri = assets.mesh(triId);
+    check(tri != nullptr && tri->vertices.size() == 3 && tri->indices.size() == 3,
+          "OBJ negative relative indices resolve to the defined vertices");
+    check(tri != nullptr && nearlyVec3(tri->vertices[0].normal, glm::vec3{0.0f, 0.0f, 1.0f}, 1e-5) &&
+              nearlyEqual(tri->vertices[0].texCoord.x, 0.0, 1e-9) &&
+              nearlyEqual(tri->vertices[0].texCoord.y, 0.0, 1e-9),
+          "normal-less OBJ faces get a generated flat normal and default UVs");
+    check(assets.loadObj("broken", badPath) == engine::kInvalidAssetId && assets.meshCount() == 2,
+          "OBJ with an out-of-range face index is rejected without registering");
+    check(assets.loadObj("missing", dir / "not_here.obj") == engine::kInvalidAssetId,
+          "missing OBJ file yields an invalid id");
+
+    // --- AABB + auto-scale normalization --------------------------------
+    check(crate != nullptr && nearlyVec3(crate->bounds.min, glm::vec3{-1000.0f, 0.0f, -250.0f}, 1e-3) &&
+              nearlyVec3(crate->bounds.max, glm::vec3{1000.0f, 1000.0f, 250.0f}, 1e-3),
+          "mesh AABB is the min/max over all imported vertices");
+    check(crate != nullptr && nearlyVec3(crate->bounds.center, glm::vec3{0.0f, 500.0f, 0.0f}, 1e-3) &&
+              nearlyVec3(crate->bounds.extents, glm::vec3{1000.0f, 500.0f, 250.0f}, 1e-3) &&
+              nearlyVec3(crate->bounds.size, glm::vec3{2000.0f, 1000.0f, 500.0f}, 1e-3),
+          "mesh bounds derive center, half-extents and full size from the AABB");
+    check(crate != nullptr && nearlyEqual(crate->bounds.autoScaleFactor, 1.0 / 2000.0, 1e-9),
+          "auto-scale factor is 1/max full extent (millimetres normalize to a 1-unit longest side)");
+    check(tri != nullptr && nearlyEqual(tri->bounds.autoScaleFactor, 0.5, 1e-6),
+          "metre-scale meshes get the same normalization rule (no unit is special)");
+    const engine::MeshBounds direct = engine::computeMeshBounds(crate != nullptr
+                                                                    ? std::span<const engine::Vertex>{crate->vertices}
+                                                                    : std::span<const engine::Vertex>{});
+    check(nearlyVec3(direct.center, glm::vec3{0.0f, 500.0f, 0.0f}, 1e-3) &&
+              nearlyEqual(direct.autoScaleFactor, 1.0 / 2000.0, 1e-9),
+          "computeMeshBounds reproduces the registered bounds from raw vertices");
+
+    // --- ECS spawn: transform, mesh, rigid body, 1:1 hitbox -------------
+    engine::Scene scene;
+    engine::Entity spawned = scene.spawnImportedModel(*crate, "ImportedCrate", glm::vec3{10.0f, 20.0f, 30.0f},
+                                                      glm::vec3{2.0f, 3.0f, 4.0f}, 2.5f);
+    check(spawned.isValid(), "spawnImportedModel returns a live entity");
+    const auto& transform = spawned.getComponent<engine::TransformComponent>();
+    check(nearlyVec3(transform.scale, glm::vec3{2.0f, 3.0f, 4.0f} * (1.0f / 2000.0f), 1e-7),
+          "transform scale is userScale * autoScaleFactor");
+    const auto& meshComponent = spawned.getComponent<engine::MeshComponent>();
+    check(meshComponent.assetId == "millimetreCrate" &&
+              nearlyVec3(meshComponent.localBounds.min, crate->bounds.min, 1e-3) &&
+              nearlyVec3(meshComponent.localBounds.max, crate->bounds.max, 1e-3),
+          "mesh component references the asset and its raw local bounds");
+    check(spawned.hasComponent<engine::RigidBodyComponent>() &&
+              nearlyEqual(spawned.getComponent<engine::RigidBodyComponent>().mass, 2.5, 1e-6),
+          "spawned model carries a rigid body of the requested mass");
+    const auto& collider = spawned.getComponent<engine::ColliderComponent>();
+    check(collider.type == engine::ColliderComponent::Type::Box &&
+              nearlyVec3(collider.halfExtents, crate->bounds.extents, 1e-3) &&
+              nearlyVec3(collider.centerOffset, crate->bounds.center, 1e-3),
+          "collider is a box with halfExtents = bounds.extents and centerOffset = bounds.center");
+    // The rendered world AABB and the physics world box must coincide:
+    // both are the raw bounds scaled by the same transform scale, the
+    // collider additionally recentered by its (scaled) center offset.
+    const engine::AABB worldVisual = meshComponent.localBounds.transformed(transform.modelMatrix());
+    const glm::vec3 colliderWorldCenter = transform.position + transform.scale * collider.centerOffset;
+    const glm::vec3 colliderWorldExtents = collider.halfExtents * transform.scale;
+    check(nearlyVec3(worldVisual.center(), colliderWorldCenter, 1e-4) &&
+              nearlyVec3(worldVisual.extents(), colliderWorldExtents, 1e-4),
+          "rendered world bounds and collider world box are identical (1:1 hitbox)");
+
+    engine::Entity scalarSpawned = scene.spawnImportedModel(*crate, "ScalarCrate", glm::vec3{0.0f}, 2.0f, 1.0f);
+    check(nearlyVec3(scalarSpawned.getComponent<engine::TransformComponent>().scale,
+                     glm::vec3{2.0f / 2000.0f}, 1e-7),
+          "scalar userScale overload normalizes uniformly");
+    const size_t entitiesBeforeInvalid = scene.entityCount();
+    const engine::MeshAsset emptyAsset;
+    check(!scene.spawnImportedModel(emptyAsset, "Empty", glm::vec3{0.0f}).isValid() &&
+              scene.entityCount() == entitiesBeforeInvalid,
+          "spawning an empty asset is rejected without creating an entity");
+
+    // --- Physics: the offset hitbox lands exactly on the visual bottom --
+    {
+        engine::Scene physicsScene;
+        auto floor = physicsScene.createEntity("ImportFloor");
+        floor.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+        auto& floorBody = floor.addComponent<engine::RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floor.addComponent<engine::ColliderComponent>(
+            engine::ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+
+        // userScale 2 => world crate is 2 x 1 x 0.5, its AABB center
+        // riding 0.5 above the entity origin (raw center y=500 mm).
+        engine::Entity landed = physicsScene.spawnImportedModel(*crate, "LandedCrate", glm::vec3{0.0f, 0.08f, 0.0f},
+                                                                glm::vec3{2.0f}, 1.0f);
+        engine::PhysicsSettings settings;
+        engine::PhysicsSystem physics;
+        engine::PhysicsSystem::Stats stats;
+        for (int step = 0; step < 150; ++step) {
+            stats = physics.update(physicsScene, 1.0 / 60.0, settings);
+        }
+        const auto& landedTransform = landed.getComponent<engine::TransformComponent>();
+        const engine::AABB landedVisual =
+            landed.getComponent<engine::MeshComponent>().localBounds.transformed(landedTransform.modelMatrix());
+        check(stats.contacts > 0 && nearlyEqual(landedVisual.min.y, 0.0, 0.01),
+              "imported model rests with its visual bottom exactly on the floor (offset hitbox)");
+        check(glm::length(landed.getComponent<engine::RigidBodyComponent>().velocity) < 0.05f,
+              "imported model settles after landing");
+    }
 }
 
 void testLockFreeRingBuffer() {
@@ -2682,6 +2864,7 @@ int main() {
     testHardwareProfile();
     testVramBudget();
     testAssetManagement();
+    testImportedModelPipeline();
     testLockFreeRingBuffer();
     testJobSystem();
     testAsyncLoggerConcurrency();

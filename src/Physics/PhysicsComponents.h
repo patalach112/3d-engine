@@ -132,12 +132,19 @@ struct alignas(16) RigidBodyComponent {
 // scaled by TransformComponent::scale. Box is treated as an OBB once the
 // body rotates. Capsules use the local Y axis. Convex hulls accept up to
 // eight points and collide through world-space support/SAT projection.
+//
+// centerOffset shifts the collider's center in the body's local frame
+// (also scaled by TransformComponent::scale). It exists so a collider
+// can sit exactly on an imported mesh's AABB center when the model's
+// origin is not its geometric center — the rendered mesh and the
+// hitbox then occupy the same world volume with no manual tuning.
 // ---------------------------------------------------------------------------
 struct alignas(16) ColliderComponent {
     enum class Type : uint8_t { Box, Sphere, Plane, Obb, Capsule, ConvexHull };
 
     Type type = Type::Box;
     glm::vec3 halfExtents{0.5f, 0.5f, 0.5f};
+    glm::vec3 centerOffset{0.0f};
     float radius = 0.5f;
     float capsuleHalfHeight = 0.25f; // half length of the cylinder segment
     glm::vec3 planeNormal{0.0f, 1.0f, 0.0f};
@@ -148,15 +155,18 @@ struct alignas(16) ColliderComponent {
     ColliderComponent() = default;
     explicit ColliderComponent(const glm::vec3& halfExtents_) : halfExtents(halfExtents_) {}
 
-    [[nodiscard]] static ColliderComponent box(const glm::vec3& halfExtents_) {
+    [[nodiscard]] static ColliderComponent box(const glm::vec3& halfExtents_,
+                                               const glm::vec3& centerOffset_ = glm::vec3{0.0f}) {
         ColliderComponent collider;
         collider.type = Type::Box;
         collider.halfExtents = halfExtents_;
+        collider.centerOffset = centerOffset_;
         return collider;
     }
 
-    [[nodiscard]] static ColliderComponent obb(const glm::vec3& halfExtents_) {
-        ColliderComponent collider = box(halfExtents_);
+    [[nodiscard]] static ColliderComponent obb(const glm::vec3& halfExtents_,
+                                               const glm::vec3& centerOffset_ = glm::vec3{0.0f}) {
+        ColliderComponent collider = box(halfExtents_, centerOffset_);
         collider.type = Type::Obb;
         return collider;
     }
@@ -195,6 +205,10 @@ struct alignas(16) ColliderComponent {
         return collider;
     }
 };
+
+// Import/spawning code refers to the box configuration of this unified
+// collider component by this conventional name (ColliderComponent::box).
+using BoxColliderComponent = ColliderComponent;
 
 // A localized radial gravity source. Attach with TransformComponent to a
 // planet/field entity; no RigidBodyComponent is required.
@@ -269,7 +283,7 @@ struct PhysicsSettings {
 
 static_assert(sizeof(RigidBodyComponent) == 208 && alignof(RigidBodyComponent) == 16,
               "RigidBodyComponent must remain a dense 208-byte value");
-static_assert(sizeof(ColliderComponent) == 144 && alignof(ColliderComponent) == 16,
-              "ColliderComponent must remain a dense 144-byte value");
+static_assert(sizeof(ColliderComponent) == 160 && alignof(ColliderComponent) == 16,
+              "ColliderComponent must remain a dense 160-byte value");
 
 } // namespace engine

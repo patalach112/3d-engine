@@ -12,6 +12,39 @@ Entity Scene::createEntity(const std::string& name) {
     return entity;
 }
 
+Entity Scene::spawnImportedModel(const MeshAsset& asset, const std::string& name, const glm::vec3& position,
+                                 const glm::vec3& userScale, float mass) {
+    if (asset.id == kInvalidAssetId || asset.vertices.empty() || asset.indices.empty()) {
+        ENGINE_LOG_WARNING("Scene: spawnImportedModel('" << name << "') rejected: asset '" << asset.name
+                                                         << "' has no geometry");
+        return Entity{};
+    }
+
+    Entity entity = createEntity(name);
+
+    // Auto-scale normalization: raw file units cancel out here. The
+    // same factor scales the collider (PhysicsSystem multiplies local
+    // collider dimensions by transform scale), so mesh and hitbox stay
+    // locked together at every user scale.
+    auto& transform = entity.addComponent<TransformComponent>(position);
+    transform.scale = userScale * asset.bounds.autoScaleFactor;
+
+    auto& mesh = entity.addComponent<MeshComponent>(asset.name);
+    mesh.localBounds = asset.bounds.aabb();
+
+    entity.addComponent<RigidBodyComponent>(mass);
+
+    // 1:1 hitbox: raw AABB half-extents as the box size, raw AABB
+    // center as the local offset from the model origin.
+    entity.addComponent<ColliderComponent>(ColliderComponent::box(asset.bounds.extents, asset.bounds.center));
+    return entity;
+}
+
+Entity Scene::spawnImportedModel(const MeshAsset& asset, const std::string& name, const glm::vec3& position,
+                                 float userScale, float mass) {
+    return spawnImportedModel(asset, name, position, glm::vec3{userScale}, mass);
+}
+
 void Scene::destroyEntity(Entity entity) {
     if (!isValid(entity)) {
         return;

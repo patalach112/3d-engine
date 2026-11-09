@@ -87,9 +87,22 @@ constexpr float kEpsilon = 1e-6f;
     }
     const glm::vec3 dimensions = collider.halfExtents * 2.0f * scale;
     const float factor = mass / 12.0f;
-    return glm::mat3{factor * (dimensions.y * dimensions.y + dimensions.z * dimensions.z), 0.0f, 0.0f,
-                     0.0f, factor * (dimensions.x * dimensions.x + dimensions.z * dimensions.z), 0.0f,
-                     0.0f, 0.0f, factor * (dimensions.x * dimensions.x + dimensions.y * dimensions.y)};
+    glm::mat3 inertia{factor * (dimensions.y * dimensions.y + dimensions.z * dimensions.z), 0.0f, 0.0f,
+                      0.0f, factor * (dimensions.x * dimensions.x + dimensions.z * dimensions.z), 0.0f,
+                      0.0f, 0.0f, factor * (dimensions.x * dimensions.x + dimensions.y * dimensions.y)};
+    // Parallel-axis term: a box whose center is offset from the body
+    // origin (imported-mesh hitboxes) resists rotation about that
+    // origin with the extra m * (|d|^2 I - d d^T) inertia.
+    const glm::vec3 offset = collider.centerOffset * scale;
+    const float offsetLengthSq = glm::dot(offset, offset);
+    if (offsetLengthSq > 1e-12f) {
+        inertia += mass * glm::mat3{offsetLengthSq - offset.x * offset.x, -offset.y * offset.x,
+                                    -offset.z * offset.x, -offset.x * offset.y,
+                                    offsetLengthSq - offset.y * offset.y, -offset.z * offset.y,
+                                    -offset.x * offset.z, -offset.y * offset.z,
+                                    offsetLengthSq - offset.z * offset.z};
+    }
+    return inertia;
 }
 
 
@@ -643,14 +656,19 @@ void PhysicsSystem::buildGeometry(JobSystem* jobs, uint32_t parallelMinBodies, f
             const ColliderComponent& collider = *ref.collider;
             RigidBodyComponent& body = *ref.body;
             geometry.type = collider.type;
-            geometry.center = ref.transform->position;
-            geometry.previousCenter = ref.transform->position - body.velocity * dt;
+            geometry.axes = rotationMatrix(body.orientation);
+            const glm::vec3 scale = glm::abs(ref.transform->scale);
+            // The collider's world center rides its local centerOffset
+            // (scaled, then rotated into world space): an imported
+            // mesh's hitbox sits on its AABB center even when the model
+            // origin — the transform/body position, which stays the
+            // center of mass for impulse lever arms — is elsewhere.
+            geometry.center = ref.transform->position + geometry.axes * (collider.centerOffset * scale);
+            geometry.previousCenter = geometry.center - body.velocity * dt;
             geometry.displacement = body.velocity * dt;
             geometry.isPlane = collider.type == ColliderComponent::Type::Plane;
-            geometry.axes = rotationMatrix(body.orientation);
             geometry.boundsCenter = geometry.center;
 
-            const glm::vec3 scale = glm::abs(ref.transform->scale);
             geometry.halfExtents = collider.halfExtents * scale;
             geometry.radius = collider.radius * std::max({scale.x, scale.y, scale.z});
             geometry.planeNormal = glm::dot(collider.planeNormal, collider.planeNormal) > kEpsilon

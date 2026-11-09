@@ -1,6 +1,7 @@
 #pragma once
 #include "Core/Export.h"
 
+#include "Assets/AssetManager.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Scene/Components.h"
 
@@ -73,6 +74,25 @@ public:
 
     // Creates an entity with a TagComponent carrying the given name.
     Entity createEntity(const std::string& name = "Entity");
+    // Spawns a fully-wired entity for an imported/registered mesh:
+    //
+    //   TransformComponent  scale = userScale * mesh.bounds.autoScaleFactor
+    //                       (the mesh's longest dimension becomes
+    //                       userScale's longest dimension, whatever
+    //                       units the source file used)
+    //   MeshComponent       asset name + the mesh's raw local AABB
+    //   RigidBodyComponent  dynamic body of the given mass
+    //   ColliderComponent   box with halfExtents = bounds.extents and
+    //                       centerOffset = bounds.center
+    //
+    // Mesh, collider and transform all consume the same raw bounds, so
+    // the physics hitbox is a 1:1 match of the rendered bounds at any
+    // user scale with no manual collider configuration. Returns an
+    // invalid Entity when the asset carries no geometry.
+    Entity spawnImportedModel(const MeshAsset& asset, const std::string& name, const glm::vec3& position,
+                              const glm::vec3& userScale = glm::vec3{1.0f}, float mass = 1.0f);
+    Entity spawnImportedModel(const MeshAsset& asset, const std::string& name, const glm::vec3& position,
+                              float userScale, float mass = 1.0f);
     // Destroys the entity and all of its components. No-op for stale handles.
     void destroyEntity(Entity entity);
     [[nodiscard]] bool isValid(Entity entity) const;

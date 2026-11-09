@@ -20,35 +20,35 @@ std::vector<Vertex> Cube::vertices() {
 
     return {
         // Front (+Z)
-        {{-h, -h, h}, kFront, kMaterialTint},
-        {{h, -h, h}, kFront, kMaterialTint},
-        {{h, h, h}, kFront, kMaterialTint},
-        {{-h, h, h}, kFront, kMaterialTint},
+        {{-h, -h, h}, kFront, kMaterialTint, glm::vec2{0.0f, 0.0f}},
+        {{h, -h, h}, kFront, kMaterialTint, glm::vec2{1.0f, 0.0f}},
+        {{h, h, h}, kFront, kMaterialTint, glm::vec2{1.0f, 1.0f}},
+        {{-h, h, h}, kFront, kMaterialTint, glm::vec2{0.0f, 1.0f}},
         // Back (-Z)
-        {{h, -h, -h}, kBack, kMaterialTint},
-        {{-h, -h, -h}, kBack, kMaterialTint},
-        {{-h, h, -h}, kBack, kMaterialTint},
-        {{h, h, -h}, kBack, kMaterialTint},
+        {{h, -h, -h}, kBack, kMaterialTint, glm::vec2{0.0f, 0.0f}},
+        {{-h, -h, -h}, kBack, kMaterialTint, glm::vec2{1.0f, 0.0f}},
+        {{-h, h, -h}, kBack, kMaterialTint, glm::vec2{1.0f, 1.0f}},
+        {{h, h, -h}, kBack, kMaterialTint, glm::vec2{0.0f, 1.0f}},
         // Right (+X)
-        {{h, -h, h}, kRight, kMaterialTint},
-        {{h, -h, -h}, kRight, kMaterialTint},
-        {{h, h, -h}, kRight, kMaterialTint},
-        {{h, h, h}, kRight, kMaterialTint},
+        {{h, -h, h}, kRight, kMaterialTint, glm::vec2{0.0f, 0.0f}},
+        {{h, -h, -h}, kRight, kMaterialTint, glm::vec2{1.0f, 0.0f}},
+        {{h, h, -h}, kRight, kMaterialTint, glm::vec2{1.0f, 1.0f}},
+        {{h, h, h}, kRight, kMaterialTint, glm::vec2{0.0f, 1.0f}},
         // Left (-X)
-        {{-h, -h, -h}, kLeft, kMaterialTint},
-        {{-h, -h, h}, kLeft, kMaterialTint},
-        {{-h, h, h}, kLeft, kMaterialTint},
-        {{-h, h, -h}, kLeft, kMaterialTint},
+        {{-h, -h, -h}, kLeft, kMaterialTint, glm::vec2{0.0f, 0.0f}},
+        {{-h, -h, h}, kLeft, kMaterialTint, glm::vec2{1.0f, 0.0f}},
+        {{-h, h, h}, kLeft, kMaterialTint, glm::vec2{1.0f, 1.0f}},
+        {{-h, h, -h}, kLeft, kMaterialTint, glm::vec2{0.0f, 1.0f}},
         // Top (+Y)
-        {{-h, h, h}, kTop, kMaterialTint},
-        {{h, h, h}, kTop, kMaterialTint},
-        {{h, h, -h}, kTop, kMaterialTint},
-        {{-h, h, -h}, kTop, kMaterialTint},
+        {{-h, h, h}, kTop, kMaterialTint, glm::vec2{0.0f, 0.0f}},
+        {{h, h, h}, kTop, kMaterialTint, glm::vec2{1.0f, 0.0f}},
+        {{h, h, -h}, kTop, kMaterialTint, glm::vec2{1.0f, 1.0f}},
+        {{-h, h, -h}, kTop, kMaterialTint, glm::vec2{0.0f, 1.0f}},
         // Bottom (-Y)
-        {{-h, -h, -h}, kBottom, kMaterialTint},
-        {{h, -h, -h}, kBottom, kMaterialTint},
-        {{h, -h, h}, kBottom, kMaterialTint},
-        {{-h, -h, h}, kBottom, kMaterialTint},
+        {{-h, -h, -h}, kBottom, kMaterialTint, glm::vec2{0.0f, 0.0f}},
+        {{h, -h, -h}, kBottom, kMaterialTint, glm::vec2{1.0f, 0.0f}},
+        {{h, -h, h}, kBottom, kMaterialTint, glm::vec2{1.0f, 1.0f}},
+        {{-h, -h, h}, kBottom, kMaterialTint, glm::vec2{0.0f, 1.0f}},
     };
 }
 
