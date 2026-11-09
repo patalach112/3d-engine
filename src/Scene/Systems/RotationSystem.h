@@ -12,11 +12,12 @@ class Scene;
 // loop's fixed update, so spinning is deterministic and independent of
 // frame rate.
 //
-// The JobSystem overload is data-parallel: work items (component pointer +
-// angular delta) are snapshotted on the calling thread, then batches write
-// to disjoint TransformComponents concurrently — no structural registry
-// changes happen while jobs run, which is the thread-safety contract for
-// EnTT storage access. parallelFor()'s return is the barrier.
+// Iteration runs over an EnTT owning group, so Transform and Spin
+// components form two contiguous, index-aligned dense arrays; the
+// JobSystem overload then writes to disjoint array elements concurrently
+// (TransformComponent's cache-line padding prevents false sharing). No
+// structural registry changes happen while jobs run, and parallelFor()'s
+// return is the barrier before the next system.
 // ---------------------------------------------------------------------------
 class RotationSystem {
 public:

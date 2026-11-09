@@ -196,6 +196,26 @@ and no structural registry changes happen concurrently.
   (above `[Performance] parallelMinDrawItems`), with deterministic
   sequential compaction afterwards
 
+### Strict data-oriented layout (Phase 4, Sub-step 1)
+
+Hot ECS components are laid out for dense, cache-friendly iteration:
+
+- `TransformComponent` is exactly one 64-byte cache line (`alignas(64)`), so
+  parallel fixed updates never false-share between neighboring entities;
+  `SpinComponent` is a dense 16-byte value (four per cache line), and
+  `MeshComponent` keeps its hot bounds/visibility fields ahead of the cold
+  asset-id string. Layout is enforced with compile-time assertions.
+- The pool allocator now allocates 64-byte-aligned pages and selects block
+  classes by `max(bytes, alignment)`, so pooled storage honors cache-line
+  alignment without internal gaps.
+- EnTT stores components in dense paged arrays (1024 elements per page, one
+  contiguous allocation per page). `Scene/DenseIteration.h` resolves dense
+  indices through that page table; `RotationSystem` uses an owning
+  `Transform + Spin` group so both storages share an index-aligned dense
+  prefix and parallel workers write disjoint elements, while
+  `RenderSystem` snapshots contiguous entity handles and evaluates disjoint
+  per-entity output slots before deterministic compaction.
+
 ### Frustum culling (`src/Graphics/Frustum.*`, `src/Geometry/Bounds.*`)
 
 View frustum planes are extracted from the view-projection matrix
@@ -208,12 +228,14 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 100+ checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 118 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
 (barriers, exactly-once parallel coverage, exception containment), and
-frustum/AABB math — everything verifiable without a GPU.
+frustum/AABB math, plus data-oriented layout checks (component size/alignment,
+dense-page pointer strides, owning-group pairing with non-spinning decoys, and
+5,000 entities × 40 parallel fixed steps) — everything verifiable without a GPU.
 
 ## Configuration
 
@@ -306,6 +328,7 @@ mouse (press again to quit).
     │   └── Input.h/.cpp        # Key/mouse state, transitions, mouse delta
     ├── Scene/
     │   ├── Scene.h/.cpp        # RAII ECS world (entt::registry), Entity handle
+    │   ├── DenseIteration.h    # Dense-index access into EnTT's paged storage
     │   ├── Components.h/.cpp   # Tag/Transform/Camera/Mesh/Spin components
     │   └── Systems/
     │       ├── CameraSystem.*  # Input-driven active camera (variable update)
@@ -341,7 +364,9 @@ what it depends on.
   foundation components, camera/rotation/render systems, multi-entity
   rendering via push constants
 - **Phase 4 — Performance & memory ✅:** paginated pool allocator for ECS
-  storage, work-stealing job system with parallel systems, frustum culling
+  storage, work-stealing job system with parallel systems, frustum culling,
+  and strict data-oriented component layout (cache-line transforms, dense
+  paged storage, owning-group parallel iteration)
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.

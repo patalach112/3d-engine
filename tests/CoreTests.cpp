@@ -12,6 +12,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/vec4.hpp>
 
+#include "Scene/DenseIteration.h"
 #include "Scene/Scene.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/RotationSystem.h"
@@ -494,6 +495,129 @@ void testParallelSystemsAndCulling() {
           "disabling culling draws every mesh");
 }
 
+void testDataOrientedLayout() {
+    std::cout << "Data-oriented layout\n";
+
+    // Compile-time layout contract (static_asserts also live in Components.h).
+    check(sizeof(engine::TransformComponent) == 64 && alignof(engine::TransformComponent) == 64,
+          "TransformComponent occupies exactly one 64-byte cache line");
+    check(sizeof(engine::SpinComponent) == 16 && alignof(engine::SpinComponent) == 16,
+          "SpinComponent packs densely at 16 bytes");
+
+    // Pool allocator serves cache-line-aligned component arrays.
+    engine::memory::PoolAllocator<engine::TransformComponent> allocator;
+    engine::TransformComponent* array = allocator.allocate(16);
+    check(reinterpret_cast<uintptr_t>(array) % 64 == 0, "pooled transform array is 64-byte aligned");
+    const auto byteStride = reinterpret_cast<const char*>(&array[5]) - reinterpret_cast<const char*>(&array[2]);
+    check(byteStride == 3 * static_cast<std::ptrdiff_t>(sizeof(engine::TransformComponent)),
+          "pooled array elements are densely packed with no gaps");
+    for (int i = 0; i < 16; ++i) {
+        array[i].position = glm::vec3{static_cast<float>(i)};
+    }
+    check(nearlyVec3(array[15].position, glm::vec3{15.0f}), "pooled array storage is fully usable");
+    allocator.deallocate(array, 16);
+
+    // EnTT dense storage: components of sequentially created entities form
+    // one contiguous, cache-line-aligned array.
+    engine::Scene scene;
+    constexpr int kEntities = 1000;
+    constexpr int kStaticTransforms = 8;
+    std::vector<engine::Entity> staticEntities;
+    staticEntities.reserve(kStaticTransforms);
+    for (int i = 0; i < 3; ++i) {
+        engine::Entity entity = scene.createEntity("StaticBefore" + std::to_string(i));
+        entity.addComponent<engine::TransformComponent>(glm::vec3{-1.0f, 0.0f, 0.0f});
+        staticEntities.push_back(entity);
+    }
+    std::vector<engine::Entity> entities;
+    entities.reserve(kEntities);
+    for (int i = 0; i < kEntities; ++i) {
+        engine::Entity entity = scene.createEntity("Packed" + std::to_string(i));
+        entity.addComponent<engine::TransformComponent>(glm::vec3{static_cast<float>(i), 0.0f, 0.0f});
+        auto& spin = entity.addComponent<engine::SpinComponent>();
+        spin.degreesPerSecond = glm::vec3{0.0f, static_cast<float>(i % 8) * 10.0f, 0.0f};
+        entities.push_back(entity);
+    }
+    for (int i = 3; i < kStaticTransforms; ++i) {
+        engine::Entity entity = scene.createEntity("StaticAfter" + std::to_string(i));
+        entity.addComponent<engine::TransformComponent>(glm::vec3{-1.0f, 0.0f, 0.0f});
+        staticEntities.push_back(entity);
+    }
+
+    // EnTT packs components into dense pages (1024 elements per page, one
+    // contiguous allocation per page). All 1008 transforms fit in a single
+    // page, which must be one cache-line-aligned, gap-free array.
+    const auto& transformStorage = scene.registry().storage<engine::TransformComponent>();
+    const engine::TransformComponent* const* pages = transformStorage.raw();
+    const engine::TransformComponent* page = pages[0];
+    check(page != nullptr &&
+              transformStorage.size() == static_cast<size_t>(kEntities + kStaticTransforms),
+          "transform storage holds every component densely");
+    check(reinterpret_cast<uintptr_t>(page) % 64 == 0, "dense page starts on a cache line");
+    check(engine::denseElementAt(transformStorage, 5) == page + 5,
+          "dense index resolution walks the page as an array");
+    bool allAligned = true;
+    bool strideExact = true;
+    for (int i = 0; i < kEntities + kStaticTransforms; ++i) {
+        allAligned = allAligned && (reinterpret_cast<uintptr_t>(page + i) % 64 == 0);
+        if (i > 0) {
+            strideExact = strideExact && (reinterpret_cast<const char*>(page + i) -
+                                          reinterpret_cast<const char*>(page + i - 1)) ==
+                                             static_cast<std::ptrdiff_t>(sizeof(engine::TransformComponent));
+        }
+    }
+    check(allAligned, "every transform in the page is cache-line aligned");
+    check(strideExact, "consecutive transforms are exactly sizeof(T) apart (zero gaps)");
+
+    // Owning-group pairing: after parallel rotation, each entity must have
+    // rotated by *its own* spin — proof the two dense arrays stay
+    // index-aligned under the group.
+    engine::JobSystem jobs(engine::JobSystem::Config{4});
+    engine::RotationSystem::update(scene, 1.0, jobs);
+    bool pairingCorrect = true;
+    for (int i = 0; i < kEntities; ++i) {
+        const float expected = static_cast<float>(i % 8) * 10.0f;
+        pairingCorrect = pairingCorrect &&
+                         nearlyEqual(entities[i].getComponent<engine::TransformComponent>().rotationDegrees.y,
+                                     expected, 1e-4);
+    }
+    check(pairingCorrect, "group-aligned arrays keep transform/spin pairs matched under parallel rotation");
+    bool staticUntouched = true;
+    for (engine::Entity entity : staticEntities) {
+        staticUntouched = staticUntouched &&
+                          nearlyEqual(entity.getComponent<engine::TransformComponent>().rotationDegrees.y,
+                                      0.0, 1e-4);
+    }
+    check(staticUntouched, "owning group leaves non-spinning transforms untouched");
+
+    // High-speed iteration stability: 5000 entities x 40 parallel fixed
+    // steps must land every entity on exactly the same angle.
+    engine::Scene bigScene;
+    constexpr int kBig = 5000;
+    for (int i = 0; i < kBig; ++i) {
+        engine::Entity entity = bigScene.createEntity("Spinner");
+        entity.addComponent<engine::TransformComponent>();
+        entity.addComponent<engine::SpinComponent>(glm::vec3{0.0f, 90.0f, 0.0f});
+    }
+    const auto start = std::chrono::steady_clock::now();
+    for (int step = 0; step < 40; ++step) {
+        engine::RotationSystem::update(bigScene, 0.25, jobs); // +22.5 deg per step
+    }
+    const double elapsedMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    size_t visited = 0;
+    bool allAt180 = true;
+    bigScene.registry().view<engine::TransformComponent>().each(
+        [&visited, &allAt180](const engine::TransformComponent& transform) {
+            ++visited;
+            // 40 steps * 22.5 deg = 900 deg == 180 deg (mod 360)
+            allAt180 = allAt180 && nearlyEqual(transform.rotationDegrees.y, 180.0, 1e-2);
+        });
+    check(visited == static_cast<size_t>(kBig), "parallel iteration visits every entity");
+    check(allAt180, "5000 entities x 40 parallel steps stay exactly in sync");
+    std::cout << "  [INFO] 200k parallel component updates took " << elapsedMs << " ms\n";
+}
+
 void testTime() {
     std::cout << "Time\n";
     engine::Time time;
@@ -547,6 +671,7 @@ int main() {
     testJobSystem();
     testFrustumCulling();
     testParallelSystemsAndCulling();
+    testDataOrientedLayout();
     testFixedTimestep();
     testTime();
     testGameLoop();

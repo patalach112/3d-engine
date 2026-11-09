@@ -15,7 +15,9 @@ namespace {
 
 constexpr size_t kPageBytes = 64 * 1024;
 constexpr size_t kMaxPooledBytes = 4096;
-constexpr size_t kMaxPooledAlignment = alignof(std::max_align_t);
+// Pages are allocated 64-byte aligned and block sizes are powers of two,
+// so any alignment up to a full cache line is honored by pooled blocks.
+constexpr size_t kMaxPooledAlignment = 64;
 
 // Block size classes: powers of two from 16 B to 4 KiB.
 constexpr std::array<size_t, 9> kBlockSizes = {16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
@@ -54,22 +56,31 @@ struct PoolCore::Impl {
         size_t blocksInUse = 0;
         size_t blocksTotal = 0;
         size_t peakBlocksInUse = 0;
-        std::vector<std::unique_ptr<std::byte[]>> pages;
+        std::vector<void*> pages; // 64-byte aligned raw pages, freed by ~Impl
 
         void addPage(size_t blockSize) {
-            auto page = std::make_unique<std::byte[]>(kPageBytes);
+            void* page = alignedAllocate(kPageBytes, kMaxPooledAlignment);
             const size_t blockCount = kPageBytes / blockSize;
             // Push every block onto the intrusive free list (each block's
             // first bytes store the next pointer).
             for (size_t i = 0; i < blockCount; ++i) {
-                void* block = page.get() + i * blockSize;
+                void* block = static_cast<std::byte*>(page) + i * blockSize;
                 *static_cast<void**>(block) = freeList;
                 freeList = block;
             }
             blocksTotal += blockCount;
-            pages.push_back(std::move(page));
+            pages.push_back(page);
         }
     };
+
+    ~Impl() {
+        for (SizeClass& sizeClass : classes) {
+            for (void* page : sizeClass.pages) {
+                alignedDeallocate(page);
+            }
+        }
+    }
+
 
     std::array<SizeClass, kBlockSizes.size()> classes;
     size_t fallbackAllocations = 0;
@@ -83,7 +94,10 @@ void* PoolCore::allocate(size_t bytes, size_t alignment) {
     if (bytes == 0) {
         bytes = 1;
     }
-    const size_t classIndex = classIndexFor(bytes);
+    // A block's offset within its 64-byte aligned page is a multiple of
+    // the block size, so sizing the class by max(bytes, alignment) keeps
+    // every block aligned (block sizes are powers of two).
+    const size_t classIndex = classIndexFor(std::max(bytes, alignment));
     if (classIndex >= kBlockSizes.size() || alignment > kMaxPooledAlignment) {
         void* pointer = alignedAllocate(bytes, std::max(alignment, sizeof(void*)));
         if (pointer != nullptr) {
@@ -112,7 +126,7 @@ void PoolCore::deallocate(void* pointer, size_t bytes, size_t alignment) noexcep
     if (bytes == 0) {
         bytes = 1;
     }
-    const size_t classIndex = classIndexFor(bytes);
+    const size_t classIndex = classIndexFor(std::max(bytes, alignment));
     if (classIndex >= kBlockSizes.size() || alignment > kMaxPooledAlignment) {
         {
             std::lock_guard lock(m_impl->mutex);

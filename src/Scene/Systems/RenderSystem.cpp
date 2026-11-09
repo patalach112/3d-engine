@@ -11,19 +11,19 @@
 namespace engine {
 namespace {
 
-struct MeshWork {
-    const TransformComponent* transform;
-    const MeshComponent* mesh;
-};
-
 // Evaluates one entity: model matrix, world bounds, frustum test.
-// Writes into a disjoint slot, so it is safe to run concurrently.
-void evaluateMesh(const MeshWork& work, const Frustum& frustum, bool cullingEnabled,
+// Components are fetched by entity handle through the view (read-only
+// sparse-array lookups into dense storage); writes go to a disjoint
+// output slot, so ranges are safe to run concurrently.
+template <typename View>
+void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum, bool cullingEnabled,
                   std::optional<DrawItem>& outItem, char& outCulled) {
-    const glm::mat4 model = work.transform->modelMatrix();
+    const TransformComponent& transform = view.template get<TransformComponent>(entity);
+    const MeshComponent& mesh = view.template get<MeshComponent>(entity);
+    const glm::mat4 model = transform.modelMatrix();
     outCulled = 0;
     if (cullingEnabled) {
-        const AABB worldBounds = work.mesh->localBounds.transformed(model);
+        const AABB worldBounds = mesh.localBounds.transformed(model);
         if (!frustum.intersects(worldBounds)) {
             outCulled = 1;
             return;
@@ -51,36 +51,40 @@ PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
     frame.view = activeCamera->camera.viewMatrix();
     frame.projection = activeCamera->camera.projectionMatrix(aspectRatio);
 
-    std::vector<MeshWork> work;
-    scene.registry().view<TransformComponent, MeshComponent>().each(
-        [&work](const TransformComponent& transform, const MeshComponent& mesh) {
-            if (mesh.visible) {
-                work.push_back(MeshWork{&transform, &mesh});
-            }
-        });
-    frame.meshCount = static_cast<uint32_t>(work.size());
+    // Collect visible entities from the view. Entity handles come from
+    // the view's dense entity array, so this snapshot is one contiguous
+    // int array — cheap, and immune to storage reallocation afterwards.
+    auto view = scene.registry().view<TransformComponent, MeshComponent>();
+    std::vector<entt::entity> entities;
+    for (const entt::entity entity : view) {
+        if (view.get<MeshComponent>(entity).visible) {
+            entities.push_back(entity);
+        }
+    }
+    frame.meshCount = static_cast<uint32_t>(entities.size());
 
     const Frustum frustum{frame.projection * frame.view};
-    std::vector<std::optional<DrawItem>> evaluated(work.size());
-    std::vector<char> culledFlags(work.size(), 0); // not vector<bool>: slots are written concurrently
+    std::vector<std::optional<DrawItem>> evaluated(entities.size());
+    std::vector<char> culledFlags(entities.size(), 0); // not vector<bool>: slots written concurrently
 
-    const auto evaluateRange = [&work, &frustum, &options, &evaluated, &culledFlags](size_t begin, size_t end) {
+    const auto evaluateRange = [&view, &entities, &frustum, &options, &evaluated,
+                                &culledFlags](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
-            evaluateMesh(work[i], frustum, options.frustumCulling, evaluated[i], culledFlags[i]);
+            evaluateMesh(view, entities[i], frustum, options.frustumCulling, evaluated[i], culledFlags[i]);
         }
     };
 
-    if (options.jobs != nullptr && work.size() >= options.parallelMinItems) {
+    if (options.jobs != nullptr && entities.size() >= options.parallelMinItems) {
         // parallelFor returning is the synchronization barrier: every slot
         // below is fully written before compaction reads it.
-        options.jobs->parallelFor(work.size(), 0, evaluateRange);
+        options.jobs->parallelFor(entities.size(), 0, evaluateRange);
     } else {
-        evaluateRange(0, work.size());
+        evaluateRange(0, entities.size());
     }
 
     // Sequential compaction keeps draw order deterministic.
-    frame.drawItems.reserve(work.size());
-    for (size_t i = 0; i < work.size(); ++i) {
+    frame.drawItems.reserve(entities.size());
+    for (size_t i = 0; i < entities.size(); ++i) {
         if (culledFlags[i] != 0) {
             ++frame.culledCount;
         } else if (evaluated[i].has_value()) {
