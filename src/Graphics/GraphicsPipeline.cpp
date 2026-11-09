@@ -7,6 +7,7 @@
 
 #include <array>
 #include <glm/mat4x4.hpp>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 
@@ -16,15 +17,82 @@
 
 namespace engine {
 
+namespace {
+
+VkPrimitiveTopology toVulkan(PrimitiveTopology topology) {
+    switch (topology) {
+    case PrimitiveTopology::TriangleStrip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case PrimitiveTopology::LineList: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case PrimitiveTopology::TriangleList: break;
+    }
+    return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
+VkPolygonMode toVulkan(PolygonMode mode) {
+    return mode == PolygonMode::Line ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+}
+
+VkCullModeFlags toVulkan(CullMode mode) {
+    switch (mode) {
+    case CullMode::None: return VK_CULL_MODE_NONE;
+    case CullMode::Front: return VK_CULL_MODE_FRONT_BIT;
+    case CullMode::Back: break;
+    }
+    return VK_CULL_MODE_BACK_BIT;
+}
+
+VkCompareOp toVulkan(DepthCompare compare) {
+    switch (compare) {
+    case DepthCompare::LessOrEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
+    case DepthCompare::Equal: return VK_COMPARE_OP_EQUAL;
+    case DepthCompare::Always: return VK_COMPARE_OP_ALWAYS;
+    case DepthCompare::Never: return VK_COMPARE_OP_NEVER;
+    case DepthCompare::Less: break;
+    }
+    return VK_COMPARE_OP_LESS;
+}
+
+uint64_t pipelineKey(const PipelineStateDesc& state, const std::string& vertexShaderFile,
+                     const std::string& fragmentShaderFile) {
+    uint64_t hash = hashPipelineState(state);
+    for (const std::string& name : {vertexShaderFile, fragmentShaderFile}) {
+        for (const unsigned char c : name) {
+            hash ^= c;
+            hash *= 1099511628211ull;
+        }
+        hash ^= 0xFFu;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+} // namespace
+
 GraphicsPipeline::GraphicsPipeline(VulkanContext& context, const Swapchain& swapchain) : m_context(context) {
     createDescriptorSetLayout();
-    createPipeline(swapchain);
+    createPipelineCache();
+    m_pipeline = createPipeline(swapchain, PipelineStateDesc{}, "cube.vert.spv", "cube.frag.spv");
+    m_stateCache.intern(PipelineStateDesc{});
+    m_pipelinesByState.emplace(pipelineKey(PipelineStateDesc{}, "cube.vert.spv", "cube.frag.spv"), m_pipeline);
+    m_distinctPipelines = 1;
 }
 
 GraphicsPipeline::~GraphicsPipeline() {
     const VkDevice device = m_context.device();
-    if (m_pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, m_pipeline, nullptr);
+    // Destroy every distinct pipeline exactly once (materials may share).
+    std::unordered_set<VkPipeline> destroyed;
+    const auto destroyOnce = [&destroyed, device](VkPipeline pipeline) {
+        if (pipeline != VK_NULL_HANDLE && destroyed.insert(pipeline).second) {
+            vkDestroyPipeline(device, pipeline, nullptr);
+        }
+    };
+    destroyOnce(m_pipeline);
+    for (const auto& [materialId, pipeline] : m_materialPipelines) {
+        (void)materialId;
+        destroyOnce(pipeline);
+    }
+    if (m_pipelineCache != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(device, m_pipelineCache, nullptr);
     }
     if (m_layout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device, m_layout, nullptr);
@@ -36,6 +104,43 @@ GraphicsPipeline::~GraphicsPipeline() {
 
 void GraphicsPipeline::bind(VkCommandBuffer commandBuffer) const {
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+}
+
+VkPipeline GraphicsPipeline::pipelineFor(uint32_t materialId) const {
+    const auto found = m_materialPipelines.find(materialId);
+    return found != m_materialPipelines.end() ? found->second : VK_NULL_HANDLE;
+}
+
+VkPipeline GraphicsPipeline::getOrCreatePipeline(uint32_t materialId, const PipelineStateDesc& state,
+                                                 const std::string& vertexShaderFile,
+                                                 const std::string& fragmentShaderFile,
+                                                 const Swapchain& swapchain) {
+    if (const VkPipeline existing = pipelineFor(materialId); existing != VK_NULL_HANDLE) {
+        return existing;
+    }
+    // State deduplication: an identical (state, shader pair) combination
+    // reuses the existing VkPipeline; only genuinely new combinations
+    // pay a creation (accelerated by the VkPipelineCache).
+    m_stateCache.intern(state);
+    const uint64_t key = pipelineKey(state, vertexShaderFile, fragmentShaderFile);
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    if (const auto found = m_pipelinesByState.find(key); found != m_pipelinesByState.end()) {
+        pipeline = found->second;
+    } else {
+        pipeline = createPipeline(swapchain, state, vertexShaderFile, fragmentShaderFile);
+        m_pipelinesByState.emplace(key, pipeline);
+        ++m_distinctPipelines;
+    }
+    m_materialPipelines.emplace(materialId, pipeline);
+    return pipeline;
+}
+
+void GraphicsPipeline::createPipelineCache() {
+    VkPipelineCacheCreateInfo cacheInfo{};
+    cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    if (vkCreatePipelineCache(m_context.device(), &cacheInfo, nullptr, &m_pipelineCache) != VK_SUCCESS) {
+        throw std::runtime_error("GraphicsPipeline: failed to create pipeline cache");
+    }
 }
 
 void GraphicsPipeline::createDescriptorSetLayout() {
@@ -73,11 +178,13 @@ VkShaderModule GraphicsPipeline::createShaderModule(const char* fileName) const 
     return shaderModule;
 }
 
-void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
+VkPipeline GraphicsPipeline::createPipeline(const Swapchain& swapchain, const PipelineStateDesc& state,
+                                            const std::string& vertexShaderFile,
+                                            const std::string& fragmentShaderFile) {
     const VkDevice device = m_context.device();
 
-    VkShaderModule vertexShader = createShaderModule("cube.vert.spv");
-    VkShaderModule fragmentShader = createShaderModule("cube.frag.spv");
+    VkShaderModule vertexShader = createShaderModule(vertexShaderFile.c_str());
+    VkShaderModule fragmentShader = createShaderModule(fragmentShaderFile.c_str());
 
     VkPipelineShaderStageCreateInfo vertexStage{};
     vertexStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -107,7 +214,7 @@ void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.topology = toVulkan(state.topology);
     inputAssembly.primitiveRestartEnable = VK_FALSE;
 
     // --- Viewport / scissor (dynamic: set per frame, resize-proof) ----------
@@ -128,9 +235,9 @@ void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.depthClampEnable = VK_FALSE;
     rasterizer.rasterizerDiscardEnable = VK_FALSE;
-    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.polygonMode = toVulkan(state.polygonMode);
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.cullMode = toVulkan(state.cullMode);
     // GLM's projection flips the framebuffer Y axis, which reverses triangle
     // winding on screen. Declaring clockwise front faces keeps back-face
     // culling correct for geometry wound CCW in model space.
@@ -145,9 +252,9 @@ void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
     // --- Depth testing (required for correct 3D occlusion) ------------------
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depthStencil.depthTestEnable = VK_TRUE;
-    depthStencil.depthWriteEnable = VK_TRUE;
-    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthTestEnable = state.depthTestEnable ? VK_TRUE : VK_FALSE;
+    depthStencil.depthWriteEnable = state.depthWriteEnable ? VK_TRUE : VK_FALSE;
+    depthStencil.depthCompareOp = toVulkan(state.depthCompare);
     depthStencil.depthBoundsTestEnable = VK_FALSE;
     depthStencil.stencilTestEnable = VK_FALSE;
 
@@ -155,7 +262,7 @@ void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
     VkPipelineColorBlendAttachmentState colorBlendAttachment{};
     colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    colorBlendAttachment.blendEnable = VK_FALSE;
+    colorBlendAttachment.blendEnable = state.blendEnable ? VK_TRUE : VK_FALSE;
 
     VkPipelineColorBlendStateCreateInfo colorBlending{};
     colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -178,7 +285,8 @@ void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges = &pushConstantRange;
 
-    if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &m_layout) != VK_SUCCESS) {
+    if (m_layout == VK_NULL_HANDLE &&
+        vkCreatePipelineLayout(device, &layoutInfo, nullptr, &m_layout) != VK_SUCCESS) {
         vkDestroyShaderModule(device, vertexShader, nullptr);
         vkDestroyShaderModule(device, fragmentShader, nullptr);
         throw std::runtime_error("GraphicsPipeline: failed to create pipeline layout");
@@ -200,8 +308,9 @@ void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
     pipelineInfo.renderPass = swapchain.renderPass();
     pipelineInfo.subpass = 0;
 
+    VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result =
-        vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline);
+        vkCreateGraphicsPipelines(device, m_pipelineCache, 1, &pipelineInfo, nullptr, &pipeline);
 
     // Shader modules are baked into the pipeline and can be released.
     vkDestroyShaderModule(device, vertexShader, nullptr);
@@ -210,6 +319,7 @@ void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
     if (result != VK_SUCCESS) {
         throw std::runtime_error("GraphicsPipeline: failed to create graphics pipeline");
     }
+    return pipeline;
 }
 
 } // namespace engine

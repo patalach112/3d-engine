@@ -1,6 +1,7 @@
 #include "Core/Application.h"
 
 #include "Core/Logger.h"
+#include "Geometry/Cube.h"
 #include "Scene/Components.h"
 #include "Scene/Systems/CameraSystem.h"
 #include "Scene/Systems/RotationSystem.h"
@@ -22,13 +23,16 @@ Application::Application(EngineConfig config)
       m_jobSystem(JobSystem::Config{m_config.performance.jobWorkerCount,
                                     m_config.performance.parallelBatchSize}),
       m_vramBudget(static_cast<uint64_t>(m_config.render.vramBudgetMiB) * 1024 * 1024),
+      m_stagingBudget(static_cast<uint64_t>(m_config.render.stagingBufferBudgetMiB) * 1024 * 1024),
+      m_assets(m_vramBudget, m_stagingBudget),
       m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
-                     m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems) {
+                     m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems, &m_assets) {
     ENGINE_LOG_INFO("Hardware profile: JobSystem workers "
                     << m_jobSystem.workerCount() << " (+ main thread), parallel batch "
                     << m_config.performance.parallelBatchSize << " items, VRAM budget "
                     << m_config.render.vramBudgetMiB << " MiB (staging "
                     << m_config.render.stagingBufferBudgetMiB << " MiB)");
+    registerAssets();
     // Reserve pooled component storage before populating the scene.
     m_scene.reserveCapacity(m_config.performance.entityReserve);
     buildScene();
@@ -41,6 +45,37 @@ Application::~Application() {
     // Make sure no frame is still using the resources that member
     // destruction is about to release (Renderer, buffers, swapchain...).
     m_context.waitIdle();
+}
+
+void Application::registerAssets() {
+    // Built-in geometry, registered once at startup. Registration
+    // reserves VRAM against the GTX 970 budget; ids are stable from here
+    // on and are what MeshComponents reference by name.
+    m_assets.registerMesh("cube", Cube::vertices(), Cube::indices());
+
+    MaterialDesc defaultMaterial;
+    defaultMaterial.name = "default";
+    const MaterialId defaultId = m_assets.registerMaterial(defaultMaterial);
+
+    MaterialDesc doubleSidedMaterial;
+    doubleSidedMaterial.name = "doubleSided";
+    doubleSidedMaterial.pipeline.cullMode = CullMode::None;
+    const MaterialId doubleSidedId = m_assets.registerMaterial(doubleSidedMaterial);
+
+    // Deterministic PSO creation for both materials (deduplicated by
+    // pipeline state + shader pair, accelerated by the VkPipelineCache).
+    if (const MaterialAsset* material = m_assets.material(defaultId)) {
+        m_pipeline.getOrCreatePipeline(material->id, material->desc.pipeline, material->desc.vertexShader,
+                                       material->desc.fragmentShader, m_swapchain);
+    }
+    if (const MaterialAsset* material = m_assets.material(doubleSidedId)) {
+        m_pipeline.getOrCreatePipeline(material->id, material->desc.pipeline, material->desc.vertexShader,
+                                       material->desc.fragmentShader, m_swapchain);
+    }
+    ENGINE_LOG_INFO("Assets registered: " << m_assets.meshCount() << " mesh(es), " << m_assets.materialCount()
+                                          << " material(s), VRAM reserved " << m_assets.reservedVramBytes()
+                                          << " bytes, " << m_pipeline.cachedPipelineCount()
+                                          << " distinct pipeline(s)");
 }
 
 void Application::buildScene() {
@@ -58,13 +93,15 @@ void Application::buildScene() {
     Entity leftCube = m_scene.createEntity("CubeLeft");
     auto& leftTransform = leftCube.addComponent<TransformComponent>(glm::vec3{-2.0f, 0.5f, -2.0f});
     leftTransform.scale = glm::vec3{0.6f};
-    leftCube.addComponent<MeshComponent>("cube");
+    auto& leftMesh = leftCube.addComponent<MeshComponent>("cube");
+    leftMesh.materialName = "doubleSided";
     leftCube.addComponent<SpinComponent>(glm::vec3{20.0f, 45.0f, 0.0f});
 
     Entity rightCube = m_scene.createEntity("CubeRight");
     auto& rightTransform = rightCube.addComponent<TransformComponent>(glm::vec3{2.0f, -0.5f, -2.5f});
     rightTransform.scale = glm::vec3{0.8f};
-    rightCube.addComponent<MeshComponent>("cube");
+    auto& rightMesh = rightCube.addComponent<MeshComponent>("cube");
+    rightMesh.materialName = "doubleSided";
     rightCube.addComponent<SpinComponent>(glm::vec3{0.0f, -30.0f, 15.0f});
 
     ENGINE_LOG_INFO("Scene built: " << m_scene.entityCount() << " entities (player camera, "

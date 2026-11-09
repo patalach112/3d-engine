@@ -79,6 +79,8 @@ add_executable(3d-engine
     src/Core/Camera.cpp
     src/Core/Jobs/JobSystem.cpp
     src/Core/Memory/PoolAllocator.cpp
+    src/Assets/AssetManager.cpp
+    src/Graphics/PipelineState.cpp
     src/Scene/Scene.cpp
     src/Scene/Components.cpp
     src/Scene/Systems/CameraSystem.cpp
@@ -228,7 +230,9 @@ if(BUILD_TESTING)
         src/Geometry/Cube.cpp
         src/Graphics/Frustum.cpp
     src/Graphics/RenderQueue.cpp
-        src/Scene/Scene.cpp
+        src/Assets/AssetManager.cpp
+    src/Graphics/PipelineState.cpp
+    src/Scene/Scene.cpp
         src/Scene/Components.cpp
         src/Scene/Systems/CameraSystem.cpp
         src/Scene/Systems/RotationSystem.cpp

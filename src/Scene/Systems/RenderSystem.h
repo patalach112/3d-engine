@@ -9,6 +9,7 @@
 
 namespace engine {
 
+class AssetManager;
 class JobSystem;
 class Renderer;
 class Scene;
@@ -29,6 +30,7 @@ struct PreparedFrame {
 // Knobs for frame preparation.
 struct FramePrepareOptions {
     JobSystem* jobs = nullptr;      // parallelize matrix/bounds work when set
+    const AssetManager* assets = nullptr; // resolves stable material ids/indices
     bool frustumCulling = true;     // from [Render] config
     bool sortDrawItems = true;      // sort the render queue before submission
     size_t parallelMinItems = 128;  // below this, sequential is cheaper
@@ -49,7 +51,8 @@ struct FramePrepareOptions {
 class RenderSystem {
 public:
     RenderSystem(Renderer& renderer, const Swapchain& swapchain, JobSystem* jobs = nullptr,
-                 bool frustumCulling = true, size_t parallelMinItems = 128, bool sortDrawItems = true);
+                 bool frustumCulling = true, size_t parallelMinItems = 128, bool sortDrawItems = true,
+                 const AssetManager* assets = nullptr);
 
     // Draws the current scene state. Must run after update systems so it
     // never renders a half-updated world.
@@ -70,6 +73,7 @@ private:
     bool m_frustumCulling;
     size_t m_parallelMinItems;
     bool m_sortDrawItems;
+    const AssetManager* m_assets;
     bool m_warnedNoCamera = false;
     uint32_t m_lastDrawnCount = 0;
     uint32_t m_lastCulledCount = 0;

@@ -18,7 +18,10 @@
 #include "Scene/Systems/RotationSystem.h"
 
 #include "Core/Concurrency/LockFreeRingBuffer.h"
+#include "Assets/AssetManager.h"
 #include "Core/HardwareProfile.h"
+#include "Geometry/Cube.h"
+#include "Graphics/PipelineState.h"
 #include "Core/Jobs/JobSystem.h"
 #include "Graphics/VramBudget.h"
 #include "Graphics/RenderQueue.h"
@@ -529,6 +532,110 @@ void testVramBudget() {
           "concurrent reservations stop exactly at the budget cap");
 }
 
+void testAssetManagement() {
+    std::cout << "Asset management & materials\n";
+
+    engine::VramBudget vram(1024 * 1024);
+    engine::VramBudget staging(1024 * 1024);
+    {
+        engine::AssetManager assets(vram, staging);
+
+        // Mesh registration: stable id, computed bounds, VRAM accounting.
+        const engine::MeshId cubeId = assets.registerMesh("cube", engine::Cube::vertices(), engine::Cube::indices());
+        check(cubeId == 1, "first mesh gets stable id 1");
+        const engine::MeshAsset* cube = assets.mesh("cube");
+        check(cube != nullptr && cube->vramBytes > 0, "mesh VRAM footprint accounted");
+        check(cube != nullptr && nearlyEqual(cube->bounds.extents().x, 0.5, 1e-4),
+              "mesh bounds computed from vertices");
+        check(vram.usedBytes() == cube->vramBytes, "mesh registration reserves VRAM budget");
+        check(assets.registerMesh("cube", engine::Cube::vertices(), engine::Cube::indices()) == cubeId &&
+                  assets.meshCount() == 1,
+              "mesh registration is idempotent by name");
+
+        // Shader registration.
+        const std::vector<uint32_t> fakeSpirv = {0x07230203u, 0x00010000u};
+        check(assets.registerShader("test", fakeSpirv) == 1 && assets.shader(1)->byteSize == 8,
+              "shader registered with stable id and byte size");
+        check(assets.loadShader("missing", "definitely/not/a/file.spv") == engine::kInvalidAssetId,
+              "missing shader file yields invalid id");
+
+        // Materials: dense stable ids + descriptor indices.
+        engine::MaterialDesc defaultDesc;
+        defaultDesc.name = "default";
+        engine::MaterialDesc doubleSided = defaultDesc;
+        doubleSided.name = "doubleSided";
+        doubleSided.pipeline.cullMode = engine::CullMode::None;
+        const engine::MaterialId defaultId = assets.registerMaterial(defaultDesc);
+        const engine::MaterialId doubleId = assets.registerMaterial(doubleSided);
+        check(defaultId == 1 && doubleId == 2, "material ids are dense and stable");
+        check(assets.material("doubleSided")->descriptorIndex == 1,
+              "descriptor index is the dense material slot");
+        check(assets.registerMaterial(defaultDesc) == defaultId && assets.materialCount() == 2,
+              "material registration is idempotent by name");
+
+        // PSO cache: same state interns to the same PSO, new state creates.
+        engine::PipelineStateCache psoCache;
+        const uint32_t psoA = psoCache.intern(engine::PipelineStateDesc{});
+        engine::PipelineStateDesc otherState;
+        otherState.cullMode = engine::CullMode::None;
+        const uint32_t psoB = psoCache.intern(otherState);
+        check(psoA == 1 && psoB == 2 && psoCache.intern(engine::PipelineStateDesc{}) == psoA &&
+                  psoCache.creationCount() == 2,
+              "PSO cache deduplicates states deterministically");
+        check(engine::hashPipelineState(engine::PipelineStateDesc{}) != engine::hashPipelineState(otherState),
+              "pipeline state hash distinguishes states");
+    }
+    check(vram.usedBytes() == 0, "asset manager releases VRAM reservations on destruction");
+
+    // Budget discipline: an undersized budget rejects registration cleanly.
+    engine::VramBudget tinyVram(64);
+    engine::VramBudget tinyStaging(64);
+    engine::AssetManager limited(tinyVram, tinyStaging);
+    check(limited.registerMesh("cube", engine::Cube::vertices(), engine::Cube::indices()) ==
+              engine::kInvalidAssetId,
+          "mesh exceeding the VRAM budget is rejected (no over-commit)");
+
+    // Material resolution through RenderSystem: DrawItems carry the
+    // registered stable ids and descriptor indices, sorted by material.
+    engine::VramBudget bigVram(1024 * 1024);
+    engine::VramBudget bigStaging(1024 * 1024);
+    engine::AssetManager assets(bigVram, bigStaging);
+    engine::MaterialDesc matA;
+    matA.name = "matA";
+    engine::MaterialDesc matB;
+    matB.name = "matB";
+    const engine::MaterialId idA = assets.registerMaterial(matA);
+    const engine::MaterialId idB = assets.registerMaterial(matB);
+
+    engine::Scene scene;
+    engine::Entity player = scene.createEntity("Player");
+    player.addComponent<engine::CameraComponent>(engine::CameraConfig{});
+    const auto addCube = [&scene](float z, const char* material) {
+        engine::Entity cube = scene.createEntity("Cube");
+        cube.addComponent<engine::TransformComponent>(glm::vec3{0.0f, 0.0f, z});
+        auto& mesh = cube.addComponent<engine::MeshComponent>("cube");
+        mesh.materialName = material;
+    };
+    addCube(-1.0f, "matB");
+    addCube(-4.0f, "matA");
+    addCube(-2.0f, "matB");
+
+    engine::FramePrepareOptions options;
+    options.assets = &assets;
+    options.frustumCulling = false;
+    const engine::PreparedFrame frame = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+    bool idsOk = frame.renderQueue.size() == 3;
+    bool indicesOk = true;
+    for (const engine::DrawItem& item : frame.renderQueue.items()) {
+        idsOk = idsOk && (item.materialId == idA || item.materialId == idB);
+        indicesOk = indicesOk && item.descriptorIndex == item.materialId - 1;
+    }
+    check(idsOk, "render items carry stable registered material ids");
+    check(indicesOk, "render items carry dense descriptor indices");
+    check(frame.renderQueue.items().front().materialId == std::min(idA, idB),
+          "render queue groups by registered material id");
+}
+
 void testLockFreeRingBuffer() {
     std::cout << "LockFreeRingBuffer\n";
     using engine::concurrency::LockFreeRingBuffer;
@@ -750,10 +857,11 @@ void testRenderSortingIntegration() {
 
     // Two materials interleaved in depth; default camera at (0,0,3)
     // looking down -Z, so view depth = 3 - z.
-    const auto addCube = [&scene](float x, float z, const char* asset) {
+    const auto addCube = [&scene](float x, float z, const char* material) {
         engine::Entity cube = scene.createEntity("Cube");
         cube.addComponent<engine::TransformComponent>(glm::vec3{x, 0.0f, z});
-        cube.addComponent<engine::MeshComponent>(asset);
+        auto& mesh = cube.addComponent<engine::MeshComponent>("cube");
+        mesh.materialName = material;
     };
     addCube(0.0f, -1.0f, "matA"); // depth 4
     addCube(1.0f, 1.0f, "matB");  // depth 2
@@ -1065,6 +1173,7 @@ int main() {
     testPoolAllocator();
     testHardwareProfile();
     testVramBudget();
+    testAssetManagement();
     testLockFreeRingBuffer();
     testJobSystem();
     testAsyncLoggerConcurrency();

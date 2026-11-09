@@ -306,7 +306,7 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 169 checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 186 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
@@ -319,7 +319,52 @@ render-queue checks (sort-key ordering, stable ties, 5,000-item parallel
 sort integrity/determinism, material grouping with front-to-back order in
 integrated frames), and hardware-profile checks (worker-count resolution,
 batch granularity, config/profile agreement, VRAM budget accounting under
-concurrency) — everything verifiable without a GPU.
+concurrency), and Phase 5 resource checks (stable asset/material ids,
+VRAM-budgeted registration and rejection, PSO state deduplication,
+descriptor indices flowing into sorted draw items) — everything
+verifiable without a GPU.
+
+## Phase 5 — Asset Management, Shader Pipelines & Materials ✅
+
+### Asset registry (`src/Assets/AssetManager.*`)
+
+Assets are registered once at startup into dense, pre-reserved storage
+and referenced everywhere by stable 1-based integer ids (deterministic
+for a deterministic registration order — no heap fragmentation from
+per-frame lookups, no runtime stalls). Meshes carry geometry + computed
+bounds, shaders carry SPIR-V words (registerable from memory or file),
+and materials carry a shader pair, a base-color tint, and a
+`PipelineStateDesc`. Registration is idempotent by name and
+VRAM-disciplined: GPU-bound data first passes a transient staging-budget
+check, then reserves its device-local footprint against the GTX 970
+`VramBudget` (fast-segment cap) — over-budget registration fails cleanly
+with an invalid id instead of over-committing VRAM. Reservations are
+released on manager destruction.
+
+### Pipeline state objects & pipeline cache (`src/Graphics/PipelineState.*`, `GraphicsPipeline`)
+
+`PipelineStateDesc` (topology, polygon/cull mode, depth state, blending)
+is hashed deterministically (FNV-1a); `PipelineStateCache` interns
+states to stable PSO ids so N materials sharing a state cost one real
+pipeline. `GraphicsPipeline` is now a PSO manager: it owns a
+`VkPipelineCache` (fed to every `vkCreateGraphicsPipelines`), creates
+pipelines deterministically per material, deduplicates by
+(state, shader pair), and shares one pipeline layout/descriptor layout
+across all of them so descriptor bindings survive per-material pipeline
+switches.
+
+### Descriptor indexing groundwork & renderer integration
+
+Materials get dense descriptor indices (`materialId - 1`) — the slot
+each material will occupy in a descriptor-indexing material array.
+`MeshComponent` now references mesh + material by name; `RenderSystem`
+resolves them through the `AssetManager` into `DrawItem`s carrying the
+stable material id and descriptor index (the deterministic name hash
+remains the fallback for asset-less scenes), the `RenderQueue` sorts by
+that id as before, and the `Renderer` rebinds pipelines only at material
+group boundaries while recording — push constants and the
+view/projection UBO flow are unchanged. The demo scene registers a
+`default` and a `doubleSided` material and creates both PSOs at startup.
 
 ## Configuration
 
@@ -412,6 +457,8 @@ mouse (press again to quit).
     ├── Platform/
     │   ├── Window.h/.cpp       # GLFW window, surface, resize/input callbacks
     │   └── Input.h/.cpp        # Key/mouse state, transitions, mouse delta
+    ├── Assets/
+    │   └── AssetManager.h/.cpp # Mesh/shader/material registry, VRAM-budgeted
     ├── Scene/
     │   ├── Scene.h/.cpp        # RAII ECS world (entt::registry), Entity handle
     │   ├── DenseIteration.h    # Dense-index access into EnTT's paged storage
@@ -433,6 +480,7 @@ mouse (press again to quit).
         ├── Frustum.h/.cpp        # View frustum extraction + AABB/sphere tests
         ├── RenderQueue.h/.cpp    # CPU render command stream + parallel sort
         ├── VramBudget.h          # CAS-based VRAM accounting policy (GTX 970)
+        ├── PipelineState.h/.cpp  # PSO descriptions, hashing, state cache
         └── Renderer.h/.cpp       # Frames-in-flight, command recording, present
 ```
 
@@ -459,6 +507,10 @@ what it depends on.
   CPU-side render queue (material grouping + front-to-back Early-Z), and
   i5-3470/GTX 970 hardware-profile tuning (core-exact thread pool, L2
   batching, VRAM budgeting, preset config)
+- **Phase 5 — Assets, pipelines & materials ✅:** stable-id asset
+  registry with VRAM-budgeted registration, deterministic PSO manager
+  over a VkPipelineCache, dense descriptor indices, and material-grouped
+  pipeline binding in the sorted render queue
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.

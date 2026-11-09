@@ -60,7 +60,8 @@ struct MeshComponent {
     // unit cube; real mesh assets will supply their own bounds later.
     AABB localBounds{glm::vec3{-0.5f}, glm::vec3{0.5f}};
     bool visible = true;
-    std::string assetId = "cube";
+    std::string assetId = "cube";    // mesh asset name (AssetManager)
+    std::string materialName = "default"; // material name (AssetManager)
 
     MeshComponent() = default;
     explicit MeshComponent(std::string assetId_) : assetId(std::move(assetId_)) {}

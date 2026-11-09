@@ -1,5 +1,6 @@
 #include "Scene/Systems/RenderSystem.h"
 
+#include "Assets/AssetManager.h"
 #include "Core/Jobs/JobSystem.h"
 #include "Core/Logger.h"
 #include "Graphics/Frustum.h"
@@ -32,7 +33,8 @@ uint32_t materialIdFor(std::string_view assetId) {
 // ranges are safe to run concurrently.
 template <typename View>
 void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum, const glm::mat4& viewMatrix,
-                  bool cullingEnabled, std::optional<DrawItem>& outItem, char& outCulled) {
+                  bool cullingEnabled, const AssetManager* assets, std::optional<DrawItem>& outItem,
+                  char& outCulled) {
     const TransformComponent& transform = view.template get<TransformComponent>(entity);
     const MeshComponent& mesh = view.template get<MeshComponent>(entity);
     const glm::mat4 model = transform.modelMatrix();
@@ -45,10 +47,21 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
         }
     }
     const float viewDepth = -(viewMatrix * glm::vec4(transform.position, 1.0f)).z;
-    const uint32_t materialId = materialIdFor(mesh.assetId);
+    // Stable material identity: the AssetManager's registered id (and
+    // its dense descriptor index) when available; the deterministic
+    // name hash is the fallback for scenes built without an asset pass.
+    uint32_t materialId = materialIdFor(mesh.materialName);
+    uint32_t descriptorIndex = 0;
+    if (assets != nullptr) {
+        if (const MaterialAsset* material = assets->material(mesh.materialName)) {
+            materialId = material->id;
+            descriptorIndex = material->descriptorIndex;
+        }
+    }
     DrawItem item;
     item.model = model;
     item.materialId = materialId;
+    item.descriptorIndex = descriptorIndex;
     item.viewDepth = viewDepth;
     item.sortKey = RenderQueue::makeSortKey(materialId, viewDepth);
     outItem = item;
@@ -57,9 +70,10 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
 } // namespace
 
 RenderSystem::RenderSystem(Renderer& renderer, const Swapchain& swapchain, JobSystem* jobs,
-                           bool frustumCulling, size_t parallelMinItems, bool sortDrawItems)
+                           bool frustumCulling, size_t parallelMinItems, bool sortDrawItems,
+                           const AssetManager* assets)
     : m_renderer(renderer), m_swapchain(swapchain), m_jobs(jobs), m_frustumCulling(frustumCulling),
-      m_parallelMinItems(parallelMinItems), m_sortDrawItems(sortDrawItems) {}
+      m_parallelMinItems(parallelMinItems), m_sortDrawItems(sortDrawItems), m_assets(assets) {}
 
 PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
                                          const FramePrepareOptions& options) {
@@ -92,8 +106,8 @@ PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
     const auto evaluateRange = [&view, &entities, &frustum, &options, &evaluated, &culledFlags,
                                 &frame](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
-            evaluateMesh(view, entities[i], frustum, frame.view, options.frustumCulling, evaluated[i],
-                         culledFlags[i]);
+            evaluateMesh(view, entities[i], frustum, frame.view, options.frustumCulling, options.assets,
+                         evaluated[i], culledFlags[i]);
         }
     };
 
@@ -130,6 +144,7 @@ void RenderSystem::render(Scene& scene) {
 
     FramePrepareOptions options;
     options.jobs = m_jobs;
+    options.assets = m_assets;
     options.frustumCulling = m_frustumCulling;
     options.parallelMinItems = m_parallelMinItems;
     options.sortDrawItems = m_sortDrawItems;

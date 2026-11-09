@@ -23,6 +23,10 @@ struct DrawItem {
     glm::mat4 model{1.0f};
     uint64_t sortKey = 0;
     uint32_t materialId = 0;
+    // Slot of this material in the descriptor-indexing material array
+    // (AssetManager assigns dense indices). Carried per draw so shaders
+    // can fetch material data by index instead of rebinding descriptors.
+    uint32_t descriptorIndex = 0;
     float viewDepth = 0.0f;
 };
 

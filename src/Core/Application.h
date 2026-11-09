@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Assets/AssetManager.h"
 #include "Core/EngineConfig.h"
 #include "Core/GameLoop.h"
 #include "Core/Jobs/JobSystem.h"
@@ -46,6 +47,7 @@ public:
     void run();
 
 private:
+    void registerAssets();
     void buildScene();
     void handleMouseCapture();
     void logLoopStats(const char* context) const;
@@ -60,6 +62,8 @@ private:
     GameLoop m_gameLoop;
     JobSystem m_jobSystem;
     VramBudget m_vramBudget;
+    VramBudget m_stagingBudget;
+    AssetManager m_assets;
     Scene m_scene;
     RenderSystem m_renderSystem;
 

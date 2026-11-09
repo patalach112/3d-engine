@@ -225,7 +225,21 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.layout(), 0, 1,
                             &m_descriptorSets[m_currentFrame], 0, nullptr);
 
+    // Draw items arrive sorted by material (RenderQueue), so pipeline
+    // switches happen once per material group, not per draw. All
+    // pipelines share one layout, so the descriptor binding above stays
+    // valid across switches. Unknown materials keep the current pipeline.
+    uint32_t boundMaterial = 0;
+    bool haveBoundMaterial = false;
     for (const DrawItem& item : drawItems) {
+        if (!haveBoundMaterial || item.materialId != boundMaterial) {
+            if (const VkPipeline pipeline = m_pipeline.pipelineFor(item.materialId);
+                pipeline != VK_NULL_HANDLE) {
+                vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            }
+            boundMaterial = item.materialId;
+            haveBoundMaterial = true;
+        }
         vkCmdPushConstants(commandBuffer, m_pipeline.layout(), VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(glm::mat4), &item.model);
         vkCmdDrawIndexed(commandBuffer, m_indexCount, 1, 0, 0, 0);
