@@ -160,26 +160,88 @@ bool testEntity(const TransformComponent& transform, const ColliderComponent* co
     return false;
 }
 
-void collectHits(const Scene& scene, const Ray& ray, float maxDistance, const Scene::MeshResolver* resolver,
-                 std::vector<RaycastHit>& outHits) {
-    const auto& registry = scene.registry();
-    const auto view = registry.view<TransformComponent>();
-    Candidate candidate;
+} // namespace
+
+void Scene::syncRaycastTree() const {
+    std::vector<uint32_t> present;
+    present.reserve(m_raycastProxies.size());
+    const auto view = m_registry.view<TransformComponent>();
     for (const entt::entity entity : view) {
         const TransformComponent& transform = view.get<TransformComponent>(entity);
-        const ColliderComponent* collider = registry.try_get<ColliderComponent>(entity);
-        const MeshComponent* mesh = registry.try_get<MeshComponent>(entity);
-        if (testEntity(transform, collider, mesh, resolver, ray, maxDistance, candidate)) {
-            outHits.push_back(RaycastHit{entity, candidate.distance, candidate.position, candidate.normal});
+        const ColliderComponent* collider = m_registry.try_get<ColliderComponent>(entity);
+        const MeshComponent* mesh = m_registry.try_get<MeshComponent>(entity);
+
+        // Pick bounds: exactly the volumes the exact tests use — the
+        // box/OBB collider's world AABB, or a visible mesh's world
+        // AABB, unioned when both exist (a superset stays correct:
+        // the exact tests still decide every hit).
+        bool hasBox = false;
+        AABB box{};
+        const glm::mat4 model = transform.modelMatrix();
+        if (collider != nullptr &&
+            (collider->type == ColliderComponent::Type::Box || collider->type == ColliderComponent::Type::Obb)) {
+            const AABB localBox{collider->centerOffset - glm::abs(collider->halfExtents),
+                                collider->centerOffset + glm::abs(collider->halfExtents)};
+            box = localBox.transformed(model);
+            hasBox = true;
+        }
+        if (mesh != nullptr && mesh->visible) {
+            const AABB meshBox = mesh->localBounds.transformed(model);
+            box = hasBox ? box.combined(meshBox) : meshBox;
+            hasBox = true;
+        }
+        if (!hasBox) {
+            continue;
+        }
+        const uint32_t key = entt::to_integral(entity);
+        present.push_back(key);
+        const glm::vec3 center = box.center();
+        if (const auto found = m_raycastProxies.find(key); found != m_raycastProxies.end()) {
+            // Fat boxes absorb the motion of anything that only moved
+            // a little since the last query.
+            m_raycastTree.moveLeaf(found->second.proxy, box, center - found->second.lastCenter);
+            found->second.lastCenter = center;
+        } else {
+            const DynamicAABBTree::ProxyId proxy = m_raycastTree.insertLeaf(box, entity);
+            m_raycastProxies.emplace(key, RaycastProxyEntry{proxy, center});
+        }
+    }
+    // Entities that were destroyed (or stopped being pickable) lose
+    // their proxies; everything else stays put.
+    std::sort(present.begin(), present.end());
+    for (auto it = m_raycastProxies.begin(); it != m_raycastProxies.end();) {
+        if (!std::binary_search(present.begin(), present.end(), it->first)) {
+            m_raycastTree.removeLeaf(it->second.proxy);
+            it = m_raycastProxies.erase(it);
+        } else {
+            ++it;
         }
     }
 }
 
-} // namespace
+void Scene::collectBVHHits(const Ray& ray, float maxDistance, const MeshResolver* resolver, bool closestOnly,
+                           std::vector<RaycastHit>& outHits) const {
+    syncRaycastTree();
+    float best = maxDistance;
+    Candidate candidate;
+    m_raycastTree.raycast(ray, maxDistance, [&](entt::entity entity) {
+        const TransformComponent* transform = m_registry.try_get<TransformComponent>(entity);
+        if (transform != nullptr &&
+            testEntity(*transform, m_registry.try_get<ColliderComponent>(entity),
+                       m_registry.try_get<MeshComponent>(entity), resolver, ray,
+                       closestOnly ? best : maxDistance, candidate)) {
+            outHits.push_back(RaycastHit{entity, candidate.distance, candidate.position, candidate.normal});
+            if (closestOnly) {
+                best = candidate.distance;
+            }
+        }
+        return closestOnly ? best : maxDistance;
+    });
+}
 
 bool Scene::raycast(const Ray& ray, RaycastHit& outHit, float maxDistance) const {
     std::vector<RaycastHit> hits;
-    collectHits(*this, ray, maxDistance, nullptr, hits);
+    collectBVHHits(ray, maxDistance, nullptr, true, hits);
     if (hits.empty()) {
         return false;
     }
@@ -190,7 +252,7 @@ bool Scene::raycast(const Ray& ray, RaycastHit& outHit, float maxDistance) const
 
 size_t Scene::raycastAll(const Ray& ray, std::vector<RaycastHit>& outHits, float maxDistance) const {
     outHits.clear();
-    collectHits(*this, ray, maxDistance, nullptr, outHits);
+    collectBVHHits(ray, maxDistance, nullptr, false, outHits);
     std::sort(outHits.begin(), outHits.end(),
               [](const RaycastHit& a, const RaycastHit& b) { return a.distance < b.distance; });
     return outHits.size();
@@ -199,7 +261,7 @@ size_t Scene::raycastAll(const Ray& ray, std::vector<RaycastHit>& outHits, float
 bool Scene::raycastPrecise(const Ray& ray, RaycastHit& outHit, const MeshResolver& resolveMesh,
                            float maxDistance) const {
     std::vector<RaycastHit> hits;
-    collectHits(*this, ray, maxDistance, &resolveMesh, hits);
+    collectBVHHits(ray, maxDistance, &resolveMesh, true, hits);
     if (hits.empty()) {
         return false;
     }

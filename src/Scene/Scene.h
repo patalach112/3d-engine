@@ -4,6 +4,7 @@
 #include "Assets/AssetManager.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Scene/Components.h"
+#include "Scene/DynamicAABBTree.h"
 #include "Scene/Raycast.h"
 
 #include <entt/entt.hpp>
@@ -13,6 +14,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -167,8 +169,29 @@ public:
     [[nodiscard]] const Registry& registry() const { return m_registry; }
 
 private:
+    // Broadphase acceleration for the raycast queries above: a dynamic
+    // AABB tree over every pickable entity's world bounds (collider
+    // AABB unioned with the visible mesh's world AABB — the same
+    // candidacy the exact tests use). Physics writes transforms
+    // directly, so no EnTT hooks can keep it current; instead the
+    // tree is synced at the top of every raycast query (fat boxes
+    // absorb small motions, so syncing is mostly a bounds pass) and
+    // the BVH then prunes the exact tests to the ray's actual path.
+    struct RaycastProxyEntry {
+        DynamicAABBTree::ProxyId proxy = DynamicAABBTree::kNullProxy;
+        glm::vec3 lastCenter{0.0f}; // movement since here predicts the fat box
+    };
+    void syncRaycastTree() const;
+    // BVH traversal + exact per-entity tests. With closestOnly, each
+    // hit found tightens the traversal's clip distance, pruning
+    // subtrees that cannot contain a closer hit.
+    void collectBVHHits(const Ray& ray, float maxDistance, const MeshResolver* resolver, bool closestOnly,
+                        std::vector<RaycastHit>& outHits) const;
+
     Registry m_registry;
     size_t m_entityCount = 0; // Scene-created, still-alive entities
+    mutable DynamicAABBTree m_raycastTree;
+    mutable std::unordered_map<uint32_t /*entt integral*/, RaycastProxyEntry> m_raycastProxies;
 };
 
 // --- Entity template implementations (need the complete Scene) -------------

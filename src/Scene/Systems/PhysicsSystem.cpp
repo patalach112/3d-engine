@@ -353,6 +353,9 @@ size_t PhysicsSystem::resetToSpawnStates(Scene& scene) {
     // (but not reallocating) the scratch arrays lets the next fixed step
     // rebuild it from the respawned transforms.
     m_candidatePairs.clear();
+    m_broadTree.clear();
+    m_broadProxies.clear();
+    m_broadBodyIndex.clear();
     m_contactSlots.clear();
     m_contacts.clear();
     m_warmContacts.clear();
@@ -731,49 +734,73 @@ void PhysicsSystem::buildGeometry(JobSystem* jobs, uint32_t parallelMinBodies, f
 }
 
 void PhysicsSystem::broadPhase() {
-    m_broadEntries.clear();
     m_planeBodies.clear();
     m_candidatePairs.clear();
-    m_broadEntries.reserve(m_bodies.size());
+    m_broadBodyIndex.clear();
 
     for (size_t i = 0; i < m_bodies.size(); ++i) {
         const uint32_t index = static_cast<uint32_t>(i);
         if (m_geometry[i].isPlane) {
             m_planeBodies.push_back(index);
+            continue;
+        }
+        const BodyGeometry& geometry = m_geometry[i];
+        const uint32_t key = entt::to_integral(m_bodies[i].entity);
+        m_broadBodyIndex.emplace(key, index);
+        // Sync the persistent tree with this step's tight world box.
+        // The fat box absorbs small motion, so steady scenes only pay
+        // for moveLeaf when a body genuinely travels.
+        const AABB tight{geometry.boundsCenter - geometry.boundsHalf,
+                         geometry.boundsCenter + geometry.boundsHalf};
+        if (const auto found = m_broadProxies.find(key); found != m_broadProxies.end()) {
+            m_broadTree.moveLeaf(found->second, tight, geometry.displacement);
         } else {
-            const BodyGeometry& geometry = m_geometry[i];
-            // Expand the swept interval by the body's own step motion so a
-            // fast body remains a candidate against obstacles it crossed
-            // during this step, even if it no longer overlaps discretely.
-            const float pad = glm::length(geometry.displacement) * 2.0f;
-            m_broadEntries.push_back(BroadEntry{geometry.boundsCenter.x - geometry.boundsHalf.x - pad,
-                                                geometry.boundsCenter.x + geometry.boundsHalf.x + pad, index});
+            m_broadProxies.emplace(key, m_broadTree.insertLeaf(tight, m_bodies[i].entity));
         }
     }
 
-    std::sort(m_broadEntries.begin(), m_broadEntries.end(), [](const BroadEntry& a, const BroadEntry& b) {
-        return a.minX != b.minX ? a.minX < b.minX : a.bodyIndex < b.bodyIndex;
-    });
-
-    // Sweep on X and keep only bodies whose intervals still overlap.
-    // Full AABB rejection happens in the narrow phase; this pass turns a
-    // naive O(n^2) search into sort + active-window work for scenes whose
-    // bodies are spatially distributed.
-    std::vector<BroadEntry> active;
-    active.reserve(m_broadEntries.size());
-    for (const BroadEntry& entry : m_broadEntries) {
-        active.erase(std::remove_if(active.begin(), active.end(),
-                                    [&entry](const BroadEntry& activeEntry) {
-                                        return activeEntry.maxX < entry.minX;
-                                    }),
-                     active.end());
-        for (const BroadEntry& activeEntry : active) {
-            m_candidatePairs.emplace_back(std::min(activeEntry.bodyIndex, entry.bodyIndex),
-                                          std::max(activeEntry.bodyIndex, entry.bodyIndex));
+    // Entities that left the simulation (destroyed, or collider
+    // changed to a plane) lose their proxies.
+    for (auto it = m_broadProxies.begin(); it != m_broadProxies.end();) {
+        if (m_broadBodyIndex.find(it->first) == m_broadBodyIndex.end()) {
+            m_broadTree.removeLeaf(it->second);
+            it = m_broadProxies.erase(it);
+        } else {
+            ++it;
         }
-        active.push_back(entry);
     }
 
+    // Query the tree once per body with the swept box, then keep the
+    // canonical half of each discovered pair. A candidate pair exists
+    // exactly when one body's swept trajectory overlaps the other's
+    // fat box (a superset of its tight box), so every pair that can
+    // touch or be crossed this step is found; compared to the old
+    // X-axis sweep this only drops pairs that were separated in Y or
+    // Z all along — false candidates the narrow phase used to reject.
+    for (size_t i = 0; i < m_bodies.size(); ++i) {
+        const uint32_t index = static_cast<uint32_t>(i);
+        const BodyGeometry& geometry = m_geometry[i];
+        if (geometry.isPlane) {
+            continue;
+        }
+        // The swept query box: the end box unioned with itself shifted
+        // back along this step's motion — the whole trajectory of the
+        // body is a candidate region, matching the old sweep's pad.
+        const AABB swept{geometry.boundsCenter - geometry.boundsHalf +
+                             glm::min(-geometry.displacement, glm::vec3{0.0f}),
+                         geometry.boundsCenter + geometry.boundsHalf +
+                             glm::max(-geometry.displacement, glm::vec3{0.0f})};
+        m_broadTree.query(swept, [this, index](entt::entity other) {
+            const auto found = m_broadBodyIndex.find(entt::to_integral(other));
+            if (found != m_broadBodyIndex.end() && found->second > index) {
+                m_candidatePairs.emplace_back(index, found->second);
+            }
+            return true;
+        });
+    }
+
+    // Planes have infinite extent: they pair against every body, as
+    // before, and are never stored in the tree.
     for (const uint32_t planeBody : m_planeBodies) {
         for (size_t i = 0; i < m_bodies.size(); ++i) {
             const uint32_t other = static_cast<uint32_t>(i);

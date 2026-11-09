@@ -16,6 +16,16 @@ struct ENGINE_GEOMETRY_API AABB {
     [[nodiscard]] glm::vec3 center() const { return (min + max) * 0.5f; }
     [[nodiscard]] glm::vec3 extents() const { return (max - min) * 0.5f; }
 
+    // Surface area of the box: the cost metric the dynamic AABB tree's
+    // SAH insertion and rotation decisions are built on.
+    [[nodiscard]] float surfaceArea() const;
+    // True when `other` lies entirely inside this box (inclusive).
+    [[nodiscard]] bool contains(const AABB& other) const;
+    // True when the two boxes overlap on every axis (inclusive).
+    [[nodiscard]] bool overlaps(const AABB& other) const;
+    // Smallest box containing both this box and `other`.
+    [[nodiscard]] AABB combined(const AABB& other) const;
+
     // World-space bounds of this box under the given transform: all eight
     // corners are transformed and re-bounded (exact for any affine matrix,
     // including rotation — the result is the tightest AABB around the

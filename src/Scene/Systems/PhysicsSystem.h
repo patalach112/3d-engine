@@ -3,6 +3,7 @@
 
 #include "Physics/PhysicsComponents.h"
 #include "Scene/Components.h"
+#include "Scene/DynamicAABBTree.h"
 
 #include <entt/entity/entity.hpp>
 
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -26,8 +28,8 @@ class Scene;
 //
 // Pipeline: snapshot bodies/fields/joints/thrusters -> apply thruster and
 // spring forces -> parallel semi-implicit integration (linear + quaternion
-// rotational dynamics) -> parallel world-geometry construction -> X-axis
-// sweep broad phase -> parallel narrow phase/CCD into disjoint slots ->
+// rotational dynamics) -> parallel world-geometry construction -> dynamic
+// AABB tree broad phase -> parallel narrow phase/CCD into disjoint slots ->
 // deterministic island generation -> warm-started sequential-impulse
 // solving per island (islands can solve in parallel; bodies never repeat
 // across islands). Scratch storage is retained between steps.
@@ -94,12 +96,6 @@ private:
         std::array<glm::vec3, 8> points{};
         uint8_t pointCount = 0;
         bool isPlane = false;
-    };
-
-    struct BroadEntry {
-        float minX = 0.0f;
-        float maxX = 0.0f;
-        uint32_t bodyIndex = 0;
     };
 
     struct Contact {
@@ -247,7 +243,15 @@ private:
 
     std::vector<BodyRef> m_bodies;
     std::vector<BodyGeometry> m_geometry;
-    std::vector<BroadEntry> m_broadEntries;
+    // Broadphase acceleration: a persistent dynamic AABB tree over the
+    // non-plane bodies' world bounds, keyed by entity (entt integral).
+    // Fat boxes absorb small motion, so steady scenes only refit on
+    // escape; planes (infinite extent) bypass the tree and, as before,
+    // are paired against every body. m_broadBodyIndex maps the entity
+    // to this step's body index for the query callbacks.
+    DynamicAABBTree m_broadTree;
+    std::unordered_map<uint32_t, DynamicAABBTree::ProxyId> m_broadProxies;
+    std::unordered_map<uint32_t, uint32_t> m_broadBodyIndex;
     std::vector<uint32_t> m_planeBodies;
     std::vector<std::pair<uint32_t, uint32_t>> m_candidatePairs;
     std::vector<std::vector<Contact>> m_contactSlots; // one manifold per candidate pair

@@ -14,6 +14,7 @@
 #include <glm/vec4.hpp>
 
 #include "Scene/DenseIteration.h"
+#include "Scene/DynamicAABBTree.h"
 #include "Scene/Scene.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
@@ -2331,6 +2332,447 @@ void testRaycasting() {
     }
 }
 
+void testSpatialPartitioning() {
+    std::cout << "Spatial partitioning (Phase 14: dynamic AABB tree / BVH)\n";
+    using engine::AABB;
+    using engine::ColliderComponent;
+    using engine::DynamicAABBTree;
+    using engine::Ray;
+    using engine::RaycastHit;
+    using engine::TransformComponent;
+
+    const auto entityAt = [](uint32_t id) { return static_cast<entt::entity>(id); };
+    const auto boxAround = [](const glm::vec3& center, float half) {
+        return AABB{center - glm::vec3{half}, center + glm::vec3{half}};
+    };
+
+    // --- Insertion, fattening, basic queries -----------------------------------
+    {
+        DynamicAABBTree tree;
+        check(tree.leafCount() == 0 && tree.nodeCount() == 0 && tree.height() == 0 && tree.validate(),
+              "empty dynamic AABB tree is valid");
+        const AABB tight = boxAround(glm::vec3{0.0f}, 0.5f);
+        const DynamicAABBTree::ProxyId proxy = tree.insertLeaf(tight, entityAt(7));
+        check(proxy != DynamicAABBTree::kNullProxy && tree.leafCount() == 1 && tree.nodeCount() == 1 &&
+                  tree.height() == 0 && tree.entity(proxy) == entityAt(7),
+              "first leaf registers its entity");
+        check(tree.proxyAabb(proxy).contains(tight) && tree.proxyAabb(proxy).min.x < tight.min.x &&
+                  tree.proxyAabb(proxy).max.x > tight.max.x && tree.validate(),
+              "leaf box is fattened beyond the tight box on every side");
+
+        std::vector<entt::entity> found;
+        const auto collect = [&found](entt::entity entity) {
+            found.push_back(entity);
+            return true;
+        };
+        tree.query(boxAround(glm::vec3{0.0f}, 0.25f), collect);
+        check(found.size() == 1 && found[0] == entityAt(7), "overlap query finds the leaf");
+        found.clear();
+        tree.query(boxAround(glm::vec3{10.0f, 0.0f, 0.0f}, 0.25f), collect);
+        check(found.empty(), "overlap query away from the leaf finds nothing");
+        tree.removeLeaf(proxy);
+        check(tree.leafCount() == 0 && tree.height() == 0 && tree.validate(),
+              "removing the only leaf empties the tree");
+        tree.query(boxAround(glm::vec3{0.0f}, 5.0f), collect);
+        check(found.empty(), "query on an emptied tree finds nothing");
+    }
+
+    // --- Query early exit ---------------------------------------------------------
+    {
+        DynamicAABBTree tree;
+        for (uint32_t i = 0; i < 3; ++i) {
+            tree.insertLeaf(boxAround(glm::vec3{static_cast<float>(i) * 0.25f, 0.0f, 0.0f}, 0.5f),
+                            entityAt(20 + i));
+        }
+        size_t callbacks = 0;
+        tree.query(boxAround(glm::vec3{0.0f}, 2.0f), [&callbacks](entt::entity) {
+            ++callbacks;
+            return false;
+        });
+        check(callbacks == 1 && tree.validate(), "query callback can stop the traversal early");
+        callbacks = 0;
+        tree.query(boxAround(glm::vec3{0.0f}, 2.0f), [&callbacks](entt::entity) {
+            ++callbacks;
+            return true;
+        });
+        check(callbacks == 3, "query visits every overlapping leaf");
+    }
+
+    // --- moveLeaf: fat box absorbs small motion, refits on escape ------------------
+    {
+        DynamicAABBTree tree;
+        const DynamicAABBTree::ProxyId proxy = tree.insertLeaf(boxAround(glm::vec3{0.0f}, 0.5f), entityAt(1));
+        const AABB fatBefore = tree.proxyAabb(proxy);
+        check(!tree.moveLeaf(proxy, boxAround(glm::vec3{0.05f, 0.0f, 0.0f}, 0.5f),
+                             glm::vec3{0.01f, 0.0f, 0.0f}),
+              "movement inside the fat box does not refit the leaf");
+        check(tree.proxyAabb(proxy).min == fatBefore.min && tree.proxyAabb(proxy).max == fatBefore.max &&
+                  tree.validate(),
+              "leaf keeps its fat box after an absorbed move");
+        check(tree.moveLeaf(proxy, boxAround(glm::vec3{5.0f, 0.0f, 0.0f}, 0.5f), glm::vec3{5.0f, 0.0f, 0.0f}),
+              "escaping the fat box refits the leaf");
+        check(tree.proxyAabb(proxy).contains(boxAround(glm::vec3{5.0f, 0.0f, 0.0f}, 0.5f)) && tree.validate(),
+              "refit leaf covers its new position");
+        std::vector<entt::entity> found;
+        tree.query(boxAround(glm::vec3{5.0f, 0.0f, 0.0f}, 0.25f), [&found](entt::entity entity) {
+            found.push_back(entity);
+            return true;
+        });
+        check(found.size() == 1 && found[0] == entityAt(1), "moved leaf is found at its new position");
+        found.clear();
+        tree.query(boxAround(glm::vec3{0.0f}, 0.25f), [&found](entt::entity entity) {
+            found.push_back(entity);
+            return true;
+        });
+        check(found.empty(), "moved leaf no longer overlaps its old position");
+    }
+
+    // --- Removal splices parents; clear resets --------------------------------------
+    {
+        DynamicAABBTree tree;
+        std::vector<DynamicAABBTree::ProxyId> proxies;
+        for (uint32_t i = 0; i < 5; ++i) {
+            proxies.push_back(tree.insertLeaf(
+                boxAround(glm::vec3{static_cast<float>(i) * 2.0f, 0.0f, 0.0f}, 0.5f), entityAt(i)));
+        }
+        check(tree.leafCount() == 5 && tree.nodeCount() == 9 && tree.validate(),
+              "five leaves build four internal nodes");
+        tree.removeLeaf(proxies[2]);
+        check(tree.leafCount() == 4 && tree.nodeCount() == 7 && tree.validate(),
+              "removal splices out the leaf and its parent");
+        std::vector<uint32_t> found;
+        tree.query(boxAround(glm::vec3{4.0f, 0.0f, 0.0f}, 100.0f), [&found](entt::entity entity) {
+            found.push_back(entt::to_integral(entity));
+            return true;
+        });
+        std::sort(found.begin(), found.end());
+        check(found == std::vector<uint32_t>{0, 1, 3, 4}, "removed leaf is gone, siblings remain queryable");
+        tree.clear();
+        check(tree.leafCount() == 0 && tree.nodeCount() == 0 && tree.validate(), "clear resets the tree");
+    }
+
+    // --- Balancing: worst-case monotonic insertion, dense grid -----------------------
+    {
+        DynamicAABBTree tree;
+        for (uint32_t i = 0; i < 256; ++i) {
+            tree.insertLeaf(boxAround(glm::vec3{static_cast<float>(i), 0.0f, 0.0f}, 0.4f), entityAt(i));
+        }
+        check(tree.leafCount() == 256 && tree.height() <= 18 && tree.validate(),
+              "monotonic insertions stay balanced (SAH sibling choice + rotations)");
+        std::vector<uint32_t> found;
+        const auto counting = [&found](entt::entity entity) {
+            found.push_back(entt::to_integral(entity));
+            return true;
+        };
+        tree.query(boxAround(glm::vec3{100.0f, 0.0f, 0.0f}, 0.9f), counting);
+        std::sort(found.begin(), found.end());
+        check(found == std::vector<uint32_t>{99, 100, 101},
+              "narrow query over a long tree returns exactly the overlapping leaves");
+        found.clear();
+        tree.query(boxAround(glm::vec3{128.0f, 0.0f, 0.0f}, 200.0f), counting);
+        check(found.size() == 256, "spanning query over a long tree reports every leaf");
+    }
+    {
+        DynamicAABBTree tree;
+        uint32_t id = 0;
+        for (int x = 0; x < 8; ++x) {
+            for (int y = 0; y < 8; ++y) {
+                for (int z = 0; z < 8; ++z) {
+                    tree.insertLeaf(boxAround(glm::vec3{static_cast<float>(x) * 2.0f,
+                                                        static_cast<float>(y) * 2.0f,
+                                                        static_cast<float>(z) * 2.0f},
+                                              0.5f),
+                                    entityAt(id++));
+                }
+            }
+        }
+        size_t found = 0;
+        tree.query(boxAround(glm::vec3{7.0f}, 100.0f), [&found](entt::entity) {
+            ++found;
+            return true;
+        });
+        check(tree.leafCount() == 512 && found == 512 && tree.height() <= 20 && tree.validate(),
+              "512-leaf grid tree is complete, balanced, and structurally valid");
+        found = 0;
+        tree.query(boxAround(glm::vec3{500.0f}, 1.0f), [&found](entt::entity) {
+            ++found;
+            return true;
+        });
+        check(found == 0, "query far outside the grid is rejected at the root");
+    }
+
+    // --- Randomized stress vs brute force ---------------------------------------------
+    {
+        DynamicAABBTree tree;
+        uint32_t rngState = 0x01234567u;
+        const auto nextUnit = [&rngState]() {
+            rngState = rngState * 1664525u + 1013904223u;
+            return static_cast<float>((rngState >> 9) & 0x7FFFFFu) / static_cast<float>(0x800000u);
+        };
+        const auto randomBox = [&nextUnit]() {
+            const glm::vec3 center{(nextUnit() - 0.5f) * 40.0f, (nextUnit() - 0.5f) * 40.0f,
+                                   (nextUnit() - 0.5f) * 40.0f};
+            const glm::vec3 half{0.25f + nextUnit() * 0.75f};
+            return AABB{center - half, center + half};
+        };
+
+        struct Leaf {
+            DynamicAABBTree::ProxyId proxy = DynamicAABBTree::kNullProxy;
+            entt::entity entity = entt::null;
+            AABB tight{};
+        };
+        std::vector<Leaf> leaves;
+        for (uint32_t i = 0; i < 300; ++i) {
+            const AABB tight = randomBox();
+            leaves.push_back(Leaf{tree.insertLeaf(tight, entityAt(1000 + i)), entityAt(1000 + i), tight});
+        }
+        check(tree.leafCount() == 300 && tree.validate(), "300 randomized insertions keep the tree valid");
+
+        const auto fatContainsAll = [&tree, &leaves]() {
+            for (const Leaf& leaf : leaves) {
+                if (!tree.proxyAabb(leaf.proxy).contains(leaf.tight)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const auto bruteForceQuery = [&tree, &leaves](const AABB& queryBox) {
+            std::vector<uint32_t> expected;
+            for (const Leaf& leaf : leaves) {
+                if (tree.proxyAabb(leaf.proxy).overlaps(queryBox)) {
+                    expected.push_back(entt::to_integral(leaf.entity));
+                }
+            }
+            std::sort(expected.begin(), expected.end());
+            return expected;
+        };
+        const auto treeQuery = [&tree](const AABB& queryBox) {
+            std::vector<uint32_t> found;
+            tree.query(queryBox, [&found](entt::entity entity) {
+                found.push_back(entt::to_integral(entity));
+                return true;
+            });
+            std::sort(found.begin(), found.end());
+            return found;
+        };
+        bool queriesMatch = true;
+        for (int q = 0; q < 25; ++q) {
+            const AABB queryBox = randomBox();
+            queriesMatch = queriesMatch && treeQuery(queryBox) == bruteForceQuery(queryBox);
+        }
+        check(queriesMatch && fatContainsAll(), "randomized overlap queries match brute force over fat boxes");
+
+        for (int round = 0; round < 30; ++round) {
+            for (int k = 0; k < 20; ++k) {
+                Leaf& leaf = leaves[static_cast<size_t>(nextUnit() * static_cast<float>(leaves.size()))];
+                const AABB moved = randomBox();
+                tree.moveLeaf(leaf.proxy, moved, moved.center() - leaf.tight.center());
+                leaf.tight = moved;
+            }
+        }
+        queriesMatch = true;
+        for (int q = 0; q < 25; ++q) {
+            const AABB queryBox = randomBox();
+            queriesMatch = queriesMatch && treeQuery(queryBox) == bruteForceQuery(queryBox);
+        }
+        check(tree.validate() && fatContainsAll() && queriesMatch,
+              "randomized moves keep every fat box covering its leaf and queries exact");
+
+        std::vector<Leaf> survivors;
+        for (size_t i = 0; i < leaves.size(); ++i) {
+            if (i % 3 == 0) {
+                tree.removeLeaf(leaves[i].proxy);
+            } else {
+                survivors.push_back(leaves[i]);
+            }
+        }
+        leaves = survivors;
+        queriesMatch = true;
+        for (int q = 0; q < 10; ++q) {
+            const AABB queryBox = randomBox();
+            queriesMatch = queriesMatch && treeQuery(queryBox) == bruteForceQuery(queryBox);
+        }
+        check(tree.validate() && tree.leafCount() == leaves.size() && queriesMatch,
+              "bulk removals keep the tree valid and queries exact");
+    }
+
+    // --- Tree ray traversal -----------------------------------------------------------
+    {
+        DynamicAABBTree tree;
+        std::vector<DynamicAABBTree::ProxyId> proxies;
+        for (uint32_t i = 0; i < 3; ++i) {
+            proxies.push_back(tree.insertLeaf(
+                boxAround(glm::vec3{0.0f, 0.0f, -5.0f - static_cast<float>(i) * 5.0f}, 0.5f), entityAt(50 + i)));
+        }
+        for (uint32_t i = 0; i < 20; ++i) {
+            proxies.push_back(tree.insertLeaf(
+                boxAround(glm::vec3{-15.0f + static_cast<float>(i % 5) * 7.0f,
+                                    4.0f + static_cast<float>(i / 5) * 3.0f,
+                                    -6.0f - static_cast<float>(i % 4) * 6.0f},
+                          0.5f),
+                entityAt(100 + i)));
+        }
+        const Ray axisRay{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+
+        std::vector<uint32_t> brute;
+        float entryDistance = 0.0f;
+        glm::vec3 entryNormal{0.0f};
+        for (const DynamicAABBTree::ProxyId proxy : proxies) {
+            if (engine::rayIntersectsAABB(axisRay, tree.proxyAabb(proxy), entryDistance, entryNormal)) {
+                brute.push_back(entt::to_integral(tree.entity(proxy)));
+            }
+        }
+        std::sort(brute.begin(), brute.end());
+
+        std::vector<uint32_t> traversed;
+        tree.raycast(axisRay, 1000.0f, [&traversed](entt::entity entity) {
+            traversed.push_back(entt::to_integral(entity));
+            return 1000.0f;
+        });
+        std::sort(traversed.begin(), traversed.end());
+        check(traversed == brute && traversed.size() == 3, "tree raycast visits exactly the pierced leaves");
+
+        traversed.clear();
+        tree.raycast(axisRay, 6.0f, [&traversed](entt::entity entity) {
+            traversed.push_back(entt::to_integral(entity));
+            return 6.0f;
+        });
+        check(traversed.size() == 1 && traversed[0] == 50, "tree raycast honours the maximum distance");
+
+        traversed.clear();
+        tree.raycast(axisRay, 1000.0f, [&traversed](entt::entity entity) {
+            traversed.push_back(entt::to_integral(entity));
+            return 0.0f;
+        });
+        check(traversed.size() == 1, "raycast callback returning zero stops the traversal");
+
+        // Clip-tightening: the callback measures each candidate's fat-box
+        // entry and returns the running best, exactly what Scene picking
+        // does with real hits.
+        float best = 1000.0f;
+        size_t visits = 0;
+        tree.raycast(axisRay, 1000.0f, [&](entt::entity entity) {
+            ++visits;
+            for (const DynamicAABBTree::ProxyId proxy : proxies) {
+                if (tree.entity(proxy) == entity &&
+                    engine::rayIntersectsAABB(axisRay, tree.proxyAabb(proxy), entryDistance, entryNormal)) {
+                    best = std::min(best, entryDistance);
+                }
+            }
+            return best;
+        });
+        check(nearlyEqual(best, 4.4, 1e-4) && visits >= 1 && visits <= 3,
+              "clip tightening prunes subtrees beyond the closest candidate");
+
+        size_t misses = 0;
+        tree.raycast(Ray{{0.0f, 50.0f, 0.0f}, {1.0f, 0.0f, 0.0f}}, 1000.0f, [&misses](entt::entity) {
+            ++misses;
+            return 1000.0f;
+        });
+        check(misses == 0 && tree.validate(), "ray missing the root box visits no leaves");
+    }
+
+    // --- Scene picking through the BVH --------------------------------------------------
+    {
+        engine::Scene scene;
+        const auto addCube = [&scene](const char* name, const glm::vec3& position) {
+            auto cube = scene.createEntity(name);
+            cube.addComponent<TransformComponent>(position);
+            cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+            return cube;
+        };
+        auto nearCube = addCube("BVHNear", glm::vec3{0.0f, 0.0f, -5.0f});
+        auto midCube = addCube("BVHMid", glm::vec3{0.0f, 0.0f, -10.0f});
+        auto farCube = addCube("BVHFar", glm::vec3{0.0f, 0.0f, -15.0f});
+        for (int i = 0; i < 24; ++i) {
+            addCube("BVHClutter", glm::vec3{-22.0f + static_cast<float>(i % 6) * 4.0f,
+                                            3.0f + static_cast<float>(i / 6) * 3.0f,
+                                            -8.0f - static_cast<float>(i % 4) * 5.0f});
+        }
+        const Ray axisRay{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+        RaycastHit hit;
+        check(scene.raycast(axisRay, hit) && hit.entity == nearCube.handle() &&
+                  nearlyEqual(hit.distance, 4.5, 1e-4),
+              "BVH picking finds the closest cube in a cluttered scene");
+        std::vector<RaycastHit> hits;
+        check(scene.raycastAll(axisRay, hits) == 3 && hits[0].entity == nearCube.handle() &&
+                  hits[1].entity == midCube.handle() && hits[2].entity == farCube.handle() &&
+                  nearlyEqual(hits[0].distance, 4.5, 1e-4) && nearlyEqual(hits[1].distance, 9.5, 1e-4) &&
+                  nearlyEqual(hits[2].distance, 14.5, 1e-4),
+              "BVH raycastAll returns the row of cubes in distance order");
+        check(!scene.raycast(axisRay, hit, 4.0f), "maxDistance still clips BVH picking");
+
+        scene.destroyEntity(nearCube);
+        check(scene.raycast(axisRay, hit) && hit.entity == midCube.handle() &&
+                  nearlyEqual(hit.distance, 9.5, 1e-4),
+              "destroyed cube is pruned from the BVH; the cube behind it is picked");
+        midCube.getComponent<TransformComponent>().position = glm::vec3{10.0f, 0.0f, -10.0f};
+        check(scene.raycast(axisRay, hit) && hit.entity == farCube.handle() &&
+                  nearlyEqual(hit.distance, 14.5, 1e-4),
+              "moved cube leaves the ray path in the BVH");
+        check(scene.raycast(Ray{{10.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit) &&
+                  hit.entity == midCube.handle() && nearlyEqual(hit.distance, 9.5, 1e-4),
+              "moved cube is picked at its new location");
+        midCube.getComponent<TransformComponent>().position.x = 10.05f;
+        check(scene.raycast(Ray{{10.05f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit) &&
+                  hit.entity == midCube.handle(),
+              "small moves inside the fat box stay pickable without a refit");
+    }
+
+    // --- Physics broadphase through the tree ----------------------------------------------
+    {
+        using engine::PhysicsSettings;
+        using engine::PhysicsSystem;
+        using engine::RigidBodyComponent;
+
+        engine::Scene scene;
+        auto floor = scene.createEntity("TreeFloor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+        floor.addComponent<RigidBodyComponent>().setStatic(true);
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{8.0f, 0.5f, 8.0f}));
+        for (int i = -1; i <= 1; ++i) {
+            auto cube = scene.createEntity("TreeCube");
+            cube.addComponent<TransformComponent>(glm::vec3{static_cast<float>(i) * 4.0f, 0.55f, 0.0f});
+            cube.addComponent<RigidBodyComponent>(1.0f);
+            cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        }
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        const PhysicsSystem::Stats stats = physics.update(scene, 1.0 / 60.0, settings);
+        check(stats.bodies == 4 && stats.candidatePairs == 3,
+              "tree broadphase pairs each resting-height cube with the floor only");
+        for (int step = 0; step < 120; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const PhysicsSystem::Stats settled = physics.lastStats();
+        check(settled.candidatePairs == 3 && settled.contacts > 0,
+              "resting cubes keep exactly their floor pairs (no cube-cube candidates)");
+    }
+    {
+        using engine::PhysicsSettings;
+        using engine::PhysicsSystem;
+        using engine::RigidBodyComponent;
+
+        engine::Scene scene;
+        auto plane = scene.createEntity("TreePlane");
+        plane.addComponent<TransformComponent>(glm::vec3{0.0f});
+        plane.addComponent<RigidBodyComponent>().setStatic(true);
+        plane.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+        for (int i = 0; i < 2; ++i) {
+            auto cube = scene.createEntity("TreePlaneCube");
+            cube.addComponent<TransformComponent>(glm::vec3{i == 0 ? -10.0f : 10.0f, 3.0f, 0.0f});
+            cube.addComponent<RigidBodyComponent>(1.0f);
+            cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        }
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        const PhysicsSystem::Stats stats = physics.update(scene, 1.0 / 60.0, settings);
+        check(stats.candidatePairs == 2, "infinite planes bypass the tree and pair against every body");
+    }
+}
+
 void testPlayerCollision() {
     std::cout << "Player collision (1:1 capsule hitbox)\n";
     using engine::ColliderComponent;
@@ -3692,6 +4134,7 @@ int main() {
     testPhysicsPhase11();
     testPhysicsSettling();
     testRaycasting();
+    testSpatialPartitioning();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

@@ -185,6 +185,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Scene.cpp
     src/Scene/Components.cpp
     src/Scene/Raycast.cpp
+    src/Scene/DynamicAABBTree.cpp
     src/Scene/Systems/CameraSystem.cpp
     src/Scene/Systems/PhysicsSystem.cpp
     src/Scene/Systems/PlayerSystem.cpp
