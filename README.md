@@ -306,7 +306,7 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 186 checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 199 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
@@ -321,8 +321,10 @@ integrated frames), and hardware-profile checks (worker-count resolution,
 batch granularity, config/profile agreement, VRAM budget accounting under
 concurrency), and Phase 5 resource checks (stable asset/material ids,
 VRAM-budgeted registration and rejection, PSO state deduplication,
-descriptor indices flowing into sorted draw items) — everything
-verifiable without a GPU.
+descriptor indices flowing into sorted draw items), and Phase 6 HUD/loop
+checks (glyph layout vertex counts and NDC bounds, HUD text composition,
+and the poll → fixed → update → render callback contract the window
+loop runs on) — everything verifiable without a GPU.
 
 ## Phase 5 — Asset Management, Shader Pipelines & Materials ✅
 
@@ -365,6 +367,33 @@ that id as before, and the `Renderer` rebinds pipelines only at material
 group boundaries while recording — push constants and the
 view/projection UBO flow are unchanged. The demo scene registers a
 `default` and a `doubleSided` material and creates both PSOs at startup.
+
+## Phase 6 — Window, Main Loop & FPS HUD ✅
+
+The GLFW window, Vulkan context (validation layers in debug builds,
+GTX 970-oriented device selection), and the fixed/variable main loop
+(JobSystem → ECS fixed update → camera update → sorted RenderSystem →
+Renderer with PSO pipelines from the AssetManager) were built in
+Phases 1–5 and are wired as one application. Startup logs the active
+hardware profile: worker count, parallel batch size, and VRAM/staging
+budgets.
+
+### FPS HUD (`src/Graphics/HudFont.*`, `src/Graphics/HudRenderer.*`)
+
+A zero-overhead bitmap-font overlay in the top-left corner shows live
+**FPS**, **frame time (ms)**, **worker threads**, **VRAM used/budget**,
+and **drawn/culled** counts:
+
+- `HudFont` is a pure-CPU 5×7 bitmap font (A–Z, digits, punctuation)
+  that lays text out as colored triangles in NDC — no font textures, no
+  descriptor sets, fully unit-testable without a GPU.
+- `HudRenderer` owns a dedicated overlay pipeline (no depth test, alpha
+  blending, `hud.vert`/`hud.frag`) and a persistently mapped vertex
+  buffer. Text is re-laid-out only when it changes (refreshed every
+  `[Render] hudUpdateIntervalSeconds`, default 0.25 s) or the viewport
+  resizes; per frame it costs exactly one pipeline bind + one draw,
+  recorded last inside the scene's render pass.
+- Toggle with `[Render] hudEnabled`.
 
 ## Configuration
 
@@ -481,6 +510,8 @@ mouse (press again to quit).
         ├── RenderQueue.h/.cpp    # CPU render command stream + parallel sort
         ├── VramBudget.h          # CAS-based VRAM accounting policy (GTX 970)
         ├── PipelineState.h/.cpp  # PSO descriptions, hashing, state cache
+        ├── HudFont.h/.cpp        # 5x7 bitmap font + HUD text layout (pure CPU)
+        ├── HudRenderer.h/.cpp    # Screen-space FPS HUD overlay pipeline
         └── Renderer.h/.cpp       # Frames-in-flight, command recording, present
 ```
 
@@ -511,6 +542,9 @@ what it depends on.
   registry with VRAM-budgeted registration, deterministic PSO manager
   over a VkPipelineCache, dense descriptor indices, and material-grouped
   pipeline binding in the sorted render queue
+- **Phase 6 — Window, loop & HUD ✅:** integrated GLFW/Vulkan application
+  loop on the hardware profile, with a zero-overhead bitmap-font FPS
+  HUD (FPS, frame time, workers, VRAM, draw stats)
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.

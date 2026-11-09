@@ -14,7 +14,8 @@
 namespace engine {
 
 Renderer::Renderer(VulkanContext& context, Window& window, Swapchain& swapchain, GraphicsPipeline& pipeline)
-    : m_context(context), m_window(window), m_swapchain(swapchain), m_pipeline(pipeline) {
+    : m_context(context), m_window(window), m_swapchain(swapchain), m_pipeline(pipeline),
+      m_hud(context, swapchain) {
     createVertexBuffer();
     createIndexBuffer();
     createUniformBuffers();
@@ -244,6 +245,9 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
                            sizeof(glm::mat4), &item.model);
         vkCmdDrawIndexed(commandBuffer, m_indexCount, 1, 0, 0, 0);
     }
+
+    // FPS HUD overlay, drawn last inside the same render pass.
+    m_hud.record(commandBuffer, extent);
 
     vkCmdEndRenderPass(commandBuffer);
 

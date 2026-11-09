@@ -238,6 +238,10 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             if (reader.applyInteger(value, intField, 0, 1048576)) {
                 config.render.stagingBufferBudgetMiB = static_cast<uint32_t>(intField);
             }
+        } else if (key == "hudenabled") {
+            reader.apply(value, config.render.hudEnabled);
+        } else if (key == "hudupdateintervalseconds") {
+            reader.applyDouble(value, config.render.hudUpdateIntervalSeconds, 0.05, 5.0);
         } else {
             return false;
         }

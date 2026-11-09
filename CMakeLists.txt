@@ -95,6 +95,8 @@ add_executable(3d-engine
     src/Geometry/Bounds.cpp
     src/Geometry/Cube.cpp
     src/Graphics/Frustum.cpp
+    src/Graphics/HudFont.cpp
+    src/Graphics/HudRenderer.cpp
     src/Graphics/RenderQueue.cpp
     src/Graphics/VulkanContext.cpp
     src/Graphics/VulkanHelpers.cpp
@@ -149,6 +151,8 @@ set(SHADER_OUTPUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/cube.vert
     ${SHADER_SOURCE_DIR}/cube.frag
+    ${SHADER_SOURCE_DIR}/hud.vert
+    ${SHADER_SOURCE_DIR}/hud.frag
 )
 
 set(SHADER_OUTPUTS "")
@@ -229,6 +233,8 @@ if(BUILD_TESTING)
         src/Geometry/Bounds.cpp
         src/Geometry/Cube.cpp
         src/Graphics/Frustum.cpp
+    src/Graphics/HudFont.cpp
+    src/Graphics/HudRenderer.cpp
     src/Graphics/RenderQueue.cpp
         src/Assets/AssetManager.cpp
     src/Graphics/PipelineState.cpp

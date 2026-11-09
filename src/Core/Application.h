@@ -68,6 +68,7 @@ private:
     RenderSystem m_renderSystem;
 
     double m_secondsSinceStatsLog = 0.0;
+    double m_secondsSinceHudUpdate = 0.0;
 };
 
 } // namespace engine

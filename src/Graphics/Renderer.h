@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "Graphics/Buffer.h"
+#include "Graphics/HudRenderer.h"
 #include "Graphics/RenderQueue.h"
 
 namespace engine {
@@ -53,6 +54,10 @@ public:
     // the swapchain when the window has been resized.
     void drawFrame(const glm::mat4& view, const glm::mat4& projection, std::span<const DrawItem> drawItems);
 
+    // Sets the FPS HUD overlay text (empty disables it). Cheap: the
+    // overlay re-lays-out only when the text actually changes.
+    void setHudText(std::string text) { m_hud.setText(std::move(text)); }
+
 private:
     void createCommandBuffers();
     void createSyncObjects();
@@ -72,6 +77,7 @@ private:
     Window& m_window;
     Swapchain& m_swapchain;
     GraphicsPipeline& m_pipeline;
+    HudRenderer m_hud;
 
     std::vector<VkCommandBuffer> m_commandBuffers;
 

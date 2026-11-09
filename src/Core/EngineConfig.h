@@ -28,6 +28,10 @@ struct RenderConfig {
     bool frustumCulling = true;
     // Sort draw items by material, then front-to-back, before submission.
     bool sortDrawItems = true;
+    // On-screen FPS HUD (bitmap-font overlay): live FPS / frame time /
+    // worker count / VRAM usage, refreshed at this interval (seconds).
+    bool hudEnabled = true;
+    double hudUpdateIntervalSeconds = 0.25;
     // Device-local VRAM planning budget for the GTX 970 profile: the
     // engine accounts allocations against this cap (below the card's
     // ~3.5 GiB fast segment) instead of over-committing VRAM.

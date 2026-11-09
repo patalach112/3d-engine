@@ -1,6 +1,7 @@
 #include "Core/Application.h"
 
 #include "Core/Logger.h"
+#include "Graphics/HudFont.h"
 #include "Geometry/Cube.h"
 #include "Scene/Components.h"
 #include "Scene/Systems/CameraSystem.h"
@@ -142,6 +143,20 @@ void Application::run() {
             if (m_secondsSinceStatsLog >= m_config.loop.statsLogIntervalSeconds) {
                 m_secondsSinceStatsLog = 0.0;
                 logLoopStats("Loop stats");
+            }
+        }
+
+        // FPS HUD: refresh a few times per second (text re-layout is the
+        // only cost; per-frame recording is one bind + one draw).
+        if (m_config.render.hudEnabled) {
+            m_secondsSinceHudUpdate += deltaSeconds;
+            if (m_secondsSinceHudUpdate >= m_config.render.hudUpdateIntervalSeconds) {
+                m_secondsSinceHudUpdate = 0.0;
+                const auto& time = m_gameLoop.time();
+                m_renderer.setHudText(formatHudText(
+                    time.framesPerSecond(), time.deltaSeconds() * 1000.0, m_jobSystem.workerCount(),
+                    m_vramBudget.usedBytes() / (1024 * 1024), m_config.render.vramBudgetMiB,
+                    m_renderSystem.lastDrawnCount(), m_renderSystem.lastCulledCount()));
             }
         }
     };

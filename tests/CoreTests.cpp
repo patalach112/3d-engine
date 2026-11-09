@@ -24,6 +24,7 @@
 #include "Graphics/PipelineState.h"
 #include "Core/Jobs/JobSystem.h"
 #include "Graphics/VramBudget.h"
+#include "Graphics/HudFont.h"
 #include "Graphics/RenderQueue.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Graphics/Frustum.h"
@@ -87,7 +88,7 @@ void testConfigLoading() {
              << "[Input]\ncaptureMouseOnStart = false\n"
              << "[Render]\nfrustumCulling = false\n"
              << "[Performance]\njobWorkerCount = 2\nentityReserve = 4096\nparallelBatchSize = 512\n"
-             << "[Render]\nvramBudgetMiB = 2048\nstagingBufferBudgetMiB = 128\n";
+             << "[Render]\nvramBudgetMiB = 2048\nstagingBufferBudgetMiB = 128\nhudEnabled = false\n";
     }
 
     const engine::EngineConfig config = engine::EngineConfig::loadFromFile(path);
@@ -111,6 +112,7 @@ void testConfigLoading() {
     check(config.performance.parallelBatchSize == 512, "parallel batch size parsed");
     check(config.render.vramBudgetMiB == 2048, "VRAM budget parsed");
     check(config.render.stagingBufferBudgetMiB == 128, "staging budget parsed");
+    check(!config.render.hudEnabled, "HUD enabled flag parsed");
     check(config.performance.entityReserve == 4096, "entity reserve parsed");
     check(config.loadWarnings.size() >= 2, "unknown/invalid keys produce warnings");
 
@@ -452,6 +454,89 @@ void testJobSystem() {
     jobs.waitForAll();
     check(afterThrow.load(), "workers survive a throwing job");
     check(jobs.failedJobCount() >= 1, "throwing job is counted as failed");
+}
+
+void testHudOverlay() {
+    std::cout << "HUD overlay\n";
+
+    check(engine::buildHudVertices("", 12, 12, 2, 1280, 720).empty(), "empty HUD text builds no vertices");
+    check(engine::buildHudVertices("A", 12, 12, 2, 0, 720).empty(), "zero viewport builds no vertices");
+
+    // Vertex count = filled font pixels x 6 (two triangles per pixel).
+    size_t filledPixels = 0;
+    for (const std::string_view row : engine::hudGlyphFor('A')) {
+        for (const char c : row) {
+            filledPixels += c == '#' ? 1 : 0;
+        }
+    }
+    const std::vector<engine::HudVertex> vertices = engine::buildHudVertices("A", 12, 12, 2, 1280, 720);
+    check(vertices.size() == filledPixels * 6, "glyph layout emits two triangles per filled pixel");
+
+    bool insideNdc = true;
+    for (const engine::HudVertex& vertex : vertices) {
+        insideNdc = insideNdc && vertex.x >= -1.0f && vertex.x <= 1.0f && vertex.y >= -1.0f && vertex.y <= 1.0f;
+    }
+    check(insideNdc, "HUD vertices stay inside NDC");
+    check(!vertices.empty() && vertices.front().x < -0.9f && vertices.front().y < -0.9f,
+          "HUD starts in the top-left corner");
+
+    // Second line is laid out below the first (larger NDC y in Vulkan
+    // framebuffer space), unknown glyphs fall back safely.
+    const std::vector<engine::HudVertex> twoLines = engine::buildHudVertices("A\n~", 12, 12, 2, 1280, 720);
+    float secondLineMinY = 2.0f;
+    const size_t secondLineStart = vertices.size();
+    for (size_t i = secondLineStart; i < twoLines.size(); ++i) {
+        secondLineMinY = std::min(secondLineMinY, twoLines[i].y);
+    }
+    check(twoLines.size() > secondLineStart && secondLineMinY > vertices.front().y,
+          "multi-line HUD flows downward with glyph fallback");
+
+    const std::string hud = engine::formatHudText(60.0, 16.67, 3, 12, 3072, 5, 2);
+    check(hud.find("FPS 60.0") != std::string::npos && hud.find("FRAME 16.67 MS") != std::string::npos,
+          "HUD text carries FPS and frame time");
+    check(hud.find("WORKERS 3+1") != std::string::npos && hud.find("VRAM 12/3072 MIB") != std::string::npos,
+          "HUD text carries worker count and VRAM usage");
+    check(hud.find("DRAWN 5 CULLED 2") != std::string::npos, "HUD text carries draw statistics");
+}
+
+void testWindowLoopIntegration() {
+    std::cout << "Window loop integration\n";
+    // The real GLFW window cannot open in CI, so this verifies the exact
+    // callback contract Application wires into GameLoop: per frame the
+    // order is poll -> fixed -> update -> render, render always last,
+    // and the loop terminates when shouldContinue reports the window
+    // close (3 frames simulated here).
+    engine::LoopConfig config;
+    config.fixedDeltaSeconds = 0.001;
+    config.maxFixedStepsPerFrame = 100;
+    config.maxFrameSeconds = 0.25;
+    config.maxFps = 0;
+    engine::GameLoop loop(config);
+
+    std::vector<std::string> order;
+    int frames = 0;
+    engine::LoopCallbacks callbacks;
+    callbacks.shouldContinue = [&frames] { return frames < 3; };
+    callbacks.pollEvents = [&order] { order.push_back("poll"); };
+    callbacks.fixedUpdate = [&order](double) { order.push_back("fixed"); };
+    callbacks.update = [&order](double) { order.push_back("update"); };
+    callbacks.render = [&order, &frames](double) {
+        order.push_back("render");
+        ++frames;
+    };
+    loop.run(callbacks);
+
+    check(frames == 3, "window loop runs until the close condition");
+    size_t renders = 0;
+    bool renderAlwaysAfterUpdate = true;
+    for (size_t i = 0; i < order.size(); ++i) {
+        if (order[i] == "render") {
+            ++renders;
+            renderAlwaysAfterUpdate = renderAlwaysAfterUpdate && i > 0 && order[i - 1] == "update";
+        }
+    }
+    check(renders == 3 && renderAlwaysAfterUpdate, "render is the last callback of every frame");
+    check(loop.stats().frames == 3, "loop statistics count the integrated frames");
 }
 
 void testHardwareProfile() {
@@ -1171,6 +1256,8 @@ int main() {
     testCamera();
     testSceneAndSystems();
     testPoolAllocator();
+    testHudOverlay();
+    testWindowLoopIntegration();
     testHardwareProfile();
     testVramBudget();
     testAssetManagement();
