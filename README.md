@@ -946,6 +946,68 @@ single-cube landing and the stack landing alongside the existing
 suite: **393 checks, all passing in Debug, Release-shared and
 Release-static, CTest 1/1.**
 
+## Resting-Contact Fix — No More Creep, Perpetual Tumble or Spawn Pop ✅
+
+Three related reports traced to one family of solver leaks around
+resting contacts:
+
+- **Perpetual tumbling / spawn chaos.** The positional pass used to
+  correct penetration by translating centres of mass straight along
+  the contact normal. For a rotating body that is an energy pump: a
+  tumbling cube's corner digs in a little deeper every sub-step, and
+  lifting the centre of mass vertically out of the penetration
+  converts solver work into gravitational potential that gravity
+  immediately converts back into spin. Measured on a single dropped
+  demo cube: spawn spin 24°/s amplified to 400°/s+ and sustained
+  indefinitely; in the full demo scene a stack cube was clocked at
+  50 m/s (156 J from a scene whose largest drop stores ~25 J) and
+  loose cubes were ejected off the floor. The correction is now a
+  positional impulse *at the contact point*, distributed between
+  translation and rotation through the same point Jacobian the
+  velocity solver uses (`invM + n·((I⁻¹(r×n))×r)`), so it mostly
+  un-rotates the dig-in that created the penetration instead of
+  lifting the body. Face contacts (r×n ≈ 0 at the centroid) reduce
+  to the old pure translation, so resting stacks are unaffected.
+  The same drop now tumbles briefly, dies within ~2 s and sleeps;
+  the demo replica (six falling cubes, 12-cube stack, player) ends
+  with every body asleep and nothing ejected.
+
+- **Standing creep.** A capsule standing across the seam between
+  two stack cubes drifted sideways ~1 mm/s with steadily growing
+  velocity: gravity re-seats it vertically every sub-step and the
+  positional pass lifted it back out along the tilted edge-contact
+  normal — a sag→lift ratchet. The contact point itself never
+  slides (measured point slide ≈ 0; the spherical bottom effectively
+  *rolls* in the seam), so velocity friction could never oppose it.
+  Two-part fix: for persistent, support-like contacts in the static
+  regime (relative tangential point velocity below a 0.05 m/s
+  zero-velocity threshold), the positional pass now cancels the
+  gravity-lateral part of the relative translation its own
+  separation produced — the correction lifts straight out of the
+  support, exactly what static friction enforces physically; and
+  resting-contact damping now also covers non-sleeping bodies (the
+  player) inside that same hard rest band, so the sub-mm/s
+  micro-roll residue is damped to exact zero instead of
+  accumulating. Driven motion is never bled: the band sits far
+  below any commanded speed and force/torque-driven bodies are
+  vetoed as before. Standing on a box — centred, off-centre, or
+  across a stack seam — now shows literally zero drift and zero
+  residual velocity over 10 s.
+
+- **Spawn pop.** Overlapping spawns already separated
+  positionally with zero velocity by construction (the velocity
+  solve has no penetration bias term); this is now pinned by
+  regression tests: a pair spawned with 10 cm overlap separates to
+  a resting, sleeping pair with peak speed 0.000 m/s, and a stack
+  spawned at exact rest spacing never exceeds 0.04 m/s and is
+  fully asleep within half a second.
+
+Verification: fifteen new regression checks (tumbling death,
+kicked-cube decay, seam-stand zero drift, press-and-hop settle,
+overlap spawn, exact-spawn stack, full demo replica) join the
+suite: **408 checks, all passing in Debug, Release-shared and
+Release-static, CTest 1/1, zero warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

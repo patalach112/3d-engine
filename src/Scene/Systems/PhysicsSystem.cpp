@@ -2168,19 +2168,29 @@ void PhysicsSystem::applyRestingContactDamping(const PhysicsSettings& settings, 
             continue;
         }
         RigidBodyComponent& body = *m_bodies[i].body;
-        // Only sleep-eligible bodies are damped: the player (allowSleep
-        // = false) must never have its driven motion bled off, and a
-        // body under an applied force/torque is being driven, not
-        // jittering.
-        if (!body.dynamic() || body.sleeping || !body.allowSleep) {
+        if (!body.dynamic() || body.sleeping) {
             continue;
         }
+        // A body under an applied force/torque is being driven, not
+        // jittering: never bleed driven motion.
         if (glm::dot(body.force, body.force) > kEpsilon || glm::dot(body.torque, body.torque) > kEpsilon) {
             continue;
         }
         // Residual motion only: genuine impacts and fast slides are
-        // the solver's business, not the damper's.
-        if (glm::length(body.velocity) > 0.3f || glm::length(body.angularVelocity) > 90.0f) {
+        // the solver's business, not the damper's. Sleep-eligible
+        // bodies are damped across the whole residual band; a
+        // non-sleeping body (the player, allowSleep = false) only
+        // inside the hard rest band below the static-stick threshold,
+        // where nothing but solver residue lives — a controller
+        // driving it by velocity override commands cruise speeds far
+        // above the band, and force-driven bodies are vetoed above.
+        // Without this, a capsule standing on a sleeping stack keeps
+        // a sub-mm/s micro-roll (its spherical bottom rolls without
+        // slipping, so point friction cannot oppose it) and creeps
+        // sideways forever; inside the band the creep is damped to
+        // exact zero within a few sub-steps.
+        const float speedLimit = body.allowSleep ? 0.3f : 0.05f;
+        if (glm::length(body.velocity) > speedLimit || glm::length(body.angularVelocity) > 90.0f) {
             continue;
         }
         body.velocity *= linearFactor;
@@ -2331,12 +2341,105 @@ void PhysicsSystem::resolvePosition(Contact& contact, const PhysicsSettings& set
     if (separationGain <= 0.0f) {
         return;
     }
-    // Mass-ratio weighting: the correction splits by inverse mass, so a
-    // light body landing on a heavy one moves itself, not the heavy body.
-    const float correctionMagnitude = separationGain / inverseMassSum;
-    m_bodies[contact.bodyA].transform->position -= contact.normal * (correctionMagnitude * invA);
-    m_bodies[contact.bodyB].transform->position += contact.normal * (correctionMagnitude * invB);
+    // Positional impulse at the contact point: the correction is
+    // distributed between translation and rotation through the same
+    // point Jacobian the velocity solver uses (response = invM +
+    // n . ((I^-1 (r x n)) x r) per body). Pure COM translation — the
+    // previous form — is an energy pump for rotating bodies: a
+    // tumbling cube's corner digs in a little more every sub-step,
+    // and lifting the centre of mass straight out of the penetration
+    // converts solver work into gravitational potential that gravity
+    // immediately converts back into spin, sustaining (even
+    // amplifying) the tumble indefinitely. With the rotational share
+    // the correction mostly un-rotates the dig-in that created the
+    // penetration, which adds no potential energy; face contacts
+    // (r x n ~ 0 at the centroid) keep the old pure-translation
+    // behaviour, so resting stacks are unaffected.
+    const glm::vec3 radiusA = contact.point - m_bodies[contact.bodyA].transform->position;
+    const glm::vec3 radiusB = contact.point - m_bodies[contact.bodyB].transform->position;
+    const auto positionalResponse = [this](uint32_t bodyIndex, float invMass, const glm::vec3& radius,
+                                           const glm::vec3& direction) {
+        if (invMass <= 0.0f) {
+            return 0.0f;
+        }
+        const glm::vec3 rCrossDir = glm::cross(radius, direction);
+        return invMass + glm::dot(direction, glm::cross(inverseInertiaWorld(bodyIndex, rCrossDir), radius));
+    };
+    const float responseSum = positionalResponse(contact.bodyA, invA, radiusA, contact.normal) +
+                              positionalResponse(contact.bodyB, invB, radiusB, contact.normal);
+    if (responseSum <= kEpsilon) {
+        return;
+    }
+    // Applies a positional impulse at the contact point and returns the
+    // displacement it produced at that point (translation plus the
+    // rotational share), so callers can measure the correction's
+    // tangential side effects.
+    const auto applyPositional = [this](uint32_t bodyIndex, float invMass, const glm::vec3& radius,
+                                        const glm::vec3& impulse) {
+        if (invMass <= 0.0f) {
+            return glm::vec3{0.0f};
+        }
+        BodyRef& ref = m_bodies[bodyIndex];
+        const glm::vec3 translation = impulse * invMass;
+        ref.transform->position += translation;
+        const glm::vec3 angularStep = inverseInertiaWorld(bodyIndex, glm::cross(radius, impulse));
+        const float angle = glm::length(angularStep);
+        if (angle > kEpsilon) {
+            const glm::quat delta = glm::angleAxis(angle, angularStep / angle);
+            ref.body->orientation = glm::normalize(delta * ref.body->orientation);
+            ref.transform->setOrientation(ref.body->orientation);
+        }
+        return translation + glm::cross(angularStep, radius);
+    };
+    const float positionalImpulse = separationGain / responseSum;
+    const glm::vec3 translationA = contact.normal * (-positionalImpulse * invA);
+    const glm::vec3 translationB = contact.normal * (positionalImpulse * invB);
+    applyPositional(contact.bodyA, invA, radiusA, contact.normal * (-positionalImpulse));
+    applyPositional(contact.bodyB, invB, radiusB, contact.normal * positionalImpulse);
     contact.penetration -= separationGain; // re-measured remainder for the next iteration
+
+    // Static-friction stick (positional tangential projection): for a
+    // persistent, support-like contact in the static regime — relative
+    // tangential point velocity below the zero-velocity threshold —
+    // cancel the gravity-lateral part of the relative translation the
+    // separation just produced, so the correction lifts the bodies
+    // straight out of the support instead of walking them sideways.
+    // Without this, a body resting across a tilted contact (a capsule
+    // bottom wedged on a box edge or straddling the seam between two
+    // cubes) ratchets laterally forever: gravity re-seats it
+    // vertically every sub-step, the positional pass lifts it back
+    // out along the tilted normal, and the asymmetry between the two
+    // paths is a slow, endless creep. The contact point itself never
+    // slides (measured slide ~ 0) — the body effectively rolls — so
+    // velocity friction cannot oppose it; it acts on velocities,
+    // after which the positions still move. Cancelling exactly the
+    // lateral translation this correction introduced is what static
+    // friction does physically: the resting body keeps its lateral
+    // position while still separating vertically. Genuinely sliding
+    // contacts (tangential speed above threshold), fresh impacts
+    // (not persistent) and wall-like contacts (normal across
+    // gravity) are untouched, and the stick never pulls a body
+    // toward an anchor — it only removes the sideways motion the
+    // separation itself introduced.
+    if (contact.persistent && glm::dot(settings.gravity, settings.gravity) > kEpsilon) {
+        const glm::vec3 gravityDir = glm::normalize(settings.gravity);
+        if (std::abs(glm::dot(contact.normal, gravityDir)) > 0.5f) {
+            const glm::vec3 relativeVelocity =
+                pointVelocity(contact.bodyB, contact.point) - pointVelocity(contact.bodyA, contact.point);
+            const glm::vec3 tangentialVelocity =
+                relativeVelocity - contact.normal * glm::dot(relativeVelocity, contact.normal);
+            constexpr float kStaticStickVelocityThreshold = 0.05f; // m/s
+            if (glm::length(tangentialVelocity) < kStaticStickVelocityThreshold) {
+                const glm::vec3 relativeTranslation = translationB - translationA;
+                const glm::vec3 lateral =
+                    relativeTranslation - gravityDir * glm::dot(relativeTranslation, gravityDir);
+                if (glm::length(lateral) > 1e-7f) {
+                    m_bodies[contact.bodyA].transform->position += lateral * (invA / inverseMassSum);
+                    m_bodies[contact.bodyB].transform->position -= lateral * (invB / inverseMassSum);
+                }
+            }
+        }
+    }
 }
 
 void PhysicsSystem::resolveJointVelocity(const JointRef& ref) {

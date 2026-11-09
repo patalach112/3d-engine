@@ -1762,6 +1762,331 @@ void testPhysicsPhase11() {
     }
 }
 
+void testPhysicsSettling() {
+    std::cout << "Physics settling (friction lock, tumble death, static spawn)\n";
+    using engine::ColliderComponent;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::RigidBodyComponent;
+    using engine::TransformComponent;
+
+    const float floorTop = -1.25f;
+    const auto addFloor = [&floorTop](engine::Scene& scene, float extent) {
+        auto floor = scene.createEntity("SettleFloor");
+        auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, floorTop - 0.05f, 0.0f});
+        floorTransform.scale = glm::vec3{extent, 0.1f, extent};
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.restitution = 0.35f;
+        floorBody.friction = 0.6f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        return floor;
+    };
+    const auto addCube = [](engine::Scene& scene, const glm::vec3& position, float scale, float mass) {
+        auto cube = scene.createEntity("SettleCube");
+        auto& transform = cube.addComponent<TransformComponent>(position);
+        transform.scale = glm::vec3{scale};
+        auto& body = cube.addComponent<RigidBodyComponent>(mass);
+        body.restitution = 0.38f;
+        body.friction = 0.5f;
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        return cube;
+    };
+    const auto addPlayer = [](engine::Scene& scene, const glm::vec3& position) {
+        auto player = scene.createEntity("SettlePlayer");
+        player.addComponent<TransformComponent>(position);
+        auto& body = player.addComponent<RigidBodyComponent>(80.0f);
+        body.restitution = 0.0f;
+        body.friction = 0.25f;
+        body.setPrincipalInertia(glm::vec3{10000.0f});
+        body.allowSleep = false;
+        player.addComponent<ColliderComponent>(ColliderComponent::capsule(0.30f, 0.45f));
+        return player;
+    };
+    const auto addStack = [&floorTop, &addCube](engine::Scene& scene, float z, float rise) {
+        std::vector<engine::Entity> cubes;
+        for (int level = 0; level < 4; ++level) {
+            for (int col = 0; col < 3; ++col) {
+                cubes.push_back(addCube(scene,
+                                        glm::vec3{-0.55f + col * 0.58f + level * 0.03f,
+                                                  floorTop + 0.26f + level * rise, z},
+                                        0.5f, 0.125f));
+            }
+        }
+        return cubes;
+    };
+
+    // Regression (perpetual tumbling): a dropped cube with spin used to
+    // gain energy from the positional solver — every sub-step its
+    // digging corner was lifted straight out of the floor, converting
+    // solver work into spin — and tumbled forever at ~200 deg/s. With
+    // rotation-aware positional correction it may bounce and tumble
+    // briefly, then friction must kill the motion completely.
+    {
+        engine::Scene scene;
+        addFloor(scene, 60.0f);
+        auto cube = addCube(scene, glm::vec3{0.0f, 1.4f, 0.0f}, 0.5f, 0.125f);
+        auto& cubeBody = cube.getComponent<RigidBodyComponent>();
+        cubeBody.velocity = glm::vec3{0.15f, 0.0f, 0.0f};
+        cubeBody.angularVelocity = glm::vec3{0.0f, 24.0f, 0.0f};
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        float latePeakSpin = 0.0f;
+        for (int step = 0; step < 360; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            if (step >= 180) {
+                latePeakSpin = std::max(latePeakSpin, glm::length(cubeBody.angularVelocity));
+            }
+        }
+        const glm::vec3 position = cube.getComponent<TransformComponent>().position;
+        check(cubeBody.sleeping && glm::length(cubeBody.velocity) == 0.0f &&
+                  glm::length(cubeBody.angularVelocity) == 0.0f,
+              "dropped spinning cube tumbles briefly then falls asleep (no perpetual tumble)");
+        check(latePeakSpin < 45.0f, "tumbling cube's spin is dead in the second half of the drop test");
+        check(std::abs(position.x) < 3.0f && std::abs(position.y - (floorTop + 0.25f)) < 0.01f,
+              "tumbled cube comes to rest on the floor near its drop site");
+    }
+
+    // A kicked cube (slide + spin) must shed both and sleep instead of
+    // rolling on forever.
+    {
+        engine::Scene scene;
+        addFloor(scene, 60.0f);
+        auto cube = addCube(scene, glm::vec3{0.0f, floorTop + 0.25f, 0.0f}, 0.5f, 0.125f);
+        auto& cubeBody = cube.getComponent<RigidBodyComponent>();
+        cubeBody.velocity = glm::vec3{1.2f, 0.0f, 0.0f};
+        cubeBody.angularVelocity = glm::vec3{0.0f, 0.0f, -160.0f};
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        for (int step = 0; step < 240; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        check(cubeBody.sleeping && glm::length(cubeBody.velocity) == 0.0f &&
+                  glm::length(cubeBody.angularVelocity) == 0.0f,
+              "kicked cube's slide and spin decay to sleep");
+    }
+
+    // Regression (standing friction lock): the player dropped onto a
+    // sleeping stack, landing across the seam between two top cubes,
+    // used to creep sideways ~0.3 mm/s forever — gravity re-seated
+    // the capsule vertically each sub-step and the positional solver
+    // lifted it back out along the tilted edge-contact normal, a
+    // ratchet velocity friction cannot oppose. Standing must be
+    // absolutely still: no drift, no residual velocity.
+    {
+        engine::Scene scene;
+        addFloor(scene, 60.0f);
+        auto cubes = addStack(scene, 0.0f, 0.53f);
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        for (int step = 0; step < 180; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        auto player = addPlayer(scene, glm::vec3{-0.30f, floorTop + 2.0f + 0.75f + 0.35f, 0.0f});
+        auto& playerTransform = player.getComponent<TransformComponent>();
+        auto& playerBody = player.getComponent<RigidBodyComponent>();
+        for (int step = 0; step < 120; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const glm::vec3 settledPosition = playerTransform.position;
+        for (int step = 0; step < 480; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        int stackAsleep = 0;
+        for (auto& cube : cubes) {
+            stackAsleep += cube.getComponent<RigidBodyComponent>().sleeping ? 1 : 0;
+        }
+        check(std::abs(playerTransform.position.x - settledPosition.x) < 0.001f &&
+                  std::abs(playerTransform.position.z - settledPosition.z) < 0.001f,
+              "player standing across a stack seam has zero lateral drift");
+        check(glm::length(playerBody.velocity) < 0.001f,
+              "standing player's residual velocity is zero (friction fully locks)");
+        check(stackAsleep == 12, "stack slept on across the seam stays fully asleep");
+    }
+
+    // Regression (player-induced spin): pressing forward while hopping
+    // against a cube may spin it while driven, but the cube must
+    // settle dead the moment the player lets go — no spin loop.
+    {
+        engine::Scene scene;
+        addFloor(scene, 60.0f);
+        auto cube = addCube(scene, glm::vec3{0.8f, floorTop + 0.25f, 0.0f}, 0.5f, 0.125f);
+        auto& cubeBody = cube.getComponent<RigidBodyComponent>();
+        auto& cubeTransform = cube.getComponent<TransformComponent>();
+        auto player = addPlayer(scene, glm::vec3{0.0f, floorTop + 0.75f, 0.0f});
+        auto& playerBody = player.getComponent<RigidBodyComponent>();
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        float peakSpinAfterRelease = 0.0f;
+        float peakCubeSpeed = 0.0f;
+        for (int step = 0; step < 720; ++step) {
+            if (step < 480) {
+                playerBody.velocity.x = 1.6f;
+                playerBody.velocity.z = 0.0f;
+                if (step % 60 == 30) {
+                    playerBody.velocity.y = 4.5f; // hop while pressing
+                }
+            } else if (step < 500) {
+                playerBody.velocity.x = -3.0f; // step away
+                playerBody.velocity.z = 0.0f;
+            } else {
+                playerBody.velocity.x = 0.0f;
+                playerBody.velocity.z = 0.0f;
+            }
+            physics.update(scene, 1.0 / 60.0, settings);
+            peakCubeSpeed = std::max(peakCubeSpeed, glm::length(cubeBody.velocity));
+            if (step >= 480) {
+                peakSpinAfterRelease = std::max(peakSpinAfterRelease, glm::length(cubeBody.angularVelocity));
+            }
+        }
+        check(peakSpinAfterRelease < 45.0f && cubeBody.sleeping &&
+                  glm::length(cubeBody.velocity) == 0.0f && glm::length(cubeBody.angularVelocity) == 0.0f,
+              "cube pressed and hopped against settles dead once the player lets go");
+        check(peakCubeSpeed < 4.0f && std::abs(cubeTransform.position.y - (floorTop + 0.25f)) < 0.01f,
+              "pressed cube is never launched or sunk");
+    }
+
+    // Regression (spawn overlap): bodies spawned overlapping with zero
+    // velocity must separate positionally with no kinetic-energy
+    // injection — no pop, no spin, straight to sleep.
+    {
+        engine::Scene scene;
+        addFloor(scene, 60.0f);
+        auto lower = addCube(scene, glm::vec3{0.0f, floorTop + 0.25f, 0.0f}, 0.5f, 0.125f);
+        auto upper = addCube(scene, glm::vec3{0.0f, floorTop + 0.25f + 0.40f, 0.0f}, 0.5f, 0.125f);
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        float peakSpeed = 0.0f;
+        float peakSpin = 0.0f;
+        for (int step = 0; step < 300; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            peakSpeed = std::max({peakSpeed, glm::length(lower.getComponent<RigidBodyComponent>().velocity),
+                                  glm::length(upper.getComponent<RigidBodyComponent>().velocity)});
+            peakSpin = std::max({peakSpin, glm::length(lower.getComponent<RigidBodyComponent>().angularVelocity),
+                                 glm::length(upper.getComponent<RigidBodyComponent>().angularVelocity)});
+        }
+        const float separation = upper.getComponent<TransformComponent>().position.y -
+                                 lower.getComponent<TransformComponent>().position.y;
+        check(peakSpeed < 0.01f && peakSpin < 1.0f,
+              "overlapping spawn resolves with zero velocity injection");
+        check(lower.getComponent<RigidBodyComponent>().sleeping &&
+                  upper.getComponent<RigidBodyComponent>().sleeping && separation > 0.49f && separation < 0.51f,
+              "overlapping spawn settles into a resting, sleeping pair");
+    }
+
+    // Regression (static spawn): a stack spawned exactly at rest
+    // spacing with zero velocity must stay essentially motionless and
+    // fall asleep immediately — no initial tumble or pop.
+    {
+        engine::Scene scene;
+        addFloor(scene, 60.0f);
+        std::vector<engine::Entity> cubes;
+        std::vector<glm::vec3> spawnPositions;
+        for (int level = 0; level < 4; ++level) {
+            for (int col = 0; col < 3; ++col) {
+                const glm::vec3 position{-0.5f + col * 0.5f, floorTop + 0.25f + level * 0.5f, 0.0f};
+                cubes.push_back(addCube(scene, position, 0.5f, 0.125f));
+                spawnPositions.push_back(position);
+            }
+        }
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        float peakSpeed = 0.0f;
+        int allAsleepStep = -1;
+        for (int step = 0; step < 180; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            bool allAsleep = true;
+            for (auto& cube : cubes) {
+                const auto& body = cube.getComponent<RigidBodyComponent>();
+                peakSpeed = std::max(peakSpeed, glm::length(body.velocity));
+                allAsleep = allAsleep && body.sleeping;
+            }
+            if (allAsleep && allAsleepStep < 0) {
+                allAsleepStep = step;
+            }
+        }
+        // Resting contacts sit a slop depth below the spawn height
+        // (~3 mm per stacked level), so heights are compared against
+        // the rest slot with the usual stack tolerance while lateral
+        // positions must match the spawn almost exactly.
+        bool unmoved = allAsleepStep >= 0;
+        for (size_t i = 0; i < cubes.size(); ++i) {
+            const glm::vec3& position = cubes[i].getComponent<TransformComponent>().position;
+            unmoved = unmoved && std::abs(position.x - spawnPositions[i].x) < 0.005f &&
+                      std::abs(position.y - spawnPositions[i].y) < 0.02f &&
+                      std::abs(position.z - spawnPositions[i].z) < 0.005f;
+        }
+        check(peakSpeed < 0.06f, "exactly spawned stack never picks up speed");
+        check(unmoved && allAsleepStep < 90, "exactly spawned stack is static and asleep immediately");
+    }
+
+    // Integration (demo scene replica): the demo's falling cubes,
+    // stack and player spawn together. The stack must never tumble,
+    // no cube may be ejected off the 9 m floor, and everything must
+    // end asleep.
+    {
+        engine::Scene scene;
+        addFloor(scene, 9.0f);
+        struct Spawn {
+            glm::vec3 position;
+            float scale;
+            glm::vec3 velocity;
+            glm::vec3 spin;
+        };
+        const Spawn spawns[] = {
+            {{0.0f, 1.4f, -2.4f}, 0.65f, {0.15f, 0, 0}, {0, 24, 0}},
+            {{0.12f, 2.8f, -2.35f}, 0.65f, {0, 0, 0}, {0, -18, 0}},
+            {{-1.25f, 1.9f, -2.2f}, 0.55f, {0.25f, 0, 0}, {0, 32, 0}},
+            {{-1.18f, 3.1f, -2.15f}, 0.55f, {0, 0, 0}, {0, -26, 0}},
+            {{1.3f, 1.6f, -2.1f}, 0.5f, {-0.2f, 0, 0}, {0, 20, 0}},
+            {{1.22f, 2.75f, -2.05f}, 0.5f, {0, 0, 0}, {0, -30, 0}},
+        };
+        std::vector<engine::Entity> loose;
+        for (const Spawn& spawn : spawns) {
+            const float mass = spawn.scale * spawn.scale * spawn.scale;
+            auto cube = addCube(scene, spawn.position, spawn.scale, mass);
+            auto& body = cube.getComponent<RigidBodyComponent>();
+            body.velocity = spawn.velocity;
+            body.angularVelocity = spawn.spin;
+            loose.push_back(cube);
+        }
+        auto stack = addStack(scene, -3.6f, 0.53f);
+        addPlayer(scene, glm::vec3{2.6f, -0.5f, 1.5f});
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        float peakStackSpin = 0.0f;
+        for (int step = 0; step < 720; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            if (step < 240) {
+                for (auto& cube : stack) {
+                    peakStackSpin =
+                        std::max(peakStackSpin, glm::length(cube.getComponent<RigidBodyComponent>().angularVelocity));
+                }
+            }
+        }
+        int stackAsleep = 0;
+        for (auto& cube : stack) {
+            stackAsleep += cube.getComponent<RigidBodyComponent>().sleeping ? 1 : 0;
+        }
+        check(stackAsleep == 12 && peakStackSpin < 45.0f,
+              "demo replica stack never tumbles and ends fully asleep");
+        bool looseSettled = true;
+        for (size_t i = 0; i < loose.size(); ++i) {
+            const auto& body = loose[i].getComponent<RigidBodyComponent>();
+            const glm::vec3& position = loose[i].getComponent<TransformComponent>().position;
+            const float restY = floorTop + spawns[i].scale * 0.5f;
+            // Flat on the floor, stacked on a sibling, or frozen at a
+            // slow balance point all count as settled; ejected,
+            // floating or still-moving do not.
+            looseSettled = looseSettled && body.sleeping && glm::length(body.velocity) == 0.0f &&
+                           std::abs(position.x) < 4.4f && std::abs(position.z) < 4.4f &&
+                           position.y > restY - 0.03f && position.y < restY + 0.55f &&
+                           position.y < spawns[i].position.y;
+        }
+        check(looseSettled, "demo replica falling cubes land on the floor and sleep (none ejected)");
+    }
+}
+
 void testPlayerCollision() {
     std::cout << "Player collision (1:1 capsule hitbox)\n";
     using engine::ColliderComponent;
@@ -3121,6 +3446,7 @@ int main() {
     testDynamicModulesAndMaterials();
     testShadowsDepthAndRotationSync();
     testPhysicsPhase11();
+    testPhysicsSettling();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();
