@@ -878,6 +878,74 @@ zero — in under a second**, with regression tests pinning the offset
 stack, the sub-threshold no-bounce landing, and the new config keys:
 386 checks, all passing in Debug, Release-shared and Release-static.
 
+## Player–Rigid-Body Interaction Fix — No More Trampolines or Ejected Stacks ✅
+
+The 80 kg player capsule (640:1 against the 0.125 kg demo cubes) fed
+back through the resting-contact chain: dropped onto a sleeping cube
+it sank ~0.2 m in, then rebounded at nearly its impact speed and
+bounced forever; dropped onto the sleeping stack it ejected cubes at
+~2× its impact speed with violent spin. Tracing one impact end to
+end isolated the loop in the solver's mass-ratio behaviour:
+
+- **Gauss-Seidel cannot cross a 640:1 chain in budget.** Each sweep
+  through a floor-pinned cube transfers only
+  ~invM_heavy/invM_light of the capsule's approach, so at
+  4 iterations × 4 sub-steps the capsule tunneled through the cube
+  before converging, while the accumulated impulse grew to the
+  chain-consistent value (~35 N·s) across many sub-steps.
+- **Warm-start redelivery then became the pump.** That impulse —
+  legitimately accumulated while the chain absorbed the impact —
+  was re-fired in full every following sub-step (+J/m long after
+  the approach was consumed), and neither the velocity iterations
+  (whose effective-mass term assumes a free partner — 8.0125 for
+  the pair vs the floor-pinned 1/80 the chain actually presents)
+  nor the saturated positional pass (capsule share ≈ 0.16% through
+  the sandwiched cube) could remove or out-correct it.
+
+The fix is **shock propagation** (support-depth-pinned solve
+masses), computed per sub-step in `solveConstraints`:
+
+- Every body's **support depth** is the shortest contact chain from
+  an immovable body (static or asleep) up to it. Within a contact
+  between different depths the shallower body is the support.
+- The **positional** pass always pins the support
+  (`Contact::solveInvMass*`): the deeper body takes the whole
+  correction share, so a heavy body sunk into a light supported one
+  climbs back out instead of both saturated corrections cancelling
+  through the sandwiched body.
+- The **velocity** pass pins the support only at extreme mass
+  ratios (≥ 16:1 inverse-mass ratio; `Contact::velInvMass*`), where
+  iteration convergence is hopeless. The impulse is then sized by —
+  and delivered only to — the heavy body, so the reaction crosses
+  the chain in one sweep per level. Comparable-mass contacts
+  (stack cubes, free collisions) keep symmetric two-body impulses,
+  which resting stacks rely on for torque balance and the momentum
+  tests rely on for exact conservation.
+- **Warm starting delivers under the same fiction** that produced
+  the stored impulse (`applyWarmStart` respects `velInvMass*`): a
+  pinned support never received the impulse while it accumulated
+  (its own support contact kept it at rest), so it never receives
+  the 80 kg-sized impulse on redelivery either. Delivery itself
+  stays uncapped — with per-contact response now matching the real
+  constraint environment, an overshooting delivery is measured and
+  clamped away by the first solver sweep of the same sub-step.
+  (Pair-response caps, measured-conductance delivery and per-body
+  speed caps were each built and rejected: they either starved
+  legitimate chain support or corrupted the accumulated-impulse
+  bookkeeping momentum conservation depends on.)
+
+Verification: an 80 kg capsule dropped 1.5–4 m onto a single
+sleeping cube comes to rest **on top of it** (cube unsunk, asleep,
+zero rebound — combined restitution is 0), and dropped onto the
+sleeping 12-cube offset stack leaves every cube at its rest
+position, asleep, with peak cube speed/spin of zero measurable
+motion; standing on a sleeping cube deviates < 4 mm over 3 s and
+jumping off imparts no velocity to it; walking pushes slide cubes
+and topple stacks without explosions. Regression tests pin the
+single-cube landing and the stack landing alongside the existing
+suite: **393 checks, all passing in Debug, Release-shared and
+Release-static, CTest 1/1.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

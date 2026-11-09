@@ -129,6 +129,28 @@ private:
         // sub-step's manifold: a persistent contact. Restitution is
         // suppressed for persistent contacts (only new impacts bounce).
         bool persistent = false;
+        // Solver inverse masses for this sub-step (shock
+        // propagation, assigned in solveConstraints): identical to
+        // the bodies' solver inverse masses, except that the
+        // shallower body of a support chain (smaller support depth)
+        // is treated as immovable within this contact. Gauss-Seidel
+        // transfers only ~invM_heavy/invM_light of a heavy body's
+        // approach per sweep through a light pinned body, so without
+        // this a heavy body tunnels through a light supported one
+        // before the iterations converge; with it, support reactions
+        // propagate through the chain in one sweep per level.
+        // solveInvMass* drive the positional pass (all ratios: the
+        // correction share must follow the support, or a crushed
+        // chain deadlocks with both corrections saturated against
+        // the sandwiched body); velInvMass* drive the velocity pass
+        // and are pinned only at extreme mass ratios (>= 16:1), where
+        // iteration convergence is hopeless — comparable-mass
+        // contacts keep symmetric two-body impulses, which resting
+        // stacks rely on for torque balance.
+        float solveInvMassA = 0.0f;
+        float solveInvMassB = 0.0f;
+        float velInvMassA = 0.0f;
+        float velInvMassB = 0.0f;
         bool continuous = false;
         float timeOfImpact = 1.0f;
         uint8_t manifoldCount = 1; // contacts sharing this pair (position correction is split across them)

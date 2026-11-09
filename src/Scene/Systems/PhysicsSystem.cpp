@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 
@@ -1794,6 +1795,20 @@ std::optional<uint32_t> PhysicsSystem::bodyIndexFor(entt::entity entity) const {
 }
 
 void PhysicsSystem::prepareWarmStarting(const PhysicsSettings& settings) {
+    // Phase 1: match stored impulses to this sub-step's contacts (by
+    // pre-centroid feature point) and stage the stored values on
+    // them. Nothing is applied yet: velocity targets are computed
+    // from the pre-delivery state, and the staged set is applied
+    // together afterwards. The stored impulses of a
+    // support chain (capsule -> cube -> floor) are only meaningful
+    // as a set; delivering them one by one would let a solver
+    // iteration measure the light middle body's transient swing as
+    // approach velocity and cash it in as kinetic energy.
+    struct StagedWarm {
+        Contact* contact;
+    };
+    std::vector<StagedWarm> staged;
+    staged.reserve(m_contacts.size());
     for (Contact& contact : m_contacts) {
         const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
         const glm::vec3 localPoint = glm::transpose(m_geometry[contact.bodyA].axes) *
@@ -1801,15 +1816,18 @@ void PhysicsSystem::prepareWarmStarting(const PhysicsSettings& settings) {
         for (const WarmContact& warm : m_warmContacts) {
             if (warm.pairKey == key && glm::dot(warm.normal, contact.normal) > 0.5f &&
                 glm::dot(warm.localPointA - localPoint, warm.localPointA - localPoint) < 0.0025f) {
+                contact.persistent = true;
                 contact.normalImpulse = warm.normalImpulse;
                 contact.tangentImpulse = warm.tangentImpulse;
-                contact.persistent = true;
-                applyWarmStart(contact);
+                staged.push_back(StagedWarm{&contact});
                 break;
             }
         }
     }
 
+    // Phase 2: velocity targets, from the pre-delivery state.
+    // (Persistence is already resolved by phase 1, which the
+    // restitution gating below depends on.)
     for (Contact& contact : m_contacts) {
         const glm::vec3 relativeVelocity =
             pointVelocity(contact.bodyB, contact.point) - pointVelocity(contact.bodyA, contact.point);
@@ -1821,6 +1839,25 @@ void PhysicsSystem::prepareWarmStarting(const PhysicsSettings& settings) {
         // neighbour (backed by an immovable floor) is a launch pump.
         contact.restitutionTarget =
             !contact.persistent && vn < -settings.restitutionVelocityThreshold ? -contact.restitution * vn : 0.0f;
+    }
+
+    // Phase 3: apply the staged set as one system. Full stored
+    // impulses are delivered: with shock propagation (see
+    // solveConstraints) every contact's iteration response matches
+    // its actual constraint environment — a light body pinned by a
+    // support chain presents only the heavy partner's inverse mass
+    // — so if a delivered impulse overshoots the current approach
+    // (e.g. one accumulated while a chain absorbed an impact, now
+    // re-fired after the approach is gone), the first solver sweep
+    // measures the true overshoot and the accumulated-impulse clamp
+    // removes it within the same sub-step, before any of it can
+    // integrate into a launch. Capping the delivery itself (by pair
+    // response, by measured conductance, or by per-body speed) was
+    // tried and rejected: each variant either starved legitimate
+    // chain support or corrupted the impulse bookkeeping that
+    // momentum conservation across sub-steps depends on.
+    for (const StagedWarm& entry : staged) {
+        applyWarmStart(*entry.contact);
     }
 }
 
@@ -1847,9 +1884,20 @@ void PhysicsSystem::applyWarmStart(Contact& contact) {
     if (solverInverseMass(contact.bodyA) + solverInverseMass(contact.bodyB) <= 0.0f) {
         return;
     }
+    // Deliver under the same mass fiction that produced the stored
+    // impulse: a body pinned as a support in the velocity solve
+    // (extreme-ratio chain) never received the impulse while it
+    // accumulated, so it must not receive it now either — the stored
+    // impulse is sized for the heavy partner's mass, and handing it
+    // to the light support would fire it at J/m_light (thousands of
+    // m/s) faster than the chain's iterations can absorb it.
     const glm::vec3 impulse = contact.normal * contact.normalImpulse + contact.tangentImpulse;
-    applyImpulseAtPoint(contact.bodyA, contact.point, impulse, -1.0f);
-    applyImpulseAtPoint(contact.bodyB, contact.point, impulse, 1.0f);
+    if (contact.velInvMassA > 0.0f) {
+        applyImpulseAtPoint(contact.bodyA, contact.point, impulse, -1.0f);
+    }
+    if (contact.velInvMassB > 0.0f) {
+        applyImpulseAtPoint(contact.bodyB, contact.point, impulse, 1.0f);
+    }
 }
 
 void PhysicsSystem::applyContinuousCollisionStops() {
@@ -1994,6 +2042,68 @@ void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem*
         }
     }
 
+    // Support depths (shock propagation): a body's depth is the
+    // length of the shortest contact chain from an immovable body
+    // (static or asleep: solver inverse mass zero) up to it. Within
+    // a contact between different depths, the shallower body is the
+    // support and is treated as immovable (Contact::solveInvMass*):
+    // plain Gauss-Seidel transfers only ~invM_heavy/invM_light of a
+    // heavy body's approach through a light pinned body per sweep,
+    // so at player-vs-cube mass ratios the heavy body tunnels
+    // through the light one before the iterations can converge,
+    // while pinning the support lets the reaction propagate one
+    // chain level per sweep. Equal-depth contacts (free collisions,
+    // side-by-side pushes) keep full two-body masses, so momentum
+    // behaviour there is untouched.
+    {
+        const uint32_t kUnreached = std::numeric_limits<uint32_t>::max();
+        std::vector<uint32_t> supportDepth(m_bodies.size(), kUnreached);
+        for (size_t i = 0; i < m_bodies.size(); ++i) {
+            if (solverInverseMass(static_cast<uint32_t>(i)) <= 0.0f) {
+                supportDepth[i] = 0;
+            }
+        }
+        for (size_t pass = 0; pass < m_bodies.size(); ++pass) {
+            bool changed = false;
+            for (const Contact& contact : m_contacts) {
+                uint32_t& depthA = supportDepth[contact.bodyA];
+                uint32_t& depthB = supportDepth[contact.bodyB];
+                if (depthA != kUnreached && depthB > depthA + 1) {
+                    depthB = depthA + 1;
+                    changed = true;
+                }
+                if (depthB != kUnreached && depthA > depthB + 1) {
+                    depthA = depthB + 1;
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                break;
+            }
+        }
+        for (Contact& contact : m_contacts) {
+            contact.solveInvMassA = solverInverseMass(contact.bodyA);
+            contact.solveInvMassB = solverInverseMass(contact.bodyB);
+            contact.velInvMassA = contact.solveInvMassA;
+            contact.velInvMassB = contact.solveInvMassB;
+            // Pin the support (shallower) body: positionally at any
+            // ratio, and for the velocity solve only when the deeper
+            // body is at least 16x heavier (inverse-mass ratio), the
+            // regime where Gauss-Seidel cannot converge in budget.
+            if (supportDepth[contact.bodyA] < supportDepth[contact.bodyB]) {
+                contact.solveInvMassA = 0.0f;
+                if (contact.velInvMassB > 0.0f && contact.velInvMassA >= 16.0f * contact.velInvMassB) {
+                    contact.velInvMassA = 0.0f;
+                }
+            } else if (supportDepth[contact.bodyB] < supportDepth[contact.bodyA]) {
+                contact.solveInvMassB = 0.0f;
+                if (contact.velInvMassA > 0.0f && contact.velInvMassB >= 16.0f * contact.velInvMassA) {
+                    contact.velInvMassB = 0.0f;
+                }
+            }
+        }
+    }
+
     prepareWarmStarting(settings);
     const auto solveOneIsland = [this, &settings](SolverIsland& island) {
         for (uint32_t iteration = 0; iteration < settings.solverIterations; ++iteration) {
@@ -2087,8 +2197,12 @@ void PhysicsSystem::applyRestingContactDamping(const PhysicsSettings& settings, 
 }
 
 void PhysicsSystem::resolveVelocity(Contact& contact, const PhysicsSettings& settings) {
-    const float invA = solverInverseMass(contact.bodyA);
-    const float invB = solverInverseMass(contact.bodyB);
+    // Velocity-solve masses: at extreme mass ratios within a support
+    // chain the support is pinned (see solveConstraints), so the
+    // impulse is sized by — and delivered only to — the heavy body;
+    // comparable-mass contacts keep symmetric two-body masses.
+    const float invA = contact.velInvMassA;
+    const float invB = contact.velInvMassB;
     if (invA + invB <= 0.0f) {
         return; // static pair, or both asleep: nothing can move
     }
@@ -2111,8 +2225,18 @@ void PhysicsSystem::resolveVelocity(Contact& contact, const PhysicsSettings& set
         return invMass + glm::dot(direction, glm::cross(inverseInertiaWorld(bodyIndex, rCrossDir), radius));
     };
     const auto applyDelta = [this, &contact](const glm::vec3& impulse) {
-        applyImpulseAtPoint(contact.bodyA, contact.point, impulse, -1.0f);
-        applyImpulseAtPoint(contact.bodyB, contact.point, impulse, 1.0f);
+        // A body pinned as this contact's support (extreme-ratio
+        // chain) receives none of the impulse: the reaction is
+        // absorbed by the support chain beneath it. Applying it
+        // would hand the light support the heavy body's momentum as
+        // a transient velocity spike its own support contact then
+        // has to absorb within the same sweep budget.
+        if (contact.velInvMassA > 0.0f) {
+            applyImpulseAtPoint(contact.bodyA, contact.point, impulse, -1.0f);
+        }
+        if (contact.velInvMassB > 0.0f) {
+            applyImpulseAtPoint(contact.bodyB, contact.point, impulse, 1.0f);
+        }
     };
 
     const float normalMass = effectiveMass(contact.bodyA, radiusA, normal, invA) +
@@ -2135,7 +2259,6 @@ void PhysicsSystem::resolveVelocity(Contact& contact, const PhysicsSettings& set
             applyDelta(normal * deltaImpulse);
         }
     }
-
     if (contact.friction <= 0.0f) {
         return;
     }
@@ -2190,8 +2313,13 @@ void PhysicsSystem::resolvePosition(Contact& contact, const PhysicsSettings& set
     if (contact.penetration <= settings.contactSlop) {
         return;
     }
-    const float invA = solverInverseMass(contact.bodyA);
-    const float invB = solverInverseMass(contact.bodyB);
+    // Shock-propagation masses (see solveConstraints): the pinned
+    // support of a chain does not move, so the deeper body takes the
+    // whole correction — this is what lets a heavy body sunk into a
+    // light supported one climb back out instead of the correction
+    // being vetoed by the support contact beneath the light body.
+    const float invA = contact.solveInvMassA;
+    const float invB = contact.solveInvMassB;
     const float inverseMassSum = invA + invB;
     if (inverseMassSum <= 0.0f) {
         return;
