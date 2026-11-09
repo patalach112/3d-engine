@@ -88,6 +88,14 @@ void Application::registerAssets() {
     doubleSidedMaterial.name = "doubleSided";
     doubleSidedMaterial.pipeline.cullMode = CullMode::None;
     registerSandboxMaterial(doubleSidedMaterial);
+
+    // Mouse-picking highlight: a hot orange the sandbox palette never
+    // uses, so the selected entity is unmistakable. Applied by swapping
+    // a MeshComponent's materialName (see handleMousePicking).
+    MaterialDesc highlightMaterial = makeSandboxCubeMaterial();
+    highlightMaterial.name = "pickedHighlight";
+    highlightMaterial.baseColor = glm::vec4{1.0f, 0.45f, 0.05f, 1.0f};
+    registerSandboxMaterial(highlightMaterial);
     ENGINE_LOG_INFO("Assets registered: " << m_assets.meshCount() << " mesh(es), " << m_assets.materialCount()
                                           << " material(s), VRAM reserved " << m_assets.reservedVramBytes()
                                           << " bytes, " << m_pipeline.cachedPipelineCount()
@@ -285,7 +293,8 @@ void Application::run() {
                     << Swapchain::presentModeName(m_swapchain.presentMode()) << ", "
                     << m_renderer.framesInFlight() << " frame(s) in flight)");
     ENGINE_LOG_INFO("Controls: WASD move, Q/E down/up, Shift boost, C resets physics cubes, mouse look "
-                    "(click window to capture mouse, Esc releases / quits)");
+                    "(click window to capture mouse, Esc releases / quits), left-click selects the object "
+                    "under the cursor (crosshair when captured)");
 
     LoopCallbacks callbacks;
     callbacks.shouldContinue = [this] { return !m_window.shouldClose(); };
@@ -365,6 +374,61 @@ void Application::handleMouseCapture() {
         m_input.setMouseCaptured(true);
         ENGINE_LOG_DEBUG("Mouse captured (click)");
     }
+}
+
+void Application::handleMousePicking() {
+    // Edge trigger: a held button must not re-pick every frame.
+    if (!m_input.wasMouseButtonPressed(MouseButton::Left)) {
+        return;
+    }
+    CameraComponent* activeCamera = m_scene.findActiveCamera();
+    if (activeCamera == nullptr) {
+        return;
+    }
+    const float aspectRatio =
+        m_window.height() > 0 ? static_cast<float>(m_window.width()) / static_cast<float>(m_window.height()) : 1.0f;
+    // With the cursor captured there is no visible pointer position:
+    // pick through the screen centre (the crosshair). Otherwise pick
+    // through the actual cursor position.
+    const glm::vec2 ndc =
+        m_input.isMouseCaptured()
+            ? glm::vec2{0.0f, 0.0f}
+            : screenToNdc(m_input.mousePosition(),
+                          glm::vec2{static_cast<float>(m_window.width()), static_cast<float>(m_window.height())});
+    const Ray ray = cameraRay(activeCamera->camera, ndc, aspectRatio);
+
+    auto& registry = m_scene.registry();
+    // Restore the previously selected entity's material before choosing
+    // a new one, so at most one object ever wears the highlight.
+    if (m_selectedEntity != entt::null && registry.valid(m_selectedEntity)) {
+        if (MeshComponent* mesh = registry.try_get<MeshComponent>(m_selectedEntity);
+            mesh != nullptr && mesh->materialName == "pickedHighlight") {
+            mesh->materialName = m_selectedMaterialName;
+        }
+    }
+    m_selectedEntity = entt::null;
+    m_selectedMaterialName.clear();
+
+    RaycastHit hit;
+    const Scene::MeshResolver resolveMesh = [this](std::string_view assetId) { return m_assets.mesh(assetId); };
+    if (!m_scene.raycastPrecise(ray, hit, resolveMesh)) {
+        ENGINE_LOG_DEBUG("Mouse pick: nothing under the cursor");
+        return;
+    }
+    m_selectedEntity = hit.entity;
+    std::string pickedName = "entity";
+    if (const TagComponent* tag = registry.try_get<TagComponent>(hit.entity); tag != nullptr) {
+        pickedName = tag->tag;
+    }
+    if (MeshComponent* mesh = registry.try_get<MeshComponent>(hit.entity); mesh != nullptr) {
+        m_selectedMaterialName = mesh->materialName;
+        mesh->materialName = "pickedHighlight";
+    }
+    ENGINE_LOG_INFO("Mouse pick: selected '" << pickedName << "' (#" << entt::to_integral(hit.entity)
+                                             << ") at distance " << hit.distance << " m, position ("
+                                             << hit.position.x << ", " << hit.position.y << ", " << hit.position.z
+                                             << "), normal (" << hit.normal.x << ", " << hit.normal.y << ", "
+                                             << hit.normal.z << ")");
 }
 
 void Application::handlePhysicsReset() {

@@ -155,6 +155,7 @@ target_link_libraries(EngineCore PUBLIC EngineFoundation EnginePlatform glm::glm
 engine_module(EngineGeometry ENGINE_BUILDING_GEOMETRY
     src/Geometry/Bounds.cpp
     src/Geometry/Cube.cpp
+    src/Geometry/Ray.cpp
 )
 target_link_libraries(EngineGeometry PUBLIC EngineFoundation glm::glm Vulkan::Vulkan)
 
@@ -183,6 +184,7 @@ target_link_libraries(EngineAssets PUBLIC EngineFoundation EngineGeometry Engine
 engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Scene.cpp
     src/Scene/Components.cpp
+    src/Scene/Raycast.cpp
     src/Scene/Systems/CameraSystem.cpp
     src/Scene/Systems/PhysicsSystem.cpp
     src/Scene/Systems/PlayerSystem.cpp

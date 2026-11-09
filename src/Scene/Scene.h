@@ -4,12 +4,17 @@
 #include "Assets/AssetManager.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Scene/Components.h"
+#include "Scene/Raycast.h"
 
 #include <entt/entt.hpp>
 
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace engine {
 
@@ -107,6 +112,40 @@ public:
     // components (physical players) use this instead of duplicating the
     // active-camera search.
     [[nodiscard]] entt::entity findActiveCameraEntity() const;
+
+    // --- Raycasting / mouse picking ------------------------------------------
+    //
+    // All three queries walk the entities that carry a TransformComponent
+    // and test, per entity, the first applicable representation:
+    //
+    //   1. (raycastPrecise only) the real mesh triangles, when the
+    //      entity has a MeshComponent whose asset id the supplied
+    //      MeshResolver can resolve — the mesh surface is then the
+    //      exact truth and bounds/colliders of that entity are ignored;
+    //   2. an exact box test for Box/Obb ColliderComponents, performed
+    //      in collider local space so rotated and non-uniformly scaled
+    //      boxes are hit precisely (this is the volume physics uses);
+    //   3. the world-space AABB of a visible MeshComponent's local
+    //      bounds (MeshBounds data, via MeshComponent::localBounds).
+    //
+    // Other collider shapes (sphere, capsule, plane, convex hull) are
+    // not raycastable yet; such entities are still found through their
+    // mesh when they have one. Hits behind the origin or farther than
+    // maxDistance are rejected. The ray's direction must be normalized.
+    using MeshResolver = std::function<const MeshAsset*(std::string_view assetId)>;
+
+    // Closest hit along the ray, if any.
+    [[nodiscard]] bool raycast(const Ray& ray, RaycastHit& outHit,
+                               float maxDistance = std::numeric_limits<float>::max()) const;
+    // Every hit along the ray, sorted by ascending distance. Clears
+    // outHits first; returns the number of hits.
+    [[nodiscard]] size_t raycastAll(const Ray& ray, std::vector<RaycastHit>& outHits,
+                                    float maxDistance = std::numeric_limits<float>::max()) const;
+    // Closest hit, testing real mesh triangles wherever resolveMesh
+    // resolves a MeshComponent's asset id (entities whose asset does
+    // not resolve fall back to the bounds/collider tests above).
+    [[nodiscard]] bool raycastPrecise(const Ray& ray, RaycastHit& outHit, const MeshResolver& resolveMesh,
+                                      float maxDistance = std::numeric_limits<float>::max()) const;
 
     // Pre-allocates component storage for the given number of entities
     // (entities, transforms, meshes, cameras, spins) so scene building

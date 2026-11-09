@@ -2087,6 +2087,250 @@ void testPhysicsSettling() {
     }
 }
 
+void testRaycasting() {
+    std::cout << "Raycasting & mouse picking (Phase 13)\n";
+    using engine::AABB;
+    using engine::ColliderComponent;
+    using engine::MeshComponent;
+    using engine::Ray;
+    using engine::RaycastHit;
+    using engine::TransformComponent;
+
+    const auto vecNear = [](const glm::vec3& a, const glm::vec3& b, float eps = 1e-4f) {
+        return std::abs(a.x - b.x) < eps && std::abs(a.y - b.y) < eps && std::abs(a.z - b.z) < eps;
+    };
+
+    // --- Screen -> NDC (Vulkan y-down convention, same as the renderer) ----
+    {
+        check(vecNear(glm::vec3{engine::screenToNdc({400.0f, 300.0f}, {800.0f, 600.0f}), 0.0f},
+                      glm::vec3{0.0f, 0.0f, 0.0f}),
+              "screen centre maps to NDC origin");
+        check(vecNear(glm::vec3{engine::screenToNdc({0.0f, 0.0f}, {800.0f, 600.0f}), 0.0f},
+                      glm::vec3{-1.0f, -1.0f, 0.0f}),
+              "screen top-left maps to NDC (-1,-1)");
+        check(vecNear(glm::vec3{engine::screenToNdc({800.0f, 600.0f}, {800.0f, 600.0f}), 0.0f},
+                      glm::vec3{1.0f, 1.0f, 0.0f}),
+              "screen bottom-right maps to NDC (1,1)");
+    }
+
+    // --- Camera unprojection -------------------------------------------------
+    {
+        engine::Camera camera{engine::CameraConfig{}}; // at (0,0,3), looking down -Z
+        const Ray center = engine::cameraRay(camera, glm::vec2{0.0f, 0.0f}, 1.0f);
+        check(vecNear(center.origin, glm::vec3{0.0f, 0.0f, 3.0f}), "camera ray originates at the eye position");
+        check(vecNear(center.direction, glm::vec3{0.0f, 0.0f, -1.0f}),
+              "camera centre ray follows the camera front vector");
+        const Ray top = engine::cameraRay(camera, glm::vec2{0.0f, -1.0f}, 1.0f);
+        check(top.direction.y > 0.35f && top.direction.z < -0.85f && std::abs(top.direction.x) < 1e-4f,
+              "NDC top-centre ray tilts upward by the half field of view");
+        const Ray bottomRight = engine::cameraRay(camera, glm::vec2{1.0f, 1.0f}, 1.0f);
+        check(bottomRight.direction.x > 0.35f && bottomRight.direction.y < -0.35f && bottomRight.direction.z < -0.7f,
+              "NDC bottom-right ray tilts right and down");
+        check(nearlyEqual(glm::length(bottomRight.direction), 1.0, 1e-5), "camera ray direction is normalized");
+        const Ray identity = engine::rayThroughNdc(glm::vec2{0.0f, 0.0f}, glm::mat4{1.0f});
+        check(vecNear(identity.origin, glm::vec3{0.0f}) && vecNear(identity.direction, glm::vec3{0.0f, 0.0f, 1.0f}),
+              "unprojection through an identity matrix runs down +Z");
+    }
+
+    // --- Ray vs AABB (slab method) -------------------------------------------
+    {
+        const AABB box{glm::vec3{-0.5f}, glm::vec3{0.5f}};
+        float distance = 0.0f;
+        glm::vec3 normal{0.0f};
+        const Ray front{{0.0f, 0.0f, 5.0f}, {0.0f, 0.0f, -1.0f}};
+        check(engine::rayIntersectsAABB(front, box, distance, normal) && nearlyEqual(distance, 4.5, 1e-5) &&
+                  vecNear(normal, glm::vec3{0.0f, 0.0f, 1.0f}) && vecNear(front.at(distance), glm::vec3{0.0f, 0.0f, 0.5f}),
+              "ray hits the front face of a box at the exact distance with the face normal");
+        const Ray side{{5.0f, 0.0f, 0.0f}, {-1.0f, 0.0f, 0.0f}};
+        check(engine::rayIntersectsAABB(side, box, distance, normal) && nearlyEqual(distance, 4.5, 1e-5) &&
+                  vecNear(normal, glm::vec3{1.0f, 0.0f, 0.0f}),
+              "ray hits a box side face with that face's normal");
+        check(!engine::rayIntersectsAABB(Ray{{2.0f, 0.0f, 5.0f}, {0.0f, 0.0f, -1.0f}}, box, distance, normal),
+              "offset ray misses the box");
+        check(!engine::rayIntersectsAABB(Ray{{0.0f, 0.0f, 5.0f}, {0.0f, 0.0f, 1.0f}}, box, distance, normal),
+              "box behind the ray origin is not hit");
+        check(!engine::rayIntersectsAABB(Ray{{0.0f, 2.0f, 5.0f}, {0.0f, 0.0f, -1.0f}}, box, distance, normal),
+              "ray parallel to a slab and outside it misses");
+        check(engine::rayIntersectsAABB(Ray{{0.0f, 0.2f, 5.0f}, {0.0f, 0.0f, -1.0f}}, box, distance, normal) &&
+                  nearlyEqual(distance, 4.5, 1e-5),
+              "ray parallel to a slab and inside it still hits");
+        const Ray inside{{0.1f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+        check(engine::rayIntersectsAABB(inside, box, distance, normal) && distance == 0.0f &&
+                  vecNear(normal, glm::vec3{0.0f, 0.0f, 1.0f}),
+              "ray starting inside a box hits at distance zero");
+    }
+
+    // --- Ray vs triangle (Moller-Trumbore) -------------------------------------
+    {
+        const glm::vec3 a{0.0f, 0.0f, 0.0f};
+        const glm::vec3 b{2.0f, 0.0f, 0.0f};
+        const glm::vec3 c{0.0f, 2.0f, 0.0f};
+        float distance = 0.0f;
+        glm::vec2 barycentric{0.0f};
+        const Ray down{{0.25f, 0.25f, 1.0f}, {0.0f, 0.0f, -1.0f}};
+        check(engine::rayIntersectsTriangle(down, a, b, c, distance, barycentric) &&
+                  nearlyEqual(distance, 1.0, 1e-5) && nearlyEqual(barycentric.x, 0.125, 1e-5) &&
+                  nearlyEqual(barycentric.y, 0.125, 1e-5) &&
+                  vecNear(down.at(distance), glm::vec3{0.25f, 0.25f, 0.0f}),
+              "ray hits a triangle at the exact distance with barycentric coordinates");
+        check(!engine::rayIntersectsTriangle(Ray{{1.5f, 1.5f, 1.0f}, {0.0f, 0.0f, -1.0f}}, a, b, c, distance,
+                                             barycentric),
+              "ray past the triangle's hypotenuse misses");
+        check(engine::rayIntersectsTriangle(Ray{{0.25f, 0.25f, -1.0f}, {0.0f, 0.0f, 1.0f}}, a, b, c, distance,
+                                            barycentric) &&
+                  nearlyEqual(distance, 1.0, 1e-5),
+              "triangle test is two-sided (back face hits)");
+        check(!engine::rayIntersectsTriangle(Ray{{0.25f, 0.25f, 1.0f}, {0.0f, 0.0f, 1.0f}}, a, b, c, distance,
+                                             barycentric),
+              "triangle behind the ray is not hit");
+        check(!engine::rayIntersectsTriangle(Ray{{0.25f, 0.25f, 1.0f}, {1.0f, 0.0f, 0.0f}}, a, b, c, distance,
+                                             barycentric),
+              "ray parallel to the triangle plane misses");
+    }
+
+    // --- Scene raycast queries -------------------------------------------------
+    const auto addBoxCube = [](engine::Scene& scene, const char* name, const glm::vec3& position,
+                               float rotationYDegrees = 0.0f) {
+        auto cube = scene.createEntity(name);
+        auto& transform = cube.addComponent<TransformComponent>(position);
+        transform.rotationDegrees.y = rotationYDegrees;
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        return cube;
+    };
+    {
+        engine::Scene scene;
+        auto cube = addBoxCube(scene, "TargetCube", glm::vec3{0.0f, 0.0f, -5.0f});
+        RaycastHit hit;
+        const Ray ray{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+        check(scene.raycast(ray, hit) && hit.entity == cube.handle() && nearlyEqual(hit.distance, 4.5, 1e-4) &&
+                  vecNear(hit.position, glm::vec3{0.0f, 0.0f, -4.5f}) && vecNear(hit.normal, glm::vec3{0.0f, 0.0f, 1.0f}),
+              "scene raycast hits a box collider with distance, point and normal");
+        check(!scene.raycast(Ray{{0.0f, 3.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit),
+              "scene raycast reports a miss above the cube");
+        RaycastHit insideHit;
+        check(scene.raycast(Ray{{0.0f, 0.0f, -5.0f}, {0.0f, 0.0f, -1.0f}}, insideHit) && insideHit.distance == 0.0f,
+              "scene raycast starting inside a collider hits at distance zero");
+    }
+    {
+        engine::Scene scene;
+        auto nearCube = addBoxCube(scene, "NearCube", glm::vec3{0.0f, 0.0f, -5.0f});
+        auto farCube = addBoxCube(scene, "FarCube", glm::vec3{0.0f, 0.0f, -8.0f});
+        const Ray ray{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+        RaycastHit hit;
+        check(scene.raycast(ray, hit) && hit.entity == nearCube.handle(),
+              "scene raycast returns the closest of several hits");
+        std::vector<RaycastHit> hits;
+        check(scene.raycastAll(ray, hits) == 2 && hits[0].entity == nearCube.handle() &&
+                  hits[1].entity == farCube.handle() && hits[0].distance < hits[1].distance,
+              "raycastAll returns every hit sorted by distance");
+        check(scene.raycastAll(ray, hits, 6.0f) == 1 && hits[0].entity == nearCube.handle(),
+              "raycastAll honours maxDistance");
+        check(!scene.raycast(ray, hit, 4.0f), "scene raycast honours maxDistance");
+    }
+    {
+        // Rotated box: an exact local-space (OBB) test. A world-AABB
+        // approximation would report 4.293 for both rays; the true
+        // rotated-square cross-section gives 4.293 through the centre
+        // vertex but 4.943 at x = 0.65, entering through the slanted
+        // face whose normal is (sqrt(2)/2, 0, sqrt(2)/2).
+        engine::Scene scene;
+        auto cube = addBoxCube(scene, "RotatedCube", glm::vec3{0.0f, 0.0f, -5.0f}, 45.0f);
+        RaycastHit hit;
+        check(scene.raycast(Ray{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit) &&
+                  nearlyEqual(hit.distance, 5.0 - std::sqrt(2.0) / 2.0, 1e-3),
+              "raycast against a 45-degree box hits the leading vertex");
+        check(scene.raycast(Ray{{0.65f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit) &&
+                  nearlyEqual(hit.distance, 4.943, 1e-3) &&
+                  vecNear(hit.normal, glm::vec3{std::sqrt(2.0f) / 2.0f, 0.0f, std::sqrt(2.0f) / 2.0f}, 1e-3f),
+              "raycast against a rotated box is an exact OBB test, not a world AABB");
+        (void)cube;
+    }
+    {
+        // Non-box colliders are not raycast; the entity behind them is.
+        engine::Scene scene;
+        auto blocker = scene.createEntity("CapsuleBlocker");
+        blocker.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -3.0f});
+        blocker.addComponent<ColliderComponent>(ColliderComponent::capsule(0.30f, 0.45f));
+        auto cube = addBoxCube(scene, "BehindCube", glm::vec3{0.0f, 0.0f, -5.0f});
+        RaycastHit hit;
+        check(scene.raycast(Ray{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit) && hit.entity == cube.handle() &&
+                  nearlyEqual(hit.distance, 4.5, 1e-4),
+              "raycast passes through a capsule-only entity and hits the box behind it");
+    }
+    {
+        // Mesh bounds path (no collider): visible meshes are pickable
+        // through their local bounds; invisible ones are not, but an
+        // invisible mesh's collider still is.
+        engine::Scene scene;
+        auto meshOnly = scene.createEntity("MeshOnly");
+        meshOnly.addComponent<TransformComponent>(glm::vec3{3.0f, 0.0f, -5.0f});
+        meshOnly.addComponent<MeshComponent>();
+        RaycastHit hit;
+        check(scene.raycast(Ray{{3.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit) &&
+                  hit.entity == meshOnly.handle() && nearlyEqual(hit.distance, 4.5, 1e-4),
+              "raycast hits a mesh-only entity through its local bounds");
+        check(!scene.raycast(Ray{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit),
+              "raycast misses a mesh-only entity outside its bounds");
+        meshOnly.getComponent<MeshComponent>().visible = false;
+        check(!scene.raycast(Ray{{3.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit),
+              "invisible mesh is not picked through its bounds");
+        meshOnly.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        check(scene.raycast(Ray{{3.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit) &&
+                  hit.entity == meshOnly.handle(),
+              "invisible mesh's box collider is still picked");
+    }
+
+    // --- Precise (per-triangle) picking -----------------------------------------
+    {
+        engine::MeshAsset triangleAsset;
+        triangleAsset.name = "tri";
+        triangleAsset.vertices = {engine::Vertex{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}},
+                                  engine::Vertex{{2.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}},
+                                  engine::Vertex{{0.0f, 2.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f}}};
+        triangleAsset.indices = {0, 1, 2};
+        triangleAsset.bounds = engine::computeMeshBounds(triangleAsset.vertices);
+
+        engine::Scene scene;
+        auto triangle = scene.createEntity("Triangle");
+        triangle.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -5.0f});
+        auto& mesh = triangle.addComponent<MeshComponent>();
+        mesh.assetId = "tri";
+        mesh.localBounds = triangleAsset.bounds.aabb();
+
+        const engine::Scene::MeshResolver resolver = [&triangleAsset](std::string_view assetId) {
+            return assetId == "tri" ? &triangleAsset : nullptr;
+        };
+        const engine::Scene::MeshResolver noResolver = [](std::string_view) { return nullptr; };
+
+        RaycastHit hit;
+        const Ray throughTriangle{{0.25f, 0.25f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+        check(scene.raycastPrecise(throughTriangle, hit, resolver) && hit.entity == triangle.handle() &&
+                  nearlyEqual(hit.distance, 5.0, 1e-4) && vecNear(hit.position, glm::vec3{0.25f, 0.25f, -5.0f}) &&
+                  vecNear(hit.normal, glm::vec3{0.0f, 0.0f, 1.0f}),
+              "precise raycast hits the exact triangle surface");
+        const Ray pastTriangle{{1.5f, 1.5f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+        check(scene.raycast(pastTriangle, hit) && nearlyEqual(hit.distance, 5.0, 1e-4),
+              "bounds raycast hits where only the bounding box is present");
+        check(!scene.raycastPrecise(pastTriangle, hit, resolver),
+              "precise raycast misses where the ray only clips the bounding box");
+        check(scene.raycastPrecise(pastTriangle, hit, noResolver) && nearlyEqual(hit.distance, 5.0, 1e-4),
+              "precise raycast falls back to bounds when the asset cannot be resolved");
+    }
+
+    // --- End to end: camera ray into a scene --------------------------------------
+    {
+        engine::Scene scene;
+        auto cube = addBoxCube(scene, "PickTarget", glm::vec3{0.0f, 0.0f, -5.0f});
+        engine::Camera camera{engine::CameraConfig{}}; // eye at (0,0,3) looking down -Z
+        RaycastHit hit;
+        check(scene.raycast(engine::cameraRay(camera, glm::vec2{0.0f, 0.0f}, 1.0f), hit) &&
+                  hit.entity == cube.handle() && nearlyEqual(hit.distance, 7.5, 1e-3),
+              "camera centre ray picks the cube straight ahead at eye distance");
+        check(!scene.raycast(engine::cameraRay(camera, glm::vec2{0.9f, 0.0f}, 1.0f), hit),
+              "camera ray near the screen edge misses the cube");
+    }
+}
+
 void testPlayerCollision() {
     std::cout << "Player collision (1:1 capsule hitbox)\n";
     using engine::ColliderComponent;
@@ -3447,6 +3691,7 @@ int main() {
     testShadowsDepthAndRotationSync();
     testPhysicsPhase11();
     testPhysicsSettling();
+    testRaycasting();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

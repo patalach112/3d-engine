@@ -1008,6 +1008,51 @@ overlap spawn, exact-spawn stack, full demo replica) join the
 suite: **408 checks, all passing in Debug, Release-shared and
 Release-static, CTest 1/1, zero warnings.**
 
+## Phase 13 — Raycasting & Mouse Picking ✅
+
+World-space ray queries for picking, visibility probes and gameplay:
+
+- **Core math** (`Geometry/Ray.h`, EngineGeometry): `Ray`
+  (origin + normalized direction), a slab-method **ray vs AABB**
+  test reporting entry distance and face normal (parallel axes and
+  origin-inside-box handled exactly, no inverse-direction NaNs),
+  a two-sided **Möller–Trumbore ray vs triangle** test reporting
+  distance and barycentric coordinates, `rayThroughNdc`
+  (unprojection through an inverse view-projection matrix) and
+  `screenToNdc` (window pixels → Vulkan-convention NDC, y-down on
+  both sides, so no flip is needed against the renderer's
+  Y-flipped projection).
+- **Camera rays**: `cameraRay(camera, ndc, aspectRatio)` builds the
+  picking ray through any screen point with its origin snapped to
+  the eye, so distances are measured from the camera.
+- **Scene queries** (`Scene::raycast`, `raycastAll`,
+  `raycastPrecise`): per entity, the first applicable
+  representation is tested — exact per-triangle intersection when
+  a `MeshResolver` resolves the entity's `MeshComponent` asset id
+  (the mesh surface is then the truth, with the asset's
+  `MeshBounds` as broadphase), an exact **oriented-box** test for
+  `BoxColliderComponent`/OBB colliders done in collider local
+  space (rotated boxes hit through their slanted faces, not their
+  world AABB), or the world AABB of a visible mesh's local bounds.
+  Sphere/capsule/plane/hull colliders are not raycast yet and fall
+  through to their mesh. `RaycastHit` carries entity, distance,
+  world position and world normal (oriented against the ray).
+- **Mouse picking** (Application): left-click casts a precise ray
+  through the cursor (or through the crosshair while the mouse is
+  captured), logs the picked entity's name/id/distance/position/
+  normal, and highlights it by swapping its material to a dedicated
+  hot-orange `pickedHighlight`; the previous selection's material
+  is restored, and clicking empty space deselects.
+
+Verification: 41 new checks (NDC conversion, unprojection against
+the real projection matrix, AABB face/inside/parallel cases,
+triangle barycentrics and back faces, closest/all/max-distance
+scene queries, rotated-OBB exactness vs the AABB approximation,
+precise-vs-bounds discrimination on a single triangle, and a
+camera-ray end-to-end pick) join the suite: **449 checks, all
+passing in Debug, Release-shared and Release-static, CTest 1/1,
+zero warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

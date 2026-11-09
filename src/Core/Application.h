@@ -52,6 +52,7 @@ private:
     void registerAssets();
     void buildScene();
     void handleMouseCapture();
+    void handleMousePicking();
     void handlePhysicsReset();
     void logLoopStats(const char* context) const;
 
@@ -73,6 +74,13 @@ private:
 
     double m_secondsSinceStatsLog = 0.0;
     double m_secondsSinceHudUpdate = 0.0;
+
+    // Mouse picking selection: the last entity clicked, and the
+    // material name it carried before the highlight was applied (so
+    // selecting something else — or clicking empty space — restores
+    // it). entt::null when nothing is selected.
+    entt::entity m_selectedEntity = entt::null;
+    std::string m_selectedMaterialName;
 };
 
 } // namespace engine
