@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <unordered_map>
 #include <utility>
 
 namespace engine {
@@ -195,17 +196,55 @@ PhysicsSystem::Stats PhysicsSystem::update(Scene& scene, double fixedDeltaSecond
         return m_lastStats;
     }
 
+    // Internal sub-stepping: the caller's fixed step is split into
+    // settings.subSteps full simulation passes. Every sub-step
+    // re-integrates, re-derives world geometry (including the swept CCD
+    // displacement), and re-solves, so a fast capsule or projectile is
+    // collision-sampled subSteps times per fixed step and cannot tunnel
+    // through thin floors/walls between samples. Warm-start impulses and
+    // sleep timers carry across sub-steps, so stability compounds
+    // instead of resetting.
+    const uint32_t subSteps = std::max(1u, settings.subSteps);
+    const double subDelta = fixedDeltaSeconds / static_cast<double>(subSteps);
+    m_lastStats.subSteps = subSteps;
+    m_subStepCount = subSteps;
+    for (uint32_t subStep = 0; subStep < subSteps; ++subStep) {
+        m_subStepIndex = subStep;
+        stepOnce(scene, subDelta, settings, jobs);
+    }
+    m_subStepIndex = 0;
+    m_subStepCount = 1;
+    return m_lastStats;
+}
+
+void PhysicsSystem::stepOnce(Scene& scene, double fixedDeltaSeconds, const PhysicsSettings& settings,
+                             JobSystem* jobs) {
     m_ccdEnabled = settings.ccdEnabled;
     snapshotBodies(scene);
+    if (m_subStepIndex == 0) {
+        // Capture gameplay-accumulated forces before constraint forces
+        // (thrusters/springs, re-applied every sub-step) are added.
+        m_persistentForces.assign(m_bodies.size(), glm::vec3{0.0f});
+        m_persistentTorques.assign(m_bodies.size(), glm::vec3{0.0f});
+        for (size_t i = 0; i < m_bodies.size(); ++i) {
+            m_persistentForces[i] = m_bodies[i].body->force;
+            m_persistentTorques[i] = m_bodies[i].body->torque;
+        }
+    }
     snapshotConstraints(scene);
     if (settings.gravitationalParameter > 0.0f) {
         m_gravitySources.push_back(GravitySource{settings.gravityCenter, settings.gravitationalParameter, 0.0f});
     }
     applyExternalForces();
     m_lastStats.bodies = m_bodies.size();
+    m_lastStats.dynamicBodies = 0;
+    m_lastStats.sleepingBodies = 0;
     for (const BodyRef& ref : m_bodies) {
         if (ref.body->dynamic()) {
             ++m_lastStats.dynamicBodies;
+            if (ref.body->sleeping) {
+                ++m_lastStats.sleepingBodies;
+            }
         }
     }
 
@@ -217,11 +256,12 @@ PhysicsSystem::Stats PhysicsSystem::update(Scene& scene, double fixedDeltaSecond
     buildIslands();
     solveConstraints(settings, jobs);
 
-    m_lastStats.candidatePairs = m_candidatePairs.size();
-    m_lastStats.contacts = m_contacts.size();
+    // Peak across sub-steps: a contact that exists only in the first
+    // sub-step (e.g. a bounce) is still this update's contact report.
+    m_lastStats.candidatePairs = std::max(m_lastStats.candidatePairs, m_candidatePairs.size());
+    m_lastStats.contacts = std::max(m_lastStats.contacts, m_contacts.size());
     m_lastStats.joints = m_joints.size();
     m_lastStats.solverIterations = settings.solverIterations;
-    return m_lastStats;
 }
 
 size_t PhysicsSystem::captureSpawnStates(Scene& scene) {
@@ -283,6 +323,8 @@ size_t PhysicsSystem::resetToSpawnStates(Scene& scene) {
         body.angularMomentum = state.angularMomentum;
         body.orientation = state.orientation;
         body.orientationInitialized = true;
+        body.sleeping = false;
+        body.sleepTimer = 0.0f;
         body.acceleration = glm::vec3{0.0f};
         body.clearForcesAndTorques();
 
@@ -438,13 +480,51 @@ void PhysicsSystem::integrate(double fixedDeltaSeconds, const PhysicsSettings& s
         for (size_t i = begin; i < end; ++i) {
             BodyRef& ref = m_bodies[i];
             RigidBodyComponent& body = *ref.body;
+            const auto consumeForces = [this, i](RigidBodyComponent& target) {
+                if (m_subStepIndex + 1 >= m_subStepCount) {
+                    target.clearForcesAndTorques();
+                } else if (i < m_persistentForces.size()) {
+                    target.force = m_persistentForces[i];
+                    target.torque = m_persistentTorques[i];
+                }
+            };
             if (!body.dynamic()) {
                 body.inverseMass = 0.0f;
                 body.acceleration = glm::vec3{0.0f};
-                body.clearForcesAndTorques();
+                consumeForces(body);
                 continue;
             }
             initializeOrientationAndInertia(*ref.transform, body, *ref.collider);
+
+            if (body.sleeping) {
+                // Sleeping bodies skip integration entirely (the CPU
+                // saving). They wake on accumulated force/torque, or
+                // when gravity applies but last step's contacts no
+                // longer support them (support removed underneath).
+                const bool hasForce = glm::dot(body.force, body.force) > kEpsilon ||
+                                      glm::dot(body.torque, body.torque) > kEpsilon;
+                bool supported = !body.useGravity;
+                if (!supported) {
+                    for (const Contact& contact : m_contacts) {
+                        if (contact.bodyA == static_cast<uint32_t>(i) ||
+                            contact.bodyB == static_cast<uint32_t>(i)) {
+                            supported = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasForce || !supported) {
+                    body.sleeping = false;
+                    body.sleepTimer = 0.0f;
+                } else {
+                    body.velocity = glm::vec3{0.0f};
+                    body.angularVelocity = glm::vec3{0.0f};
+                    body.angularMomentum = glm::vec3{0.0f};
+                    body.acceleration = glm::vec3{0.0f};
+                    consumeForces(body);
+                    continue;
+                }
+            }
 
             glm::vec3 gravitationalAcceleration = settings.gravity;
             for (const GravitySource& source : m_gravitySources) {
@@ -495,13 +575,55 @@ void PhysicsSystem::integrate(double fixedDeltaSeconds, const PhysicsSettings& s
                 body.orientation = glm::normalize(delta * body.orientation);
             }
             body.angularVelocity = glm::degrees(angularVelocity);
+
+            // Sleep bookkeeping: sustained slowness (both linear and
+            // angular) accumulates toward sleep; any real motion resets
+            // the timer. Falling asleep zeroes the velocities so the
+            // body is perfectly at rest instead of micro-jittering.
+            if (settings.sleepEnabled && body.allowSleep) {
+                const float linearSpeed = glm::length(body.velocity);
+                const float angularSpeed = glm::length(body.angularVelocity);
+                // Sleep requires a resting contact (last sub-step's
+                // contact list) or a gravity-free body: a slow but
+                // unsupported body (falling apex, orbiting craft) must
+                // never freeze mid-flight.
+                bool restingContact = !body.useGravity;
+                if (!restingContact) {
+                    for (const Contact& contact : m_contacts) {
+                        if (contact.bodyA == static_cast<uint32_t>(i) ||
+                            contact.bodyB == static_cast<uint32_t>(i)) {
+                            restingContact = true;
+                            break;
+                        }
+                    }
+                }
+                if (restingContact && linearSpeed < settings.sleepSpeedThreshold &&
+                    angularSpeed < settings.sleepAngularThreshold) {
+                    body.sleepTimer += dt;
+                    if (body.sleepTimer >= settings.sleepDelaySeconds) {
+                        body.sleeping = true;
+                        body.velocity = glm::vec3{0.0f};
+                        body.angularVelocity = glm::vec3{0.0f};
+                        body.angularMomentum = glm::vec3{0.0f};
+                    }
+                } else {
+                    // Decay instead of hard reset: resting stacks jitter
+                    // in small bursts (contact flicker, warm-start
+                    // transients); a burst should drain the timer, not
+                    // restart the whole sleep delay.
+                    body.sleepTimer = std::max(0.0f, body.sleepTimer - 2.0f * dt);
+                }
+            } else {
+                body.sleepTimer = 0.0f;
+            }
+
             ref.transform->position += body.velocity * dt;
             // 1:1 visual sync: push the integrated quaternion straight
             // into the transform. The render matrix is built from this
             // exact quaternion (no Euler round-trip), so what is drawn
             // is exactly what the collider solver simulated.
             ref.transform->setOrientation(body.orientation);
-            body.clearForcesAndTorques();
+            consumeForces(body);
         }
     };
 
@@ -644,12 +766,12 @@ void PhysicsSystem::broadPhase() {
 }
 
 void PhysicsSystem::narrowPhase(JobSystem* jobs, uint32_t parallelMinBodies) {
-    m_contactSlots.assign(m_candidatePairs.size(), std::nullopt);
+    m_contactSlots.assign(m_candidatePairs.size(), std::vector<Contact>{});
     const auto evaluateRange = [this](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
             const auto [bodyA, bodyB] = m_candidatePairs[i];
-            m_contactSlots[i] = collide(bodyA, bodyB);
-            if (!m_contactSlots[i].has_value() && m_ccdEnabled) {
+            collideManifold(bodyA, bodyB, m_contactSlots[i]);
+            if (m_contactSlots[i].empty() && m_ccdEnabled) {
                 const glm::vec3 relativeDisplacement =
                     m_geometry[bodyB].displacement - m_geometry[bodyA].displacement;
                 if (glm::length(relativeDisplacement) > 0.05f) {
@@ -664,7 +786,11 @@ void PhysicsSystem::narrowPhase(JobSystem* jobs, uint32_t parallelMinBodies) {
                     base.normal = glm::length(centerDelta) > kEpsilon ? glm::normalize(centerDelta)
                                                                       : glm::normalize(relativeDisplacement);
                     base.penetration = 0.001f;
-                    m_contactSlots[i] = sweptCollide(bodyA, bodyB, base);
+                    if (const std::optional<Contact> swept = sweptCollide(bodyA, bodyB, base)) {
+                        Contact contact = *swept;
+                        contact.point = contactPointWorld(bodyA, bodyB, contact.normal);
+                        m_contactSlots[i].push_back(contact);
+                    }
                 }
             }
         }
@@ -677,10 +803,382 @@ void PhysicsSystem::narrowPhase(JobSystem* jobs, uint32_t parallelMinBodies) {
     }
 
     m_contacts.clear();
-    for (const std::optional<Contact>& contact : m_contactSlots) {
-        if (contact.has_value()) {
-            m_contacts.push_back(*contact);
+    for (const std::vector<Contact>& manifold : m_contactSlots) {
+        for (const Contact& contact : manifold) {
+            m_contacts.push_back(contact);
         }
+    }
+
+    // Tag every contact with its manifold size: positional correction is
+    // split across the points of a pair so a 4-point face contact does
+    // not correct four times as hard as a single-point contact.
+    std::unordered_map<uint64_t, uint8_t> manifoldCounts;
+    for (const Contact& contact : m_contacts) {
+        const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
+        uint8_t& count = manifoldCounts[key];
+        count = static_cast<uint8_t>(std::min(255, static_cast<int>(count) + 1));
+    }
+    for (Contact& contact : m_contacts) {
+        const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
+        contact.manifoldCount = manifoldCounts[key];
+    }
+
+    // Manifold centroid reduction for the velocity solve: every point of
+    // a manifold shares the manifold's centroid as its lever arm. A face
+    // contact's centroid sits under the center of mass, so resting and
+    // sliding bodies get no spurious pitch/roll/yaw torque from
+    // sequential per-corner impulses (the classic manifold ratchet),
+    // while an edge/corner manifold's centroid is genuinely offset, so
+    // real tipping moments still resolve through it. Per-point
+    // penetration depths are kept for the positional pass.
+    std::unordered_map<uint64_t, glm::vec3> centroidSums;
+    for (const Contact& contact : m_contacts) {
+        const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
+        centroidSums[key] += contact.point;
+    }
+    for (Contact& contact : m_contacts) {
+        const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
+        contact.point = centroidSums[key] / static_cast<float>(contact.manifoldCount);
+    }
+}
+
+glm::vec3 PhysicsSystem::supportPointWorld(uint32_t bodyIndex, const glm::vec3& direction) const {
+    const BodyGeometry& geometry = m_geometry[bodyIndex];
+    const glm::vec3 dir = glm::dot(direction, direction) > kEpsilon ? glm::normalize(direction) : direction;
+    switch (geometry.type) {
+    case ColliderComponent::Type::Sphere:
+        return geometry.center + dir * geometry.radius;
+    case ColliderComponent::Type::Capsule: {
+        const float endSign = glm::dot(geometry.capsuleAxis, dir) >= 0.0f ? 1.0f : -1.0f;
+        return geometry.center + geometry.capsuleAxis * (geometry.capsuleHalfHeight * endSign) +
+               dir * geometry.radius;
+    }
+    case ColliderComponent::Type::ConvexHull: {
+        glm::vec3 best = geometry.center;
+        float bestDot = -1e30f;
+        for (uint8_t i = 0; i < geometry.pointCount; ++i) {
+            const float candidate = glm::dot(geometry.points[i], dir);
+            if (candidate > bestDot) {
+                bestDot = candidate;
+                best = geometry.points[i];
+            }
+        }
+        return best;
+    }
+    case ColliderComponent::Type::Box:
+    case ColliderComponent::Type::Obb:
+    case ColliderComponent::Type::Plane:
+        break;
+    }
+    // Box-like: the corner furthest along the direction.
+    glm::vec3 point = geometry.center;
+    for (int axis = 0; axis < 3; ++axis) {
+        const float sign = glm::dot(geometry.axes[axis], dir) >= 0.0f ? 1.0f : -1.0f;
+        point += geometry.axes[axis] * (sign * geometry.halfExtents[axis]);
+    }
+    return point;
+}
+
+glm::vec3 PhysicsSystem::contactPointWorld(uint32_t bodyA, uint32_t bodyB, const glm::vec3& normal) const {
+    const BodyGeometry& a = m_geometry[bodyA];
+    const BodyGeometry& b = m_geometry[bodyB];
+    const glm::vec3 n = glm::dot(normal, normal) > kEpsilon ? glm::normalize(normal) : normal;
+    // Depth position: halfway between the two support faces along n.
+    const glm::vec3 supportA = supportPointWorld(bodyA, n);
+    const glm::vec3 supportB = supportPointWorld(bodyB, -n);
+    const float faceMidDepth = 0.5f * (glm::dot(supportA, n) + glm::dot(supportB, n));
+    // Tangential position: between the two centers (support corners of
+    // a large body would fabricate lever arms meters long).
+    const glm::vec3 centerMid = (a.center + b.center) * 0.5f;
+    const glm::vec3 tangential = centerMid - n * glm::dot(centerMid, n);
+    // Capsules are the exception: their contact rides the segment, so
+    // use the segment point closest to the other center.
+    const auto capsulePoint = [](const BodyGeometry& capsule, const glm::vec3& otherCenter,
+                                 const glm::vec3& dir) {
+        const glm::vec3 capA = capsule.center - capsule.capsuleAxis * capsule.capsuleHalfHeight;
+        const glm::vec3 capB = capsule.center + capsule.capsuleAxis * capsule.capsuleHalfHeight;
+        const glm::vec3 segment = capB - capA;
+        const float lengthSq = glm::dot(segment, segment);
+        const float t = lengthSq > kEpsilon
+                            ? glm::clamp(glm::dot(otherCenter - capA, segment) / lengthSq, 0.0f, 1.0f)
+                            : 0.0f;
+        return capA + segment * t + dir * capsule.radius;
+    };
+    if (a.type == ColliderComponent::Type::Capsule) {
+        const glm::vec3 onCapsule = capsulePoint(a, b.center, n);
+        return onCapsule - n * (0.5f * glm::dot(onCapsule - supportB, n));
+    }
+    if (b.type == ColliderComponent::Type::Capsule) {
+        const glm::vec3 onCapsule = capsulePoint(b, a.center, -n);
+        return onCapsule + n * (0.5f * glm::dot(supportA - onCapsule, n));
+    }
+    return tangential + n * faceMidDepth;
+}
+
+void PhysicsSystem::collideManifold(uint32_t bodyA, uint32_t bodyB, std::vector<Contact>& out) const {
+    out.clear();
+    const BodyGeometry& a = m_geometry[bodyA];
+    const BodyGeometry& b = m_geometry[bodyB];
+    const auto isBoxLike = [](const BodyGeometry& geometry) {
+        return geometry.type == ColliderComponent::Type::Box ||
+               geometry.type == ColliderComponent::Type::Obb;
+    };
+
+    const auto boxCorners = [](const BodyGeometry& geometry, std::array<glm::vec3, 8>& corners) {
+        size_t cornerIndex = 0;
+        for (const float sx : {-1.0f, 1.0f}) {
+            for (const float sy : {-1.0f, 1.0f}) {
+                for (const float sz : {-1.0f, 1.0f}) {
+                    corners[cornerIndex++] = geometry.center + geometry.axes[0] * (sx * geometry.halfExtents.x) +
+                                             geometry.axes[1] * (sy * geometry.halfExtents.y) +
+                                             geometry.axes[2] * (sz * geometry.halfExtents.z);
+                }
+            }
+        }
+    };
+
+    // Dedicated manifold: box resting on a plane — every box corner below
+    // the plane becomes a contact with its own penetration depth, so a
+    // landed box is supported across its face, not balanced on a point.
+    if ((a.isPlane || b.isPlane) && !(a.isPlane && b.isPlane)) {
+        const uint32_t planeIndex = a.isPlane ? bodyA : bodyB;
+        const uint32_t otherIndex = a.isPlane ? bodyB : bodyA;
+        const BodyGeometry& plane = m_geometry[planeIndex];
+        const BodyGeometry& other = m_geometry[otherIndex];
+        if (isBoxLike(other)) {
+            const float offset = m_bodies[planeIndex].collider->planeOffset;
+            std::array<glm::vec3, 8> corners{};
+            boxCorners(other, corners);
+            std::vector<Contact> points;
+            for (const glm::vec3& corner : corners) {
+                const float penetration = -(glm::dot(plane.planeNormal, corner) - offset);
+                if (penetration > 0.0f) {
+                    Contact contact;
+                    contact.bodyA = bodyA;
+                    contact.bodyB = bodyB;
+                    contact.normal = planeIndex == bodyA ? plane.planeNormal : -plane.planeNormal;
+                    contact.point = corner;
+                    contact.penetration = penetration;
+                    contact.restitution = combinedRestitution(*m_bodies[bodyA].body, *m_bodies[bodyB].body);
+                    contact.friction = combinedFriction(*m_bodies[bodyA].body, *m_bodies[bodyB].body);
+                    contact.anisotropicFriction =
+                        combinedAnisotropicFriction(*m_bodies[bodyA].body, *m_bodies[bodyB].body);
+                    points.push_back(contact);
+                }
+            }
+            if (!points.empty()) {
+                // Deepest first, then farthest-point reduction to at
+                // most four: a face contact keeps its four corners
+                // spread across the face (never clustered on one edge).
+                std::sort(points.begin(), points.end(), [](const Contact& lhs, const Contact& rhs) {
+                    return lhs.penetration > rhs.penetration;
+                });
+                if (points.size() > 4) {
+                    std::vector<Contact> reduced;
+                    reduced.push_back(points.front());
+                    while (reduced.size() < 4) {
+                        float bestDistance = -1.0f;
+                        size_t bestIndex = 0;
+                        for (size_t i = 0; i < points.size(); ++i) {
+                            bool alreadyPicked = false;
+                            for (const Contact& picked : reduced) {
+                                alreadyPicked = alreadyPicked || picked.point == points[i].point;
+                            }
+                            if (alreadyPicked) {
+                                continue;
+                            }
+                            float minDistance = 1e30f;
+                            for (const Contact& picked : reduced) {
+                                minDistance = std::min(minDistance,
+                                                       glm::dot(picked.point - points[i].point,
+                                                                picked.point - points[i].point));
+                            }
+                            if (minDistance > bestDistance) {
+                                bestDistance = minDistance;
+                                bestIndex = i;
+                            }
+                        }
+                        reduced.push_back(points[bestIndex]);
+                    }
+                    points = std::move(reduced);
+                }
+                out = std::move(points);
+                return;
+            }
+        }
+    }
+
+    // Dedicated manifold: box vs box — corners of either box that lie
+    // inside the other become contact points along the SAT normal. A
+    // resting face contact yields the four bottom corners; an edge/corner
+    // contact yields one or two, so tipping moments resolve through real
+    // lever arms instead of a single central push.
+    if (isBoxLike(a) && isBoxLike(b)) {
+        const std::optional<Contact> base = collide(bodyA, bodyB);
+        if (!base.has_value()) {
+            return;
+        }
+        const auto cornersInside = [&boxCorners](const BodyGeometry& source, const BodyGeometry& container,
+                                                 const glm::vec3& worldNormal, float penetration,
+                                                 std::vector<glm::vec3>& inside) {
+            std::array<glm::vec3, 8> corners{};
+            boxCorners(source, corners);
+            const glm::mat3 worldToLocal = glm::transpose(container.axes);
+            const glm::vec3 tolerance{0.005f};
+            for (const glm::vec3& corner : corners) {
+                const glm::vec3 local = worldToLocal * (corner - container.center);
+                const glm::vec3 absLocal = glm::abs(local);
+                if (absLocal.x <= container.halfExtents.x + tolerance.x &&
+                    absLocal.y <= container.halfExtents.y + tolerance.y &&
+                    absLocal.z <= container.halfExtents.z + tolerance.z) {
+                    inside.push_back(corner);
+                    continue;
+                }
+                // Passed-through feature: a corner that crossed a
+                // thin body overshoots it along the contact normal
+                // only. Overshoot in any other direction means the
+                // corner is simply outside (an edge contact keeps
+                // exactly its two true endpoints).
+                const glm::vec3 excessLocal = glm::sign(local) * glm::max(absLocal - container.halfExtents, glm::vec3{0.0f});
+                const glm::vec3 excessWorld = container.axes * excessLocal;
+                const float excessLength = glm::length(excessWorld);
+                if (excessLength > kEpsilon && excessLength <= penetration + 0.005f &&
+                    std::abs(glm::dot(excessWorld / excessLength, worldNormal)) > 0.9f) {
+                    inside.push_back(corner);
+                }
+            }
+        };
+        std::vector<glm::vec3> points;
+        cornersInside(a, b, base->normal, base->penetration, points);
+        cornersInside(b, a, base->normal, base->penetration, points);
+
+        if (points.size() >= 2) {
+            std::sort(points.begin(), points.end(), [](const glm::vec3& lhs, const glm::vec3& rhs) {
+                if (lhs.x != rhs.x) {
+                    return lhs.x < rhs.x;
+                }
+                if (lhs.y != rhs.y) {
+                    return lhs.y < rhs.y;
+                }
+                return lhs.z < rhs.z;
+            });
+            points.erase(std::unique(points.begin(), points.end(),
+                                     [](const glm::vec3& lhs, const glm::vec3& rhs) {
+                                         return glm::dot(lhs - rhs, lhs - rhs) < 1e-8f;
+                                     }),
+                         points.end());
+            if (points.size() > 4) {
+                // Farthest-point reduction: keep four points spread
+                // across the contact face, never clustered on one edge
+                // (a clustered manifold tips the resting body over).
+                std::vector<glm::vec3> reduced;
+                reduced.push_back(points.front());
+                while (reduced.size() < 4) {
+                    float bestDistance = -1.0f;
+                    size_t bestIndex = 0;
+                    for (size_t i = 0; i < points.size(); ++i) {
+                        bool alreadyPicked = false;
+                        for (const glm::vec3& picked : reduced) {
+                            alreadyPicked = alreadyPicked || picked == points[i];
+                        }
+                        if (alreadyPicked) {
+                            continue;
+                        }
+                        float minDistance = 1e30f;
+                        for (const glm::vec3& picked : reduced) {
+                            minDistance = std::min(minDistance,
+                                                   glm::dot(picked - points[i], picked - points[i]));
+                        }
+                        if (minDistance > bestDistance) {
+                            bestDistance = minDistance;
+                            bestIndex = i;
+                        }
+                    }
+                    reduced.push_back(points[bestIndex]);
+                }
+                points = std::move(reduced);
+            }
+            for (const glm::vec3& point : points) {
+                Contact contact = *base;
+                contact.point = point;
+                out.push_back(contact);
+            }
+            return;
+        }
+        Contact contact = *base;
+        contact.point = contactPointWorld(bodyA, bodyB, contact.normal);
+        out.push_back(contact);
+        return;
+    }
+
+    // Dedicated manifold: capsule vs box — both capsule segment endpoints
+    // are tested against the box, so a capsule lying/standing across a
+    // box top (the player!) is supported at two points instead of one.
+    const bool aIsCapsule = a.type == ColliderComponent::Type::Capsule;
+    const bool bIsCapsule = b.type == ColliderComponent::Type::Capsule;
+    if ((aIsCapsule && isBoxLike(b)) || (bIsCapsule && isBoxLike(a))) {
+        const std::optional<Contact> base = collide(bodyA, bodyB);
+        if (!base.has_value()) {
+            return;
+        }
+        const uint32_t capsuleIndex = aIsCapsule ? bodyA : bodyB;
+        const uint32_t boxIndex = aIsCapsule ? bodyB : bodyA;
+        const BodyGeometry& capsule = m_geometry[capsuleIndex];
+        const BodyGeometry& box = m_geometry[boxIndex];
+        const glm::mat3 worldToLocal = glm::transpose(box.axes);
+        {
+            // Primary point: the true closest pair between the capsule
+            // segment and the box surface (mid-segment features
+            // included), not just an endpoint.
+            const glm::vec3 localA = worldToLocal * (capsule.center - capsule.capsuleAxis * capsule.capsuleHalfHeight - box.center);
+            const glm::vec3 localB = worldToLocal * (capsule.center + capsule.capsuleAxis * capsule.capsuleHalfHeight - box.center);
+            float closestT = 0.0f;
+            glm::vec3 segmentPoint;
+            glm::vec3 boxPoint;
+            const float distance = segmentBoxDistance(localA, localB, box.halfExtents, closestT, segmentPoint, boxPoint);
+            if (distance < capsule.radius + 0.01f) {
+                Contact contact = *base;
+                contact.point = box.center + box.axes * ((segmentPoint + boxPoint) * 0.5f);
+                contact.penetration =
+                    distance > kEpsilon ? std::max(capsule.radius - distance, 0.0005f) : base->penetration;
+                out.push_back(contact);
+            }
+        }
+        for (const float endSign : {-1.0f, 1.0f}) {
+            const glm::vec3 endpoint = capsule.center + capsule.capsuleAxis * (capsule.capsuleHalfHeight * endSign);
+            const glm::vec3 local = worldToLocal * (endpoint - box.center);
+            const glm::vec3 clamped = glm::clamp(local, -box.halfExtents, box.halfExtents);
+            const glm::vec3 closest = box.center + box.axes * clamped;
+            const float distance = glm::length(endpoint - closest);
+            if (distance < capsule.radius + 0.01f) {
+                Contact contact = *base;
+                contact.point = (endpoint + closest) * 0.5f;
+                contact.penetration =
+                    distance > kEpsilon ? std::max(capsule.radius - distance, 0.0005f) : base->penetration;
+                bool duplicate = false;
+                for (const Contact& existing : out) {
+                    duplicate = duplicate || glm::dot(existing.point - contact.point,
+                                                      existing.point - contact.point) < 0.0016f;
+                }
+                if (!duplicate) {
+                    out.push_back(contact);
+                }
+            }
+        }
+        if (out.empty()) {
+            Contact contact = *base;
+            contact.point = contactPointWorld(bodyA, bodyB, contact.normal);
+            out.push_back(contact);
+        }
+        return;
+    }
+
+    // Generic path: the single-point solver contact, with its lever arm
+    // at the midpoint of the two support points along the normal.
+    if (const std::optional<Contact> contact = collide(bodyA, bodyB)) {
+        Contact result = *contact;
+        result.point = contactPointWorld(bodyA, bodyB, result.normal);
+        out.push_back(result);
     }
 }
 
@@ -1148,6 +1646,56 @@ float PhysicsSystem::inverseMass(uint32_t bodyIndex) const {
     return body.dynamic() ? body.inverseMass : 0.0f;
 }
 
+float PhysicsSystem::solverInverseMass(uint32_t bodyIndex) const {
+    const RigidBodyComponent& body = *m_bodies[bodyIndex].body;
+    if (body.sleeping) {
+        return 0.0f; // asleep: immovable until the wake pass says otherwise
+    }
+    return body.dynamic() ? body.inverseMass : 0.0f;
+}
+
+glm::vec3 PhysicsSystem::angularVelocityRad(uint32_t bodyIndex) const {
+    const RigidBodyComponent& body = *m_bodies[bodyIndex].body;
+    if (!body.dynamic()) {
+        return glm::vec3{0.0f};
+    }
+    // Angular momentum is the conserved quantity the solver modifies, so
+    // derive omega from it; fall back to the component's angular velocity
+    // before the first integration seeds momentum.
+    if (glm::dot(body.angularMomentum, body.angularMomentum) > kEpsilon) {
+        return inverseInertiaWorld(bodyIndex, body.angularMomentum);
+    }
+    return glm::radians(body.angularVelocity);
+}
+
+glm::vec3 PhysicsSystem::pointVelocity(uint32_t bodyIndex, const glm::vec3& point) const {
+    const RigidBodyComponent& body = *m_bodies[bodyIndex].body;
+    const glm::vec3 radius = point - m_bodies[bodyIndex].transform->position;
+    return body.velocity + glm::cross(angularVelocityRad(bodyIndex), radius);
+}
+
+void PhysicsSystem::applyImpulseAtPoint(uint32_t bodyIndex, const glm::vec3& point, const glm::vec3& impulse,
+                                        float sign) {
+    RigidBodyComponent& body = *m_bodies[bodyIndex].body;
+    const float invMass = solverInverseMass(bodyIndex);
+    if (invMass <= 0.0f) {
+        return;
+    }
+    body.velocity += sign * impulse * invMass;
+    // Torque coupling: an impulse off-center changes angular momentum,
+    // which the integrator turns back into angular velocity. This is
+    // what lets manifold points right a tipping box (or start one
+    // rolling) instead of every contact pushing through the center.
+    const glm::vec3 radius = point - m_bodies[bodyIndex].transform->position;
+    body.angularMomentum += sign * glm::cross(radius, impulse);
+}
+
+void PhysicsSystem::wakeBody(uint32_t bodyIndex) {
+    RigidBodyComponent& body = *m_bodies[bodyIndex].body;
+    body.sleeping = false;
+    body.sleepTimer = 0.0f;
+}
+
 glm::vec3 PhysicsSystem::inverseInertiaWorld(uint32_t bodyIndex, const glm::vec3& vector) const {
     const RigidBodyComponent& body = *m_bodies[bodyIndex].body;
     if (!body.dynamic()) {
@@ -1170,8 +1718,11 @@ std::optional<uint32_t> PhysicsSystem::bodyIndexFor(entt::entity entity) const {
 void PhysicsSystem::prepareWarmStarting(const PhysicsSettings& settings) {
     for (Contact& contact : m_contacts) {
         const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
+        const glm::vec3 localPoint = glm::transpose(m_geometry[contact.bodyA].axes) *
+                                     (contact.point - m_geometry[contact.bodyA].center);
         for (const WarmContact& warm : m_warmContacts) {
-            if (warm.pairKey == key && glm::dot(warm.normal, contact.normal) > 0.5f) {
+            if (warm.pairKey == key && glm::dot(warm.normal, contact.normal) > 0.5f &&
+                glm::dot(warm.localPointA - localPoint, warm.localPointA - localPoint) < 0.0025f) {
                 contact.normalImpulse = warm.normalImpulse;
                 contact.tangentImpulse = warm.tangentImpulse;
                 applyWarmStart(contact);
@@ -1182,7 +1733,7 @@ void PhysicsSystem::prepareWarmStarting(const PhysicsSettings& settings) {
 
     for (Contact& contact : m_contacts) {
         const glm::vec3 relativeVelocity =
-            m_bodies[contact.bodyB].body->velocity - m_bodies[contact.bodyA].body->velocity;
+            pointVelocity(contact.bodyB, contact.point) - pointVelocity(contact.bodyA, contact.point);
         const float vn = glm::dot(relativeVelocity, contact.normal);
         contact.restitutionTarget = vn < -settings.restitutionVelocityThreshold ? -contact.restitution * vn : 0.0f;
     }
@@ -1195,23 +1746,25 @@ void PhysicsSystem::storeWarmStarting() {
         WarmContact warm;
         warm.pairKey = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
         warm.normal = contact.normal;
+        // Manifold points share one centroid constraint, so each point's
+        // accumulated impulse is one share of the pair total; every
+        // point re-applies its own share next step (see prepare).
+        warm.localPointA = glm::transpose(m_geometry[contact.bodyA].axes) *
+                           (contact.point - m_geometry[contact.bodyA].center);
         warm.normalImpulse = contact.normalImpulse;
+        warm.restitutionTarget = contact.restitutionTarget;
         warm.tangentImpulse = contact.tangentImpulse;
         m_warmContacts.push_back(warm);
     }
 }
 
 void PhysicsSystem::applyWarmStart(Contact& contact) {
-    const float invA = inverseMass(contact.bodyA);
-    const float invB = inverseMass(contact.bodyB);
-    if (invA + invB <= 0.0f) {
+    if (solverInverseMass(contact.bodyA) + solverInverseMass(contact.bodyB) <= 0.0f) {
         return;
     }
-    RigidBodyComponent& a = *m_bodies[contact.bodyA].body;
-    RigidBodyComponent& b = *m_bodies[contact.bodyB].body;
     const glm::vec3 impulse = contact.normal * contact.normalImpulse + contact.tangentImpulse;
-    a.velocity -= impulse * invA;
-    b.velocity += impulse * invB;
+    applyImpulseAtPoint(contact.bodyA, contact.point, impulse, -1.0f);
+    applyImpulseAtPoint(contact.bodyB, contact.point, impulse, 1.0f);
 }
 
 void PhysicsSystem::applyContinuousCollisionStops() {
@@ -1219,8 +1772,8 @@ void PhysicsSystem::applyContinuousCollisionStops() {
         if (!contact.continuous || contact.timeOfImpact >= 1.0f) {
             continue;
         }
-        const float invA = inverseMass(contact.bodyA);
-        const float invB = inverseMass(contact.bodyB);
+        const float invA = solverInverseMass(contact.bodyA);
+        const float invB = solverInverseMass(contact.bodyB);
         if (invA + invB <= 0.0f) {
             continue;
         }
@@ -1318,6 +1871,36 @@ void PhysicsSystem::buildIslands() {
 }
 
 void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem* jobs) {
+    // Wake pass: a sleeping body struck hard enough (or deeply
+    // penetrated, or dragged by an awake joint partner) rejoins the
+    // simulation; gentle resting contact leaves it asleep and immovable.
+    if (settings.sleepEnabled) {
+        for (const Contact& contact : m_contacts) {
+            RigidBodyComponent& a = *m_bodies[contact.bodyA].body;
+            RigidBodyComponent& b = *m_bodies[contact.bodyB].body;
+            if (a.sleeping == b.sleeping) {
+                continue;
+            }
+            const float approachSpeed = -glm::dot(b.velocity - a.velocity, contact.normal);
+            if (contact.penetration > 4.0f * settings.contactSlop ||
+                approachSpeed > settings.wakeSpeedThreshold) {
+                wakeBody(a.sleeping ? contact.bodyA : contact.bodyB);
+            }
+        }
+        for (const JointRef& joint : m_joints) {
+            if (!joint.hasBodyB) {
+                continue;
+            }
+            RigidBodyComponent& a = *m_bodies[joint.bodyA].body;
+            RigidBodyComponent& b = *m_bodies[joint.bodyB].body;
+            if (a.sleeping && !b.sleeping) {
+                wakeBody(joint.bodyA);
+            } else if (b.sleeping && !a.sleeping) {
+                wakeBody(joint.bodyB);
+            }
+        }
+    }
+
     prepareWarmStarting(settings);
     const auto solveOneIsland = [this, &settings](SolverIsland& island) {
         for (uint32_t iteration = 0; iteration < settings.solverIterations; ++iteration) {
@@ -1331,8 +1914,13 @@ void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem*
         for (const size_t jointIndex : island.joints) {
             resolveJointPosition(m_joints[jointIndex]);
         }
-        for (const size_t contactIndex : island.contacts) {
-            resolvePosition(m_contacts[contactIndex], settings);
+        // Non-linear position correction: iterate the projection so the
+        // remaining penetration is re-measured after every pass.
+        const uint32_t positionIterations = std::max(1u, settings.positionIterations);
+        for (uint32_t iteration = 0; iteration < positionIterations; ++iteration) {
+            for (const size_t contactIndex : island.contacts) {
+                resolvePosition(m_contacts[contactIndex], settings);
+            }
         }
     };
 
@@ -1352,72 +1940,128 @@ void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem*
 }
 
 void PhysicsSystem::resolveVelocity(Contact& contact, const PhysicsSettings& settings) {
-    const float invA = inverseMass(contact.bodyA);
-    const float invB = inverseMass(contact.bodyB);
-    const float inverseMassSum = invA + invB;
-    if (inverseMassSum <= 0.0f) {
+    const float invA = solverInverseMass(contact.bodyA);
+    const float invB = solverInverseMass(contact.bodyB);
+    if (invA + invB <= 0.0f) {
+        return; // static pair, or both asleep: nothing can move
+    }
+    (void)settings;
+
+    const glm::vec3 normal = contact.normal;
+    const glm::vec3 radiusA = contact.point - m_bodies[contact.bodyA].transform->position;
+    const glm::vec3 radiusB = contact.point - m_bodies[contact.bodyB].transform->position;
+
+    // Effective mass along a direction at the contact point:
+    // 1 / (invM + n . ((I^-1 (r x n)) x r)) per body. This is the exact
+    // mass-ratio weighting between translation and rotation, so a light
+    // body striking a heavy body's edge responds correctly in both.
+    const auto effectiveMass = [this](uint32_t bodyIndex, const glm::vec3& radius, const glm::vec3& direction,
+                                      float invMass) {
+        if (invMass <= 0.0f) {
+            return 0.0f;
+        }
+        const glm::vec3 rCrossDir = glm::cross(radius, direction);
+        return invMass + glm::dot(direction, glm::cross(inverseInertiaWorld(bodyIndex, rCrossDir), radius));
+    };
+    const auto applyDelta = [this, &contact](const glm::vec3& impulse) {
+        applyImpulseAtPoint(contact.bodyA, contact.point, impulse, -1.0f);
+        applyImpulseAtPoint(contact.bodyB, contact.point, impulse, 1.0f);
+    };
+
+    const float normalMass = effectiveMass(contact.bodyA, radiusA, normal, invA) +
+                             effectiveMass(contact.bodyB, radiusB, normal, invB);
+    if (normalMass <= 0.0f) {
         return;
     }
-
-    RigidBodyComponent& a = *m_bodies[contact.bodyA].body;
-    RigidBodyComponent& b = *m_bodies[contact.bodyB].body;
-    const glm::vec3 normal = contact.normal;
-
-    glm::vec3 relativeVelocity = b.velocity - a.velocity;
-    const float velocityAlongNormal = glm::dot(relativeVelocity, normal);
     {
-        // Accumulated sequential impulse: the total normal impulse is
-        // clamped to the compressive half-space, while each iteration
-        // applies only the delta. This lets warm-started contacts reduce
-        // an excessive stored impulse instead of bouncing the stack.
-        const float lambda = (contact.restitutionTarget - velocityAlongNormal) / inverseMassSum;
+        // Accumulated sequential impulse at the contact point: the total
+        // is clamped to the compressive half-space, each iteration
+        // applies only the delta (warm-start friendly, no stack bounce).
+        const glm::vec3 relativeVelocity =
+            pointVelocity(contact.bodyB, contact.point) - pointVelocity(contact.bodyA, contact.point);
+        const float velocityAlongNormal = glm::dot(relativeVelocity, normal);
+        const float lambda = (contact.restitutionTarget - velocityAlongNormal) / normalMass;
         const float newImpulse = std::max(0.0f, contact.normalImpulse + lambda);
         const float deltaImpulse = newImpulse - contact.normalImpulse;
         contact.normalImpulse = newImpulse;
-        a.velocity -= normal * deltaImpulse * invA;
-        b.velocity += normal * deltaImpulse * invB;
+        if (deltaImpulse != 0.0f) {
+            applyDelta(normal * deltaImpulse);
+        }
     }
-    (void)settings;
 
     if (contact.friction <= 0.0f) {
         return;
     }
-    relativeVelocity = b.velocity - a.velocity;
+    // Anisotropic Coulomb friction at the contact point: two tangent
+    // axes, each with its own friction coefficient and its own
+    // point-effective mass, accumulated and clamped per axis to
+    // mu * normalImpulse (the friction cone, axis-decomposed). For the
+    // player capsule this produces smooth wall/floor sliding: tangential
+    // motion is damped per axis without ever sticking the normal solve.
+    const glm::vec3 relativeVelocity =
+        pointVelocity(contact.bodyB, contact.point) - pointVelocity(contact.bodyA, contact.point);
     const glm::vec3 tangentialVelocity = relativeVelocity - normal * glm::dot(relativeVelocity, normal);
     const float tangentialSpeed = glm::length(tangentialVelocity);
-    if (tangentialSpeed <= kEpsilon) {
+    if (tangentialSpeed <= kEpsilon && glm::dot(contact.tangentImpulse, contact.tangentImpulse) <= kEpsilon) {
         return;
     }
-    const glm::vec3 tangent = tangentialVelocity / tangentialSpeed;
+    const glm::vec3 tangent = tangentialSpeed > kEpsilon
+                                  ? tangentialVelocity / tangentialSpeed
+                                  : glm::normalize(glm::cross(normal, glm::vec3{0.0f, 1.0f, 0.0f}) +
+                                                   glm::vec3{kEpsilon});
     const glm::vec3 tangent2 = glm::normalize(glm::cross(normal, tangent));
     const float friction1 = contact.anisotropicFriction.x >= 0.0f ? contact.anisotropicFriction.x : contact.friction;
     const float friction2 = contact.anisotropicFriction.y >= 0.0f ? contact.anisotropicFriction.y : contact.friction;
-    const glm::vec3 desired = tangent * (-glm::dot(relativeVelocity, tangent) / inverseMassSum) +
-                              tangent2 * (-glm::dot(relativeVelocity, tangent2) / inverseMassSum);
+    const float tangentMass1 = effectiveMass(contact.bodyA, radiusA, tangent, invA) +
+                               effectiveMass(contact.bodyB, radiusB, tangent, invB);
+    const float tangentMass2 = effectiveMass(contact.bodyA, radiusA, tangent2, invA) +
+                               effectiveMass(contact.bodyB, radiusB, tangent2, invB);
     const float maxFriction1 = std::max(contact.normalImpulse, 0.0f) * friction1;
     const float maxFriction2 = std::max(contact.normalImpulse, 0.0f) * friction2;
-    glm::vec3 clamped = tangent * std::clamp(glm::dot(desired, tangent), -maxFriction1, maxFriction1) +
-                        tangent2 * std::clamp(glm::dot(desired, tangent2), -maxFriction2, maxFriction2);
+    const float old1 = glm::dot(contact.tangentImpulse, tangent);
+    const float old2 = glm::dot(contact.tangentImpulse, tangent2);
+    const float candidate1 =
+        tangentMass1 > 0.0f ? old1 - glm::dot(relativeVelocity, tangent) / tangentMass1 : old1;
+    const float candidate2 =
+        tangentMass2 > 0.0f ? old2 - glm::dot(relativeVelocity, tangent2) / tangentMass2 : old2;
+    const glm::vec3 clamped = tangent * std::clamp(candidate1, -maxFriction1, maxFriction1) +
+                              tangent2 * std::clamp(candidate2, -maxFriction2, maxFriction2);
     const glm::vec3 deltaImpulse = clamped - contact.tangentImpulse;
     contact.tangentImpulse = clamped;
-    a.velocity -= deltaImpulse * invA;
-    b.velocity += deltaImpulse * invB;
+    if (glm::dot(deltaImpulse, deltaImpulse) > 0.0f) {
+        applyDelta(deltaImpulse);
+    }
 }
 
-void PhysicsSystem::resolvePosition(const Contact& contact, const PhysicsSettings& settings) {
+void PhysicsSystem::resolvePosition(Contact& contact, const PhysicsSettings& settings) {
+    // Non-linear positional projection: each call corrects only a
+    // clamped share of the *remaining* penetration, then re-measures
+    // (bookkeeps) what is left. solveConstraints iterates this, so a
+    // deep landing penetration converges geometrically over
+    // positionIterations passes instead of receiving one violent
+    // full-depth shove, and a resting contact stops exactly at the slop.
     if (contact.penetration <= settings.contactSlop) {
         return;
     }
-    const float invA = inverseMass(contact.bodyA);
-    const float invB = inverseMass(contact.bodyB);
+    const float invA = solverInverseMass(contact.bodyA);
+    const float invB = solverInverseMass(contact.bodyB);
     const float inverseMassSum = invA + invB;
     if (inverseMassSum <= 0.0f) {
         return;
     }
-    const float correctionMagnitude = (contact.penetration - settings.contactSlop) *
-                                      std::clamp(settings.positionCorrection, 0.0f, 1.0f) / inverseMassSum;
+    float separationGain = (contact.penetration - settings.contactSlop) *
+                           std::clamp(settings.positionCorrection, 0.0f, 1.0f);
+    separationGain = std::min(separationGain, std::max(settings.maxPositionCorrection, 0.0f));
+    separationGain /= static_cast<float>(std::max<uint8_t>(contact.manifoldCount, 1));
+    if (separationGain <= 0.0f) {
+        return;
+    }
+    // Mass-ratio weighting: the correction splits by inverse mass, so a
+    // light body landing on a heavy one moves itself, not the heavy body.
+    const float correctionMagnitude = separationGain / inverseMassSum;
     m_bodies[contact.bodyA].transform->position -= contact.normal * (correctionMagnitude * invA);
     m_bodies[contact.bodyB].transform->position += contact.normal * (correctionMagnitude * invB);
+    contact.penetration -= separationGain; // re-measured remainder for the next iteration
 }
 
 void PhysicsSystem::resolveJointVelocity(const JointRef& ref) {

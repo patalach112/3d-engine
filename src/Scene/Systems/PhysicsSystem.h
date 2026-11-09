@@ -37,12 +37,14 @@ public:
     struct Stats {
         size_t bodies = 0;
         size_t dynamicBodies = 0;
+        size_t sleepingBodies = 0;
         size_t candidatePairs = 0;
         size_t contacts = 0;
         size_t islands = 0;
         size_t largestIsland = 0;
         size_t joints = 0;
         uint32_t solverIterations = 0;
+        uint32_t subSteps = 1;
     };
 
     Stats update(Scene& scene, double fixedDeltaSeconds, const PhysicsSettings& settings,
@@ -104,6 +106,11 @@ private:
         uint32_t bodyA = 0;
         uint32_t bodyB = 0;
         glm::vec3 normal{1.0f, 0.0f, 0.0f};
+        // World-space contact point (solver lever arm). Manifold
+        // generation emits up to four of these per pair (box corners,
+        // capsule endpoints), so resting stacks are supported across a
+        // face instead of balanced on one central point.
+        glm::vec3 point{0.0f};
         float penetration = 0.0f;
         float restitution = 0.0f;
         float friction = 0.0f;
@@ -113,11 +120,18 @@ private:
         glm::vec3 tangentImpulse{0.0f};
         bool continuous = false;
         float timeOfImpact = 1.0f;
+        uint8_t manifoldCount = 1; // contacts sharing this pair (position correction is split across them)
     };
 
     struct WarmContact {
         uint64_t pairKey = 0;
         glm::vec3 normal{1.0f, 0.0f, 0.0f};
+        // Contact point stored in body A's local frame: manifold points
+        // are features (box corners, capsule ends), so the local point
+        // identifies the feature across steps. Re-applying an impulse at
+        // a *different* feature would inject phantom torque, so matching
+        // is done on this local point, not the moving world point.
+        glm::vec3 localPointA{0.0f};
         float normalImpulse = 0.0f;
         float restitutionTarget = 0.0f;
         glm::vec3 tangentImpulse{0.0f};
@@ -159,12 +173,35 @@ private:
     void solveConstraints(const PhysicsSettings& settings, JobSystem* jobs);
 
     [[nodiscard]] std::optional<Contact> collide(uint32_t bodyA, uint32_t bodyB) const;
+    // Multi-point manifold generation: appends up to four contacts for
+    // the pair (single-point fallback for shape pairs without a dedicated
+    // manifold path).
+    void collideManifold(uint32_t bodyA, uint32_t bodyB, std::vector<Contact>& out) const;
+    // World-space support point of a body's shape in a direction (used
+    // for contact lever arms on shape pairs without a dedicated
+    // manifold path).
+    [[nodiscard]] glm::vec3 supportPointWorld(uint32_t bodyIndex, const glm::vec3& direction) const;
+    // Robust generic contact point: correct depth along the normal
+    // (midpoint of the two support faces), tangential position anchored
+    // between the body centers — never at a far support corner of a
+    // large body, which would fabricate a huge lever arm.
+    [[nodiscard]] glm::vec3 contactPointWorld(uint32_t bodyA, uint32_t bodyB, const glm::vec3& normal) const;
     [[nodiscard]] std::optional<Contact> sweptCollide(uint32_t bodyA, uint32_t bodyB, const Contact& base) const;
     void prepareWarmStarting(const PhysicsSettings& settings);
     void storeWarmStarting();
     void applyWarmStart(Contact& contact);
     void resolveVelocity(Contact& contact, const PhysicsSettings& settings);
-    void resolvePosition(const Contact& contact, const PhysicsSettings& settings);
+    void resolvePosition(Contact& contact, const PhysicsSettings& settings);
+    // Solver-side mass accessors: sleeping bodies report zero inverse
+    // mass (immovable) until woken; point-velocity helpers evaluate
+    // v + omega x r at a contact point for torque-coupled impulses.
+    [[nodiscard]] float solverInverseMass(uint32_t bodyIndex) const;
+    [[nodiscard]] glm::vec3 angularVelocityRad(uint32_t bodyIndex) const;
+    [[nodiscard]] glm::vec3 pointVelocity(uint32_t bodyIndex, const glm::vec3& point) const;
+    void applyImpulseAtPoint(uint32_t bodyIndex, const glm::vec3& point, const glm::vec3& impulse,
+                             float sign);
+    void wakeBody(uint32_t bodyIndex);
+    void stepOnce(Scene& scene, double fixedDeltaSeconds, const PhysicsSettings& settings, JobSystem* jobs);
     void resolveJointVelocity(const JointRef& joint);
     void resolveJointPosition(const JointRef& joint);
     [[nodiscard]] float inverseMass(uint32_t bodyIndex) const;
@@ -176,7 +213,7 @@ private:
     std::vector<BroadEntry> m_broadEntries;
     std::vector<uint32_t> m_planeBodies;
     std::vector<std::pair<uint32_t, uint32_t>> m_candidatePairs;
-    std::vector<std::optional<Contact>> m_contactSlots;
+    std::vector<std::vector<Contact>> m_contactSlots; // one manifold per candidate pair
     std::vector<Contact> m_contacts;
     std::vector<WarmContact> m_warmContacts;
     std::vector<GravitySource> m_gravitySources;
@@ -184,6 +221,13 @@ private:
     std::vector<JointRef> m_joints;
     std::vector<SolverIsland> m_islands;
     std::vector<SpawnState> m_spawnStates;
+    // Force/torque accumulated by gameplay code before an update: these
+    // act over the whole fixed step, so integrate restores them after
+    // each non-final sub-step instead of consuming them in the first.
+    std::vector<glm::vec3> m_persistentForces;
+    std::vector<glm::vec3> m_persistentTorques;
+    uint32_t m_subStepIndex = 0;
+    uint32_t m_subStepCount = 1;
     bool m_ccdEnabled = true;
     Stats m_lastStats;
 };

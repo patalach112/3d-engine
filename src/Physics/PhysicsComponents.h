@@ -54,6 +54,15 @@ struct alignas(16) RigidBodyComponent {
     bool useGravity = true;
     bool autoInertia = true;
     bool orientationInitialized = false;
+    // Sleep state (PhysicsSystem): a body whose linear/angular speeds
+    // stay below the settings thresholds for sleepDelaySeconds falls
+    // asleep and is skipped by integration and treated as immovable by
+    // the solver until a force, impulse-worthy impact, or joint partner
+    // wakes it. The player body opts out (allowSleep = false) so input
+    // response is never gated by sleep.
+    float sleepTimer = 0.0f;
+    bool sleeping = false;
+    bool allowSleep = true;
 
     RigidBodyComponent() = default;
     explicit RigidBodyComponent(float mass_, bool isStatic_ = false) : isStatic(isStatic_) { setMass(mass_); }
@@ -86,12 +95,16 @@ struct alignas(16) RigidBodyComponent {
 
     void addForce(const glm::vec3& addedForce) {
         if (!isStatic) {
+            sleeping = false; // external forces wake the body
+            sleepTimer = 0.0f;
             force += addedForce;
         }
     }
 
     void addTorque(const glm::vec3& addedTorque) {
         if (!isStatic) {
+            sleeping = false;
+            sleepTimer = 0.0f;
             torque += addedTorque;
         }
     }
@@ -233,10 +246,29 @@ struct PhysicsSettings {
     uint32_t solverIterations = 4;
     uint32_t parallelMinBodies = 128;
     bool ccdEnabled = true;
+    // Internal sub-stepping: each update() call is split into this many
+    // full simulation sub-steps, so fast bodies (player capsule, CCD
+    // projectiles) are sampled several times per fixed step and cannot
+    // tunnel through thin geometry between samples.
+    uint32_t subSteps = 4;
+    // Non-linear position correction: the positional pass iterates,
+    // re-measuring the remaining penetration after every correction, and
+    // each iteration's separation gain is clamped to
+    // maxPositionCorrection meters so deep landings resolve firmly over
+    // a few passes instead of exploding in one.
+    uint32_t positionIterations = 2;
+    float maxPositionCorrection = 0.05f;
+    // Sleeping: bodies slower than both thresholds for sleepDelaySeconds
+    // fall asleep (skipped by integration, immovable in the solver).
+    bool sleepEnabled = true;
+    float sleepSpeedThreshold = 0.12f;       // m/s
+    float sleepAngularThreshold = 8.0f;       // degrees/s
+    float sleepDelaySeconds = 0.5f;
+    float wakeSpeedThreshold = 0.2f;          // m/s approach speed that wakes a sleeping body
 };
 
-static_assert(sizeof(RigidBodyComponent) == 192 && alignof(RigidBodyComponent) == 16,
-              "RigidBodyComponent must remain a dense 192-byte value");
+static_assert(sizeof(RigidBodyComponent) == 208 && alignof(RigidBodyComponent) == 16,
+              "RigidBodyComponent must remain a dense 208-byte value");
 static_assert(sizeof(ColliderComponent) == 144 && alignof(ColliderComponent) == 16,
               "ColliderComponent must remain a dense 144-byte value");
 

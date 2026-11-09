@@ -391,6 +391,16 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             if (reader.applyInteger(value, intField, 0, 64)) {
                 config.physics.solverIterations = static_cast<uint32_t>(intField);
             }
+        } else if (key == "substeps") {
+            if (reader.applyInteger(value, intField, 1, 16)) {
+                config.physics.subSteps = static_cast<uint32_t>(intField);
+            }
+        } else if (key == "positioniterations") {
+            if (reader.applyInteger(value, intField, 1, 8)) {
+                config.physics.positionIterations = static_cast<uint32_t>(intField);
+            }
+        } else if (key == "sleepenabled") {
+            reader.apply(value, config.physics.sleepEnabled);
         } else if (key == "parallelminbodies") {
             if (reader.applyInteger(value, intField, 1, 10000000)) {
                 config.physics.parallelMinBodies = static_cast<uint32_t>(intField);

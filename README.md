@@ -690,6 +690,84 @@ let the rendered mesh disagree with its collider. Now:
   render matrix matches `mat3_cast(body.orientation)` after every one
   of 240 tumbling steps at high angular velocity.
 
+## Phase 11 — Sub-Stepped Physics, Contact Manifolds & Sleeping ✅
+
+The physics upgrade targets mechanical realism and removes the classic
+player-jump, tunneling and stacking glitches by changing *where* contact
+impulses act, not just how hard they push:
+
+### Internal sub-stepping
+
+`PhysicsSystem::update()` now splits every fixed step into
+`subSteps` (default 4, config `subSteps =`) full simulation sub-steps —
+snapshot, force capture, integration, broad/narrow phase, islands and
+solving all re-run per sub-step and the world geometry (including swept
+CCD bounds) is re-derived each time. Fast capsules and projectiles are
+sampled four times as often, so a 120 m/s body crossing a thin floor is
+caught discretely even with CCD disabled (verified by an A/B test that
+also keeps a CCD-only control case). Gameplay forces are captured once
+and act over the whole fixed step; thruster/spring constraint forces
+re-apply per sub-step, so nothing is silently divided by the sub-step
+count.
+
+### Multi-point contact manifolds
+
+- Box–box: corners of each box inside the other (with a directional
+  pass-through rule for corners that crossed a thin body) form up to
+  four manifold points, reduced by farthest-point sampling so a face
+  contact keeps its corners spread — never clustered on one edge.
+- Box–plane: all supporting corners touch (a unit cube reports 4
+  contacts, not 1).
+- Capsule–box: the exact segment-to-box closest pair plus segment
+  endpoints inside the box; generic pairs use a contact point whose
+  depth is the support-face midpoint and whose tangential position is
+  anchored between the body centers, so a big floor's far support
+  corner can never fabricate a metre-long lever arm.
+
+### Solver: point impulses without the manifold ratchet
+
+Contacts now carry true world points and impulses act at the point —
+`v += J/m`, `L += r × J` — with angular effective mass, so off-center
+hits spin bodies correctly and mass ratios are honoured exactly
+(1 kg vs 100 kg exchanges measured momentum to machine precision).
+Sequential per-corner impulses on a centered face, however, ratchet:
+asymmetric shares feed back through friction and pitch/yaw a pushed or
+resting cube over time. The velocity solve therefore reduces every
+manifold to its **centroid lever arm** — a face contact acts under the
+center of mass (zero spurious torque: a 0.5-restitution floor bounce
+returns exactly vy = 2.0 with zero residual spin), while an edge
+manifold's genuinely offset centroid still tips the body as it should.
+Per-point penetration depths are retained for the positional pass.
+
+### Non-linear position correction
+
+The positional pass iterates (`positionIterations`, default 2),
+re-measuring penetration from the mutated contact after every
+correction and clamping each iteration's separation gain to
+`maxPositionCorrection` (0.05 m), split across manifold points so a
+4-point face does not correct four times as hard as a single point.
+Deep jump landings resolve firmly over a few passes instead of one
+explosive pop, and the player capsule lands from a jump at rest height
+with zero sink and zero residual velocity.
+
+### Friction & sleeping
+
+Anisotropic Coulomb friction (two tangent coefficients per body, blended
+pair-wise) is unchanged in form but now acts at the manifold centroid,
+giving the player capsule smooth wall/box-top sliding without sticking.
+Resting bodies fall asleep: below 0.12 m/s and 8°/s *with a supporting
+contact from the previous sub-step* (unsupported slow bodies in zero-G
+never freeze) for 0.5 s — the timer decays rather than hard-resetting
+on jitter bursts — the body is skipped by integration and treated as
+immovable by the solver until a force, torque, impact or lost support
+wakes it. The demo player is exempt (`allowSleep = false`).
+`PhysicsStats` reports sleeping bodies and the sub-step count, and
+candidate/contact counts are the peak across sub-steps so a mid-step
+bounce is never invisible. Tests cover sub-step configuration and
+clamping, the 120 m/s anti-tunneling A/B, sleeping stacks waking under
+a dropped heavy ball, momentum exchange, penetration clamping and the
+player jump landing: 350 checks, all passing.
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

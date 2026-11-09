@@ -410,7 +410,7 @@ void testPhysics() {
     using engine::RigidBodyComponent;
     using engine::TransformComponent;
 
-    check(sizeof(RigidBodyComponent) == 192, "rigid body remains a dense 192-byte component");
+    check(sizeof(RigidBodyComponent) == 208, "rigid body remains a dense 208-byte component");
     check(sizeof(ColliderComponent) == 144, "collider remains a dense 144-byte component");
     {
         RigidBodyComponent inertiaBody(2.0f);
@@ -448,7 +448,11 @@ void testPhysics() {
         const auto& rigidBody = entity.getComponent<RigidBodyComponent>();
         check(stats.bodies == 1 && stats.dynamicBodies == 1, "physics snapshots one dynamic body");
         check(nearlyEqual(rigidBody.velocity.y, -1.0), "gravity integrates velocity by delta time");
-        check(nearlyEqual(transform.position.y, 9.9, 1e-4), "velocity integrates position by delta time");
+        // Four internal sub-steps integrate gravity semi-implicitly at
+        // dt/4, so the position is the sub-stepped sum (9.9375), not the
+        // single-step 9.9 — sub-stepping is the documented default.
+        check(nearlyEqual(transform.position.y, 9.9375, 1e-4),
+              "velocity integrates position by delta time (sub-stepped)");
         check(nearlyEqual(rigidBody.acceleration.y, -10.0), "rigid body records integrated acceleration");
         check(nearlyEqual(entity.getComponent<TransformComponent>().rotationDegrees.y, 9.0, 1e-4),
               "angular velocity integrates rotation by delta time");
@@ -492,7 +496,7 @@ void testPhysics() {
         settings.gravity = glm::vec3{0.0f};
         PhysicsSystem physics;
         const auto stats = physics.update(scene, 1.0 / 60.0, settings);
-        check(stats.contacts == 1, "box-plane narrow phase reports one contact");
+        check(stats.contacts == 4, "box-plane narrow phase generates a four-point manifold");
         check(nearlyEqual(cubeBody.velocity.y, 2.0, 1e-4), "floor bounce applies restitution");
         check(cube.getComponent<TransformComponent>().position.y > 0.43f,
               "floor contact corrects penetration");
@@ -618,7 +622,7 @@ void testPhysics() {
         bool integrated = stats.bodies == 256 && stats.candidatePairs == 0;
         for (auto& entity : entities) {
             integrated = integrated && nearlyEqual(entity.getComponent<RigidBodyComponent>().velocity.y, -1.0) &&
-                         nearlyEqual(entity.getComponent<TransformComponent>().position.y, 9.9, 1e-4);
+                         nearlyEqual(entity.getComponent<TransformComponent>().position.y, 9.9375, 1e-4);
         }
         check(integrated, "JobSystem-parallel physics integrates every body exactly once");
     }
@@ -729,7 +733,10 @@ void testPhysics() {
         settings.gravity = glm::vec3{0.0f};
         PhysicsSystem physics;
         physics.update(scene, 0.1, settings);
-        check(nearlyEqual(satelliteBody.velocity.x, -0.1, 1e-5),
+        // Sub-stepped integration re-evaluates the inverse-square field
+        // as the satellite falls inward, so the value is slightly more
+        // accurate than the single-step -0.1 (hence the wider band).
+        check(nearlyEqual(satelliteBody.velocity.x, -0.1, 1e-3),
               "radial gravity field accelerates toward its source");
     }
     {
@@ -762,7 +769,7 @@ void testPhysics() {
         settings.gravityCenter = glm::vec3{0.0f};
         PhysicsSystem physics;
         physics.update(scene, 0.1, settings);
-        check(nearlyEqual(satelliteBody.velocity.x, -0.2, 1e-5),
+        check(nearlyEqual(satelliteBody.velocity.x, -0.2, 1e-3),
               "global point-mass gravity uses inverse-square acceleration");
     }
 
@@ -806,7 +813,8 @@ void testPhysics() {
         PhysicsSettings settings;
         settings.gravity = glm::vec3{0.0f};
         PhysicsSystem physics;
-        check(physics.update(scene, 0.01, settings).contacts == 1, "rotated OBB pair generates a contact");
+        check(physics.update(scene, 0.01, settings).contacts == 2,
+              "rotated OBB pair generates a two-point edge manifold");
     }
     {
         engine::Scene scene;
@@ -862,6 +870,10 @@ void testPhysics() {
         PhysicsSettings settings;
         settings.gravity = glm::vec3{0.0f};
         settings.ccdEnabled = ccdEnabled;
+        // The control case also steps once per update: with sub-stepping
+        // on, even CCD-less physics samples the wall crossing (that is
+        // Phase 11 working as intended), so isolating CCD requires both.
+        settings.subSteps = ccdEnabled ? 4u : 1u;
         PhysicsSystem physics;
         const auto stats = physics.update(scene, 1.0 / 30.0, settings);
         outX = projectile.getComponent<TransformComponent>().position.x;
@@ -956,7 +968,11 @@ void testPhysics() {
         settings.gravity = glm::vec3{0.0f};
         PhysicsSystem physics;
         physics.update(scene, 0.1, settings);
-        check(nearlyEqual(craftBody.velocity.x, 0.5, 1e-5), "thruster force accelerates by F/m");
+        // The thruster direction rotates with the craft as torque
+        // builds, so the world-X component lands a hair under F/m * dt
+        // while the total thrust magnitude is preserved.
+        check(nearlyEqual(craftBody.velocity.x, 0.5, 2e-3) && glm::length(craftBody.velocity) < 0.51f,
+              "thruster force accelerates by F/m");
         check(craftBody.angularVelocity.z < -1.0f, "offset thruster generates torque");
     }
 
@@ -1279,6 +1295,205 @@ void testShadowsDepthAndRotationSync() {
             }
         }
         check(inSync, "tumbling rigid body render matrix stays 1:1 with physics orientation for 240 steps");
+    }
+}
+
+
+void testPhysicsPhase11() {
+    std::cout << "Physics Phase 11 (sub-stepping, manifolds, sleep)\n";
+    using engine::ColliderComponent;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::RigidBodyComponent;
+    using engine::TransformComponent;
+
+    // Sub-stepping is reported and configurable.
+    {
+        engine::Scene scene;
+        auto body = scene.createEntity("Body");
+        body.addComponent<TransformComponent>(glm::vec3{0.0f, 10.0f, 0.0f});
+        body.addComponent<RigidBodyComponent>(1.0f);
+        body.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        check(physics.update(scene, 1.0 / 60.0, settings).subSteps == 4,
+              "physics runs four internal sub-steps by default");
+        settings.subSteps = 1;
+        check(physics.update(scene, 1.0 / 60.0, settings).subSteps == 1,
+              "physics sub-step count is configurable");
+        settings.subSteps = 0;
+        check(physics.update(scene, 1.0 / 60.0, settings).subSteps == 1,
+              "physics sub-step count clamps to at least one");
+    }
+
+    // Anti-tunneling A/B: with CCD off, a single step lets a 60 m/s cube
+    // jump clean over a thin floor slab; four sub-steps sample the fall
+    // every 0.25 m and the cube is caught and lands on the slab.
+    const auto fastFall = [](uint32_t subSteps) {
+        engine::Scene scene;
+        auto floor = scene.createEntity("ThinFloor");
+        auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        floorTransform.scale = glm::vec3{9.0f, 0.1f, 9.0f};
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.friction = 0.6f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto cube = scene.createEntity("FastCube");
+        cube.addComponent<TransformComponent>(glm::vec3{0.0f, 1.6f, 0.0f});
+        auto& cubeBody = cube.addComponent<RigidBodyComponent>(1.0f);
+        cubeBody.velocity = glm::vec3{0.0f, -120.0f, 0.0f};
+        cubeBody.restitution = 0.0f;
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.25f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        settings.ccdEnabled = false; // isolate sub-stepping from swept CCD
+        settings.subSteps = subSteps;
+        PhysicsSystem physics;
+        for (int step = 0; step < 3; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        return cube.getComponent<TransformComponent>().position.y;
+    };
+    check(fastFall(1) < -1.0f, "single-step physics tunnels through a thin floor at 120 m/s (CCD off)");
+    check(fastFall(4) > 0.2f, "sub-stepped physics catches a 120 m/s cube on a thin floor (CCD off)");
+
+    // Sleeping: a resting stack falls asleep (velocities exactly zero,
+    // bodies counted in stats), then a dropped heavy ball wakes it.
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("SleepFloor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.friction = 0.6f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+        auto lower = scene.createEntity("SleepLower");
+        lower.addComponent<TransformComponent>(glm::vec3{0.0f, 0.5f, 0.0f});
+        auto& lowerBody = lower.addComponent<RigidBodyComponent>(1.0f);
+        lowerBody.friction = 0.6f;
+        lowerBody.restitution = 0.0f;
+        lower.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto upper = scene.createEntity("SleepUpper");
+        upper.addComponent<TransformComponent>(glm::vec3{0.0f, 1.5f, 0.0f});
+        auto& upperBody = upper.addComponent<RigidBodyComponent>(1.0f);
+        upperBody.friction = 0.6f;
+        upperBody.restitution = 0.0f;
+        upper.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        PhysicsSystem::Stats stats{};
+        for (int step = 0; step < 240; ++step) {
+            stats = physics.update(scene, 1.0 / 60.0, settings);
+        }
+        check(lowerBody.sleeping && upperBody.sleeping, "resting stack falls asleep");
+        check(stats.sleepingBodies == 2, "sleeping bodies are counted in physics stats");
+        check(glm::length(lowerBody.velocity) == 0.0f && glm::length(upperBody.velocity) == 0.0f,
+              "sleeping bodies are exactly at rest (no micro-jitter)");
+
+        auto ball = scene.createEntity("WakeBall");
+        ball.addComponent<TransformComponent>(glm::vec3{0.0f, 3.2f, 0.0f});
+        auto& ballBody = ball.addComponent<RigidBodyComponent>(5.0f);
+        ballBody.restitution = 0.0f;
+        ball.addComponent<ColliderComponent>(ColliderComponent::sphere(0.4f));
+        bool wokeOnImpact = false;
+        for (int step = 0; step < 120 && !wokeOnImpact; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            wokeOnImpact = !upperBody.sleeping || glm::length(upperBody.velocity) > 0.05f;
+        }
+        check(wokeOnImpact, "a dropped heavy ball wakes the sleeping stack on impact");
+    }
+
+    // Mass-ratio weighting: an inelastic 1 kg vs 100 kg collision leaves
+    // the heavy body almost unmoved while the light body adopts nearly
+    // the heavy body's velocity (total momentum conserved).
+    {
+        engine::Scene scene;
+        auto light = scene.createEntity("LightBox");
+        light.addComponent<TransformComponent>(glm::vec3{-0.49f, 0.0f, 0.0f});
+        auto& lightBody = light.addComponent<RigidBodyComponent>(1.0f);
+        lightBody.velocity = glm::vec3{4.0f, 0.0f, 0.0f};
+        lightBody.restitution = 0.0f;
+        lightBody.friction = 0.0f;
+        light.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto heavy = scene.createEntity("HeavyBox");
+        heavy.addComponent<TransformComponent>(glm::vec3{0.49f, 0.0f, 0.0f});
+        auto& heavyBody = heavy.addComponent<RigidBodyComponent>(100.0f);
+        heavyBody.restitution = 0.0f;
+        heavyBody.friction = 0.0f;
+        heavy.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 0.01, settings);
+        const float commonVelocity = 4.0f / 101.0f; // momentum / total mass
+        check(nearlyEqual(heavyBody.velocity.x, commonVelocity, 2e-3) &&
+                  nearlyEqual(lightBody.velocity.x, commonVelocity, 2e-3),
+              "light-vs-heavy collision conserves momentum with mass-ratio weighting");
+        check(std::abs(heavyBody.velocity.x) < std::abs(lightBody.velocity.x - 4.0f) / 50.0f,
+              "heavy body barely responds to a light impact");
+    }
+
+    // Non-linear position correction: a deeply embedded box (0.2 m into
+    // the floor) is projected out over a few passes without velocity
+    // spikes or overshoot above its resting height.
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("ClampFloor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.friction = 0.6f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+        auto cube = scene.createEntity("EmbeddedCube");
+        cube.addComponent<TransformComponent>(glm::vec3{0.0f, 0.3f, 0.0f}); // 0.2 m embedded
+        auto& cubeBody = cube.addComponent<RigidBodyComponent>(1.0f);
+        cubeBody.restitution = 0.0f;
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        physics.update(scene, 1.0 / 60.0, settings);
+        const float yAfterOne = cube.getComponent<TransformComponent>().position.y;
+        check(yAfterOne > 0.32f && yAfterOne < 0.52f,
+              "deep penetration is corrected firmly but clamped (no explosive pop-out)");
+        for (int step = 0; step < 120; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float yRest = cube.getComponent<TransformComponent>().position.y;
+        check(yRest > 0.47f && yRest < 0.53f && glm::length(cubeBody.velocity) < 0.15f,
+              "embedded box settles at resting height without jitter");
+    }
+
+    // Player-jump regression: a capsule dropped from height lands on the
+    // finite floor with the sub-stepped solver and stays grounded (no
+    // bounce-out, no sink) across many steps.
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("JumpFloor");
+        auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        floorTransform.scale = glm::vec3{9.0f, 0.1f, 9.0f};
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.friction = 0.6f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto player = scene.createEntity("JumpPlayer");
+        player.addComponent<TransformComponent>(glm::vec3{0.0f, 3.0f, 0.0f});
+        auto& playerBody = player.addComponent<RigidBodyComponent>(80.0f);
+        playerBody.restitution = 0.0f;
+        playerBody.friction = 0.25f;
+        playerBody.allowSleep = false;
+        player.addComponent<ColliderComponent>(ColliderComponent::capsule(0.30f, 0.45f));
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        float minY = 10.0f;
+        for (int step = 0; step < 180; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            minY = std::min(minY, player.getComponent<TransformComponent>().position.y);
+        }
+        const float restY = player.getComponent<TransformComponent>().position.y;
+        check(minY > 0.70f, "falling player capsule never sinks into the floor while landing");
+        check(restY > 0.70f && restY < 0.80f && std::abs(playerBody.velocity.y) < 0.2f,
+              "player capsule rests grounded at capsule height after a jump landing");
     }
 }
 
@@ -2458,6 +2673,7 @@ int main() {
     testPhysics();
     testDynamicModulesAndMaterials();
     testShadowsDepthAndRotationSync();
+    testPhysicsPhase11();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

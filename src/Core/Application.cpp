@@ -109,6 +109,7 @@ void Application::buildScene() {
     playerBody.restitution = 0.0f;
     playerBody.friction = 0.25f;
     playerBody.setPrincipalInertia(glm::vec3{10000.0f}); // capsule stays upright
+    playerBody.allowSleep = false; // the player must always respond to input instantly
     player.addComponent<ColliderComponent>(
         ColliderComponent::capsule(PlayerSystem::kCapsuleRadius, PlayerSystem::kCapsuleHalfHeight));
 
