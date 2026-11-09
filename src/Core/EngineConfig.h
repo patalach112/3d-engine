@@ -3,6 +3,7 @@
 #include "Core/Camera.h"
 #include "Core/GameLoop.h"
 #include "Core/Logger.h"
+#include "Core/PresentationMode.h"
 #include "Platform/Input.h"
 
 #include <filesystem>
@@ -21,9 +22,11 @@ struct WindowConfig {
 
 // Presentation settings (see config/engine.ini, [Render]).
 struct RenderConfig {
-    // true  -> present with FIFO (vsync: tear-free, paced to refresh rate)
-    // false -> prefer IMMEDIATE, then MAILBOX (lowest latency, may tear)
+    // In Auto mode: true -> FIFO (vsync), false -> IMMEDIATE/MAILBOX.
     bool vsync = true;
+    // auto, fifo, mailbox, immediate, or fifo_relaxed. An explicit mode
+    // (anything other than Auto) overrides the vsync switch above.
+    PresentationMode presentMode = PresentationMode::Auto;
     // Skip drawing entities whose bounds are outside the view frustum.
     bool frustumCulling = true;
     // Sort draw items by material, then front-to-back, before submission.

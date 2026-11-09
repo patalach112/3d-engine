@@ -136,7 +136,7 @@ PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
     return frame;
 }
 
-void RenderSystem::render(Scene& scene) {
+bool RenderSystem::render(Scene& scene) {
     const VkExtent2D extent = m_swapchain.extent();
     const float aspectRatio = extent.height > 0
                                   ? static_cast<float>(extent.width) / static_cast<float>(extent.height)
@@ -158,13 +158,13 @@ void RenderSystem::render(Scene& scene) {
         }
         m_lastDrawnCount = 0;
         m_lastCulledCount = 0;
-        return;
+        return false;
     }
     m_warnedNoCamera = false;
     m_lastDrawnCount = static_cast<uint32_t>(frame.renderQueue.size());
     m_lastCulledCount = frame.culledCount;
 
-    m_renderer.drawFrame(frame.view, frame.projection, frame.renderQueue.items());
+    return m_renderer.drawFrame(frame.view, frame.projection, frame.renderQueue.items());
 }
 
 } // namespace engine

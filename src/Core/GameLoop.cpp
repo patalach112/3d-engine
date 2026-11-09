@@ -67,6 +67,12 @@ void GameLoop::run(const LoopCallbacks& callbacks) {
         const double rawDelta = m_time.tick();
         const double frameDelta = std::min(rawDelta, m_config.maxFrameSeconds);
         m_stats.droppedSeconds += rawDelta - frameDelta;
+        if (rawDelta > m_config.maxFrameSeconds) {
+            // A window drag/resize or debugger hitch is a break in the
+            // presented-frame stream, not an extremely fast or slow run.
+            // Start a fresh FPS window after it.
+            m_time.resetFramesPerSecond();
+        }
 
         double interpolationAlpha = 0.0;
         if (m_config.fixedTimestepEnabled) {
@@ -84,11 +90,20 @@ void GameLoop::run(const LoopCallbacks& callbacks) {
         if (callbacks.update) {
             callbacks.update(frameDelta);
         }
+        bool framePresented = true;
         if (callbacks.render) {
-            callbacks.render(interpolationAlpha);
+            framePresented = callbacks.render(interpolationAlpha);
         }
 
-        ++m_stats.frames;
+        if (framePresented) {
+            ++m_stats.frames;
+            m_time.recordPresentedFrame();
+        } else {
+            // A resize/swapchain rebuild may make the loop spin through
+            // iterations that display nothing. They are not frames and
+            // must not feed either the statistics or the smoothed FPS.
+            m_time.resetFramesPerSecond();
+        }
         m_stats.elapsedSeconds = m_time.elapsedSeconds();
 
         applyFrameRateCap(frameStart);

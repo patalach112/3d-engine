@@ -13,8 +13,8 @@
 
 namespace engine {
 
-Swapchain::Swapchain(VulkanContext& context, const Window& window, bool vsync)
-    : m_context(context), m_window(window), m_vsync(vsync) {
+Swapchain::Swapchain(VulkanContext& context, const Window& window, PresentationSettings presentation)
+    : m_context(context), m_window(window), m_presentation(presentation) {
     createSwapchain(VK_NULL_HANDLE);
     createImageViews();
     m_depthFormat = findDepthFormat();
@@ -80,7 +80,9 @@ void Swapchain::createSwapchain(VkSwapchainKHR oldSwapchain) {
     const SwapChainSupportDetails support = m_context.querySwapChainSupport(m_context.physicalDevice());
 
     const VkSurfaceFormatKHR surfaceFormat = chooseSurfaceFormat(support.formats);
-    const VkPresentModeKHR presentMode = choosePresentMode(support.presentModes);
+    const VkPresentModeKHR presentMode =
+        selectPresentMode(m_presentation.mode, m_presentation.vsync, support.presentModes);
+    m_presentMode = presentMode;
     const VkExtent2D extent = chooseExtent(support.capabilities);
 
     uint32_t imageCount = support.capabilities.minImageCount + 1;
@@ -128,7 +130,11 @@ void Swapchain::createSwapchain(VkSwapchainKHR oldSwapchain) {
     m_extent = extent;
 
     ENGINE_LOG_DEBUG("swapchain: " << extent.width << 'x' << extent.height << ", " << m_images.size()
-                                    << " images, format " << static_cast<int>(surfaceFormat.format));
+                                    << " images, format " << static_cast<int>(surfaceFormat.format)
+                                    << ", requested present mode "
+                                    << presentationModeName(m_presentation.mode) << " (vsync "
+                                    << (m_presentation.vsync ? "on" : "off") << "), using "
+                                    << presentModeName(presentMode));
 }
 
 void Swapchain::createImageViews() {
@@ -241,24 +247,59 @@ VkSurfaceFormatKHR Swapchain::chooseSurfaceFormat(const std::vector<VkSurfaceFor
     return formats.front();
 }
 
-VkPresentModeKHR Swapchain::choosePresentMode(const std::vector<VkPresentModeKHR>& presentModes) const {
-    if (m_vsync) {
-        // FIFO is the only present mode the specification guarantees to
-        // exist: tear-free and paced to the display refresh rate.
-        ENGINE_LOG_DEBUG("swapchain: vsync enabled, using FIFO present mode");
+VkPresentModeKHR Swapchain::selectPresentMode(PresentationMode requested, bool vsync,
+                                              const std::vector<VkPresentModeKHR>& availableModes) {
+    const auto available = [&availableModes](VkPresentModeKHR mode) {
+        return std::find(availableModes.begin(), availableModes.end(), mode) != availableModes.end();
+    };
+
+    switch (requested) {
+    case PresentationMode::Fifo:
+        // FIFO is guaranteed by the Vulkan specification.
+        return VK_PRESENT_MODE_FIFO_KHR;
+    case PresentationMode::FifoRelaxed:
+        return available(VK_PRESENT_MODE_FIFO_RELAXED_KHR) ? VK_PRESENT_MODE_FIFO_RELAXED_KHR
+                                                           : VK_PRESENT_MODE_FIFO_KHR;
+    case PresentationMode::Mailbox:
+        return available(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR
+                                                      : VK_PRESENT_MODE_FIFO_KHR;
+    case PresentationMode::Immediate:
+        if (available(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+            return VK_PRESENT_MODE_IMMEDIATE_KHR;
+        }
+        return available(VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR
+                                                      : VK_PRESENT_MODE_FIFO_KHR;
+    case PresentationMode::Auto:
+        break;
+    }
+
+    if (vsync) {
         return VK_PRESENT_MODE_FIFO_KHR;
     }
-    // Lowest latency first: IMMEDIATE presents as fast as possible (may
-    // tear), MAILBOX is the tear-free low-latency compromise.
-    for (const VkPresentModeKHR preferred :
-         {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR}) {
-        if (std::find(presentModes.begin(), presentModes.end(), preferred) != presentModes.end()) {
-            ENGINE_LOG_DEBUG("swapchain: vsync disabled, using present mode " << static_cast<int>(preferred));
-            return preferred;
-        }
+    // Auto with vsync off keeps the historical preference: present as soon
+    // as possible; use Mailbox when the platform does not offer Immediate.
+    if (available(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
     }
-    ENGINE_LOG_DEBUG("swapchain: vsync disabled but only FIFO is available; using FIFO");
+    if (available(VK_PRESENT_MODE_MAILBOX_KHR)) {
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    }
+    if (available(VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
+        return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+    }
     return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+const char* Swapchain::presentModeName(VkPresentModeKHR mode) {
+    switch (mode) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
+    case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
+    case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+    case VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR: return "SHARED_DEMAND_REFRESH";
+    case VK_PRESENT_MODE_SHARED_CONTINUOUS_REFRESH_KHR: return "SHARED_CONTINUOUS_REFRESH";
+    default: return "UNKNOWN";
+    }
 }
 
 VkExtent2D Swapchain::chooseExtent(const VkSurfaceCapabilitiesKHR& capabilities) const {

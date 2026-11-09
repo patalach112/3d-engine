@@ -2,6 +2,8 @@
 
 #include <vulkan/vulkan.h>
 
+#include "Core/PresentationMode.h"
+
 #include <cstddef>
 #include <vector>
 
@@ -20,11 +22,16 @@ class Window;
 // formats, so it is created once and survives recreation — the graphics
 // pipeline built against it therefore stays valid across resizes.
 // ---------------------------------------------------------------------------
+struct PresentationSettings {
+    PresentationMode mode = PresentationMode::Auto;
+    bool vsync = true;
+};
+
 class Swapchain {
 public:
-    // vsync selects the presentation policy (configured in [Render]):
-    // true -> FIFO, false -> lowest-latency modes. See choosePresentMode().
-    Swapchain(VulkanContext& context, const Window& window, bool vsync);
+    // The requested mode/vsync pair is resolved against the modes the
+    // surface actually supports; presentMode() reports the result.
+    Swapchain(VulkanContext& context, const Window& window, PresentationSettings presentation);
     ~Swapchain();
 
     Swapchain(const Swapchain&) = delete;
@@ -43,6 +50,13 @@ public:
     [[nodiscard]] size_t imageCount() const { return m_images.size(); }
     [[nodiscard]] VkFramebuffer framebuffer(size_t index) const { return m_framebuffers.at(index); }
     [[nodiscard]] VkSwapchainKHR handle() const { return m_swapchain; }
+    [[nodiscard]] const PresentationSettings& presentationSettings() const { return m_presentation; }
+    [[nodiscard]] VkPresentModeKHR presentMode() const { return m_presentMode; }
+
+    // Pure mode resolution, separated from Vulkan creation for testing.
+    [[nodiscard]] static VkPresentModeKHR selectPresentMode(PresentationMode requested, bool vsync,
+                                                            const std::vector<VkPresentModeKHR>& availableModes);
+    [[nodiscard]] static const char* presentModeName(VkPresentModeKHR mode);
 
 private:
     void createSwapchain(VkSwapchainKHR oldSwapchain);
@@ -53,7 +67,6 @@ private:
     void cleanupSwapchainResources();
 
     [[nodiscard]] VkSurfaceFormatKHR chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats) const;
-    [[nodiscard]] VkPresentModeKHR choosePresentMode(const std::vector<VkPresentModeKHR>& presentModes) const;
     [[nodiscard]] VkExtent2D chooseExtent(const VkSurfaceCapabilitiesKHR& capabilities) const;
     [[nodiscard]] VkFormat findDepthFormat() const;
     [[nodiscard]] VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling,
@@ -61,7 +74,8 @@ private:
 
     VulkanContext& m_context;
     const Window& m_window;
-    bool m_vsync;
+    PresentationSettings m_presentation;
+    VkPresentModeKHR m_presentMode = VK_PRESENT_MODE_FIFO_KHR;
 
     VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
     std::vector<VkImage> m_images; // owned by the swapchain, never destroyed manually

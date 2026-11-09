@@ -55,8 +55,10 @@ public:
                  const AssetManager* assets = nullptr);
 
     // Draws the current scene state. Must run after update systems so it
-    // never renders a half-updated world.
-    void render(Scene& scene);
+    // never renders a half-updated world. Returns false when no frame
+    // was presented (no camera, or swapchain recreation), so loop/FPS
+    // accounting does not mistake a skipped iteration for a real frame.
+    bool render(Scene& scene);
 
     // Scene -> frame data derivation (no GPU involvement).
     static PreparedFrame prepareFrame(Scene& scene, float aspectRatio,

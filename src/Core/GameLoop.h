@@ -84,7 +84,9 @@ struct LoopCallbacks {
     std::function<void(double deltaSeconds)> update;
     // Rendering; called once per frame. interpolationAlpha in [0, 1) says
     // how far the render state sits between the last two fixed states.
-    std::function<void(double interpolationAlpha)> render;
+    // Return true only when a frame was actually presented; skipped or
+    // swapchain-rebuilding iterations are excluded from FPS accounting.
+    std::function<bool(double interpolationAlpha)> render;
 };
 
 struct LoopStats {

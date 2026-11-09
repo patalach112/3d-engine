@@ -33,15 +33,18 @@ struct UniformBufferObject {
 // Owns everything needed to draw frames: per-frame command buffers,
 // uniform buffers + descriptor sets, synchronization primitives, and the
 // cube's vertex/index buffers. Uses a classic frames-in-flight scheme:
-// at most kMaxFramesInFlight frames are recorded/submitted concurrently,
+// the configured number of frames are recorded/submitted concurrently,
 // each with its own command buffer, uniform buffer and sync objects, so
-// the CPU never overwrites data the GPU is still reading.
+// the CPU never overwrites data the GPU is still reading. Low-latency
+// presentation modes use one frame in flight (see below), trading some
+// CPU/GPU overlap for a shorter sample-to-display queue.
 // ---------------------------------------------------------------------------
 class Renderer {
 public:
     static constexpr int kMaxFramesInFlight = 2;
 
-    Renderer(VulkanContext& context, Window& window, Swapchain& swapchain, GraphicsPipeline& pipeline);
+    Renderer(VulkanContext& context, Window& window, Swapchain& swapchain, GraphicsPipeline& pipeline,
+             uint32_t maxFramesInFlight = kMaxFramesInFlight);
     ~Renderer();
 
     Renderer(const Renderer&) = delete;
@@ -51,8 +54,22 @@ public:
 
     // Draws one frame: camera matrices go to the uniform buffer, each
     // item's model matrix is pushed per draw. Transparently recreates
-    // the swapchain when the window has been resized.
-    void drawFrame(const glm::mat4& view, const glm::mat4& projection, std::span<const DrawItem> drawItems);
+    // the swapchain when the window has been resized. Returns false when
+    // no frame was submitted/presented (e.g. the swapchain was rebuilt),
+    // so callers must not count that iteration as a displayed frame.
+    bool drawFrame(const glm::mat4& view, const glm::mat4& projection, std::span<const DrawItem> drawItems);
+
+    [[nodiscard]] uint32_t framesInFlight() const { return m_framesInFlight; }
+
+    // Mailbox/Immediate can replace or present work without waiting for
+    // a refresh boundary; allowing the CPU to run a second frame ahead
+    // would recreate much of FIFO's input queue. Keep those modes to a
+    // single in-flight frame, and retain two for FIFO-style throughput.
+    [[nodiscard]] static constexpr uint32_t framesInFlightForPresentMode(VkPresentModeKHR mode) {
+        return (mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR)
+                   ? 1u
+                   : static_cast<uint32_t>(kMaxFramesInFlight);
+    }
 
     // Sets the FPS HUD overlay text (empty disables it). Cheap: the
     // overlay re-lays-out only when the text actually changes.
@@ -84,6 +101,7 @@ private:
     std::vector<VkSemaphore> m_imageAvailableSemaphores;
     std::vector<VkSemaphore> m_renderFinishedSemaphores;
     std::vector<VkFence> m_inFlightFences;
+    uint32_t m_framesInFlight = kMaxFramesInFlight;
     uint32_t m_currentFrame = 0;
 
     Buffer m_vertexBuffer;

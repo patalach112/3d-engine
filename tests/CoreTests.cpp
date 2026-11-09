@@ -27,6 +27,8 @@
 #include "Graphics/VramBudget.h"
 #include "Graphics/HudFont.h"
 #include "Graphics/RenderQueue.h"
+#include "Graphics/Renderer.h"
+#include "Graphics/Swapchain.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Graphics/Frustum.h"
 
@@ -80,7 +82,7 @@ void testConfigLoading() {
     {
         std::ofstream file(path);
         file << "[Window]\nwidth = 800\nheight = 600\ntitle = Test Title\nresizable = false\n"
-             << "[Render]\nvsync = false\nsortDrawItems = false\n"
+             << "[Render]\nvsync = false\npresentMode = immediate\nsortDrawItems = false\n"
              << "[Logger]\nlevel = Warning\nconsole = false\n"
              << "[Loop]\nfixedDeltaSeconds = 0.01\nmaxFps = 144\nmaxFixedStepsPerFrame = 3\n"
              << "bogusKey = 1\n"
@@ -98,6 +100,7 @@ void testConfigLoading() {
     check(config.window.title == "Test Title", "window title parsed");
     check(!config.window.resizable, "window resizable parsed");
     check(!config.render.vsync, "vsync parsed");
+    check(config.render.presentMode == engine::PresentationMode::Immediate, "present mode parsed");
     check(!config.render.sortDrawItems, "render queue sorting flag parsed");
     check(config.logger.minimumLevel == engine::LogLevel::Warning, "log level parsed");
     check(!config.logger.consoleEnabled, "logger console flag parsed");
@@ -125,6 +128,44 @@ void testConfigLoading() {
           "missing file yields defaults plus a warning");
 
     std::filesystem::remove_all(dir);
+}
+
+void testPresentationModes() {
+    std::cout << "Presentation modes\n";
+    using engine::PresentationMode;
+    using engine::Swapchain;
+
+    const std::vector<VkPresentModeKHR> allModes = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR,
+                                                    VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                                    VK_PRESENT_MODE_FIFO_RELAXED_KHR};
+    check(Swapchain::selectPresentMode(PresentationMode::Auto, true, allModes) == VK_PRESENT_MODE_FIFO_KHR,
+          "auto + vsync selects FIFO");
+    check(Swapchain::selectPresentMode(PresentationMode::Auto, false, allModes) ==
+              VK_PRESENT_MODE_IMMEDIATE_KHR,
+          "auto without vsync selects immediate when available");
+    check(Swapchain::selectPresentMode(PresentationMode::Mailbox, true, allModes) ==
+              VK_PRESENT_MODE_MAILBOX_KHR,
+          "explicit mailbox overrides vsync");
+    check(Swapchain::selectPresentMode(PresentationMode::Immediate, false, allModes) ==
+              VK_PRESENT_MODE_IMMEDIATE_KHR,
+          "explicit immediate selects immediate");
+    check(Swapchain::selectPresentMode(PresentationMode::FifoRelaxed, false, allModes) ==
+              VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+          "explicit fifo_relaxed selects fifo_relaxed");
+
+    const std::vector<VkPresentModeKHR> fifoOnly = {VK_PRESENT_MODE_FIFO_KHR};
+    check(Swapchain::selectPresentMode(PresentationMode::Mailbox, false, fifoOnly) ==
+              VK_PRESENT_MODE_FIFO_KHR,
+          "mailbox falls back to guaranteed FIFO");
+    check(Swapchain::selectPresentMode(PresentationMode::Immediate, false, fifoOnly) ==
+              VK_PRESENT_MODE_FIFO_KHR,
+          "immediate falls back to guaranteed FIFO");
+    check(engine::Renderer::framesInFlightForPresentMode(VK_PRESENT_MODE_MAILBOX_KHR) == 1,
+          "mailbox uses one frame in flight for low latency");
+    check(engine::Renderer::framesInFlightForPresentMode(VK_PRESENT_MODE_IMMEDIATE_KHR) == 1,
+          "immediate uses one frame in flight for low latency");
+    check(engine::Renderer::framesInFlightForPresentMode(VK_PRESENT_MODE_FIFO_KHR) == 2,
+          "FIFO retains two frames in flight");
 }
 
 void testLogger() {
@@ -611,6 +652,7 @@ void testWindowLoopIntegration() {
     callbacks.render = [&order, &frames](double) {
         order.push_back("render");
         ++frames;
+        return true;
     };
     loop.run(callbacks);
 
@@ -1303,6 +1345,21 @@ void testTime() {
     check(delta > 0.0, "tick reports a positive delta after sleeping");
     check(time.elapsedSeconds() >= delta, "elapsed time accumulates at least one delta");
     check(time.frameCount() == 1, "frame count increments per tick");
+
+    // Regression test for the resize FPS spike: many presented-frame
+    // records inside one FPS window must not be converted into a bogus
+    // instantaneous 1000+ FPS value before the window has elapsed.
+    for (int i = 0; i < 1000; ++i) {
+        time.recordPresentedFrame();
+    }
+    check(time.framesPerSecond() == 0.0, "FPS meter ignores sub-window frame bursts");
+    std::this_thread::sleep_for(std::chrono::milliseconds(260));
+    time.tick();
+    time.recordPresentedFrame();
+    check(time.framesPerSecond() > 0.0 && time.framesPerSecond() < 10000.0,
+          "FPS meter reports a bounded windowed rate");
+    time.resetFramesPerSecond();
+    check(time.framesPerSecond() == 0.0, "FPS meter resets after a hitch or skipped frame");
 }
 
 void testGameLoop() {
@@ -1326,7 +1383,10 @@ void testGameLoop() {
     callbacks.pollEvents = [&polls] { ++polls; };
     callbacks.fixedUpdate = [&fixedSteps](double) { ++fixedSteps; };
     callbacks.update = [&updates](double) { ++updates; };
-    callbacks.render = [&renders](double) { ++renders; };
+    callbacks.render = [&renders](double) {
+        ++renders;
+        return true;
+    };
 
     loop.run(callbacks);
 
@@ -1334,12 +1394,30 @@ void testGameLoop() {
     check(polls == 3 && updates == 3 && renders == 3, "poll/update/render fire once per frame");
     check(loop.stats().fixedSteps == static_cast<uint64_t>(fixedSteps),
           "fixed-step statistics match executed fixed updates");
+
+    // Swapchain recreation during a resize returns false from render:
+    // those iterations are real loop passes, but they presented nothing
+    // and must not inflate frame/FPS statistics.
+    engine::GameLoop skippedLoop(config);
+    int skippedContinueChecks = 0;
+    int skippedRenders = 0;
+    engine::LoopCallbacks skippedCallbacks;
+    skippedCallbacks.shouldContinue = [&skippedContinueChecks] { return ++skippedContinueChecks <= 3; };
+    skippedCallbacks.render = [&skippedRenders](double) {
+        ++skippedRenders;
+        return false;
+    };
+    skippedLoop.run(skippedCallbacks);
+    check(skippedRenders == 3 && skippedLoop.stats().frames == 0,
+          "skipped presentations are not counted as frames");
+    check(skippedLoop.time().framesPerSecond() == 0.0, "skipped presentations do not feed FPS");
 }
 
 } // namespace
 
 int main() {
     testConfigLoading();
+    testPresentationModes();
     testLogger();
     testCamera();
     testSceneAndSystems();

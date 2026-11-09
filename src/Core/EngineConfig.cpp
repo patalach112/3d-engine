@@ -226,6 +226,21 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
     if (section == "render") {
         if (key == "vsync") {
             reader.apply(value, config.render.vsync);
+        } else if (key == "presentmode") {
+            const std::string mode = toLower(value);
+            if (mode == "auto") {
+                config.render.presentMode = PresentationMode::Auto;
+            } else if (mode == "fifo") {
+                config.render.presentMode = PresentationMode::Fifo;
+            } else if (mode == "mailbox") {
+                config.render.presentMode = PresentationMode::Mailbox;
+            } else if (mode == "immediate") {
+                config.render.presentMode = PresentationMode::Immediate;
+            } else if (mode == "fifo_relaxed" || mode == "fifo-relaxed" || mode == "fiforelaxed") {
+                config.render.presentMode = PresentationMode::FifoRelaxed;
+            } else {
+                reader.warnInvalid(value, "one of auto/fifo/mailbox/immediate/fifo_relaxed");
+            }
         } else if (key == "frustumculling") {
             reader.apply(value, config.render.frustumCulling);
         } else if (key == "sortdrawitems") {

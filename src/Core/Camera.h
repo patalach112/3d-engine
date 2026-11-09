@@ -24,8 +24,8 @@ struct CameraConfig {
     // values only control how quickly the rendered orientation/velocity
     // converges to the accumulated target. Using 1-exp(-dt/tau) makes the
     // convergence rate identical at 30, 60, 144, ... FPS. 0 disables it.
-    float lookSmoothingSeconds = 0.03f;
-    float movementSmoothingSeconds = 0.07f;
+    float lookSmoothingSeconds = 0.01f;
+    float movementSmoothingSeconds = 0.03f;
 
     // Absolute pitch limit. Staying below 90 degrees keeps the camera's
     // front vector from ever aligning with the world up vector, which is

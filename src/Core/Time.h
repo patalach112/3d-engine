@@ -9,9 +9,11 @@ namespace engine {
 // Time
 //
 // High-resolution frame clock built on std::chrono::steady_clock (monotonic,
-// never adjusted backwards). Call tick() once per frame; it reports the
-// delta since the previous tick, accumulates total elapsed time, counts
-// frames, and maintains a smoothed frames-per-second estimate.
+// never adjusted backwards). Call tick() once per loop iteration for delta
+// time; call recordPresentedFrame() only after a frame is actually
+// submitted/presented. FPS is calculated from presented frames over a
+// time window, never from the reciprocal of one (possibly near-zero)
+// delta, so swapchain recreation/resizing cannot make it spike falsely.
 // ---------------------------------------------------------------------------
 class Time {
 public:
@@ -23,8 +25,15 @@ public:
     // the first tick measures from this moment.
     void reset();
 
-    // Advances the clock by one frame and returns the delta time in seconds.
+    // Advances the clock by one iteration and returns delta time.
     double tick();
+
+    // Records one actually presented frame in the FPS window.
+    void recordPresentedFrame();
+
+    // Discards the current FPS window (used after a hitch/resize or a
+    // skipped presentation, so stale samples cannot be reported as FPS).
+    void resetFramesPerSecond();
 
     [[nodiscard]] double deltaSeconds() const { return m_deltaSeconds; }
     [[nodiscard]] double elapsedSeconds() const { return m_elapsedSeconds; }
@@ -41,6 +50,8 @@ public:
 private:
     Clock::time_point m_startTime;
     Clock::time_point m_lastTickTime;
+    Clock::time_point m_fpsWindowStart;
+    uint64_t m_fpsWindowFrames = 0;
     double m_deltaSeconds = 0.0;
     double m_elapsedSeconds = 0.0;
     uint64_t m_frameCount = 0;

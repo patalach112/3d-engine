@@ -414,11 +414,23 @@ edited without rebuilding. Lookup order:
 5. Built-in defaults
 
 Invalid or unknown keys never abort startup: they fall back to defaults and
-are reported as warnings. Sections: `[Window]`, `[Render]` (`vsync` selects
-FIFO vs. low-latency present modes), `[Logger]` (level, sinks, rotation,
-async writes), `[Loop]` (fixed-delta, step cap, frame clamp, FPS cap),
-`[Input]` (mouse capture behavior) and `[Camera]` (start pose, movement
-speed/boost, mouse sensitivity, pitch limit, clip planes).
+are reported as warnings. Sections: `[Window]`, `[Render]`, `[Logger]`
+(level, sinks, rotation, async writes), `[Loop]` (fixed-delta, step cap,
+frame clamp, FPS cap), `[Input]` (mouse capture behavior) and `[Camera]`
+(start pose, movement speed/boost, mouse sensitivity, pitch limit, clip
+planes).
+
+Presentation is controlled in `[Render]`: `presentMode` accepts `auto`,
+`fifo`, `mailbox`, `immediate`, and `fifo_relaxed`; an explicit mode
+overrides `vsync`. In `auto`, `vsync = true` selects FIFO while
+`vsync = false` prefers IMMEDIATE then MAILBOX. The shipped default is
+MAILBOX. Mailbox/Immediate also use one frame in flight instead of two,
+so input sampled for a frame is not queued behind an extra CPU frame;
+FIFO retains two frames in flight for throughput. The startup log prints
+the requested mode, the mode actually selected after surface fallback,
+and the frame-in-flight count. FPS is measured from actually presented
+frames over a 0.25-second window: swapchain-rebuilding/skipped iterations
+and resize hitches reset the window instead of creating false spikes.
 
 ## Building
 

@@ -17,9 +17,11 @@ Application::Application(EngineConfig config)
                m_config.window.resizable, m_config.input.captureMouseOnStart),
       m_input(m_window),
       m_context(m_window),
-      m_swapchain(m_context, m_window, m_config.render.vsync),
+      m_swapchain(m_context, m_window,
+                  PresentationSettings{m_config.render.presentMode, m_config.render.vsync}),
       m_pipeline(m_context, m_swapchain),
-      m_renderer(m_context, m_window, m_swapchain, m_pipeline),
+      m_renderer(m_context, m_window, m_swapchain, m_pipeline,
+                 Renderer::framesInFlightForPresentMode(m_swapchain.presentMode())),
       m_gameLoop(m_config.loop),
       m_jobSystem(JobSystem::Config{m_config.performance.jobWorkerCount,
                                     m_config.performance.parallelBatchSize}),
@@ -114,7 +116,10 @@ void Application::run() {
     ENGINE_LOG_INFO("Engine started (fixed timestep "
                     << loop.fixedDeltaSeconds << "s, max " << loop.maxFixedStepsPerFrame
                     << " steps/frame, max FPS " << (loop.maxFps == 0 ? "uncapped" : std::to_string(loop.maxFps))
-                    << ", vsync " << (m_config.render.vsync ? "on" : "off") << ")");
+                    << ", present mode requested " << presentationModeName(m_config.render.presentMode)
+                    << " (vsync " << (m_config.render.vsync ? "on" : "off") << "), using "
+                    << Swapchain::presentModeName(m_swapchain.presentMode()) << ", "
+                    << m_renderer.framesInFlight() << " frame(s) in flight)");
     ENGINE_LOG_INFO("Controls: WASD move, Q/E down/up, Shift boost, mouse look "
                     "(click window to capture mouse, Esc releases / quits)");
 
@@ -160,8 +165,9 @@ void Application::run() {
             }
         }
     };
-    // Rendering always runs last, over fully updated scene state.
-    callbacks.render = [this](double /*interpolationAlpha*/) { m_renderSystem.render(m_scene); };
+    // Rendering always runs last, over fully updated scene state. The
+    // return value lets GameLoop count only presented frames for FPS.
+    callbacks.render = [this](double /*interpolationAlpha*/) { return m_renderSystem.render(m_scene); };
 
     m_gameLoop.run(callbacks);
 

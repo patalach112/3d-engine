@@ -7,15 +7,18 @@
 #include "Graphics/VulkanContext.h"
 #include "Platform/Window.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <stdexcept>
 
 namespace engine {
 
-Renderer::Renderer(VulkanContext& context, Window& window, Swapchain& swapchain, GraphicsPipeline& pipeline)
+Renderer::Renderer(VulkanContext& context, Window& window, Swapchain& swapchain, GraphicsPipeline& pipeline,
+                   uint32_t maxFramesInFlight)
     : m_context(context), m_window(window), m_swapchain(swapchain), m_pipeline(pipeline),
-      m_hud(context, swapchain) {
+      m_hud(context, swapchain),
+      m_framesInFlight(std::clamp(maxFramesInFlight, 1u, static_cast<uint32_t>(kMaxFramesInFlight))) {
     createVertexBuffer();
     createIndexBuffer();
     createUniformBuffers();
@@ -48,7 +51,7 @@ Renderer::~Renderer() {
 }
 
 void Renderer::createCommandBuffers() {
-    m_commandBuffers.resize(kMaxFramesInFlight);
+    m_commandBuffers.resize(m_framesInFlight);
 
     VkCommandBufferAllocateInfo allocateInfo{};
     allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -77,8 +80,8 @@ void Renderer::createRenderFinishedSemaphores() {
 }
 
 void Renderer::createSyncObjects() {
-    m_imageAvailableSemaphores.resize(kMaxFramesInFlight);
-    m_inFlightFences.resize(kMaxFramesInFlight);
+    m_imageAvailableSemaphores.resize(m_framesInFlight);
+    m_inFlightFences.resize(m_framesInFlight);
 
     VkSemaphoreCreateInfo semaphoreInfo{};
     semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -88,7 +91,7 @@ void Renderer::createSyncObjects() {
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT; // first frame must not deadlock
 
     const VkDevice device = m_context.device();
-    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+    for (uint32_t i = 0; i < m_framesInFlight; ++i) {
         if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &m_imageAvailableSemaphores[i]) != VK_SUCCESS ||
             vkCreateFence(device, &fenceInfo, nullptr, &m_inFlightFences[i]) != VK_SUCCESS) {
             throw std::runtime_error("Renderer: failed to create synchronization objects");
@@ -113,8 +116,8 @@ void Renderer::createIndexBuffer() {
 
 void Renderer::createUniformBuffers() {
     constexpr VkDeviceSize bufferSize = sizeof(UniformBufferObject);
-    m_uniformBuffers.reserve(kMaxFramesInFlight);
-    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+    m_uniformBuffers.reserve(m_framesInFlight);
+    for (uint32_t i = 0; i < m_framesInFlight; ++i) {
         Buffer buffer(m_context, bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         buffer.map(); // persistently mapped; rewritten each frame
@@ -125,13 +128,13 @@ void Renderer::createUniformBuffers() {
 void Renderer::createDescriptorPool() {
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSize.descriptorCount = static_cast<uint32_t>(kMaxFramesInFlight);
+    poolSize.descriptorCount = m_framesInFlight;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
-    poolInfo.maxSets = static_cast<uint32_t>(kMaxFramesInFlight);
+    poolInfo.maxSets = m_framesInFlight;
 
     if (vkCreateDescriptorPool(m_context.device(), &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("Renderer: failed to create descriptor pool");
@@ -139,7 +142,7 @@ void Renderer::createDescriptorPool() {
 }
 
 void Renderer::createDescriptorSets() {
-    const std::vector<VkDescriptorSetLayout> layouts(kMaxFramesInFlight, m_pipeline.descriptorSetLayout());
+    const std::vector<VkDescriptorSetLayout> layouts(m_framesInFlight, m_pipeline.descriptorSetLayout());
 
     VkDescriptorSetAllocateInfo allocateInfo{};
     allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -147,12 +150,12 @@ void Renderer::createDescriptorSets() {
     allocateInfo.descriptorSetCount = static_cast<uint32_t>(layouts.size());
     allocateInfo.pSetLayouts = layouts.data();
 
-    m_descriptorSets.resize(kMaxFramesInFlight);
+    m_descriptorSets.resize(m_framesInFlight);
     if (vkAllocateDescriptorSets(m_context.device(), &allocateInfo, m_descriptorSets.data()) != VK_SUCCESS) {
         throw std::runtime_error("Renderer: failed to allocate descriptor sets");
     }
 
-    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+    for (uint32_t i = 0; i < m_framesInFlight; ++i) {
         VkDescriptorBufferInfo bufferInfo{};
         bufferInfo.buffer = m_uniformBuffers[i].handle();
         bufferInfo.offset = 0;
@@ -256,7 +259,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     }
 }
 
-void Renderer::drawFrame(const glm::mat4& view, const glm::mat4& projection,
+bool Renderer::drawFrame(const glm::mat4& view, const glm::mat4& projection,
                          std::span<const DrawItem> drawItems) {
     const VkDevice device = m_context.device();
 
@@ -268,7 +271,7 @@ void Renderer::drawFrame(const glm::mat4& view, const glm::mat4& projection,
                                                    VK_NULL_HANDLE, &imageIndex);
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
         recreateSwapchain();
-        return;
+        return false;
     }
     if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
         throw std::runtime_error("Renderer: failed to acquire swapchain image");
@@ -322,7 +325,8 @@ void Renderer::drawFrame(const glm::mat4& view, const glm::mat4& projection,
         throw std::runtime_error("Renderer: failed to present swapchain image");
     }
 
-    m_currentFrame = (m_currentFrame + 1) % kMaxFramesInFlight;
+    m_currentFrame = (m_currentFrame + 1) % m_framesInFlight;
+    return true;
 }
 
 void Renderer::recreateSwapchain() {
