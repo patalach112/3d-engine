@@ -402,6 +402,50 @@ and **drawn/culled** counts:
   recorded last inside the scene's render pass.
 - Toggle with `[Render] hudEnabled`.
 
+## Phase 7 — Custom Physics & Rigid-Body Collisions ✅
+
+### Components (`src/Physics/PhysicsComponents.h`)
+
+Physics is ECS-native, not an external object hierarchy:
+
+- `RigidBodyComponent` (exactly one 64-byte cache line): velocity,
+  last-step acceleration, accumulated force (cleared after integration),
+  mass/inverse-mass, restitution, friction, static and gravity flags.
+- `ColliderComponent` (dense 48-byte value): box (half-extents), sphere
+  (radius), or plane (`normal·x = offset`). Box/sphere dimensions are
+  local and scaled by `TransformComponent::scale`.
+- `PhysicsSettings`: gravity, damping, restitution velocity threshold,
+  contact slop, position-correction factor, solver iterations, and the
+  parallel batching threshold — all configurable under `[Physics]`.
+
+Scene storage reservation now includes rigid bodies and colliders, so
+their EnTT dense paged arrays are preallocated with the other hot ECS data.
+
+### PhysicsSystem (`src/Scene/Systems/PhysicsSystem.*`)
+
+Runs only in the fixed timestep. Each step snapshots
+`Transform + RigidBody + Collider` entities into a flat body list, then:
+
+1. integrates gravity/forces with semi-implicit Euler in parallel,
+2. computes world collider geometry in parallel,
+3. runs an X-axis sort-and-sweep broad phase (planes handled separately),
+4. evaluates box/box, sphere/sphere, box/sphere, and shape/plane narrow
+   phase pairs in parallel into disjoint contact slots, and
+5. resolves contacts sequentially in deterministic order with normal
+   impulses, restitution, Coulomb friction, and penetration correction.
+
+Slow impacts use zero restitution and a small contact slop, so cubes can
+settle and stack without micro-bouncing. Scratch vectors retain capacity
+between steps, and `parallelFor()` barriers separate every parallel phase
+from sequential solver work.
+
+### Demo scene
+
+The startup scene now has a static floor (flattened cube + plane collider
+at `y = -1.25`) and six rigid-body cubes that fall, bounce, collide, slide,
+and stack in front of the camera. Physics statistics (body/contact counts)
+are available from `PhysicsSystem::lastStats()`.
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
@@ -416,9 +460,10 @@ edited without rebuilding. Lookup order:
 Invalid or unknown keys never abort startup: they fall back to defaults and
 are reported as warnings. Sections: `[Window]`, `[Render]`, `[Logger]`
 (level, sinks, rotation, async writes), `[Loop]` (fixed-delta, step cap,
-frame clamp, FPS cap), `[Input]` (mouse capture behavior) and `[Camera]`
+frame clamp, FPS cap), `[Input]` (mouse capture behavior), `[Camera]`
 (start pose, movement speed/boost, mouse sensitivity, pitch limit, clip
-planes).
+planes), and `[Physics]` (gravity, solver iterations, contact slop,
+resting-impact threshold, and parallel-body threshold).
 
 Presentation is controlled in `[Render]`: `presentMode` accepts `auto`,
 `fifo`, `mailbox`, `immediate`, and `fifo_relaxed`; an explicit mode

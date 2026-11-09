@@ -84,6 +84,7 @@ add_executable(3d-engine
     src/Scene/Scene.cpp
     src/Scene/Components.cpp
     src/Scene/Systems/CameraSystem.cpp
+    src/Scene/Systems/PhysicsSystem.cpp
     src/Scene/Systems/RotationSystem.cpp
     src/Scene/Systems/RenderSystem.cpp
     src/Core/EngineConfig.cpp
@@ -241,6 +242,7 @@ if(BUILD_TESTING)
     src/Scene/Scene.cpp
         src/Scene/Components.cpp
         src/Scene/Systems/CameraSystem.cpp
+        src/Scene/Systems/PhysicsSystem.cpp
         src/Scene/Systems/RotationSystem.cpp
         src/Scene/Systems/RenderSystem.cpp
         src/Graphics/VulkanContext.cpp

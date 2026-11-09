@@ -12,6 +12,7 @@
 #include "Platform/Input.h"
 #include "Platform/Window.h"
 #include "Scene/Scene.h"
+#include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/RenderSystem.h"
 
 namespace engine {
@@ -65,6 +66,7 @@ private:
     VramBudget m_stagingBudget;
     AssetManager m_assets;
     Scene m_scene;
+    PhysicsSystem m_physicsSystem;
     RenderSystem m_renderSystem;
 
     double m_secondsSinceStatsLog = 0.0;

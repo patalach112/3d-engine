@@ -16,6 +16,7 @@
 #include "Scene/DenseIteration.h"
 #include "Scene/Scene.h"
 #include "Scene/Systems/RenderSystem.h"
+#include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
 #include "Core/Concurrency/LockFreeRingBuffer.h"
@@ -90,6 +91,7 @@ void testConfigLoading() {
              << "[Camera]\nmovementSpeed = 7.5\nmouseSensitivity = 0.25\npositionZ = 5\n"
              << "lookSmoothingSeconds = 0.04\nmovementSmoothingSeconds = 0.09\n"
              << "[Input]\ncaptureMouseOnStart = false\n"
+             << "[Physics]\ngravityY = -12.5\nsolverIterations = 7\nparallelMinBodies = 32\n"
              << "[Render]\nfrustumCulling = false\n"
              << "[Performance]\njobWorkerCount = 2\nentityReserve = 4096\nparallelBatchSize = 512\n"
              << "[Render]\nvramBudgetMiB = 2048\nstagingBufferBudgetMiB = 128\nhudEnabled = false\n";
@@ -114,6 +116,9 @@ void testConfigLoading() {
     check(nearlyEqual(config.camera.lookSmoothingSeconds, 0.04f, 1e-6), "camera look smoothing parsed");
     check(nearlyEqual(config.camera.movementSmoothingSeconds, 0.09f, 1e-6), "camera movement smoothing parsed");
     check(!config.input.captureMouseOnStart, "input capture flag parsed");
+    check(nearlyEqual(config.physics.gravity.y, -12.5f, 1e-6), "physics gravity parsed");
+    check(config.physics.solverIterations == 7, "physics solver iterations parsed");
+    check(config.physics.parallelMinBodies == 32, "physics parallel threshold parsed");
     check(!config.render.frustumCulling, "frustum culling flag parsed");
     check(config.performance.jobWorkerCount == 2, "job worker count parsed");
     check(config.performance.parallelBatchSize == 512, "parallel batch size parsed");
@@ -382,6 +387,209 @@ void testCamera() {
           "captured cursor uses GLFW_CURSOR_DISABLED");
     check(engine::Window::cursorModeForCapture(false) == GLFW_CURSOR_NORMAL,
           "released cursor uses GLFW_CURSOR_NORMAL");
+}
+
+void testPhysics() {
+    std::cout << "Physics\n";
+    using engine::ColliderComponent;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::RigidBodyComponent;
+    using engine::TransformComponent;
+
+    // Component API and layout are part of the DOD contract.
+    RigidBodyComponent body(2.0f);
+    check(nearlyEqual(body.inverseMass, 0.5), "rigid body inverse mass follows mass");
+    body.addForce(glm::vec3{4.0f, 0.0f, 0.0f});
+    check(nearlyVec3(body.force, glm::vec3{4.0f, 0.0f, 0.0f}), "rigid body accumulates forces");
+
+    // Semi-implicit Euler gravity integration: v += g*dt, then x += v*dt.
+    {
+        engine::Scene scene;
+        auto entity = scene.createEntity("Falling");
+        entity.addComponent<TransformComponent>(glm::vec3{0.0f, 10.0f, 0.0f});
+        entity.addComponent<RigidBodyComponent>(1.0f);
+        entity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        const auto stats = physics.update(scene, 0.1, settings);
+        const auto& transform = entity.getComponent<TransformComponent>();
+        const auto& rigidBody = entity.getComponent<RigidBodyComponent>();
+        check(stats.bodies == 1 && stats.dynamicBodies == 1, "physics snapshots one dynamic body");
+        check(nearlyEqual(rigidBody.velocity.y, -1.0), "gravity integrates velocity by delta time");
+        check(nearlyEqual(transform.position.y, 9.9, 1e-4), "velocity integrates position by delta time");
+        check(nearlyEqual(rigidBody.acceleration.y, -10.0), "rigid body records integrated acceleration");
+    }
+
+    // Force / mass integration, and forces are consumed exactly once.
+    {
+        engine::Scene scene;
+        auto entity = scene.createEntity("Forced");
+        entity.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& rigidBody = entity.addComponent<RigidBodyComponent>(2.0f);
+        rigidBody.addForce(glm::vec3{10.0f, 0.0f, 0.0f});
+        entity.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 0.1, settings);
+        check(nearlyEqual(rigidBody.velocity.x, 0.5), "force divided by mass integrates velocity");
+        check(nearlyVec3(rigidBody.force, glm::vec3{0.0f}), "physics clears consumed forces");
+    }
+
+    // Box against a static plane: a 4 m/s impact with restitution 0.5
+    // rebounds at 2 m/s and is positionally corrected out of the floor.
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("Floor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.restitution = 0.5f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+
+        auto cube = scene.createEntity("BouncingCube");
+        cube.addComponent<TransformComponent>(glm::vec3{0.0f, 0.45f, 0.0f});
+        auto& cubeBody = cube.addComponent<RigidBodyComponent>(1.0f);
+        cubeBody.velocity = glm::vec3{0.0f, -4.0f, 0.0f};
+        cubeBody.restitution = 0.5f;
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        const auto stats = physics.update(scene, 1.0 / 60.0, settings);
+        check(stats.contacts == 1, "box-plane narrow phase reports one contact");
+        check(nearlyEqual(cubeBody.velocity.y, 2.0, 1e-4), "floor bounce applies restitution");
+        check(cube.getComponent<TransformComponent>().position.y > 0.43f,
+              "floor contact corrects penetration");
+    }
+
+    // Perfectly elastic equal-mass sphere collision swaps velocities and
+    // therefore conserves both momentum and kinetic energy.
+    {
+        engine::Scene scene;
+        auto left = scene.createEntity("LeftSphere");
+        left.addComponent<TransformComponent>(glm::vec3{-0.49f, 0.0f, 0.0f});
+        auto& leftBody = left.addComponent<RigidBodyComponent>(2.0f);
+        leftBody.velocity = glm::vec3{2.0f, 0.0f, 0.0f};
+        leftBody.restitution = 1.0f;
+        leftBody.friction = 0.0f;
+        left.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+
+        auto right = scene.createEntity("RightSphere");
+        right.addComponent<TransformComponent>(glm::vec3{0.49f, 0.0f, 0.0f});
+        auto& rightBody = right.addComponent<RigidBodyComponent>(2.0f);
+        rightBody.velocity = glm::vec3{-1.0f, 0.0f, 0.0f};
+        rightBody.restitution = 1.0f;
+        rightBody.friction = 0.0f;
+        right.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+
+        const float momentumBefore = 2.0f * leftBody.velocity.x + 2.0f * rightBody.velocity.x;
+        const float energyBefore = leftBody.velocity.x * leftBody.velocity.x +
+                                   rightBody.velocity.x * rightBody.velocity.x;
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        settings.restitutionVelocityThreshold = 0.0f;
+        PhysicsSystem physics;
+        physics.update(scene, 0.01, settings);
+        const float momentumAfter = 2.0f * leftBody.velocity.x + 2.0f * rightBody.velocity.x;
+        const float energyAfter = leftBody.velocity.x * leftBody.velocity.x +
+                                  rightBody.velocity.x * rightBody.velocity.x;
+        check(nearlyEqual(leftBody.velocity.x, -1.0, 1e-4) && nearlyEqual(rightBody.velocity.x, 2.0, 1e-4),
+              "elastic collision swaps equal-mass velocities");
+        check(nearlyEqual(momentumAfter, momentumBefore, 1e-4), "elastic collision conserves momentum");
+        check(nearlyEqual(energyAfter, energyBefore, 1e-4), "elastic collision conserves kinetic energy factor");
+    }
+
+    // Inelastic box collision reaches the momentum-conserving common velocity.
+    {
+        engine::Scene scene;
+        auto left = scene.createEntity("LeftBox");
+        left.addComponent<TransformComponent>(glm::vec3{-0.49f, 0.0f, 0.0f});
+        auto& leftBody = left.addComponent<RigidBodyComponent>(1.0f);
+        leftBody.velocity = glm::vec3{3.0f, 0.0f, 0.0f};
+        leftBody.restitution = 0.0f;
+        leftBody.friction = 0.0f;
+        left.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto right = scene.createEntity("RightBox");
+        right.addComponent<TransformComponent>(glm::vec3{0.49f, 0.0f, 0.0f});
+        auto& rightBody = right.addComponent<RigidBodyComponent>(1.0f);
+        rightBody.velocity = glm::vec3{-1.0f, 0.0f, 0.0f};
+        rightBody.restitution = 0.0f;
+        rightBody.friction = 0.0f;
+        right.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 0.01, settings);
+        check(nearlyEqual(leftBody.velocity.x, 1.0, 1e-4) && nearlyEqual(rightBody.velocity.x, 1.0, 1e-4),
+              "inelastic box collision reaches common momentum velocity");
+    }
+
+    // Stacking: two unit boxes on a plane settle at their resting heights
+    // with small residual velocity (no sinking, explosion, or jitter).
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("StackFloor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.restitution = 0.0f;
+        floorBody.friction = 0.6f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+
+        auto lower = scene.createEntity("LowerBox");
+        lower.addComponent<TransformComponent>(glm::vec3{0.0f, 0.5f, 0.0f});
+        auto& lowerBody = lower.addComponent<RigidBodyComponent>(1.0f);
+        lowerBody.restitution = 0.0f;
+        lowerBody.friction = 0.6f;
+        lower.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto upper = scene.createEntity("UpperBox");
+        upper.addComponent<TransformComponent>(glm::vec3{0.0f, 1.5f, 0.0f});
+        auto& upperBody = upper.addComponent<RigidBodyComponent>(1.0f);
+        upperBody.restitution = 0.0f;
+        upperBody.friction = 0.6f;
+        upper.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        for (int step = 0; step < 180; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float lowerY = lower.getComponent<TransformComponent>().position.y;
+        const float upperY = upper.getComponent<TransformComponent>().position.y;
+        check(lowerY > 0.47f && lowerY < 0.53f, "stacked lower box rests on the floor");
+        check(upperY > 1.45f && upperY < 1.55f, "stacked upper box rests on the lower box");
+        check(glm::length(lowerBody.velocity) < 0.1f && glm::length(upperBody.velocity) < 0.1f,
+              "stacked boxes settle without jitter");
+    }
+
+    // Broad-phase reporting and JobSystem-parallel integration.
+    {
+        engine::Scene scene;
+        std::vector<engine::Entity> entities;
+        for (int i = 0; i < 256; ++i) {
+            auto entity = scene.createEntity("ParallelBody");
+            entity.addComponent<TransformComponent>(glm::vec3{static_cast<float>(i) * 3.0f, 10.0f, 0.0f});
+            entity.addComponent<RigidBodyComponent>(1.0f);
+            entity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+            entities.push_back(entity);
+        }
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        settings.parallelMinBodies = 32;
+        engine::JobSystem jobs{engine::JobSystem::Config{3, 1024}};
+        PhysicsSystem physics;
+        const auto stats = physics.update(scene, 0.1, settings, jobs);
+        bool integrated = stats.bodies == 256 && stats.candidatePairs == 0;
+        for (auto& entity : entities) {
+            integrated = integrated && nearlyEqual(entity.getComponent<RigidBodyComponent>().velocity.y, -1.0) &&
+                         nearlyEqual(entity.getComponent<TransformComponent>().position.y, 9.9, 1e-4);
+        }
+        check(integrated, "JobSystem-parallel physics integrates every body exactly once");
+    }
 }
 
 void testSceneAndSystems() {
@@ -1420,6 +1628,7 @@ int main() {
     testPresentationModes();
     testLogger();
     testCamera();
+    testPhysics();
     testSceneAndSystems();
     testPoolAllocator();
     testHudOverlay();

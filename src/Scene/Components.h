@@ -3,6 +3,7 @@
 #include "Core/Camera.h"
 #include "Core/HardwareProfile.h"
 #include "Geometry/Bounds.h"
+#include "Physics/PhysicsComponents.h"
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>

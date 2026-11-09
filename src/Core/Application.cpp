@@ -5,6 +5,7 @@
 #include "Geometry/Cube.h"
 #include "Scene/Components.h"
 #include "Scene/Systems/CameraSystem.h"
+#include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
 #include <utility>
@@ -86,29 +87,45 @@ void Application::buildScene() {
     Entity player = m_scene.createEntity("Player");
     player.addComponent<CameraComponent>(m_config.camera);
 
-    // The original Phase 1 cube, now an ECS entity at the origin.
-    Entity cube = m_scene.createEntity("Cube");
-    cube.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, 0.0f});
-    cube.addComponent<MeshComponent>("cube");
+    // Static floor: rendered as a flattened cube whose top surface is
+    // y=-1.25, with an infinite plane collider at exactly that height.
+    constexpr float floorTop = -1.25f;
+    Entity floor = m_scene.createEntity("Floor");
+    auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, floorTop - 0.05f, -2.0f});
+    floorTransform.scale = glm::vec3{9.0f, 0.1f, 9.0f};
+    floor.addComponent<MeshComponent>("cube");
+    auto& floorBody = floor.addComponent<RigidBodyComponent>();
+    floorBody.setStatic(true);
+    floorBody.restitution = 0.35f;
+    floorBody.friction = 0.6f;
+    floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, floorTop));
 
-    // Two companions demonstrating multi-entity rendering and the
-    // fixed-step rotation system (they spin deterministically).
-    Entity leftCube = m_scene.createEntity("CubeLeft");
-    auto& leftTransform = leftCube.addComponent<TransformComponent>(glm::vec3{-2.0f, 0.5f, -2.0f});
-    leftTransform.scale = glm::vec3{0.6f};
-    auto& leftMesh = leftCube.addComponent<MeshComponent>("cube");
-    leftMesh.materialName = "doubleSided";
-    leftCube.addComponent<SpinComponent>(glm::vec3{20.0f, 45.0f, 0.0f});
+    // Falling/bouncing rigid-body cubes. Their unit-cube mesh is scaled
+    // by TransformComponent; the box collider's local half-extents are
+    // 0.5, so PhysicsSystem derives each world AABB from that same scale.
+    const auto addPhysicsCube = [this](const char* name, const glm::vec3& position, float scale,
+                                       const glm::vec3& velocity) {
+        Entity entity = m_scene.createEntity(name);
+        auto& transform = entity.addComponent<TransformComponent>(position);
+        transform.scale = glm::vec3{scale};
+        entity.addComponent<MeshComponent>("cube");
+        auto& body = entity.addComponent<RigidBodyComponent>(scale * scale * scale);
+        body.velocity = velocity;
+        body.restitution = 0.38f;
+        body.friction = 0.5f;
+        entity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        return entity;
+    };
 
-    Entity rightCube = m_scene.createEntity("CubeRight");
-    auto& rightTransform = rightCube.addComponent<TransformComponent>(glm::vec3{2.0f, -0.5f, -2.5f});
-    rightTransform.scale = glm::vec3{0.8f};
-    auto& rightMesh = rightCube.addComponent<MeshComponent>("cube");
-    rightMesh.materialName = "doubleSided";
-    rightCube.addComponent<SpinComponent>(glm::vec3{0.0f, -30.0f, 15.0f});
+    addPhysicsCube("CubeCenter", glm::vec3{0.0f, 1.4f, -2.4f}, 0.65f, glm::vec3{0.15f, 0.0f, 0.0f});
+    addPhysicsCube("CubeCenterTop", glm::vec3{0.12f, 2.8f, -2.35f}, 0.65f, glm::vec3{0.0f, 0.0f, 0.0f});
+    addPhysicsCube("CubeLeft", glm::vec3{-1.25f, 1.9f, -2.2f}, 0.55f, glm::vec3{0.25f, 0.0f, 0.0f});
+    addPhysicsCube("CubeLeftTop", glm::vec3{-1.18f, 3.1f, -2.15f}, 0.55f, glm::vec3{0.0f, 0.0f, 0.0f});
+    addPhysicsCube("CubeRight", glm::vec3{1.3f, 1.6f, -2.1f}, 0.5f, glm::vec3{-0.2f, 0.0f, 0.0f});
+    addPhysicsCube("CubeRightTop", glm::vec3{1.22f, 2.75f, -2.05f}, 0.5f, glm::vec3{0.0f, 0.0f, 0.0f});
 
-    ENGINE_LOG_INFO("Scene built: " << m_scene.entityCount() << " entities (player camera, "
-                                    << "1 static cube, 2 spinning cubes)");
+    ENGINE_LOG_INFO("Scene built: " << m_scene.entityCount() << " entities (player camera, static physics floor, "
+                                    << "6 falling rigid-body cubes)");
 }
 
 void Application::run() {
@@ -135,6 +152,10 @@ void Application::run() {
     // integration is data-parallel across worker threads, and
     // parallelFor()'s return is the barrier before the variable update.
     callbacks.fixedUpdate = [this](double fixedDeltaSeconds) {
+        // Rigid-body physics is deterministic simulation, so it lives in
+        // the fixed step (never the variable/render-rate update). Its
+        // parallel phases return at JobSystem barriers before rendering.
+        m_physicsSystem.update(m_scene, fixedDeltaSeconds, m_config.physics, m_jobSystem);
         RotationSystem::update(m_scene, fixedDeltaSeconds, m_jobSystem);
     };
     // Player control is frame-rate dependent by nature (mouse look), so

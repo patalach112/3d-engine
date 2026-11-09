@@ -354,6 +354,53 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
         return true;
     }
 
+    // --- [Physics] -------------------------------------------------------------
+    if (section == "physics") {
+        double doubleField = 0.0;
+        if (key == "enabled") {
+            reader.apply(value, config.physics.enabled);
+        } else if (key == "gravityx") {
+            if (reader.applyDouble(value, doubleField, -1000.0, 1000.0)) {
+                config.physics.gravity.x = static_cast<float>(doubleField);
+            }
+        } else if (key == "gravityy") {
+            if (reader.applyDouble(value, doubleField, -1000.0, 1000.0)) {
+                config.physics.gravity.y = static_cast<float>(doubleField);
+            }
+        } else if (key == "gravityz") {
+            if (reader.applyDouble(value, doubleField, -1000.0, 1000.0)) {
+                config.physics.gravity.z = static_cast<float>(doubleField);
+            }
+        } else if (key == "lineardamping") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 100.0)) {
+                config.physics.linearDamping = static_cast<float>(doubleField);
+            }
+        } else if (key == "restitutionvelocitythreshold") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 1000.0)) {
+                config.physics.restitutionVelocityThreshold = static_cast<float>(doubleField);
+            }
+        } else if (key == "contactslop") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 1.0)) {
+                config.physics.contactSlop = static_cast<float>(doubleField);
+            }
+        } else if (key == "positioncorrection") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 1.0)) {
+                config.physics.positionCorrection = static_cast<float>(doubleField);
+            }
+        } else if (key == "solveriterations") {
+            if (reader.applyInteger(value, intField, 0, 64)) {
+                config.physics.solverIterations = static_cast<uint32_t>(intField);
+            }
+        } else if (key == "parallelminbodies") {
+            if (reader.applyInteger(value, intField, 1, 10000000)) {
+                config.physics.parallelMinBodies = static_cast<uint32_t>(intField);
+            }
+        } else {
+            return false;
+        }
+        return true;
+    }
+
     // --- [Input] ---------------------------------------------------------------
     if (section == "input") {
         if (key == "capturemouseonstart") {

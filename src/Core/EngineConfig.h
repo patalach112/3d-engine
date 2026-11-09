@@ -4,6 +4,7 @@
 #include "Core/GameLoop.h"
 #include "Core/Logger.h"
 #include "Core/PresentationMode.h"
+#include "Physics/PhysicsComponents.h"
 #include "Platform/Input.h"
 
 #include <filesystem>
@@ -80,6 +81,7 @@ struct EngineConfig {
     CameraConfig camera;
     InputConfig input;
     PerformanceConfig performance;
+    PhysicsSettings physics;
 
     // File the values were actually loaded from; empty when defaults were used.
     std::string sourcePath;
