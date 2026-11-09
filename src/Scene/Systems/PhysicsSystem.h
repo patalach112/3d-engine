@@ -111,6 +111,13 @@ private:
         // capsule endpoints), so resting stacks are supported across a
         // face instead of balanced on one central point.
         glm::vec3 point{0.0f};
+        // Pre-centroid manifold feature point (a real corner/endpoint).
+        // The velocity solve acts at the manifold centroid (contact.point),
+        // but warm-start identity must follow the feature: after centroid
+        // reduction every point of a pair shares one point, so matching
+        // warm impulses by contact.point would hand every contact the
+        // first contact's share and apply it manifoldCount times.
+        glm::vec3 featurePoint{0.0f};
         float penetration = 0.0f;
         float restitution = 0.0f;
         float friction = 0.0f;
@@ -118,6 +125,10 @@ private:
         float normalImpulse = 0.0f;
         float restitutionTarget = 0.0f;
         glm::vec3 tangentImpulse{0.0f};
+        // True when warm starting matched this contact to the previous
+        // sub-step's manifold: a persistent contact. Restitution is
+        // suppressed for persistent contacts (only new impacts bounce).
+        bool persistent = false;
         bool continuous = false;
         float timeOfImpact = 1.0f;
         uint8_t manifoldCount = 1; // contacts sharing this pair (position correction is split across them)
@@ -170,7 +181,11 @@ private:
     void narrowPhase(JobSystem* jobs, uint32_t parallelMinBodies);
     void applyContinuousCollisionStops();
     void buildIslands();
-    void solveConstraints(const PhysicsSettings& settings, JobSystem* jobs);
+    void solveConstraints(const PhysicsSettings& settings, JobSystem* jobs, float dt);
+    // Bleeds residual linear/angular energy out of low-speed bodies in
+    // contact (see PhysicsSettings::contactLinearDamping) and snaps
+    // sub-threshold remainders to exact rest.
+    void applyRestingContactDamping(const PhysicsSettings& settings, float dt);
 
     [[nodiscard]] std::optional<Contact> collide(uint32_t bodyA, uint32_t bodyB) const;
     // Multi-point manifold generation: appends up to four contacts for

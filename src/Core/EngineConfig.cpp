@@ -375,6 +375,18 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             if (reader.applyDouble(value, doubleField, -1e-9, 100.0)) {
                 config.physics.linearDamping = static_cast<float>(doubleField);
             }
+        } else if (key == "angulardamping") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 100.0)) {
+                config.physics.angularDamping = static_cast<float>(doubleField);
+            }
+        } else if (key == "contactlineardamping") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 1000.0)) {
+                config.physics.contactLinearDamping = static_cast<float>(doubleField);
+            }
+        } else if (key == "contactangulardamping") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 1000.0)) {
+                config.physics.contactAngularDamping = static_cast<float>(doubleField);
+            }
         } else if (key == "restitutionvelocitythreshold") {
             if (reader.applyDouble(value, doubleField, -1e-9, 1000.0)) {
                 config.physics.restitutionVelocityThreshold = static_cast<float>(doubleField);
@@ -386,6 +398,10 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
         } else if (key == "positioncorrection") {
             if (reader.applyDouble(value, doubleField, -1e-9, 1.0)) {
                 config.physics.positionCorrection = static_cast<float>(doubleField);
+            }
+        } else if (key == "maxpositioncorrection") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 1.0)) {
+                config.physics.maxPositionCorrection = static_cast<float>(doubleField);
             }
         } else if (key == "solveriterations") {
             if (reader.applyInteger(value, intField, 0, 64)) {
@@ -401,6 +417,22 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             }
         } else if (key == "sleepenabled") {
             reader.apply(value, config.physics.sleepEnabled);
+        } else if (key == "sleepspeedthreshold") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 10.0)) {
+                config.physics.sleepSpeedThreshold = static_cast<float>(doubleField);
+            }
+        } else if (key == "sleepangularthreshold") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 3600.0)) {
+                config.physics.sleepAngularThreshold = static_cast<float>(doubleField);
+            }
+        } else if (key == "sleepdelayseconds") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 60.0)) {
+                config.physics.sleepDelaySeconds = static_cast<float>(doubleField);
+            }
+        } else if (key == "wakespeedthreshold") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 100.0)) {
+                config.physics.wakeSpeedThreshold = static_cast<float>(doubleField);
+            }
         } else if (key == "parallelminbodies") {
             if (reader.applyInteger(value, intField, 1, 10000000)) {
                 config.physics.parallelMinBodies = static_cast<uint32_t>(intField);

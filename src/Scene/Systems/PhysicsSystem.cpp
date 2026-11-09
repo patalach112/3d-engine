@@ -267,7 +267,7 @@ void PhysicsSystem::stepOnce(Scene& scene, double fixedDeltaSeconds, const Physi
     narrowPhase(jobs, settings.parallelMinBodies);
     applyContinuousCollisionStops();
     buildIslands();
-    solveConstraints(settings, jobs);
+    solveConstraints(settings, jobs, static_cast<float>(fixedDeltaSeconds));
 
     // Peak across sub-steps: a contact that exists only in the first
     // sub-step (e.g. a bounce) is still this update's contact report.
@@ -579,6 +579,10 @@ void PhysicsSystem::integrate(double fixedDeltaSeconds, const PhysicsSettings& s
                 body.angularMomentum = worldInertia * angularVelocity;
             }
             body.angularMomentum += body.torque * dt;
+            const float angularDamping = glm::clamp(settings.angularDamping, 0.0f, 1.0f);
+            if (angularDamping > 0.0f) {
+                body.angularMomentum *= std::max(0.0f, 1.0f - angularDamping * dt);
+            }
             angularVelocity = inverseInertiaWorld(static_cast<uint32_t>(i), body.angularMomentum);
 
             const float angularSpeed = glm::length(angularVelocity);
@@ -841,22 +845,38 @@ void PhysicsSystem::narrowPhase(JobSystem* jobs, uint32_t parallelMinBodies) {
         contact.manifoldCount = manifoldCounts[key];
     }
 
+    for (Contact& contact : m_contacts) {
+        contact.featurePoint = contact.point;
+    }
+
     // Manifold centroid reduction for the velocity solve: every point of
     // a manifold shares the manifold's centroid as its lever arm. A face
     // contact's centroid sits under the center of mass, so resting and
     // sliding bodies get no spurious pitch/roll/yaw torque from
     // sequential per-corner impulses (the classic manifold ratchet),
     // while an edge/corner manifold's centroid is genuinely offset, so
-    // real tipping moments still resolve through it. Per-point
-    // penetration depths are kept for the positional pass.
+    // real tipping moments still resolve through it. The centroid is
+    // weighted by per-point penetration depth, so when a box leans its
+    // loaded (deeper) corners pull the force line toward themselves —
+    // the pressure-shift righting moment that lets offset stacks
+    // settle instead of rocking forever. Falls back to the plain
+    // centroid when every depth is zero (resting exactly at the slop).
     std::unordered_map<uint64_t, glm::vec3> centroidSums;
+    std::unordered_map<uint64_t, glm::vec3> plainSums;
+    std::unordered_map<uint64_t, float> centroidWeights;
     for (const Contact& contact : m_contacts) {
         const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
-        centroidSums[key] += contact.point;
+        const float weight = std::max(contact.penetration, 0.0f);
+        centroidSums[key] += contact.point * weight;
+        plainSums[key] += contact.point;
+        centroidWeights[key] += weight;
     }
     for (Contact& contact : m_contacts) {
         const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
-        contact.point = centroidSums[key] / static_cast<float>(contact.manifoldCount);
+        const float totalWeight = centroidWeights[key];
+        contact.point = totalWeight > kEpsilon
+                            ? centroidSums[key] / totalWeight
+                            : plainSums[key] / static_cast<float>(contact.manifoldCount);
     }
 }
 
@@ -1066,59 +1086,99 @@ void PhysicsSystem::collideManifold(uint32_t bodyA, uint32_t bodyB, std::vector<
                 }
             }
         };
+        // Each manifold point also gets its own penetration depth
+        // along the normal: how far that corner has crossed the other
+        // box's near face. A leaning box's deep corner carries a
+        // larger depth than its lifted corner — the manifold centroid
+        // below is weighted by these depths, so the solver's force
+        // line shifts onto the loaded edge and rights the box, the
+        // way real contact pressure redistributes.
+        const glm::vec3 supportA = supportPointWorld(bodyA, base->normal);
+        const glm::vec3 supportB = supportPointWorld(bodyB, -base->normal);
         std::vector<glm::vec3> points;
-        cornersInside(a, b, base->normal, base->penetration, points);
-        cornersInside(b, a, base->normal, base->penetration, points);
+        std::vector<float> pointPenetrations;
+        const auto collectWithDepth = [&](uint32_t source, uint32_t container, const glm::vec3& farSupport) {
+            std::vector<glm::vec3> inside;
+            cornersInside(m_geometry[source], m_geometry[container], base->normal, base->penetration, inside);
+            for (const glm::vec3& point : inside) {
+                points.push_back(point);
+                const float depth = source == bodyA ? glm::dot(point - farSupport, base->normal)
+                                                    : glm::dot(farSupport - point, base->normal);
+                pointPenetrations.push_back(std::max(depth, 0.0f));
+            }
+        };
+        collectWithDepth(bodyA, bodyB, supportB);
+        collectWithDepth(bodyB, bodyA, supportA);
 
         if (points.size() >= 2) {
-            std::sort(points.begin(), points.end(), [](const glm::vec3& lhs, const glm::vec3& rhs) {
-                if (lhs.x != rhs.x) {
-                    return lhs.x < rhs.x;
+            // Sort/de-duplicate/reduce points with their depths attached.
+            std::vector<size_t> order(points.size());
+            for (size_t i = 0; i < order.size(); ++i) {
+                order[i] = i;
+            }
+            std::sort(order.begin(), order.end(), [&points](size_t lhs, size_t rhs) {
+                if (points[lhs].x != points[rhs].x) {
+                    return points[lhs].x < points[rhs].x;
                 }
-                if (lhs.y != rhs.y) {
-                    return lhs.y < rhs.y;
+                if (points[lhs].y != points[rhs].y) {
+                    return points[lhs].y < points[rhs].y;
                 }
-                return lhs.z < rhs.z;
+                return points[lhs].z < points[rhs].z;
             });
-            points.erase(std::unique(points.begin(), points.end(),
-                                     [](const glm::vec3& lhs, const glm::vec3& rhs) {
-                                         return glm::dot(lhs - rhs, lhs - rhs) < 1e-8f;
-                                     }),
-                         points.end());
+            std::vector<glm::vec3> sortedPoints;
+            std::vector<float> sortedPenetrations;
+            for (const size_t index : order) {
+                if (!sortedPoints.empty() &&
+                    glm::dot(sortedPoints.back() - points[index], sortedPoints.back() - points[index]) < 1e-8f) {
+                    sortedPenetrations.back() = std::max(sortedPenetrations.back(), pointPenetrations[index]);
+                    continue;
+                }
+                sortedPoints.push_back(points[index]);
+                sortedPenetrations.push_back(pointPenetrations[index]);
+            }
+            points = std::move(sortedPoints);
+            pointPenetrations = std::move(sortedPenetrations);
             if (points.size() > 4) {
                 // Farthest-point reduction: keep four points spread
                 // across the contact face, never clustered on one edge
                 // (a clustered manifold tips the resting body over).
-                std::vector<glm::vec3> reduced;
-                reduced.push_back(points.front());
+                std::vector<size_t> reduced{0};
                 while (reduced.size() < 4) {
                     float bestDistance = -1.0f;
                     size_t bestIndex = 0;
                     for (size_t i = 0; i < points.size(); ++i) {
                         bool alreadyPicked = false;
-                        for (const glm::vec3& picked : reduced) {
-                            alreadyPicked = alreadyPicked || picked == points[i];
+                        for (const size_t picked : reduced) {
+                            alreadyPicked = alreadyPicked || picked == i;
                         }
                         if (alreadyPicked) {
                             continue;
                         }
                         float minDistance = 1e30f;
-                        for (const glm::vec3& picked : reduced) {
+                        for (const size_t picked : reduced) {
                             minDistance = std::min(minDistance,
-                                                   glm::dot(picked - points[i], picked - points[i]));
+                                                   glm::dot(points[picked] - points[i], points[picked] - points[i]));
                         }
                         if (minDistance > bestDistance) {
                             bestDistance = minDistance;
                             bestIndex = i;
                         }
                     }
-                    reduced.push_back(points[bestIndex]);
+                    reduced.push_back(bestIndex);
                 }
-                points = std::move(reduced);
+                std::vector<glm::vec3> reducedPoints;
+                std::vector<float> reducedPenetrations;
+                for (const size_t index : reduced) {
+                    reducedPoints.push_back(points[index]);
+                    reducedPenetrations.push_back(pointPenetrations[index]);
+                }
+                points = std::move(reducedPoints);
+                pointPenetrations = std::move(reducedPenetrations);
             }
-            for (const glm::vec3& point : points) {
+            for (size_t i = 0; i < points.size(); ++i) {
                 Contact contact = *base;
-                contact.point = point;
+                contact.point = points[i];
+                contact.penetration = pointPenetrations[i];
                 out.push_back(contact);
             }
             return;
@@ -1737,12 +1797,13 @@ void PhysicsSystem::prepareWarmStarting(const PhysicsSettings& settings) {
     for (Contact& contact : m_contacts) {
         const uint64_t key = (static_cast<uint64_t>(contact.bodyA) << 32u) | contact.bodyB;
         const glm::vec3 localPoint = glm::transpose(m_geometry[contact.bodyA].axes) *
-                                     (contact.point - m_geometry[contact.bodyA].center);
+                                     (contact.featurePoint - m_geometry[contact.bodyA].center);
         for (const WarmContact& warm : m_warmContacts) {
             if (warm.pairKey == key && glm::dot(warm.normal, contact.normal) > 0.5f &&
                 glm::dot(warm.localPointA - localPoint, warm.localPointA - localPoint) < 0.0025f) {
                 contact.normalImpulse = warm.normalImpulse;
                 contact.tangentImpulse = warm.tangentImpulse;
+                contact.persistent = true;
                 applyWarmStart(contact);
                 break;
             }
@@ -1753,7 +1814,13 @@ void PhysicsSystem::prepareWarmStarting(const PhysicsSettings& settings) {
         const glm::vec3 relativeVelocity =
             pointVelocity(contact.bodyB, contact.point) - pointVelocity(contact.bodyA, contact.point);
         const float vn = glm::dot(relativeVelocity, contact.normal);
-        contact.restitutionTarget = vn < -settings.restitutionVelocityThreshold ? -contact.restitution * vn : 0.0f;
+        // Restitution fires only on a new impact faster than the rest
+        // threshold. A persistent contact keeps target 0 no matter how
+        // the island's other contacts shuffle velocities around: in a
+        // stack, re-applying restitution against an already-resting
+        // neighbour (backed by an immovable floor) is a launch pump.
+        contact.restitutionTarget =
+            !contact.persistent && vn < -settings.restitutionVelocityThreshold ? -contact.restitution * vn : 0.0f;
     }
 }
 
@@ -1768,7 +1835,7 @@ void PhysicsSystem::storeWarmStarting() {
         // accumulated impulse is one share of the pair total; every
         // point re-applies its own share next step (see prepare).
         warm.localPointA = glm::transpose(m_geometry[contact.bodyA].axes) *
-                           (contact.point - m_geometry[contact.bodyA].center);
+                           (contact.featurePoint - m_geometry[contact.bodyA].center);
         warm.normalImpulse = contact.normalImpulse;
         warm.restitutionTarget = contact.restitutionTarget;
         warm.tangentImpulse = contact.tangentImpulse;
@@ -1888,7 +1955,7 @@ void PhysicsSystem::buildIslands() {
     m_lastStats.islands = m_islands.size();
 }
 
-void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem* jobs) {
+void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem* jobs, float dt) {
     // Wake pass: a sleeping body struck hard enough (or deeply
     // penetrated, or dragged by an awake joint partner) rejoins the
     // simulation; gentle resting contact leaves it asleep and immovable.
@@ -1900,8 +1967,16 @@ void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem*
                 continue;
             }
             const float approachSpeed = -glm::dot(b.velocity - a.velocity, contact.normal);
-            if (contact.penetration > 4.0f * settings.contactSlop ||
-                approachSpeed > settings.wakeSpeedThreshold) {
+            // Wake on a genuine impact, or on severe *and* moving
+            // penetration. Penetration alone is not enough: positional
+            // correction in a neighbouring awake body can transiently
+            // deepen a sleeping body's contact on paper, and waking it
+            // for that just re-ignites the jitter the sleep state was
+            // supposed to end.
+            const bool hardImpact = approachSpeed > settings.wakeSpeedThreshold;
+            const bool severeMovingPenetration = contact.penetration > std::max(8.0f * settings.contactSlop, 0.02f) &&
+                                                 approachSpeed > 0.05f;
+            if (hardImpact || severeMovingPenetration) {
                 wakeBody(a.sleeping ? contact.bodyA : contact.bodyB);
             }
         }
@@ -1954,7 +2029,61 @@ void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem*
             solveOneIsland(island);
         }
     }
+    applyRestingContactDamping(settings, dt);
     storeWarmStarting();
+}
+
+void PhysicsSystem::applyRestingContactDamping(const PhysicsSettings& settings, float dt) {
+    if (dt <= 0.0f || (settings.contactLinearDamping <= 0.0f && settings.contactAngularDamping <= 0.0f)) {
+        return;
+    }
+    std::vector<char> inContact(m_bodies.size(), 0);
+    for (const Contact& contact : m_contacts) {
+        // Only persistent, weight-bearing contacts qualify: a contact
+        // born this sub-step is an impact whose post-solve velocity is
+        // the solver's exact answer (bleeding it would break momentum
+        // conservation), and a side contact (wall, zero-gravity bump)
+        // is not "resting" on anything. Stacks and floor contacts have
+        // near-vertical normals and persist across sub-steps.
+        if (!contact.persistent || std::abs(contact.normal.y) < 0.5f) {
+            continue;
+        }
+        inContact[contact.bodyA] = 1;
+        inContact[contact.bodyB] = 1;
+    }
+    const float linearFactor = std::exp(-std::max(settings.contactLinearDamping, 0.0f) * dt);
+    const float angularFactor = std::exp(-std::max(settings.contactAngularDamping, 0.0f) * dt);
+    for (size_t i = 0; i < m_bodies.size(); ++i) {
+        if (inContact[i] == 0) {
+            continue;
+        }
+        RigidBodyComponent& body = *m_bodies[i].body;
+        // Only sleep-eligible bodies are damped: the player (allowSleep
+        // = false) must never have its driven motion bled off, and a
+        // body under an applied force/torque is being driven, not
+        // jittering.
+        if (!body.dynamic() || body.sleeping || !body.allowSleep) {
+            continue;
+        }
+        if (glm::dot(body.force, body.force) > kEpsilon || glm::dot(body.torque, body.torque) > kEpsilon) {
+            continue;
+        }
+        // Residual motion only: genuine impacts and fast slides are
+        // the solver's business, not the damper's.
+        if (glm::length(body.velocity) > 0.3f || glm::length(body.angularVelocity) > 90.0f) {
+            continue;
+        }
+        body.velocity *= linearFactor;
+        body.angularVelocity *= angularFactor;
+        body.angularMomentum *= angularFactor;
+        // Snap the last whisper of motion to exact zero so sleep
+        // bookkeeping (and the renderer) sees a truly still body.
+        if (glm::length(body.velocity) < 0.01f && glm::length(body.angularVelocity) < 1.0f) {
+            body.velocity = glm::vec3{0.0f};
+            body.angularVelocity = glm::vec3{0.0f};
+            body.angularMomentum = glm::vec3{0.0f};
+        }
+    }
 }
 
 void PhysicsSystem::resolveVelocity(Contact& contact, const PhysicsSettings& settings) {

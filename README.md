@@ -745,7 +745,7 @@ Per-point penetration depths are retained for the positional pass.
 The positional pass iterates (`positionIterations`, default 2),
 re-measuring penetration from the mutated contact after every
 correction and clamping each iteration's separation gain to
-`maxPositionCorrection` (0.05 m), split across manifold points so a
+`maxPositionCorrection` (0.02 m; see the stacking stability fix below), split across manifold points so a
 4-point face does not correct four times as hard as a single point.
 Deep jump landings resolve firmly over a few passes instead of one
 explosive pop, and the player capsule lands from a jump at rest height
@@ -756,7 +756,7 @@ with zero sink and zero residual velocity.
 Anisotropic Coulomb friction (two tangent coefficients per body, blended
 pair-wise) is unchanged in form but now acts at the manifold centroid,
 giving the player capsule smooth wall/box-top sliding without sticking.
-Resting bodies fall asleep: below 0.12 m/s and 8°/s *with a supporting
+Resting bodies fall asleep: below 0.05 m/s and 3°/s *with a supporting
 contact from the previous sub-step* (unsupported slow bodies in zero-G
 never freeze) for 0.5 s — the timer decays rather than hard-resetting
 on jitter bursts — the body is skipped by integration and treated as
@@ -821,6 +821,62 @@ by construction at any user scale — verified numerically in tests,
 including a landing test where an off-center imported crate comes to
 rest with its *visual* bottom exactly on the floor. Phase 12 adds 23
 checks (373 total, all passing).
+
+## Stacking Stability Fix — No More Jitter, Bouncing or Chain-Launches ✅
+
+After Phase 12, multi-level stacks of the demo cubes (0.5 m cubes,
+restitution 0.38, each level offset 0.03 m) never settled: they rocked,
+vibrated and eventually threw cubes at several m/s. Instrumented
+tracing isolated three distinct solver defects, each fixed at its root:
+
+- **Warm-start identity collision.** After the manifold-centroid
+  reduction every contact of a pair shares one point, and warm starting
+  matched stored impulses by that shared point — so *each* manifold
+  point re-applied the *first* point's impulse share every sub-step,
+  injecting energy and torque into the stack. Contacts now carry a
+  stable pre-centroid `featurePoint` (the corner/endpoint that
+  generated the point) and warm-start prepare/store match on it.
+- **Restitution chain reaction.** A resting contact that warm-started
+  from the previous sub-step still aimed at
+  `restitution × approach speed` captured at first impact; solved
+  against an immovable lower neighbour, that target pumped the upper
+  body upward iteration after iteration (+0.10 → +0.31 m/s in one
+  sub-step), and the wave amplified level by level. Restitution now
+  fires only on a *new* (non-persistent) impact above
+  `restitutionVelocityThreshold` (1 m/s) — below the threshold, or on
+  any persistent contact, the restitution target is exactly zero.
+- **No pressure-shift righting moment.** A leaning cube's contact
+  patch was solved at the unweighted face centroid, so nothing pushed
+  back against tilt. Box–box manifold points now carry true per-point
+  penetration depths, and the velocity-solve centroid is
+  penetration-weighted: the deeper (loaded) corner pulls the force
+  line toward itself, producing the restoring moment a real contact
+  patch produces. Per-point depths also drive the positional pass.
+
+Supporting tuning, all in `[Physics]`:
+
+- **Resting-contact damping** (`contactLinearDamping = 20`,
+  `contactAngularDamping = 40`, 1/s): bodies resting on persistent,
+  weight-bearing contacts at residual speeds (< 0.3 m/s, < 90°/s)
+  bleed energy every sub-step and snap to exact zero below
+  0.01 m/s / 1°/s. Force-driven bodies and the player
+  (`allowSleep = false`) are never damped, and fresh impacts are
+  untouched, so momentum conservation stays exact.
+- **Relaxed, clamped position correction**: gain 0.8 → 0.35 per pass,
+  per-pass clamp `maxPositionCorrection = 0.02` m, slop
+  0.001 → 0.003 m — resting manifolds converge instead of popping
+  apart and re-impacting.
+- **Tighter sleep, harder wake discipline**: sleep thresholds
+  0.05 m/s and 3°/s (after 0.5 s under them); penetration alone no
+  longer wakes a sleeper — a real approach speed
+  (> `wakeSpeedThreshold`, or deep penetration with approach) is
+  required, so positional correction can't jitter a stack awake.
+
+Verification: the demo's 12-cube offset stack (and 6–8 cube towers
+spawned at rest) reach **absolute rest — asleep, velocities exactly
+zero — in under a second**, with regression tests pinning the offset
+stack, the sub-threshold no-bounce landing, and the new config keys:
+386 checks, all passing in Debug, Release-shared and Release-static.
 
 ## Configuration
 
@@ -1006,5 +1062,10 @@ what it depends on.
 - **Phase 12 — Asset import pipeline ✅:** dependency-free OBJ import
   into the asset registry, AABB/MeshBounds auto-scale normalization,
   and one-call ECS spawning with a 1:1 offset box hitbox
+- **Stacking stability fix ✅:** warm-start feature identity,
+  persistent-contact restitution suppression, penetration-weighted
+  manifold centroids, resting-contact damping, relaxed/clamped
+  position correction and hardened sleep/wake thresholds — stacks
+  settle to absolute rest in under a second
 - Later phases build the real engine core on top of this foundation —
   editors and visual tooling only arrive once the core is complete.

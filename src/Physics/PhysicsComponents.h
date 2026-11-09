@@ -254,9 +254,18 @@ struct PhysicsSettings {
     float gravitationalParameter = 0.0f; // optional global radial field (mu)
     float gravitySoftening = 0.01f;      // avoids a singularity at a point mass
     float linearDamping = 0.0f;
+    float angularDamping = 0.0f;
+    // Approach speeds at or below this (m/s) never produce restitution:
+    // the contact rests instead of bouncing. Restitution additionally
+    // only fires on a *new* impact — a persistent (warm-started)
+    // contact never re-bounces, which is what stops stacked bodies
+    // from launching each other in a restitution chain reaction.
     float restitutionVelocityThreshold = 1.0f;
-    float contactSlop = 0.001f;
-    float positionCorrection = 0.8f;
+    float contactSlop = 0.003f;
+    // Relaxed positional gain: each pass removes only this fraction of
+    // the remaining penetration (clamped per pass below), so resting
+    // manifolds converge instead of popping apart and re-impacting.
+    float positionCorrection = 0.35f;
     uint32_t solverIterations = 4;
     uint32_t parallelMinBodies = 128;
     bool ccdEnabled = true;
@@ -271,12 +280,23 @@ struct PhysicsSettings {
     // maxPositionCorrection meters so deep landings resolve firmly over
     // a few passes instead of exploding in one.
     uint32_t positionIterations = 2;
-    float maxPositionCorrection = 0.05f;
+    float maxPositionCorrection = 0.02f;
+    // Resting-contact damping (exponential rates, 1/s): a body resting
+    // on a persistent, weight-bearing contact whose speeds are already
+    // residual (below 0.3 m/s and 90 deg/s) bleeds linear/angular
+    // energy every sub-step, and sub-0.01 m/s / sub-1 deg/s remainders
+    // snap to exact zero. This is what drains micro-jitter out of
+    // stacks instead of letting solver noise circulate forever.
+    // Bodies that opt out of sleep (the player) are never damped.
+    float contactLinearDamping = 20.0f;
+    float contactAngularDamping = 40.0f;
     // Sleeping: bodies slower than both thresholds for sleepDelaySeconds
     // fall asleep (skipped by integration, immovable in the solver).
+    // The thresholds are deliberately tight — a body moving faster
+    // than this is visibly moving, not jittering.
     bool sleepEnabled = true;
-    float sleepSpeedThreshold = 0.12f;       // m/s
-    float sleepAngularThreshold = 8.0f;       // degrees/s
+    float sleepSpeedThreshold = 0.05f;       // m/s
+    float sleepAngularThreshold = 3.0f;       // degrees/s
     float sleepDelaySeconds = 0.5f;
     float wakeSpeedThreshold = 0.2f;          // m/s approach speed that wakes a sleeping body
 };

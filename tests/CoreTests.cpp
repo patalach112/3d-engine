@@ -96,6 +96,9 @@ void testConfigLoading() {
              << "[Input]\ncaptureMouseOnStart = false\n"
              << "[Physics]\ngravityY = -12.5\nsolverIterations = 7\nparallelMinBodies = 32\n"
              << "demoMode = space\nccdEnabled = false\ngravitationalParameter = 42\ngravitySoftening = 0.25\n"
+             << "angularDamping = 0.1\ncontactLinearDamping = 12\ncontactAngularDamping = 30\n"
+             << "maxPositionCorrection = 0.04\nsleepSpeedThreshold = 0.08\nsleepAngularThreshold = 5\n"
+             << "sleepDelaySeconds = 0.75\nwakeSpeedThreshold = 0.3\n"
              << "[Render]\nfrustumCulling = false\n"
              << "[Performance]\njobWorkerCount = 2\nentityReserve = 4096\nparallelBatchSize = 512\n"
              << "[Render]\nvramBudgetMiB = 2048\nstagingBufferBudgetMiB = 128\nhudEnabled = false\n";
@@ -127,6 +130,14 @@ void testConfigLoading() {
     check(!config.physics.ccdEnabled, "physics CCD flag parsed");
     check(nearlyEqual(config.physics.gravitationalParameter, 42.0f, 1e-6), "physics radial gravity parsed");
     check(nearlyEqual(config.physics.gravitySoftening, 0.25f, 1e-6), "physics gravity softening parsed");
+    check(nearlyEqual(config.physics.angularDamping, 0.1f, 1e-6), "physics angular damping parsed");
+    check(nearlyEqual(config.physics.contactLinearDamping, 12.0f, 1e-6), "physics contact linear damping parsed");
+    check(nearlyEqual(config.physics.contactAngularDamping, 30.0f, 1e-6), "physics contact angular damping parsed");
+    check(nearlyEqual(config.physics.maxPositionCorrection, 0.04f, 1e-6), "physics max position correction parsed");
+    check(nearlyEqual(config.physics.sleepSpeedThreshold, 0.08f, 1e-6), "physics sleep speed threshold parsed");
+    check(nearlyEqual(config.physics.sleepAngularThreshold, 5.0f, 1e-6), "physics sleep angular threshold parsed");
+    check(nearlyEqual(config.physics.sleepDelaySeconds, 0.75f, 1e-6), "physics sleep delay parsed");
+    check(nearlyEqual(config.physics.wakeSpeedThreshold, 0.3f, 1e-6), "physics wake speed threshold parsed");
     check(!config.render.frustumCulling, "frustum culling flag parsed");
     check(config.performance.jobWorkerCount == 2, "job worker count parsed");
     check(config.performance.parallelBatchSize == 512, "parallel batch size parsed");
@@ -1402,6 +1413,123 @@ void testPhysicsPhase11() {
             wokeOnImpact = !upperBody.sleeping || glm::length(upperBody.velocity) > 0.05f;
         }
         check(wokeOnImpact, "a dropped heavy ball wakes the sleeping stack on impact");
+    }
+
+    // Regression (stacking stability): an offset stack built exactly
+    // like the demo scene — 0.5 m cubes with restitution 0.38, each
+    // level shifted 0.03 m — used to jitter, chain-launch and topple:
+    // persistent contacts re-applied restitution against their
+    // neighbours, warm starting handed one contact's impulse share to
+    // every manifold point, and the shared manifold centroid gave a
+    // leaning cube no pressure-shift righting moment. The stack must
+    // now reach absolute rest (asleep, velocities exactly zero) well
+    // inside two seconds and stay put.
+    {
+        engine::Scene scene;
+        const float floorTop = -1.25f;
+        auto floor = scene.createEntity("OffsetStackFloor");
+        auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, floorTop - 0.05f, 0.0f});
+        floorTransform.scale = glm::vec3{9.0f, 0.1f, 9.0f};
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.restitution = 0.35f;
+        floorBody.friction = 0.6f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        std::vector<engine::Entity> cubes;
+        std::vector<glm::vec3> restPositions;
+        for (int level = 0; level < 4; ++level) {
+            for (int col = 0; col < 3; ++col) {
+                auto cube = scene.createEntity("OffsetStackCube");
+                const glm::vec3 position{-0.55f + col * 0.58f + level * 0.03f,
+                                         floorTop + 0.26f + level * 0.53f, -3.6f};
+                auto& transform = cube.addComponent<TransformComponent>(position);
+                transform.scale = glm::vec3{0.5f};
+                auto& body = cube.addComponent<RigidBodyComponent>(0.125f);
+                body.restitution = 0.38f;
+                body.friction = 0.5f;
+                cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+                cubes.push_back(cube);
+                // Spawned 0.03 m per level above the slot below, but a
+                // resting 0.5 m cube sits exactly 0.5 m above its
+                // neighbour: the expected rest height, not the spawn
+                // height, is the reference.
+                restPositions.push_back(glm::vec3{position.x, floorTop + 0.25f + level * 0.5f, position.z});
+            }
+        }
+
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        int asleepStep = -1;
+        float peakSpeedAfterSettleWindow = 0.0f;
+        for (int step = 0; step < 180; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            bool allAsleep = true;
+            for (auto& cube : cubes) {
+                const auto& body = cube.getComponent<RigidBodyComponent>();
+                allAsleep = allAsleep && body.sleeping;
+                if (step >= 120) {
+                    peakSpeedAfterSettleWindow =
+                        std::max(peakSpeedAfterSettleWindow, glm::length(body.velocity));
+                }
+            }
+            if (allAsleep && asleepStep < 0) {
+                asleepStep = step;
+            }
+        }
+        check(asleepStep >= 0 && asleepStep < 120,
+              "offset stack falls asleep within two seconds");
+        check(peakSpeedAfterSettleWindow == 0.0f,
+              "settled stack has zero residual velocity (no micro-jitter)");
+        bool stackIntact = true;
+        for (size_t i = 0; i < cubes.size(); ++i) {
+            const auto& transform = cubes[i].getComponent<TransformComponent>();
+            const auto& body = cubes[i].getComponent<RigidBodyComponent>();
+            stackIntact = stackIntact && body.sleeping &&
+                          glm::length(body.velocity) == 0.0f &&
+                          glm::length(body.angularVelocity) == 0.0f &&
+                          std::abs(transform.position.y - restPositions[i].y) < 0.02f &&
+                          std::abs(transform.position.x - restPositions[i].x) < 0.05f &&
+                          std::abs(transform.position.z - restPositions[i].z) < 0.05f;
+        }
+        check(stackIntact, "offset stack stays stacked at absolute rest");
+    }
+
+    // Regression (perpetual micro-bounce): an impact slower than the
+    // restitution velocity threshold must never bounce, even with a
+    // bouncy material — it lands, stays down, and falls asleep.
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("SoftLandingFloor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.restitution = 0.9f;
+        floorBody.friction = 0.5f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+        auto cube = scene.createEntity("SoftLandingCube");
+        cube.addComponent<TransformComponent>(glm::vec3{0.0f, 0.51f, 0.0f});
+        auto& cubeBody = cube.addComponent<RigidBodyComponent>(1.0f);
+        cubeBody.velocity = glm::vec3{0.0f, -0.5f, 0.0f}; // below the 1 m/s threshold
+        cubeBody.restitution = 0.9f;
+        cubeBody.friction = 0.5f;
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        float maxRebound = 0.0f;
+        bool sawContact = false;
+        for (int step = 0; step < 120; ++step) {
+            const auto stats = physics.update(scene, 1.0 / 60.0, settings);
+            sawContact = sawContact || stats.contacts > 0;
+            if (sawContact) {
+                maxRebound = std::max(maxRebound, cubeBody.velocity.y);
+            }
+        }
+        check(sawContact && maxRebound <= 0.05f,
+              "sub-threshold impact never bounces (restitution clamped to zero)");
+        check(cubeBody.sleeping && glm::length(cubeBody.velocity) == 0.0f,
+              "soft-landed cube falls asleep at exact rest");
     }
 
     // Mass-ratio weighting: an inelastic 1 kg vs 100 kg collision leaves
