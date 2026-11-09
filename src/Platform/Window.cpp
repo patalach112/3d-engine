@@ -1,5 +1,7 @@
 #include "Platform/Window.h"
 
+#include "Platform/Input.h"
+
 #include <stdexcept>
 
 namespace engine {
@@ -22,6 +24,11 @@ Window::Window(int width, int height, const char* title, bool resizable)
 
     glfwSetWindowUserPointer(m_window, this);
     glfwSetFramebufferSizeCallback(m_window, &Window::framebufferResizeCallback);
+    glfwSetKeyCallback(m_window, &Window::keyCallback);
+    glfwSetMouseButtonCallback(m_window, &Window::mouseButtonCallback);
+    glfwSetCursorPosCallback(m_window, &Window::cursorPositionCallback);
+    glfwSetScrollCallback(m_window, &Window::scrollCallback);
+    glfwSetWindowFocusCallback(m_window, &Window::windowFocusCallback);
 }
 
 Window::~Window() {
@@ -69,14 +76,43 @@ std::vector<const char*> Window::requiredInstanceExtensions() {
     return {extensions, extensions + count};
 }
 
-bool Window::isEscapePressed() const {
-    return glfwGetKey(m_window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+Window* Window::fromGlfwWindow(GLFWwindow* window) {
+    return static_cast<Window*>(glfwGetWindowUserPointer(window));
 }
 
 void Window::framebufferResizeCallback(GLFWwindow* window, int /*width*/, int /*height*/) {
-    auto* self = static_cast<Window*>(glfwGetWindowUserPointer(window));
-    if (self != nullptr) {
+    if (Window* self = fromGlfwWindow(window); self != nullptr) {
         self->m_framebufferResized = true;
+    }
+}
+
+void Window::keyCallback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/) {
+    if (Window* self = fromGlfwWindow(window); self != nullptr && self->m_inputHandler != nullptr) {
+        self->m_inputHandler->onKeyEvent(key, action);
+    }
+}
+
+void Window::mouseButtonCallback(GLFWwindow* window, int button, int action, int /*mods*/) {
+    if (Window* self = fromGlfwWindow(window); self != nullptr && self->m_inputHandler != nullptr) {
+        self->m_inputHandler->onMouseButtonEvent(button, action);
+    }
+}
+
+void Window::cursorPositionCallback(GLFWwindow* window, double xPosition, double yPosition) {
+    if (Window* self = fromGlfwWindow(window); self != nullptr && self->m_inputHandler != nullptr) {
+        self->m_inputHandler->onCursorPositionEvent(xPosition, yPosition);
+    }
+}
+
+void Window::scrollCallback(GLFWwindow* window, double xOffset, double yOffset) {
+    if (Window* self = fromGlfwWindow(window); self != nullptr && self->m_inputHandler != nullptr) {
+        self->m_inputHandler->onScrollEvent(xOffset, yOffset);
+    }
+}
+
+void Window::windowFocusCallback(GLFWwindow* window, int focused) {
+    if (Window* self = fromGlfwWindow(window); self != nullptr && self->m_inputHandler != nullptr) {
+        self->m_inputHandler->onFocusChanged(focused == GLFW_TRUE);
     }
 }
 

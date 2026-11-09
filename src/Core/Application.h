@@ -1,14 +1,14 @@
 #pragma once
 
+#include "Core/Camera.h"
 #include "Core/EngineConfig.h"
 #include "Core/GameLoop.h"
 #include "Graphics/GraphicsPipeline.h"
 #include "Graphics/Renderer.h"
 #include "Graphics/Swapchain.h"
 #include "Graphics/VulkanContext.h"
+#include "Platform/Input.h"
 #include "Platform/Window.h"
-
-#include <glm/vec3.hpp>
 
 namespace engine {
 
@@ -18,13 +18,15 @@ namespace engine {
 // Composition root of the engine. Owns every subsystem by value and relies
 // on member declaration order for both construction and destruction:
 //
-//   construct:  config -> Window -> VulkanContext -> swapchain ->
-//               GraphicsPipeline -> Renderer -> GameLoop
+//   construct:  config -> Window -> Input -> VulkanContext -> swapchain ->
+//               GraphicsPipeline -> Renderer -> GameLoop -> Camera
 //   destruct:   exact reverse, so GPU resources are always released before
 //               the device, surface, instance and window they depend on.
+//               (Input unregisters itself from the Window while the Window
+//               is still alive.)
 //
-// All tuning (window, presentation, logging, loop rates) arrives through
-// EngineConfig — this class contains no hardcoded settings.
+// All tuning (window, presentation, logging, loop rates, camera, input)
+// arrives through EngineConfig — this class contains no hardcoded settings.
 // ---------------------------------------------------------------------------
 class Application {
 public:
@@ -39,30 +41,20 @@ public:
     void run();
 
 private:
-    // Phase 1 demo scene state. The cube's orientation is integrated in
-    // fixed updates (deterministic), and rendering extrapolates it by the
-    // loop's interpolation alpha so motion stays smooth at any frame rate.
-    struct CubeRotation {
-        glm::vec3 anglesDegrees{0.0f};
-        glm::vec3 angularVelocityDegreesPerSecond{55.0f, 32.0f, 18.0f}; // X, Y, Z
-
-        void advance(double fixedDeltaSeconds);
-        [[nodiscard]] glm::vec3 extrapolatedAngles(double interpolationAlpha,
-                                                   double fixedDeltaSeconds) const;
-    };
-
-    [[nodiscard]] UniformBufferObject computeTransforms(double interpolationAlpha) const;
+    [[nodiscard]] UniformBufferObject computeTransforms() const;
+    void handleMouseCapture();
     void logLoopStats(const char* context) const;
 
     EngineConfig m_config;
     Window m_window;
+    Input m_input;
     VulkanContext m_context;
     Swapchain m_swapchain;
     GraphicsPipeline m_pipeline;
     Renderer m_renderer;
     GameLoop m_gameLoop;
+    Camera m_camera;
 
-    CubeRotation m_cubeRotation;
     double m_secondsSinceStatsLog = 0.0;
 };
 

@@ -12,11 +12,17 @@ Application::Application(EngineConfig config)
     : m_config(std::move(config)),
       m_window(m_config.window.width, m_config.window.height, m_config.window.title.c_str(),
                m_config.window.resizable),
+      m_input(m_window),
       m_context(m_window),
       m_swapchain(m_context, m_window, m_config.render.vsync),
       m_pipeline(m_context, m_swapchain),
       m_renderer(m_context, m_window, m_swapchain, m_pipeline),
-      m_gameLoop(m_config.loop) {}
+      m_gameLoop(m_config.loop),
+      m_camera(m_config.camera) {
+    if (m_config.input.captureMouseOnStart) {
+        m_input.setMouseCaptured(true);
+    }
+}
 
 Application::~Application() {
     // Make sure no frame is still using the resources that member
@@ -30,18 +36,27 @@ void Application::run() {
                     << loop.fixedDeltaSeconds << "s, max " << loop.maxFixedStepsPerFrame
                     << " steps/frame, max FPS " << (loop.maxFps == 0 ? "uncapped" : std::to_string(loop.maxFps))
                     << ", vsync " << (m_config.render.vsync ? "on" : "off") << ")");
+    ENGINE_LOG_INFO("Controls: WASD move, Q/E down/up, Shift boost, mouse look "
+                    "(click window to capture mouse, Esc releases / quits)");
 
     LoopCallbacks callbacks;
     callbacks.shouldContinue = [this] { return !m_window.shouldClose(); };
     callbacks.pollEvents = [this] {
+        // Input frame protocol: clear per-frame state, then let GLFW
+        // callbacks refill it during polling.
+        m_input.beginFrame();
         m_window.pollEvents();
-        if (m_window.isEscapePressed()) {
-            m_window.requestClose();
-        }
     };
-    callbacks.fixedUpdate = [this](double fixedDeltaSeconds) { m_cubeRotation.advance(fixedDeltaSeconds); };
+    // First-person controls are frame-rate dependent by nature (mouse look),
+    // so they live in the variable update, integrated with delta time.
     callbacks.update = [this](double deltaSeconds) {
-        // Variable-rate hook: periodic loop statistics when configured.
+        handleMouseCapture();
+
+        if (m_input.isMouseCaptured()) {
+            m_camera.processLook(m_input.mouseDelta());
+        }
+        m_camera.processMovement(m_input, deltaSeconds);
+
         if (m_config.loop.statsLogIntervalSeconds > 0.0) {
             m_secondsSinceStatsLog += deltaSeconds;
             if (m_secondsSinceStatsLog >= m_config.loop.statsLogIntervalSeconds) {
@@ -50,8 +65,8 @@ void Application::run() {
             }
         }
     };
-    callbacks.render = [this](double interpolationAlpha) {
-        m_renderer.drawFrame(computeTransforms(interpolationAlpha));
+    callbacks.render = [this](double /*interpolationAlpha*/) {
+        m_renderer.drawFrame(computeTransforms());
     };
 
     m_gameLoop.run(callbacks);
@@ -62,53 +77,47 @@ void Application::run() {
     logLoopStats("Engine shutting down");
 }
 
+void Application::handleMouseCapture() {
+    if (m_input.wasKeyPressed(Key::Escape)) {
+        if (m_input.isMouseCaptured()) {
+            m_input.setMouseCaptured(false);
+            ENGINE_LOG_DEBUG("Mouse released (Esc)");
+        } else {
+            m_window.requestClose();
+        }
+        return;
+    }
+    if (!m_input.isMouseCaptured() && m_config.input.captureMouseOnClick &&
+        m_input.wasMouseButtonPressed(MouseButton::Left)) {
+        m_input.setMouseCaptured(true);
+        ENGINE_LOG_DEBUG("Mouse captured (click)");
+    }
+}
+
 void Application::logLoopStats(const char* context) const {
     const LoopStats& stats = m_gameLoop.stats();
+    const glm::vec3& position = m_camera.position();
     ENGINE_LOG_INFO(context << ": " << stats.frames << " frames in " << stats.elapsedSeconds << "s (avg "
                             << stats.averageFramesPerSecond() << " FPS, smoothed "
                             << m_gameLoop.time().framesPerSecond() << " FPS), " << stats.fixedSteps
                             << " fixed steps, " << stats.droppedSeconds * 1000.0
-                            << " ms of simulation time dropped");
+                            << " ms dropped; camera at (" << position.x << ", " << position.y << ", "
+                            << position.z << "), yaw " << m_camera.yawDegrees() << ", pitch "
+                            << m_camera.pitchDegrees());
 }
 
-void Application::CubeRotation::advance(double fixedDeltaSeconds) {
-    anglesDegrees = glm::mod(anglesDegrees + angularVelocityDegreesPerSecond * static_cast<float>(fixedDeltaSeconds),
-                             360.0f);
-}
-
-glm::vec3 Application::CubeRotation::extrapolatedAngles(double interpolationAlpha,
-                                                        double fixedDeltaSeconds) const {
-    const float extraSeconds = static_cast<float>(interpolationAlpha * fixedDeltaSeconds);
-    return anglesDegrees + angularVelocityDegreesPerSecond * extraSeconds;
-}
-
-UniformBufferObject Application::computeTransforms(double interpolationAlpha) const {
+UniformBufferObject Application::computeTransforms() const {
     UniformBufferObject ubo;
 
-    // Orientation from the fixed-step simulation, extrapolated by the
-    // fraction of a step that has accumulated since the last step.
-    const glm::vec3 angles =
-        m_cubeRotation.extrapolatedAngles(interpolationAlpha, m_config.loop.fixedDeltaSeconds);
-    glm::mat4 model{1.0f};
-    model = glm::rotate(model, glm::radians(angles.y), glm::vec3(0.0f, 1.0f, 0.0f));
-    model = glm::rotate(model, glm::radians(angles.x), glm::vec3(1.0f, 0.0f, 0.0f));
-    model = glm::rotate(model, glm::radians(angles.z), glm::vec3(0.0f, 0.0f, 1.0f));
-    ubo.model = model;
-
-    // Static camera looking at the origin from +Z.
-    ubo.view = glm::lookAt(glm::vec3(0.0f, 0.0f, 3.0f), glm::vec3(0.0f, 0.0f, 0.0f),
-                           glm::vec3(0.0f, 1.0f, 0.0f));
+    // The cube is static now; the player moves around it.
+    ubo.model = glm::mat4{1.0f};
+    ubo.view = m_camera.viewMatrix();
 
     const VkExtent2D extent = m_swapchain.extent();
     const float aspect = extent.height > 0
                              ? static_cast<float>(extent.width) / static_cast<float>(extent.height)
                              : 1.0f;
-    ubo.proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);
-
-    // GLM was designed for OpenGL, whose clip-space Y axis points down
-    // compared to Vulkan. Flip it, otherwise the image is upside down
-    // (the pipeline's clockwise front-face setting compensates winding).
-    ubo.proj[1][1] *= -1.0f;
+    ubo.proj = m_camera.projectionMatrix(aspect);
 
     return ubo;
 }

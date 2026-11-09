@@ -55,10 +55,12 @@ FetchContent_MakeAvailable(glfw glm)
 add_executable(3d-engine
     src/main.cpp
     src/Core/Application.cpp
+    src/Core/Camera.cpp
     src/Core/EngineConfig.cpp
     src/Core/Logger.cpp
     src/Core/Time.cpp
     src/Core/GameLoop.cpp
+    src/Platform/Input.cpp
     src/Platform/Window.cpp
     src/Geometry/Cube.cpp
     src/Graphics/VulkanContext.cpp
@@ -181,13 +183,16 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(engine-core-tests
         tests/CoreTests.cpp
+        src/Core/Camera.cpp
         src/Core/EngineConfig.cpp
         src/Core/Logger.cpp
         src/Core/Time.cpp
         src/Core/GameLoop.cpp
+        src/Platform/Input.cpp
+        src/Platform/Window.cpp
     )
     target_include_directories(engine-core-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(engine-core-tests PRIVATE Threads::Threads)
+    target_link_libraries(engine-core-tests PRIVATE Threads::Threads Vulkan::Vulkan glfw glm::glm)
     if(MSVC)
         target_compile_options(engine-core-tests PRIVATE /W4 /permissive-)
     else()

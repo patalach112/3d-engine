@@ -3,10 +3,14 @@
 // dispatch. These cover the parts of the engine that can be verified
 // without a GPU or a window.
 
+#include "Core/Camera.h"
 #include "Core/EngineConfig.h"
 #include "Core/GameLoop.h"
 #include "Core/Logger.h"
 #include "Core/Time.h"
+
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/vec4.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -59,7 +63,9 @@ void testConfigLoading() {
              << "[Logger]\nlevel = Warning\nconsole = false\n"
              << "[Loop]\nfixedDeltaSeconds = 0.01\nmaxFps = 144\nmaxFixedStepsPerFrame = 3\n"
              << "bogusKey = 1\n"
-             << "[Loop]\nmaxFrameSeconds = not_a_number\n";
+             << "[Loop]\nmaxFrameSeconds = not_a_number\n"
+             << "[Camera]\nmovementSpeed = 7.5\nmouseSensitivity = 0.25\npositionZ = 5\n"
+             << "[Input]\ncaptureMouseOnStart = false\n";
     }
 
     const engine::EngineConfig config = engine::EngineConfig::loadFromFile(path);
@@ -73,6 +79,10 @@ void testConfigLoading() {
     check(config.loop.maxFps == 144, "max FPS parsed");
     check(config.loop.maxFixedStepsPerFrame == 3, "max fixed steps parsed");
     check(nearlyEqual(config.loop.maxFrameSeconds, 0.25), "invalid value keeps default");
+    check(nearlyEqual(config.camera.movementSpeed, 7.5), "camera movement speed parsed");
+    check(nearlyEqual(config.camera.mouseSensitivity, 0.25), "camera mouse sensitivity parsed");
+    check(nearlyEqual(config.camera.startPosition.z, 5.0), "camera start position parsed");
+    check(!config.input.captureMouseOnStart, "input capture flag parsed");
     check(config.loadWarnings.size() >= 2, "unknown/invalid keys produce warnings");
 
     const engine::EngineConfig missing = engine::EngineConfig::loadFromFile(dir / "does_not_exist.ini");
@@ -161,6 +171,59 @@ void testFixedTimestep() {
     check(negative.steps == 0, "negative deltas never produce steps");
 }
 
+bool nearlyVec3(const glm::vec3& value, const glm::vec3& expected, float epsilon = 1e-5f) {
+    return std::abs(value.x - expected.x) <= epsilon && std::abs(value.y - expected.y) <= epsilon &&
+           std::abs(value.z - expected.z) <= epsilon;
+}
+
+void testCamera() {
+    std::cout << "Camera\n";
+    engine::CameraConfig config;
+    engine::Camera camera(config);
+
+    check(nearlyVec3(camera.position(), glm::vec3(0.0f, 0.0f, 3.0f)), "camera starts at configured position");
+    check(nearlyVec3(camera.front(), glm::vec3(0.0f, 0.0f, -1.0f)), "yaw -90 faces down -Z");
+
+    // The origin (cube location) must sit 3 units in front of the camera.
+    const glm::vec4 originInView = camera.viewMatrix() * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    check(nearlyVec3(glm::vec3(originInView), glm::vec3(0.0f, 0.0f, -3.0f)),
+          "view matrix places the origin ahead of the camera");
+
+    // Moving the mouse right turns the camera right (front gains +X).
+    camera.processLook({100.0f, 0.0f});
+    check(camera.yawDegrees() > -90.0f && camera.front().x > 0.0f, "mouse right turns camera right");
+
+    // Pitch clamps at the configured limit instead of flipping (no gimbal lock).
+    camera.processLook({0.0f, -100000.0f}); // mouse far up
+    check(nearlyEqual(camera.pitchDegrees(), config.pitchLimitDegrees, 1e-4), "pitch clamps at +limit");
+    check(camera.front().y > 0.99f && camera.front().y < 1.0f, "pitched-up front stays below vertical");
+    camera.processLook({0.0f, 200000.0f}); // mouse far down
+    check(nearlyEqual(camera.pitchDegrees(), -static_cast<double>(config.pitchLimitDegrees), 1e-4),
+          "pitch clamps at -limit");
+
+    // Forward translation: 1 second at 3 units/s along -Z from (0,0,3).
+    camera.reset();
+    camera.translate(glm::vec3(0.0f, 0.0f, 1.0f), 1.0);
+    check(nearlyVec3(camera.position(), glm::vec3(0.0f, 0.0f, 0.0f)), "forward translation reaches the origin");
+
+    // Diagonal input is normalized: same distance as straight movement.
+    camera.reset();
+    camera.translate(glm::vec3(1.0f, 0.0f, 1.0f), 1.0);
+    const float diagonalDistance = glm::length(camera.position() - glm::vec3(0.0f, 0.0f, 3.0f));
+    check(nearlyEqual(diagonalDistance, config.movementSpeed, 1e-4), "diagonal movement is normalized");
+
+    // Vulkan projection: Y axis flipped relative to GLM's OpenGL default.
+    const glm::mat4 projection = camera.projectionMatrix(16.0f / 9.0f);
+    check(projection[0][0] > 0.0f && projection[1][1] < 0.0f, "projection has Vulkan Y flip applied");
+
+    // Reset restores the configured start state.
+    camera.processLook({250.0f, -250.0f});
+    camera.reset();
+    check(nearlyVec3(camera.position(), config.startPosition) &&
+              nearlyEqual(camera.yawDegrees(), config.startYawDegrees, 1e-4),
+          "reset restores start position and orientation");
+}
+
 void testTime() {
     std::cout << "Time\n";
     engine::Time time;
@@ -208,6 +271,7 @@ void testGameLoop() {
 int main() {
     testConfigLoading();
     testLogger();
+    testCamera();
     testFixedTimestep();
     testTime();
     testGameLoop();

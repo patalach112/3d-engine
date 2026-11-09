@@ -89,6 +89,47 @@ code. All tuning lives in **`config/engine.ini`** (see
   smooth at any display rate. An optional software FPS cap and periodic
   loop statistics (frames, FPS, fixed steps, dropped time) are configurable.
 
+## Phase 3, Step 1 — Input System & First-Person Camera ✅
+
+### Input (`src/Platform/Input.*`)
+
+Event-driven input state on top of GLFW callbacks. The `Window` owns the
+GLFW callbacks and forwards events to a registered `Input` instance; every
+other system polls clean, engine-level state — no GLFW key codes anywhere
+outside the Platform layer:
+
+- Held state: `isKeyDown(Key::W)`, `isMouseButtonDown(MouseButton::Left)`
+- Per-frame transitions: `wasKeyPressed()`, `wasMouseButtonReleased()`, …
+- Mouse motion for look controls: `mouseDelta()` (pixels per frame),
+  `mousePosition()`, `scrollDelta()`
+- Cursor capture (hidden, unbounded) for mouse look, cleared state on
+  focus loss, and a strict frame protocol: `beginFrame()` → `pollEvents()`
+  → systems query state
+
+### First-person camera (`src/Core/Camera.*`)
+
+Yaw/pitch fly camera built with GLM. Pitch is clamped to a configurable
+limit (default ±89°), so the front vector never aligns with the world up
+vector — no gimbal lock, no view flipping. Yaw wraps to [-180°, 180°).
+
+**Controls** (with mouse captured):
+
+| Input       | Action                    |
+|-------------|---------------------------|
+| Mouse       | Look around               |
+| W / A / S / D | Move forward/left/back/right |
+| E / Q       | Move up / down            |
+| Shift       | Boost (configurable multiplier) |
+| Click       | Capture the mouse         |
+| Esc         | Release mouse, again to quit |
+
+Movement is integrated with the variable update's delta time (diagonal
+movement normalized), sensitivity/speed/boost/clip planes are all
+configurable under `[Camera]`/`[Input]` in `engine.ini`, and the camera's
+view/projection matrices feed the existing UBO each frame — the cube is
+static now and the player flies around it. Periodic loop statistics now
+also report camera position/yaw/pitch.
+
 ### Unit tests
 
 `tests/CoreTests.cpp` (CTest: `engine-core-tests`) covers configuration
@@ -109,7 +150,9 @@ edited without rebuilding. Lookup order:
 Invalid or unknown keys never abort startup: they fall back to defaults and
 are reported as warnings. Sections: `[Window]`, `[Render]` (`vsync` selects
 FIFO vs. low-latency present modes), `[Logger]` (level, sinks, rotation,
-async writes) and `[Loop]` (fixed-delta, step cap, frame clamp, FPS cap).
+async writes), `[Loop]` (fixed-delta, step cap, frame clamp, FPS cap),
+`[Input]` (mouse capture behavior) and `[Camera]` (start pose, movement
+speed/boost, mouse sensitivity, pitch limit, clip planes).
 
 ## Building
 
@@ -151,7 +194,9 @@ GLSL shaders in `shaders/` are compiled to SPIR-V automatically during the
 build; the executable finds them regardless of the working directory.
 A Debug build enables Vulkan validation layers when they are installed —
 watch the console or `logs/` for `[Vulkan validation]` diagnostics while
-developing. Press **Esc** or close the window to exit.
+developing. The mouse is captured at startup for first-person look:
+**WASD** move, **Q/E** down/up, **Shift** boost, **Esc** releases the
+mouse (press again to quit).
 
 ## Project structure
 
@@ -170,12 +215,14 @@ developing. Press **Esc** or close the window to exit.
     ├── main.cpp              # Bootstrap: arguments -> config -> logger -> app
     ├── Core/
     │   ├── Application.h/.cpp  # Composition root, wires loop callbacks
+    │   ├── Camera.h/.cpp       # First-person yaw/pitch camera (GLM)
     │   ├── EngineConfig.h/.cpp # INI loading, validation, fallback chain
     │   ├── Logger.h/.cpp       # Levels, console/file/async sinks, macros
     │   ├── Time.h/.cpp         # steady_clock frame timing, delta, FPS
     │   └── GameLoop.h/.cpp     # Fixed/variable loop, FPS cap, statistics
     ├── Platform/
-    │   └── Window.h/.cpp       # GLFW window, surface, resize/input polling
+    │   ├── Window.h/.cpp       # GLFW window, surface, resize/input callbacks
+    │   └── Input.h/.cpp        # Key/mouse state, transitions, mouse delta
     ├── Geometry/
     │   ├── Vertex.h            # Interleaved position+color vertex layout
     │   └── Cube.h/.cpp         # Colored cube geometry (24 verts, 36 indices)
@@ -198,6 +245,8 @@ what it depends on.
 - **Phase 1 — First render ✅:** window, Vulkan bootstrap, rotating colored cube
 - **Phase 2 — Core infrastructure ✅:** configurable dual-sink async logger,
   robust fixed/variable game loop, data-driven configuration
+- **Phase 3, Step 1 — Input & first-person camera ✅:** GLFW-callback input
+  system, yaw/pitch FPP camera wired into the UBO update loop
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.

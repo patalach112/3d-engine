@@ -11,6 +11,8 @@
 
 namespace engine {
 
+class Input;
+
 // ---------------------------------------------------------------------------
 // Window
 //
@@ -45,7 +47,10 @@ public:
     [[nodiscard]] bool wasFramebufferResized() const { return m_framebufferResized; }
     void resetFramebufferResizedFlag() { m_framebufferResized = false; }
 
-    [[nodiscard]] bool isEscapePressed() const;
+    // Registers the input system that GLFW key/mouse callbacks are
+    // forwarded to (nullptr detaches). Owned by the caller; the Window
+    // must outlive the registration (Application's member order does).
+    void setInputHandler(Input* handler) { m_inputHandler = handler; }
 
     [[nodiscard]] GLFWwindow* handle() const { return m_window; }
     [[nodiscard]] int width() const { return m_width; }
@@ -53,8 +58,17 @@ public:
 
 private:
     static void framebufferResizeCallback(GLFWwindow* window, int width, int height);
+    static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
+    static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
+    static void cursorPositionCallback(GLFWwindow* window, double xPosition, double yPosition);
+    static void scrollCallback(GLFWwindow* window, double xOffset, double yOffset);
+    static void windowFocusCallback(GLFWwindow* window, int focused);
+
+    // The Window instance associated with a GLFW window (user pointer).
+    static Window* fromGlfwWindow(GLFWwindow* window);
 
     GLFWwindow* m_window = nullptr;
+    Input* m_inputHandler = nullptr;
     int m_width = 0;
     int m_height = 0;
     bool m_framebufferResized = false;

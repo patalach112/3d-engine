@@ -1,7 +1,9 @@
 #pragma once
 
+#include "Core/Camera.h"
 #include "Core/GameLoop.h"
 #include "Core/Logger.h"
+#include "Platform/Input.h"
 
 #include <filesystem>
 #include <string>
@@ -44,6 +46,8 @@ struct EngineConfig {
     LoopConfig loop;
     WindowConfig window;
     RenderConfig render;
+    CameraConfig camera;
+    InputConfig input;
 
     // File the values were actually loaded from; empty when defaults were used.
     std::string sourcePath;

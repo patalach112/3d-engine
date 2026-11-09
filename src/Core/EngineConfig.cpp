@@ -232,6 +232,77 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
         return true;
     }
 
+    // --- [Camera] --------------------------------------------------------------
+    if (section == "camera") {
+        double doubleField = 0.0;
+        if (key == "positionx") {
+            if (reader.applyDouble(value, doubleField, -1e6, 1e6)) {
+                config.camera.startPosition.x = static_cast<float>(doubleField);
+            }
+        } else if (key == "positiony") {
+            if (reader.applyDouble(value, doubleField, -1e6, 1e6)) {
+                config.camera.startPosition.y = static_cast<float>(doubleField);
+            }
+        } else if (key == "positionz") {
+            if (reader.applyDouble(value, doubleField, -1e6, 1e6)) {
+                config.camera.startPosition.z = static_cast<float>(doubleField);
+            }
+        } else if (key == "yawdegrees") {
+            if (reader.applyDouble(value, doubleField, -1e6, 1e6)) {
+                config.camera.startYawDegrees = static_cast<float>(doubleField);
+            }
+        } else if (key == "pitchdegrees") {
+            if (reader.applyDouble(value, doubleField, -90.0, 90.0)) {
+                config.camera.startPitchDegrees = static_cast<float>(doubleField);
+            }
+        } else if (key == "movementspeed") {
+            if (reader.applyDouble(value, doubleField, 0.0, 1000.0)) {
+                config.camera.movementSpeed = static_cast<float>(doubleField);
+            }
+        } else if (key == "boostmultiplier") {
+            if (reader.applyDouble(value, doubleField, 0.0, 100.0)) {
+                config.camera.boostMultiplier = static_cast<float>(doubleField);
+            }
+        } else if (key == "mousesensitivity") {
+            if (reader.applyDouble(value, doubleField, 0.0, 10.0)) {
+                config.camera.mouseSensitivity = static_cast<float>(doubleField);
+            }
+        } else if (key == "inverty") {
+            reader.apply(value, config.camera.invertY);
+        } else if (key == "pitchlimitdegrees") {
+            if (reader.applyDouble(value, doubleField, 0.0, 90.0)) {
+                config.camera.pitchLimitDegrees = static_cast<float>(doubleField);
+            }
+        } else if (key == "fieldofviewdegrees") {
+            if (reader.applyDouble(value, doubleField, 1.0, 179.0)) {
+                config.camera.fieldOfViewDegrees = static_cast<float>(doubleField);
+            }
+        } else if (key == "nearplane") {
+            if (reader.applyDouble(value, doubleField, 0.0, 1000.0)) {
+                config.camera.nearPlane = static_cast<float>(doubleField);
+            }
+        } else if (key == "farplane") {
+            if (reader.applyDouble(value, doubleField, 0.0, 1e6)) {
+                config.camera.farPlane = static_cast<float>(doubleField);
+            }
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    // --- [Input] ---------------------------------------------------------------
+    if (section == "input") {
+        if (key == "capturemouseonstart") {
+            reader.apply(value, config.input.captureMouseOnStart);
+        } else if (key == "capturemouseonclick") {
+            reader.apply(value, config.input.captureMouseOnClick);
+        } else {
+            return false;
+        }
+        return true;
+    }
+
     return false;
 }
 
@@ -284,6 +355,15 @@ EngineConfig loadFromExistingFile(const std::filesystem::path& path) {
                 config.loadWarnings.push_back("Unknown config key '" + section + "." + key + "'; ignored");
             }
         }
+    }
+
+    // Cross-field validation that single-key ranges cannot express.
+    if (config.camera.nearPlane >= config.camera.farPlane) {
+        config.loadWarnings.push_back("camera.nearPlane must be smaller than camera.farPlane; "
+                                      "keeping default clip planes");
+        const CameraConfig defaults;
+        config.camera.nearPlane = defaults.nearPlane;
+        config.camera.farPlane = defaults.farPlane;
     }
     return config;
 }
