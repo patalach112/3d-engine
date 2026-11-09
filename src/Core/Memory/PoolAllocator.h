@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -32,7 +33,7 @@ struct PoolStats {
 // this core dies (RAII). Thread-safe: every operation locks internally,
 // so worker threads may allocate concurrently.
 // ---------------------------------------------------------------------------
-class PoolCore {
+class ENGINE_FOUNDATION_API PoolCore {
 public:
     PoolCore();
     ~PoolCore();

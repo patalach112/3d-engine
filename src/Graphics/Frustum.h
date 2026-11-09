@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Geometry/Bounds.h"
 
@@ -33,7 +34,7 @@ struct Plane {
 // along each plane normal can keep the box inside, which makes AABB tests
 // both exact and cheap.
 // ---------------------------------------------------------------------------
-class Frustum {
+class ENGINE_GRAPHICS_API Frustum {
 public:
     explicit Frustum(const glm::mat4& viewProjection);
 

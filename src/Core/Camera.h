@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec2.hpp>
@@ -51,7 +52,7 @@ struct CameraConfig {
 //   camera.update(deltaSeconds);
 //   camera.processMovement(input, deltaSeconds);
 // ---------------------------------------------------------------------------
-class Camera {
+class ENGINE_CORE_API Camera {
 public:
     explicit Camera(const CameraConfig& config);
 
@@ -77,6 +78,16 @@ public:
     // Kept separate from processMovement so frame-rate consistency can be
     // unit-tested without a window.
     void updateMovement(glm::vec3 localDirection, double deltaSeconds, bool boost = false);
+
+    // Advances the same exponential movement smoothing used by
+    // updateMovement(), but returns the world-space velocity instead of
+    // moving the camera. Physics-driven characters use this to drive a
+    // rigid body with identical acceleration/deceleration feel.
+    [[nodiscard]] glm::vec3 smoothedMovementVelocity(glm::vec3 desiredVelocity, double deltaSeconds);
+
+    [[nodiscard]] float movementSpeed(bool boost = false) const {
+        return m_config.movementSpeed * (boost ? m_config.boostMultiplier : 1.0f);
+    }
 
     // Pure translation along the camera basis: the direction's components
     // are (right, worldUp, front) amounts, scaled by speed * deltaSeconds.

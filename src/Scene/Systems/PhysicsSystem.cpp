@@ -91,6 +91,78 @@ constexpr float kEpsilon = 1e-6f;
                      0.0f, 0.0f, factor * (dimensions.x * dimensions.x + dimensions.y * dimensions.y)};
 }
 
+
+// Closest points between two segments (standard segment/segment distance;
+// used for exact capsule/capsule narrow phase).
+void closestSegmentSegment(const glm::vec3& p1, const glm::vec3& q1, const glm::vec3& p2, const glm::vec3& q2,
+                           glm::vec3& closest1, glm::vec3& closest2) {
+    const glm::vec3 d1 = q1 - p1;
+    const glm::vec3 d2 = q2 - p2;
+    const glm::vec3 r = p1 - p2;
+    const float a = glm::dot(d1, d1);
+    const float e = glm::dot(d2, d2);
+    const float f = glm::dot(d2, r);
+    float s = 0.0f;
+    float t = 0.0f;
+    if (a <= kEpsilon && e <= kEpsilon) {
+        closest1 = p1;
+        closest2 = p2;
+        return;
+    }
+    if (a <= kEpsilon) {
+        t = glm::clamp(f / e, 0.0f, 1.0f);
+    } else {
+        const float c = glm::dot(d1, r);
+        if (e <= kEpsilon) {
+            s = glm::clamp(-c / a, 0.0f, 1.0f);
+        } else {
+            const float b = glm::dot(d1, d2);
+            const float denominator = a * e - b * b;
+            s = denominator > kEpsilon ? glm::clamp((b * f - c * e) / denominator, 0.0f, 1.0f) : 0.0f;
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = glm::clamp(-c / a, 0.0f, 1.0f);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = glm::clamp((b - c) / a, 0.0f, 1.0f);
+            }
+        }
+    }
+    closest1 = p1 + d1 * s;
+    closest2 = p2 + d2 * t;
+}
+
+// Distance from a segment to an axis-aligned box in box-local space. The
+// squared distance along a segment to a convex box is convex in the segment
+// parameter, so a deterministic ternary search finds the exact closest
+// parameter (48 iterations shrink the interval far below float precision).
+float segmentBoxDistance(const glm::vec3& p0, const glm::vec3& p1, const glm::vec3& halfExtents, float& outT,
+                         glm::vec3& outSegmentPoint, glm::vec3& outBoxPoint) {
+    const auto distanceAt = [&p0, &p1, &halfExtents](float t, glm::vec3& segmentPoint, glm::vec3& boxPoint) {
+        segmentPoint = p0 + (p1 - p0) * t;
+        boxPoint = glm::clamp(segmentPoint, -halfExtents, halfExtents);
+        const glm::vec3 delta = segmentPoint - boxPoint;
+        return glm::dot(delta, delta);
+    };
+    float low = 0.0f;
+    float high = 1.0f;
+    glm::vec3 unusedA;
+    glm::vec3 unusedB;
+    for (int iteration = 0; iteration < 48; ++iteration) {
+        const float third = (high - low) / 3.0f;
+        const float midLow = low + third;
+        const float midHigh = high - third;
+        if (distanceAt(midLow, unusedA, unusedB) < distanceAt(midHigh, unusedA, unusedB)) {
+            high = midHigh;
+        } else {
+            low = midLow;
+        }
+    }
+    outT = (low + high) * 0.5f;
+    return std::sqrt(distanceAt(outT, outSegmentPoint, outBoxPoint));
+}
+
 void initializeOrientationAndInertia(TransformComponent& transform, RigidBodyComponent& body,
                                      ColliderComponent& collider) {
     if (!body.orientationInitialized) {
@@ -738,8 +810,64 @@ std::optional<PhysicsSystem::Contact> PhysicsSystem::collide(uint32_t bodyA, uin
             return finish(contact);
         }
 
-        const glm::vec3 clamped = glm::clamp(other.center, other.center - other.boundsHalf, other.center + other.boundsHalf);
-        (void)clamped;
+        if (other.type == ColliderComponent::Type::Capsule) {
+            const glm::vec3 otherA = other.center - other.capsuleAxis * other.capsuleHalfHeight;
+            const glm::vec3 otherB = other.center + other.capsuleAxis * other.capsuleHalfHeight;
+            glm::vec3 closestCapsule;
+            glm::vec3 closestOther;
+            closestSegmentSegment(capA, capB, otherA, otherB, closestCapsule, closestOther);
+            const glm::vec3 delta = closestOther - closestCapsule;
+            const float distance = glm::length(delta);
+            const float radiusSum = capsule.radius + other.radius;
+            if (distance >= radiusSum) {
+                return std::nullopt;
+            }
+            const glm::vec3 capsuleToOther =
+                distance > kEpsilon ? delta / distance : glm::vec3{1.0f, 0.0f, 0.0f};
+            contact.normal = capsuleIndex == bodyA ? capsuleToOther : -capsuleToOther;
+            contact.penetration = radiusSum - distance;
+            return finish(contact);
+        }
+
+        if (other.type == ColliderComponent::Type::Box || other.type == ColliderComponent::Type::Obb) {
+            // Exact capsule/OBB test: transform the capsule segment into
+            // box-local space and measure segment-to-AABB distance. This is
+            // the player's 1:1 hitbox path — contact begins precisely when
+            // the capsule surface reaches a face, edge, or corner.
+            const glm::mat3 worldToLocal = glm::transpose(other.axes);
+            const glm::vec3 localA = worldToLocal * (capA - other.center);
+            const glm::vec3 localB = worldToLocal * (capB - other.center);
+            float closestT = 0.0f;
+            glm::vec3 segmentPoint;
+            glm::vec3 boxPoint;
+            const float distance = segmentBoxDistance(localA, localB, other.halfExtents, closestT, segmentPoint, boxPoint);
+            glm::vec3 boxToCapsuleLocal;
+            if (distance > kEpsilon) {
+                if (distance >= capsule.radius) {
+                    return std::nullopt;
+                }
+                boxToCapsuleLocal = (segmentPoint - boxPoint) / distance;
+                contact.penetration = capsule.radius - distance;
+            } else {
+                // Segment passes through the box: leave through the nearest
+                // face from the closest segment point.
+                const glm::vec3 faceDistance = other.halfExtents - glm::abs(segmentPoint);
+                int axis = 0;
+                if (faceDistance.y < faceDistance[axis]) {
+                    axis = 1;
+                }
+                if (faceDistance.z < faceDistance[axis]) {
+                    axis = 2;
+                }
+                boxToCapsuleLocal = glm::vec3{0.0f};
+                boxToCapsuleLocal[axis] = segmentPoint[axis] >= 0.0f ? 1.0f : -1.0f;
+                contact.penetration = capsule.radius + faceDistance[axis];
+            }
+            const glm::vec3 boxToCapsule = glm::normalize(other.axes * boxToCapsuleLocal);
+            contact.normal = capsuleIndex == bodyA ? -boxToCapsule : boxToCapsule;
+            return finish(contact);
+        }
+
         const glm::vec3 deltaMin = glm::abs(other.center - capsule.center) - other.boundsHalf;
         const float outsideDistance = glm::length(glm::max(deltaMin, glm::vec3{0.0f}));
         if (outsideDistance >= capsule.radius + std::max(other.boundsHalf.x, std::max(other.boundsHalf.y, other.boundsHalf.z))) {

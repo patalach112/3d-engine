@@ -62,4 +62,14 @@ const CameraComponent* Scene::findActiveCamera() const {
     return active;
 }
 
+entt::entity Scene::findActiveCameraEntity() const {
+    entt::entity active = entt::null;
+    m_registry.view<CameraComponent>().each([&active](entt::entity entity, const CameraComponent& camera) {
+        if (active == entt::null && camera.isActive) {
+            active = entity;
+        }
+    });
+    return active;
+}
+
 } // namespace engine

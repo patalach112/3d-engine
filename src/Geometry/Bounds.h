@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
@@ -8,7 +9,7 @@ namespace engine {
 // Axis-aligned bounding box. Used as a mesh's local-space bounds and,
 // after transformation by a model matrix, as its world-space bounds for
 // frustum culling.
-struct AABB {
+struct ENGINE_GEOMETRY_API AABB {
     glm::vec3 min{-0.5f};
     glm::vec3 max{0.5f};
 

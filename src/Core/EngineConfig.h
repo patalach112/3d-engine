@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Core/Camera.h"
 #include "Core/GameLoop.h"
@@ -73,7 +74,7 @@ struct PerformanceConfig {
 // (and reported through the logger once it exists), offending values keep
 // their defaults.
 // ---------------------------------------------------------------------------
-struct EngineConfig {
+struct ENGINE_CORE_API EngineConfig {
     LoggerConfig logger;
     LoopConfig loop;
     WindowConfig window;

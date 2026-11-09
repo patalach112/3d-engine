@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <glm/vec2.hpp>
 
@@ -67,7 +68,7 @@ struct InputConfig {
 //   2. Window::pollEvents() lets GLFW fire callbacks into this object,
 //   3. engine systems query state during update/render.
 // ---------------------------------------------------------------------------
-class Input {
+class ENGINE_PLATFORM_API Input {
 public:
     explicit Input(Window& window);
     ~Input();

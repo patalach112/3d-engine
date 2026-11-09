@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Geometry/Bounds.h"
 #include "Geometry/Vertex.h"
@@ -77,7 +78,7 @@ struct MaterialAsset {
 // letting the driver evict resources later. Reservations are released
 // when the manager is destroyed.
 // ---------------------------------------------------------------------------
-class AssetManager {
+class ENGINE_ASSETS_API AssetManager {
 public:
     struct Capacity {
         size_t meshes = 1024;

@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Graphics/RenderQueue.h" // DrawItem + RenderQueue
 
@@ -48,7 +49,7 @@ struct FramePrepareOptions {
 // provided (disjoint writes into pre-sized slots), and the queue sort
 // parallelizes through the same JobSystem for large frames.
 // ---------------------------------------------------------------------------
-class RenderSystem {
+class ENGINE_SCENE_API RenderSystem {
 public:
     RenderSystem(Renderer& renderer, const Swapchain& swapchain, JobSystem* jobs = nullptr,
                  bool frustumCulling = true, size_t parallelMinItems = 128, bool sortDrawItems = true,

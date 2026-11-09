@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Core/Camera.h"
 #include "Core/HardwareProfile.h"
@@ -36,7 +37,7 @@ struct alignas(64) TransformComponent {
     explicit TransformComponent(const glm::vec3& position_) : position(position_) {}
 
     // Model matrix: T * R(yaw) * R(pitch) * R(roll) * S.
-    [[nodiscard]] glm::mat4 modelMatrix() const;
+    [[nodiscard]] ENGINE_SCENE_API glm::mat4 modelMatrix() const;
 };
 
 // Wraps the first-person Camera. The first component with isActive = true

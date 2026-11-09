@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <vulkan/vulkan.h>
 
@@ -26,7 +27,7 @@ class Swapchain;
 // share the one layout, so descriptor set bindings stay valid across
 // per-material pipeline switches in the render loop.
 // ---------------------------------------------------------------------------
-class GraphicsPipeline {
+class ENGINE_GRAPHICS_API GraphicsPipeline {
 public:
     GraphicsPipeline(VulkanContext& context, const Swapchain& swapchain);
     ~GraphicsPipeline();

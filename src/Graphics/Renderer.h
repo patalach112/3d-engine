@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <vulkan/vulkan.h>
 
@@ -39,7 +40,7 @@ struct UniformBufferObject {
 // presentation modes use one frame in flight (see below), trading some
 // CPU/GPU overlap for a shorter sample-to-display queue.
 // ---------------------------------------------------------------------------
-class Renderer {
+class ENGINE_GRAPHICS_API Renderer {
 public:
     static constexpr int kMaxFramesInFlight = 2;
 

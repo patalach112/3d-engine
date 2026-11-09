@@ -5,45 +5,50 @@ namespace engine {
 std::vector<Vertex> Cube::vertices() {
     constexpr float h = 0.5f; // half extent
 
-    // One distinct color per face.
-    constexpr glm::vec3 kRed{1.0f, 0.25f, 0.25f};
-    constexpr glm::vec3 kGreen{0.25f, 1.0f, 0.35f};
-    constexpr glm::vec3 kBlue{0.30f, 0.45f, 1.0f};
-    constexpr glm::vec3 kYellow{1.0f, 0.90f, 0.25f};
-    constexpr glm::vec3 kMagenta{1.0f, 0.30f, 0.90f};
-    constexpr glm::vec3 kCyan{0.25f, 0.95f, 1.0f};
+    // One uniform material tint for every face. The sandbox uses a single
+    // professional material (its color lives in MaterialDesc::baseColor);
+    // per-face variation comes only from normal-based diffuse lighting in
+    // the shader, never from debug face colors.
+    constexpr glm::vec3 kMaterialTint{1.0f, 1.0f, 1.0f};
+
+    constexpr glm::vec3 kFront{0.0f, 0.0f, 1.0f};
+    constexpr glm::vec3 kBack{0.0f, 0.0f, -1.0f};
+    constexpr glm::vec3 kRight{1.0f, 0.0f, 0.0f};
+    constexpr glm::vec3 kLeft{-1.0f, 0.0f, 0.0f};
+    constexpr glm::vec3 kTop{0.0f, 1.0f, 0.0f};
+    constexpr glm::vec3 kBottom{0.0f, -1.0f, 0.0f};
 
     return {
-        // Front (+Z) — red
-        {{-h, -h, h}, kRed},
-        {{h, -h, h}, kRed},
-        {{h, h, h}, kRed},
-        {{-h, h, h}, kRed},
-        // Back (-Z) — green
-        {{h, -h, -h}, kGreen},
-        {{-h, -h, -h}, kGreen},
-        {{-h, h, -h}, kGreen},
-        {{h, h, -h}, kGreen},
-        // Right (+X) — blue
-        {{h, -h, h}, kBlue},
-        {{h, -h, -h}, kBlue},
-        {{h, h, -h}, kBlue},
-        {{h, h, h}, kBlue},
-        // Left (-X) — yellow
-        {{-h, -h, -h}, kYellow},
-        {{-h, -h, h}, kYellow},
-        {{-h, h, h}, kYellow},
-        {{-h, h, -h}, kYellow},
-        // Top (+Y) — magenta
-        {{-h, h, h}, kMagenta},
-        {{h, h, h}, kMagenta},
-        {{h, h, -h}, kMagenta},
-        {{-h, h, -h}, kMagenta},
-        // Bottom (-Y) — cyan
-        {{-h, -h, -h}, kCyan},
-        {{h, -h, -h}, kCyan},
-        {{h, -h, h}, kCyan},
-        {{-h, -h, h}, kCyan},
+        // Front (+Z)
+        {{-h, -h, h}, kFront, kMaterialTint},
+        {{h, -h, h}, kFront, kMaterialTint},
+        {{h, h, h}, kFront, kMaterialTint},
+        {{-h, h, h}, kFront, kMaterialTint},
+        // Back (-Z)
+        {{h, -h, -h}, kBack, kMaterialTint},
+        {{-h, -h, -h}, kBack, kMaterialTint},
+        {{-h, h, -h}, kBack, kMaterialTint},
+        {{h, h, -h}, kBack, kMaterialTint},
+        // Right (+X)
+        {{h, -h, h}, kRight, kMaterialTint},
+        {{h, -h, -h}, kRight, kMaterialTint},
+        {{h, h, -h}, kRight, kMaterialTint},
+        {{h, h, h}, kRight, kMaterialTint},
+        // Left (-X)
+        {{-h, -h, -h}, kLeft, kMaterialTint},
+        {{-h, -h, h}, kLeft, kMaterialTint},
+        {{-h, h, h}, kLeft, kMaterialTint},
+        {{-h, h, -h}, kLeft, kMaterialTint},
+        // Top (+Y)
+        {{-h, h, h}, kTop, kMaterialTint},
+        {{h, h, h}, kTop, kMaterialTint},
+        {{h, h, -h}, kTop, kMaterialTint},
+        {{-h, h, -h}, kTop, kMaterialTint},
+        // Bottom (-Y)
+        {{-h, -h, -h}, kBottom, kMaterialTint},
+        {{h, -h, -h}, kBottom, kMaterialTint},
+        {{h, -h, h}, kBottom, kMaterialTint},
+        {{-h, -h, h}, kBottom, kMaterialTint},
     };
 }
 

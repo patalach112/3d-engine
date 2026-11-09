@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <vulkan/vulkan.h>
 
@@ -39,7 +40,7 @@ struct SwapChainSupportDetails {
 // graphics + present queues, and the command pool. Created once by the
 // Application and passed by reference to the other graphics systems.
 // ---------------------------------------------------------------------------
-class VulkanContext {
+class ENGINE_GRAPHICS_API VulkanContext {
 public:
     explicit VulkanContext(const Window& window);
     ~VulkanContext();

@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 namespace engine {
 
@@ -19,7 +20,7 @@ class Scene;
 // structural registry changes happen while jobs run, and parallelFor()'s
 // return is the barrier before the next system.
 // ---------------------------------------------------------------------------
-class RotationSystem {
+class ENGINE_SCENE_API RotationSystem {
 public:
     static void update(Scene& scene, double fixedDeltaSeconds);
     static void update(Scene& scene, double fixedDeltaSeconds, JobSystem& jobs);

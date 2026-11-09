@@ -6,6 +6,7 @@
 #include "Scene/Components.h"
 #include "Scene/Systems/CameraSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
+#include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
 #include <utility>
@@ -57,12 +58,17 @@ void Application::registerAssets() {
     // on and are what MeshComponents reference by name.
     m_assets.registerMesh("cube", Cube::vertices(), Cube::indices());
 
+    // One standardized sandbox material: a clean slate-blue solid. Every
+    // cube renders with this single color; face-to-face variation comes
+    // only from normal-based diffuse lighting, never debug face colors.
     MaterialDesc defaultMaterial;
     defaultMaterial.name = "default";
+    defaultMaterial.baseColor = glm::vec4{0.38f, 0.44f, 0.54f, 1.0f};
     const MaterialId defaultId = m_assets.registerMaterial(defaultMaterial);
 
     MaterialDesc doubleSidedMaterial;
     doubleSidedMaterial.name = "doubleSided";
+    doubleSidedMaterial.baseColor = defaultMaterial.baseColor;
     doubleSidedMaterial.pipeline.cullMode = CullMode::None;
     const MaterialId doubleSidedId = m_assets.registerMaterial(doubleSidedMaterial);
 
@@ -83,15 +89,29 @@ void Application::registerAssets() {
 }
 
 void Application::buildScene() {
-    // Player: the active first-person camera.
+    // Player: the active first-person camera riding a physical capsule.
+    // The camera config position is the eye position; the capsule center
+    // sits one eye-height below it. The capsule (radius 0.30 m, total
+    // height 1.50 m) is simulated by PhysicsSystem, so the eye can never
+    // clip through the floor, walls, or cubes the capsule cannot pass.
     Entity player = m_scene.createEntity("Player");
     player.addComponent<CameraComponent>(m_config.camera);
+    auto& playerTransform = player.addComponent<TransformComponent>(
+        m_config.camera.startPosition - glm::vec3{0.0f, PlayerSystem::kEyeHeight, 0.0f});
+    playerTransform.scale = glm::vec3{1.0f};
+    auto& playerBody = player.addComponent<RigidBodyComponent>(80.0f);
+    playerBody.restitution = 0.0f;
+    playerBody.friction = 0.25f;
+    playerBody.setPrincipalInertia(glm::vec3{10000.0f}); // capsule stays upright
+    player.addComponent<ColliderComponent>(
+        ColliderComponent::capsule(PlayerSystem::kCapsuleRadius, PlayerSystem::kCapsuleHalfHeight));
 
     if (m_config.physics.demoMode == PhysicsDemoMode::Space) {
         // Zero-G sandbox: the uniform field is disabled for this scene and
         // the planet entity supplies localized radial gravity instead.
         m_config.physics.gravity = glm::vec3{0.0f};
         m_config.physics.gravitationalParameter = 0.0f;
+        playerBody.useGravity = false; // free-flying physical player in zero-G
 
         Entity planet = m_scene.createEntity("RadialGravityPlanet");
         auto& planetTransform = planet.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -5.0f});
@@ -172,17 +192,19 @@ void Application::buildScene() {
     }
 
     // Static floor: rendered as a flattened cube whose top surface is
-    // y=-1.25, with an infinite plane collider at exactly that height.
+    // y=-1.25. Its box collider is derived from the same transform scale,
+    // so the physical floor is exactly the rendered 9 x 0.1 x 9 slab —
+    // bodies (including the player capsule) fall at its visible edges.
     constexpr float floorTop = -1.25f;
     Entity floor = m_scene.createEntity("Floor");
-    auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, floorTop - 0.05f, -2.0f});
+    auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, floorTop - 0.05f, 0.0f});
     floorTransform.scale = glm::vec3{9.0f, 0.1f, 9.0f};
     floor.addComponent<MeshComponent>("cube");
     auto& floorBody = floor.addComponent<RigidBodyComponent>();
     floorBody.setStatic(true);
     floorBody.restitution = 0.35f;
     floorBody.friction = 0.6f;
-    floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, floorTop));
+    floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
 
     // Falling/bouncing rigid-body cubes. Their unit-cube mesh is scaled
     // by TransformComponent; the box collider's local half-extents are
@@ -233,7 +255,8 @@ void Application::buildScene() {
     m_physicsSystem.captureSpawnStates(m_scene);
 
     ENGINE_LOG_INFO("Scene built: " << m_scene.entityCount() << " entities (player camera, static physics floor, "
-                                    << "6 falling rigid-body cubes, 12-cube stacking stress scene)");
+                                    << "6 falling rigid-body cubes, 12-cube stacking stress scene, "
+                                    << "physical capsule player)");
 }
 
 void Application::run() {
@@ -263,7 +286,11 @@ void Application::run() {
         // Rigid-body physics is deterministic simulation, so it lives in
         // the fixed step (never the variable/render-rate update). Its
         // parallel phases return at JobSystem barriers before rendering.
+        // Player input becomes rigid-body velocity first, then physics
+        // resolves gravity, floor contact, cube pushback, and sliding.
+        PlayerSystem::update(m_scene, m_input, fixedDeltaSeconds);
         m_physicsSystem.update(m_scene, fixedDeltaSeconds, m_config.physics, m_jobSystem);
+        PlayerSystem::syncCamera(m_scene);
         RotationSystem::update(m_scene, fixedDeltaSeconds, m_jobSystem);
     };
     // Player control is frame-rate dependent by nature (mouse look), so

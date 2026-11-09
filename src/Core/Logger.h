@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <atomic>
 #include <cstdint>
@@ -75,7 +76,7 @@ class ILogSink;
 // they check the level first, so disabled levels cost (almost) nothing and
 // automatically capture __FILE__/__LINE__.
 // ---------------------------------------------------------------------------
-class Logger {
+class ENGINE_FOUNDATION_API Logger {
 public:
     static Logger& instance();
 
@@ -125,7 +126,7 @@ namespace detail {
 // with operator<< and submits it to the logger on destruction (end of the
 // full expression), so call sites read naturally:
 //   ENGINE_LOG_INFO("Loaded " << count << " assets");
-class LogMessage {
+class ENGINE_FOUNDATION_API LogMessage {
 public:
     LogMessage(Logger& logger, LogLevel level, const char* file, int line)
         : m_logger(logger), m_level(level), m_file(file), m_line(line) {}

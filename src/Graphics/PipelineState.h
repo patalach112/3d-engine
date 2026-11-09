@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -35,7 +36,7 @@ struct PipelineStateDesc {
 
 // Deterministic 64-bit hash of a pipeline state description (FNV-1a over
 // the field values in declaration order).
-[[nodiscard]] uint64_t hashPipelineState(const PipelineStateDesc& state);
+[[nodiscard]] ENGINE_GRAPHICS_API uint64_t hashPipelineState(const PipelineStateDesc& state);
 
 // ---------------------------------------------------------------------------
 // PipelineStateCache
@@ -47,7 +48,7 @@ struct PipelineStateDesc {
 // 1-based (0 = invalid) and assigned in first-seen order — deterministic
 // for a deterministic registration order.
 // ---------------------------------------------------------------------------
-class PipelineStateCache {
+class ENGINE_GRAPHICS_API PipelineStateCache {
 public:
     uint32_t intern(const PipelineStateDesc& state);
     [[nodiscard]] uint32_t find(const PipelineStateDesc& state) const;

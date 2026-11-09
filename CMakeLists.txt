@@ -71,61 +71,140 @@ if(TARGET EnTT)
 endif()
 
 # ---------------------------------------------------------------------------
-# Engine executable (Phase 1: first render)
+# Engine modules (shared libraries / DLLs)
+#
+# The engine builds as layered shared libraries so iterating on one module
+# does not relink (or recompile) the whole engine:
+#
+#   EngineFoundation  logging, time, memory pool, job system
+#   EnginePlatform    GLFW window + input            (links Foundation)
+#   EngineCore        camera, game loop, config      (links Platform)
+#   EngineGeometry    bounds + cube geometry         (links Foundation)
+#   EngineGraphics    Vulkan rendering stack         (links Platform/Geometry)
+#   EngineAssets      asset/material registry        (links Graphics)
+#   EngineScene       ECS scene + all systems        (links Core/Graphics/Assets)
+#   EngineApp         Application composition root   (links Scene)
+#
+# Public symbols are annotated with per-module *_API macros (Core/Export.h:
+# __declspec(dllexport/dllimport) on Windows, visibility attributes on
+# ELF/Mach-O). Each module target privately defines its
+# ENGINE_BUILDING_<MODULE> macro, and WINDOWS_EXPORT_ALL_SYMBOLS is enabled
+# as a safety net for templates/auxiliary symbols on DLL builds.
+# ENGINE_BUILD_SHARED=OFF remains available for modular static builds.
 # ---------------------------------------------------------------------------
-add_executable(3d-engine
-    src/main.cpp
-    src/Core/Application.cpp
-    src/Core/Camera.cpp
-    src/Core/Jobs/JobSystem.cpp
-    src/Core/Memory/PoolAllocator.cpp
-    src/Assets/AssetManager.cpp
-    src/Graphics/PipelineState.cpp
-    src/Scene/Scene.cpp
-    src/Scene/Components.cpp
-    src/Scene/Systems/CameraSystem.cpp
-    src/Scene/Systems/PhysicsSystem.cpp
-    src/Scene/Systems/RotationSystem.cpp
-    src/Scene/Systems/RenderSystem.cpp
-    src/Core/EngineConfig.cpp
+option(ENGINE_BUILD_SHARED "Build engine modules as shared libraries (DLLs on Windows)" ON)
+if(ENGINE_BUILD_SHARED)
+    set(ENGINE_LIBRARY_TYPE SHARED)
+else()
+    set(ENGINE_LIBRARY_TYPE STATIC)
+endif()
+
+function(engine_module target building_macro)
+    add_library(${target} ${ENGINE_LIBRARY_TYPE} ${ARGN})
+    add_library(Engine::${target} ALIAS ${target})
+    target_include_directories(${target} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(${target}
+        PUBLIC GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE
+        PRIVATE ${building_macro}=1)
+    if(NOT ENGINE_BUILD_SHARED)
+        # Static consumers must not see __declspec(dllimport) on Windows.
+        target_compile_definitions(${target} PUBLIC ENGINE_STATIC=1)
+    endif()
+    set_target_properties(${target} PROPERTIES
+        WINDOWS_EXPORT_ALL_SYMBOLS ON
+        CXX_VISIBILITY_PRESET default
+        VISIBILITY_INLINES_HIDDEN OFF)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endfunction()
+
+function(engine_copy_runtime_dlls target)
+    if(WIN32 AND ENGINE_BUILD_SHARED)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_RUNTIME_DLLS:${target}> $<TARGET_FILE_DIR:${target}>
+            COMMAND_EXPAND_LISTS
+            COMMENT "Copying engine module DLLs next to ${target}")
+    endif()
+endfunction()
+
+engine_module(EngineFoundation ENGINE_BUILDING_FOUNDATION
     src/Core/Logger.cpp
     src/Core/Time.cpp
-    src/Core/GameLoop.cpp
-    src/Platform/Input.cpp
+    src/Core/Memory/PoolAllocator.cpp
+    src/Core/Jobs/JobSystem.cpp
+)
+target_link_libraries(EngineFoundation PUBLIC Threads::Threads glm::glm)
+
+engine_module(EnginePlatform ENGINE_BUILDING_PLATFORM
     src/Platform/Window.cpp
+    src/Platform/Input.cpp
+)
+target_link_libraries(EnginePlatform PUBLIC EngineFoundation glfw Vulkan::Vulkan glm::glm)
+
+engine_module(EngineCore ENGINE_BUILDING_CORE
+    src/Core/Camera.cpp
+    src/Core/GameLoop.cpp
+    src/Core/EngineConfig.cpp
+)
+target_link_libraries(EngineCore PUBLIC EngineFoundation EnginePlatform glm::glm EnTT::EnTT)
+
+engine_module(EngineGeometry ENGINE_BUILDING_GEOMETRY
     src/Geometry/Bounds.cpp
     src/Geometry/Cube.cpp
+)
+target_link_libraries(EngineGeometry PUBLIC EngineFoundation glm::glm Vulkan::Vulkan)
+
+engine_module(EngineGraphics ENGINE_BUILDING_GRAPHICS
     src/Graphics/Frustum.cpp
-    src/Graphics/HudFont.cpp
-    src/Graphics/HudRenderer.cpp
     src/Graphics/RenderQueue.cpp
+    src/Graphics/PipelineState.cpp
     src/Graphics/VulkanContext.cpp
     src/Graphics/VulkanHelpers.cpp
     src/Graphics/Swapchain.cpp
     src/Graphics/GraphicsPipeline.cpp
     src/Graphics/Buffer.cpp
+    src/Graphics/HudFont.cpp
+    src/Graphics/HudRenderer.cpp
     src/Graphics/Renderer.cpp
 )
+target_link_libraries(EngineGraphics
+    PUBLIC EngineFoundation EnginePlatform EngineGeometry Vulkan::Vulkan glfw glm::glm)
 
-target_include_directories(3d-engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-
-target_link_libraries(3d-engine
-    PRIVATE
-        Vulkan::Vulkan
-        glfw
-        glm::glm
-        EnTT::EnTT
-        Threads::Threads
+engine_module(EngineAssets ENGINE_BUILDING_ASSETS
+    src/Assets/AssetManager.cpp
 )
+target_link_libraries(EngineAssets PUBLIC EngineFoundation EngineGeometry EngineGraphics glm::glm)
 
-# GLM must match Vulkan conventions: radians everywhere and a [0, 1] depth
-# range (instead of OpenGL's [-1, 1]).
-target_compile_definitions(3d-engine
-    PRIVATE
-        GLM_FORCE_RADIANS
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
+engine_module(EngineScene ENGINE_BUILDING_SCENE
+    src/Scene/Scene.cpp
+    src/Scene/Components.cpp
+    src/Scene/Systems/CameraSystem.cpp
+    src/Scene/Systems/PhysicsSystem.cpp
+    src/Scene/Systems/PlayerSystem.cpp
+    src/Scene/Systems/RotationSystem.cpp
+    src/Scene/Systems/RenderSystem.cpp
 )
+target_link_libraries(EngineScene
+    PUBLIC EngineFoundation EngineCore EnginePlatform EngineGeometry EngineGraphics EngineAssets
+           EnTT::EnTT glm::glm Threads::Threads)
 
+engine_module(EngineApp ENGINE_BUILDING_APP
+    src/Core/Application.cpp
+)
+target_link_libraries(EngineApp
+    PUBLIC EngineFoundation EngineCore EnginePlatform EngineGeometry EngineGraphics EngineAssets EngineScene
+           Vulkan::Vulkan glfw glm::glm EnTT::EnTT Threads::Threads)
+
+# ---------------------------------------------------------------------------
+# Engine executable (thin host: main() + EngineApp shared library)
+# ---------------------------------------------------------------------------
+add_executable(3d-engine src/main.cpp)
+target_link_libraries(3d-engine PRIVATE EngineApp)
+engine_copy_runtime_dlls(3d-engine)
 if(MSVC)
     target_compile_options(3d-engine PRIVATE /W4 /permissive-)
 else()
@@ -190,7 +269,7 @@ add_dependencies(3d-engine engine_shaders)
 # The renderer locates compiled SPIR-V through this absolute path, so the
 # executable can be launched from any working directory.
 string(REPLACE "\\" "/" SHADER_OUTPUT_DIR_SLASHES ${SHADER_OUTPUT_DIR})
-target_compile_definitions(3d-engine
+target_compile_definitions(EngineGraphics
     PRIVATE
         ENGINE_SHADER_DIR="${SHADER_OUTPUT_DIR_SLASHES}"
 )
@@ -210,7 +289,7 @@ add_custom_command(TARGET 3d-engine POST_BUILD
 )
 
 string(REPLACE "\\" "/" ENGINE_SOURCE_DIR_SLASHES ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_definitions(3d-engine
+target_compile_definitions(EngineCore
     PRIVATE
         ENGINE_DEFAULT_CONFIG_PATH="${ENGINE_SOURCE_DIR_SLASHES}/config/engine.ini"
 )
@@ -220,42 +299,14 @@ target_compile_definitions(3d-engine
 # ---------------------------------------------------------------------------
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(engine-core-tests
-        tests/CoreTests.cpp
-        src/Core/Camera.cpp
-        src/Core/EngineConfig.cpp
-        src/Core/Jobs/JobSystem.cpp
-        src/Core/Memory/PoolAllocator.cpp
-        src/Core/Logger.cpp
-        src/Core/Time.cpp
-        src/Core/GameLoop.cpp
-        src/Platform/Input.cpp
-        src/Platform/Window.cpp
-        src/Geometry/Bounds.cpp
-        src/Geometry/Cube.cpp
-        src/Graphics/Frustum.cpp
-    src/Graphics/HudFont.cpp
-    src/Graphics/HudRenderer.cpp
-    src/Graphics/RenderQueue.cpp
-        src/Assets/AssetManager.cpp
-    src/Graphics/PipelineState.cpp
-    src/Scene/Scene.cpp
-        src/Scene/Components.cpp
-        src/Scene/Systems/CameraSystem.cpp
-        src/Scene/Systems/PhysicsSystem.cpp
-        src/Scene/Systems/RotationSystem.cpp
-        src/Scene/Systems/RenderSystem.cpp
-        src/Graphics/VulkanContext.cpp
-        src/Graphics/VulkanHelpers.cpp
-        src/Graphics/Swapchain.cpp
-        src/Graphics/GraphicsPipeline.cpp
-        src/Graphics/Buffer.cpp
-        src/Graphics/Renderer.cpp
-    )
-    target_include_directories(engine-core-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(engine-core-tests PRIVATE GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE)
+    add_executable(engine-core-tests tests/CoreTests.cpp)
+    # The test host links every shared module directly: if a public symbol
+    # were missing from a DLL's export surface, this target would fail to
+    # link, so the suite doubles as the dynamic-module export test.
     target_link_libraries(engine-core-tests
-        PRIVATE Threads::Threads Vulkan::Vulkan glfw glm::glm EnTT::EnTT)
+        PRIVATE EngineApp EngineScene EngineAssets EngineGraphics EngineGeometry EngineCore
+                EnginePlatform EngineFoundation Threads::Threads Vulkan::Vulkan glfw glm::glm EnTT::EnTT)
+    engine_copy_runtime_dlls(engine-core-tests)
     if(MSVC)
         target_compile_options(engine-core-tests PRIVATE /W4 /permissive-)
     else()

@@ -17,6 +17,7 @@
 #include "Scene/Scene.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
+#include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
 #include "Core/Concurrency/LockFreeRingBuffer.h"
@@ -1030,6 +1031,182 @@ void testPhysics() {
         check(identical, "parallel physics is deterministic across worker counts");
     }
 }
+
+void testDynamicModulesAndMaterials() {
+    std::cout << "Dynamic modules & materials\n";
+
+    // This test executable links the shared engine modules directly; every
+    // call below crosses a module boundary, so a missing DLL export fails
+    // at link time rather than slipping through as a static-only build.
+    check(engine::Window::cursorModeForCapture(true) == GLFW_CURSOR_DISABLED,
+          "EnginePlatform exports window/input helpers");
+    engine::Camera moduleCamera(engine::CameraConfig{});
+    check(nearlyEqual(moduleCamera.movementSpeed(false), 3.0, 1e-6) &&
+              nearlyEqual(moduleCamera.movementSpeed(true), 7.5, 1e-6),
+          "EngineCore exports camera movement configuration");
+    engine::PipelineStateCache modulePso;
+    check(modulePso.intern(engine::PipelineStateDesc{}) == 1, "EngineGraphics exports the PSO cache");
+    engine::RenderQueue moduleQueue;
+    engine::DrawItem moduleItem;
+    moduleItem.baseColor = glm::vec4{0.38f, 0.44f, 0.54f, 1.0f};
+    moduleQueue.push(moduleItem);
+    check(moduleQueue.size() == 1 && nearlyEqual(moduleQueue.items()[0].baseColor.x, 0.38f, 1e-6),
+          "draw items carry the standardized material color across modules");
+
+    // Solid-material pipeline contract: depth test + depth write on, Less
+    // comparison, back-face culling. This is what prevents light/color
+    // bleed and see-through geometry in the sandbox.
+    const engine::PipelineStateDesc solidState;
+    check(solidState.depthTestEnable && solidState.depthWriteEnable &&
+              solidState.depthCompare == engine::DepthCompare::Less &&
+              solidState.cullMode == engine::CullMode::Back && !solidState.blendEnable,
+          "default pipeline state is a solid depth-writing back-culled material");
+
+    // Uniform sandbox geometry: 24 vertices, one tint, exact unit normals.
+    const std::vector<engine::Vertex> vertices = engine::Cube::vertices();
+    const std::vector<uint32_t> indices = engine::Cube::indices();
+    bool uniformTint = vertices.size() == 24 && indices.size() == 36;
+    bool unitNormals = uniformTint;
+    for (const engine::Vertex& vertex : vertices) {
+        uniformTint = uniformTint && nearlyVec3(vertex.color, glm::vec3{1.0f}, 1e-6);
+        unitNormals = unitNormals && nearlyEqual(glm::length(vertex.normal), 1.0, 1e-6) &&
+                      nearlyEqual(glm::dot(vertex.normal, vertex.position), 0.5, 1e-6);
+    }
+    check(uniformTint, "cube geometry uses one uniform material tint on every face");
+    check(unitNormals, "cube vertices carry exact outward face normals for diffuse shading");
+    bool windingOutward = indices.size() == 36;
+    for (size_t i = 0; i + 2 < indices.size() && windingOutward; i += 3) {
+        const glm::vec3 p0 = vertices[indices[i]].position;
+        const glm::vec3 p1 = vertices[indices[i + 1]].position;
+        const glm::vec3 p2 = vertices[indices[i + 2]].position;
+        const glm::vec3 centroid = (p0 + p1 + p2) / 3.0f;
+        windingOutward = glm::dot(glm::cross(p1 - p0, p2 - p0), centroid) > 0.0f;
+    }
+    check(windingOutward, "cube triangles wind outward so back-face culling keeps visible faces");
+    check(sizeof(engine::Vertex) == 36, "vertex format is position+normal+color (36 bytes)");
+
+    // Material colors round-trip through EngineAssets unchanged.
+    engine::VramBudget vram(1024 * 1024);
+    engine::VramBudget staging(1024 * 1024);
+    engine::AssetManager assets(vram, staging);
+    engine::MaterialDesc sandbox;
+    sandbox.name = "sandbox";
+    sandbox.baseColor = glm::vec4{0.38f, 0.44f, 0.54f, 1.0f};
+    const engine::MaterialId sandboxId = assets.registerMaterial(sandbox);
+    const engine::MaterialAsset* sandboxAsset = assets.material(sandboxId);
+    check(sandboxAsset != nullptr && nearlyEqual(sandboxAsset->desc.baseColor.x, 0.38f, 1e-6) &&
+              nearlyEqual(sandboxAsset->desc.baseColor.z, 0.54f, 1e-6),
+          "EngineAssets preserves the standardized sandbox material color");
+}
+
+void testPlayerCollision() {
+    std::cout << "Player collision (1:1 capsule hitbox)\n";
+    using engine::ColliderComponent;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::RigidBodyComponent;
+    using engine::TransformComponent;
+
+    const auto addFloor = [](engine::Scene& scene) {
+        auto floor = scene.createEntity("PlayerFloor");
+        auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        floorTransform.scale = glm::vec3{9.0f, 0.1f, 9.0f};
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.friction = 0.6f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        return floor;
+    };
+    const auto addPlayer = [](engine::Scene& scene, const glm::vec3& center) {
+        auto player = scene.createEntity("Player");
+        player.addComponent<TransformComponent>(center);
+        auto& camera = player.addComponent<engine::CameraComponent>(engine::CameraConfig{});
+        camera.camera.setOrientation(0.0f, 0.0f); // face +X
+        auto& body = player.addComponent<RigidBodyComponent>(80.0f);
+        body.restitution = 0.0f;
+        body.friction = 0.25f;
+        body.setPrincipalInertia(glm::vec3{10000.0f});
+        player.addComponent<ColliderComponent>(
+            ColliderComponent::capsule(engine::PlayerSystem::kCapsuleRadius,
+                                       engine::PlayerSystem::kCapsuleHalfHeight));
+        return player;
+    };
+
+    // Gravity landing: the capsule comes to rest with its bottom exactly on
+    // the finite floor slab (center = radius + segment half-height = 0.75 m).
+    {
+        engine::Scene scene;
+        addFloor(scene);
+        auto player = addPlayer(scene, glm::vec3{0.0f, 3.0f, 0.0f});
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        for (int step = 0; step < 180; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float centerY = player.getComponent<TransformComponent>().position.y;
+        const float speedY = player.getComponent<RigidBodyComponent>().velocity.y;
+        check(engine::PlayerSystem::hasPhysicalPlayer(scene), "physical player component set is detected");
+        check(centerY > 0.68f && centerY < 0.82f, "player capsule lands and rests on the floor");
+        check(std::abs(speedY) < 0.5f, "player landing velocity settles under gravity");
+        check(engine::PlayerSystem::syncCamera(scene) &&
+                  nearlyEqual(player.getComponent<engine::CameraComponent>().camera.position().y,
+                              centerY + engine::PlayerSystem::kEyeHeight, 1e-4),
+              "camera eye follows the simulated capsule center");
+    }
+
+    // Pushback: driving forward shoves a light cube ahead; the capsule
+    // surface never crosses the cube's near face.
+    {
+        engine::Scene scene;
+        addFloor(scene);
+        auto player = addPlayer(scene, glm::vec3{-0.2f, 0.75f, 0.0f});
+        auto cube = scene.createEntity("PushedCube");
+        cube.addComponent<TransformComponent>(glm::vec3{0.8f, 0.5f, 0.0f});
+        auto& cubeBody = cube.addComponent<RigidBodyComponent>(1.0f);
+        cubeBody.friction = 0.5f;
+        cubeBody.restitution = 0.0f;
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        for (int step = 0; step < 90; ++step) {
+            engine::PlayerSystem::driveMovement(scene, glm::vec3{0.0f, 0.0f, 1.0f}, 1.0 / 60.0);
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float playerX = player.getComponent<TransformComponent>().position.x;
+        const float cubeX = cube.getComponent<TransformComponent>().position.x;
+        check(cubeX > 0.9f, "player capsule pushes a dynamic cube forward");
+        check(playerX < cubeX - 0.5f - engine::PlayerSystem::kCapsuleRadius + 0.08f,
+              "player capsule never clips through the pushed cube");
+    }
+
+    // Sliding: diagonal motion into a static wall keeps tangential travel
+    // while the normal component is stopped at the exact capsule offset.
+    {
+        engine::Scene scene;
+        addFloor(scene);
+        auto player = addPlayer(scene, glm::vec3{0.0f, 0.75f, 0.0f});
+        auto wall = scene.createEntity("PlayerWall");
+        wall.addComponent<TransformComponent>(glm::vec3{1.0f, 1.0f, 0.0f});
+        auto& wallBody = wall.addComponent<RigidBodyComponent>();
+        wallBody.setStatic(true);
+        wall.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f, 1.0f, 3.0f}));
+
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        auto& playerBody = player.getComponent<RigidBodyComponent>();
+        for (int step = 0; step < 90; ++step) {
+            playerBody.velocity.x = 2.0f;
+            playerBody.velocity.z = 1.5f;
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const glm::vec3 position = player.getComponent<TransformComponent>().position;
+        check(position.x < 0.5f - engine::PlayerSystem::kCapsuleRadius + 0.06f,
+              "player capsule stops at the wall face (no clipping)");
+        check(position.z > 0.5f, "player slides along the wall tangentially");
+    }
+}
+
 
 void testSceneAndSystems() {
     std::cout << "Scene / ECS systems\n";
@@ -2068,6 +2245,8 @@ int main() {
     testLogger();
     testCamera();
     testPhysics();
+    testDynamicModulesAndMaterials();
+    testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();
     testHudOverlay();

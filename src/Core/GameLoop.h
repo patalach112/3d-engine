@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Core/Time.h"
 
@@ -42,7 +43,7 @@ struct LoopConfig {
 // integral number of fixed steps. It is deliberately free of callbacks and
 // clocks so it can be unit-tested deterministically.
 // ---------------------------------------------------------------------------
-class FixedTimestep {
+class ENGINE_CORE_API FixedTimestep {
 public:
     struct Result {
         uint32_t steps = 0;          // fixed steps the caller should execute now
@@ -108,7 +109,7 @@ struct LoopStats {
 // nothing about windows or graphics APIs — the Application wires those in
 // through LoopCallbacks.
 // ---------------------------------------------------------------------------
-class GameLoop {
+class ENGINE_CORE_API GameLoop {
 public:
     explicit GameLoop(LoopConfig config);
 

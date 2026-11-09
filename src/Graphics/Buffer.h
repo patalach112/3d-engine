@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <vulkan/vulkan.h>
 
@@ -15,7 +16,7 @@ class VulkanContext;
 // keeps the memory persistently mapped (used by the per-frame uniform
 // buffers, which the CPU rewrites every frame).
 // ---------------------------------------------------------------------------
-class Buffer {
+class ENGINE_GRAPHICS_API Buffer {
 public:
     Buffer() = default;
     Buffer(VulkanContext& context, VkDeviceSize size, VkBufferUsageFlags usage,
@@ -47,7 +48,7 @@ private:
 // Creates a device-local buffer and uploads `data` into it through a
 // staging buffer. Ideal for static geometry: fast GPU-side reads, written
 // once by the CPU. `usage` must not include transfer bits; they are added.
-Buffer createDeviceLocalBuffer(VulkanContext& context, const void* data, VkDeviceSize size,
+ENGINE_GRAPHICS_API Buffer createDeviceLocalBuffer(VulkanContext& context, const void* data, VkDeviceSize size,
                                VkBufferUsageFlags usage);
 
 } // namespace engine

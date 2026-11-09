@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <chrono>
 #include <cstdint>
@@ -15,7 +16,7 @@ namespace engine {
 // time window, never from the reciprocal of one (possibly near-zero)
 // delta, so swapchain recreation/resizing cannot make it spike falsely.
 // ---------------------------------------------------------------------------
-class Time {
+class ENGINE_FOUNDATION_API Time {
 public:
     using Clock = std::chrono::steady_clock;
 

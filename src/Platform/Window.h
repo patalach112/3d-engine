@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 // GLFW_INCLUDE_VULKAN makes GLFW pull in <vulkan/vulkan.h> and expose the
 // Vulkan surface helpers; GLFW_INCLUDE_NONE stops it from also including
@@ -21,7 +22,7 @@ class Input;
 // GLFW library lifetime for the application (init on construction,
 // terminate on destruction), so exactly one Window may exist at a time.
 // ---------------------------------------------------------------------------
-class Window {
+class ENGINE_PLATFORM_API Window {
 public:
     Window(int width, int height, const char* title, bool resizable = true, bool captureCursor = true);
     ~Window();

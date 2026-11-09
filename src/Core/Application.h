@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Assets/AssetManager.h"
 #include "Core/EngineConfig.h"
@@ -35,7 +36,7 @@ namespace engine {
 // the Scene, then lets ECS systems (camera, rotation, render) update and
 // draw the world each frame. All tuning arrives through EngineConfig.
 // ---------------------------------------------------------------------------
-class Application {
+class ENGINE_APP_API Application {
 public:
     explicit Application(EngineConfig config);
     ~Application();

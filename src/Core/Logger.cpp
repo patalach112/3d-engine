@@ -470,9 +470,17 @@ void Logger::log(LogLevel level, const char* file, int line, std::string_view me
 
     detail::LogRecord record;
     record.level = level;
-    record.text = "[" + formatTimestamp(std::chrono::system_clock::now()) + "] [" + toString(level) + "] ";
+    record.text.push_back('[');
+    record.text.append(formatTimestamp(std::chrono::system_clock::now()));
+    record.text.append("] [");
+    record.text.append(toString(level));
+    record.text.append("] ");
     record.text.append(message);
-    record.text += " (" + std::string(baseName(file)) + ":" + std::to_string(line) + ")";
+    record.text.append(" (");
+    record.text.append(baseName(file));
+    record.text.push_back(':');
+    record.text.append(std::to_string(line));
+    record.text.push_back(')');
 
     {
         std::shared_lock lock(m_sinkMutex);

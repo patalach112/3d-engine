@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 namespace engine {
 
@@ -13,7 +14,7 @@ class Scene;
 // with the variable frame delta. Runs in the loop's variable update;
 // rendering reads the resulting camera state afterwards, never before.
 // ---------------------------------------------------------------------------
-class CameraSystem {
+class ENGINE_SCENE_API CameraSystem {
 public:
     static void update(Scene& scene, const Input& input, double deltaSeconds);
 };

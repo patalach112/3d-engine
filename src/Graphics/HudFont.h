@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Core/Export.h"
+
 #include <array>
 #include <cstdint>
 #include <string>
@@ -45,17 +47,17 @@ using HudGlyph = std::array<std::string_view, kHudGlyphHeight>;
 
 // Returns the glyph rows for a character ('#' = filled pixel). Lowercase
 // maps to uppercase; unknown characters render as '?'.
-[[nodiscard]] const HudGlyph& hudGlyphFor(char character);
+[[nodiscard]] ENGINE_GRAPHICS_API const HudGlyph& hudGlyphFor(char character);
 
 // Builds triangle vertices for `text` (supports '\n') with the top-left
 // corner at (xPixels, yPixels), each font pixel scaled by `pixelScale`
 // screen pixels, mapped into the given viewport.
-[[nodiscard]] std::vector<HudVertex> buildHudVertices(std::string_view text, float xPixels, float yPixels,
+[[nodiscard]] ENGINE_GRAPHICS_API std::vector<HudVertex> buildHudVertices(std::string_view text, float xPixels, float yPixels,
                                                       float pixelScale, uint32_t viewportWidth,
                                                       uint32_t viewportHeight, HudColor color = {});
 
 // Composes the standard engine HUD text (uppercase, font-safe charset).
-[[nodiscard]] std::string formatHudText(double framesPerSecond, double frameMilliseconds, uint32_t workerThreads,
+[[nodiscard]] ENGINE_GRAPHICS_API std::string formatHudText(double framesPerSecond, double frameMilliseconds, uint32_t workerThreads,
                                         uint64_t vramUsedMiB, uint64_t vramBudgetMiB, uint32_t drawnCount,
                                         uint32_t culledCount);
 

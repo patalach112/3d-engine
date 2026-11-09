@@ -1,6 +1,7 @@
 #include "Graphics/GraphicsPipeline.h"
 
 #include "Geometry/Vertex.h"
+#include "Graphics/RenderQueue.h"
 #include "Graphics/Swapchain.h"
 #include "Graphics/VulkanContext.h"
 #include "Graphics/VulkanHelpers.h"
@@ -271,12 +272,15 @@ VkPipeline GraphicsPipeline::createPipeline(const Swapchain& swapchain, const Pi
     colorBlending.pAttachments = &colorBlendAttachment;
 
     // --- Pipeline layout ------------------------------------------------------
-    // Per-entity model matrices arrive as push constants (one mat4, which
-    // fits comfortably in the guaranteed 128-byte push constant minimum).
+    // Per-entity model matrices and material colors arrive as push
+    // constants (80 bytes, inside the guaranteed 128-byte minimum). The
+    // default pipeline state is a solid material: depth test + depth write
+    // enabled with Less comparison and back-face culling, so nearer solid
+    // geometry always occludes what is behind it.
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(glm::mat4);
+    pushConstantRange.size = sizeof(DrawPushConstants);
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;

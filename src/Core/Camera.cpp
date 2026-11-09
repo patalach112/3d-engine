@@ -152,6 +152,17 @@ void Camera::updateMovement(glm::vec3 localDirection, double deltaSeconds, bool 
         desiredVelocity = (m_right * direction.x + kWorldUp * direction.y + m_front * direction.z) * speed;
     }
 
+    (void)smoothedMovementVelocity(desiredVelocity, deltaSeconds);
+
+    // Velocity is in world units per second; multiplying by this frame's
+    // real elapsed time gives frame-rate-independent travel distance.
+    m_position += m_velocity * static_cast<float>(deltaSeconds);
+}
+
+glm::vec3 Camera::smoothedMovementVelocity(glm::vec3 desiredVelocity, double deltaSeconds) {
+    if (deltaSeconds <= 0.0) {
+        return m_velocity;
+    }
     if (m_config.movementSmoothingSeconds <= 0.0f) {
         m_velocity = desiredVelocity;
     } else {
@@ -162,10 +173,7 @@ void Camera::updateMovement(glm::vec3 localDirection, double deltaSeconds, bool 
             m_velocity = glm::vec3{0.0f};
         }
     }
-
-    // Velocity is in world units per second; multiplying by this frame's
-    // real elapsed time gives frame-rate-independent travel distance.
-    m_position += m_velocity * static_cast<float>(deltaSeconds);
+    return m_velocity;
 }
 
 void Camera::translate(glm::vec3 localDirection, double deltaSeconds, bool boost) {

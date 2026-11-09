@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Core/Concurrency/LockFreeRingBuffer.h"
 
@@ -41,7 +42,7 @@ namespace engine {
 // Job exceptions are caught, counted and logged — a throwing job can never
 // kill a worker thread.
 // ---------------------------------------------------------------------------
-class JobSystem {
+class ENGINE_FOUNDATION_API JobSystem {
 public:
     struct Config {
         // 0 = automatic: sized from the target hardware profile

@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <vulkan/vulkan.h>
 
@@ -27,7 +28,7 @@ struct PresentationSettings {
     bool vsync = true;
 };
 
-class Swapchain {
+class ENGINE_GRAPHICS_API Swapchain {
 public:
     // The requested mode/vsync pair is resolved against the modes the
     // surface actually supports; presentMode() reports the result.

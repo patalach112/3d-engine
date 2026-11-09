@@ -30,8 +30,9 @@ A minimal, clean application that verifies the whole rendering pipeline:
 - Swapchain (sRGB format preferred), depth buffer, render pass, and framebuffers
 - Fixed graphics pipeline with dynamic viewport/scissor, depth testing, and
   back-face culling
-- A unit cube with one distinct color per face (24 vertices / 36 indices),
-  stored in device-local vertex/index buffers uploaded through staging buffers
+- A unit cube (24 vertices / 36 indices) with exact outward face normals
+  and one uniform material tint, stored in device-local vertex/index
+  buffers uploaded through staging buffers
 - Per-frame uniform buffers feeding model/view/projection matrices (GLM) to the
   vertex shader through descriptor sets; the cube tumbles continuously around
   multiple axes at different speeds
@@ -314,7 +315,7 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 199 checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 314 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
@@ -332,7 +333,10 @@ VRAM-budgeted registration and rejection, PSO state deduplication,
 descriptor indices flowing into sorted draw items), and Phase 6 HUD/loop
 checks (glyph layout vertex counts and NDC bounds, HUD text composition,
 and the poll → fixed → update → render callback contract the window
-loop runs on) — everything verifiable without a GPU.
+loop runs on), and Phase 8 checks (shared-module link/export surface,
+uniform material color and normals, solid depth/cull pipeline defaults,
+and capsule-player landing, cube pushing, wall blocking, and sliding) —
+everything verifiable without a GPU.
 
 ## Phase 5 — Asset Management, Shader Pipelines & Materials ✅
 
@@ -491,6 +495,81 @@ scratch, and restores any `SpinComponent` velocity — without
 creating/destroying entities or reallocating ECS storage, so repeated
 resets are stable and leak-free.
 
+## Phase 8 — Dynamic Modules, Physical Player & Solid Materials ✅
+
+### Shared-library module architecture (`CMakeLists.txt`, `src/Core/Export.h`)
+
+The engine no longer builds as one monolithic executable target. CMake
+builds layered shared libraries — `.dll` on Windows, `.so`/`.dylib`
+elsewhere — and the executable is a thin host containing only `main()`:
+
+| Module | Contents |
+|---|---|
+| `EngineFoundation` | Logger, time, pool allocator, job system |
+| `EnginePlatform` | GLFW window and input |
+| `EngineCore` | Camera, game loop, configuration |
+| `EngineGeometry` | Bounds and cube geometry |
+| `EngineGraphics` | Vulkan renderer, pipelines, HUD, render queue |
+| `EngineAssets` | Mesh/shader/material registry |
+| `EngineScene` | ECS scene and camera/physics/player/render systems |
+| `EngineApp` | Application composition root |
+
+Public classes and functions carry per-module `ENGINE_*_API` annotations
+(`__declspec(dllexport/dllimport)` on Windows, visibility attributes on
+ELF/Mach-O). Each module privately defines its `ENGINE_BUILDING_<MODULE>`
+macro; `WINDOWS_EXPORT_ALL_SYMBOLS` remains a safety net for templates and
+auxiliary symbols. `ENGINE_BUILD_SHARED` defaults to `ON`; set it to `OFF`
+for a static build (CMake then defines `ENGINE_STATIC`, so no DLL import
+annotations leak into static consumers). On Windows, runtime DLLs are
+copied next to the executable and test binary automatically. The test
+executable links every module directly, so a missing public export fails
+at link time.
+
+### Physical first-person player (`PlayerSystem`, `PhysicsSystem`)
+
+The active camera entity is now a real simulated character, not a free-fly
+camera that happens to render the scene:
+
+- It owns a `TransformComponent`, an 80 kg dynamic `RigidBodyComponent`,
+  and a capsule `ColliderComponent` (radius 0.30 m, segment half-height
+  0.45 m, total height 1.50 m). The camera eye sits 0.50 m above the
+  capsule center, inside the capsule; with the default 0.1 m near plane,
+  the view plane stays within the capsule's 0.30 m clearance — the view
+  cannot enter geometry the capsule cannot.
+- Fixed-update order is `PlayerSystem` (input → smoothed rigid-body
+  velocity) → `PhysicsSystem` (gravity, contacts, solver) →
+  `PlayerSystem::syncCamera` (capsule center + eye offset) →
+  `RotationSystem`. `CameraSystem` still handles mouse look, but for a
+  physical player it never teleports the camera; non-physical cameras
+  keep the previous free-fly behavior.
+- Capsule collision is exact rather than bounding-sphere approximate:
+  capsule/capsule uses closest points between the two segments, and
+  capsule/box (including rotated OBBs) transforms the capsule segment
+  into box-local space and measures the true segment-to-box distance, so
+  contact starts precisely at a face, edge, or corner. The player therefore
+  lands on the floor, is stopped by walls, slides along them, and pushes
+  dynamic cubes with rigid-body impulses. The demo floor's collider is a
+  box matching its rendered 9 x 0.1 x 9 slab exactly.
+
+### Uniform solid materials (`Vertex`, `Cube`, shaders, push constants)
+
+- All sandbox cubes use one standardized material color (slate blue,
+  `(0.38, 0.44, 0.54)`) from `MaterialDesc::baseColor`; geometry carries a
+  single white tint. The old per-face debug colors are gone — visible
+  face variation comes only from lighting.
+- `Vertex` is position + normal + color (36 bytes). The vertex shader
+  transforms normals with the inverse-transpose model matrix, and the
+  fragment shader applies ambient + diffuse solid-material shading.
+- Each draw pushes an 80-byte `DrawPushConstants` payload (model matrix +
+  material color), inside Vulkan's guaranteed 128-byte push-constant
+  minimum.
+- The default pipeline state is a solid material: depth test and depth
+  write enabled, `Less` depth comparison, back-face culling with
+  clockwise front faces (compensating GLM's Y-flip), and no blending —
+  nearer geometry occludes farther geometry and neither light nor color
+  bleeds through solid surfaces.
+
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
@@ -545,7 +624,8 @@ sudo apt install libx11-dev libxrandr-dev libxinerama-dev \
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
+cmake --build build   # shared engine modules + thin executable
+# Modular static alternative: add -DENGINE_BUILD_SHARED=OFF
 ./build/3d-engine        # Windows: build\Debug\3d-engine.exe
 ctest --test-dir build --output-on-failure
 ```
@@ -563,8 +643,8 @@ build; the executable finds them regardless of the working directory.
 A Debug build enables Vulkan validation layers when they are installed —
 watch the console or `logs/` for `[Vulkan validation]` diagnostics while
 developing. The mouse is captured at startup for first-person look:
-**WASD** move, **Q/E** down/up, **Shift** boost, **Esc** releases the
-mouse (press again to quit).
+**WASD** move, **Space/E** up, **Q** down, **Shift** boost, **Esc**
+releases the mouse (press again to quit).
 
 ## Project structure
 
@@ -575,14 +655,15 @@ mouse (press again to quit).
 ├── config/
 │   └── engine.ini            # All engine tuning (window, render, logger, loop)
 ├── shaders/
-│   ├── cube.vert             # MVP transform (UBO) + color passthrough
-│   └── cube.frag             # Flat per-face color output
+│   ├── cube.vert             # MVP + inverse-transpose normals + material color
+│   └── cube.frag             # Ambient + diffuse solid-material shading
 ├── tests/
-│   └── CoreTests.cpp         # Config/logger/timing/loop/ECS tests (CTest)
+│   └── CoreTests.cpp         # Config/logger/physics/player/material tests (CTest)
 └── src/
     ├── main.cpp              # Bootstrap: arguments -> config -> logger -> app
     ├── Core/
     │   ├── Application.h/.cpp  # Composition root, wires loop callbacks
+    │   ├── Export.h            # Per-module DLL export/import macros
     │   ├── Camera.h/.cpp       # First-person yaw/pitch camera (GLM)
     │   ├── Concurrency/LockFreeRingBuffer.h # Bounded MPMC lock-free ring buffer
     │   ├── HardwareProfile.h   # i5-3470/GTX 970 target constants + tuning policy
@@ -602,13 +683,15 @@ mouse (press again to quit).
     │   ├── DenseIteration.h    # Dense-index access into EnTT's paged storage
     │   ├── Components.h/.cpp   # Tag/Transform/Camera/Mesh/Spin components
     │   └── Systems/
-    │       ├── CameraSystem.*  # Input-driven active camera (variable update)
+    │       ├── CameraSystem.*  # Look + physical-player camera follow
+    │       ├── PhysicsSystem.* # Rigid-body solver (fixed update)
+    │       ├── PlayerSystem.*  # Physical capsule player controller
     │       ├── RotationSystem.*# Spin integration (fixed update)
     │       └── RenderSystem.*  # Scene -> view/projection + draw items
     ├── Geometry/
-    │   ├── Vertex.h            # Interleaved position+color vertex layout
+    │   ├── Vertex.h            # Interleaved position+normal+color layout
     │   ├── Bounds.h/.cpp       # AABB + world-space transformation
-    │   └── Cube.h/.cpp         # Colored cube geometry (24 verts, 36 indices)
+    │   └── Cube.h/.cpp         # Uniform-material cube (24 verts, 36 indices)
     └── Graphics/
         ├── VulkanContext.h/.cpp  # Instance, devices, queues, command pool
         ├── VulkanHelpers.h/.cpp  # Buffers/images, one-off transfers, file IO
@@ -654,6 +737,13 @@ what it depends on.
 - **Phase 6 — Window, loop & HUD ✅:** integrated GLFW/Vulkan application
   loop on the hardware profile, with a zero-overhead bitmap-font FPS
   HUD (FPS, frame time, workers, VRAM, draw stats)
-- Later phases build the real engine core on top of this foundation (asset
-  management, scene/entity systems, materials, lighting) — editors and visual
-  tooling only arrive once the core is complete.
+- **Phase 7 — Production physics ✅:** ECS rigid-body simulation with
+  solver islands, warm starting, CCD, joints, thrusters, radial gravity,
+  and terrestrial/zero-G demo scenes
+- **Phase 8 — DLL modules, player & materials ✅:** layered shared-library
+  engine modules with explicit export/import macros, a physical capsule
+  player with exact capsule collision (landing, pushing, sliding), and a
+  uniform solid-material pipeline (normals, diffuse shading, 80-byte push
+  constants, depth-write/back-cull defaults)
+- Later phases build the real engine core on top of this foundation —
+  editors and visual tooling only arrive once the core is complete.

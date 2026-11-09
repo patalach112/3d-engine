@@ -1,6 +1,8 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <glm/mat4x4.hpp>
+#include <glm/vec4.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +30,19 @@ struct DrawItem {
     // can fetch material data by index instead of rebinding descriptors.
     uint32_t descriptorIndex = 0;
     float viewDepth = 0.0f;
+    // Uniform material color for this draw (from MaterialDesc::baseColor).
+    // Pushed to the shader with the model matrix so every sandbox mesh is
+    // shaded as one solid material, not per-face debug colors.
+    glm::vec4 baseColor{1.0f};
 };
+
+// Push-constant payload for one draw (model matrix + material color).
+// 80 bytes, comfortably inside Vulkan's guaranteed 128-byte minimum.
+struct DrawPushConstants {
+    glm::mat4 model{1.0f};
+    glm::vec4 baseColor{1.0f};
+};
+static_assert(sizeof(DrawPushConstants) == 80, "DrawPushConstants must stay a compact 80-byte payload");
 
 // ---------------------------------------------------------------------------
 // RenderQueue
@@ -51,7 +65,7 @@ struct DrawItem {
 //                         stages (also via parallelFor) combine them.
 //                         Below the threshold it falls back to sort().
 // ---------------------------------------------------------------------------
-class RenderQueue {
+class ENGINE_GRAPHICS_API RenderQueue {
 public:
     // Packs (material, depth) into the 64-bit opaque sort key. Depth is
     // clamped to the positive range; for non-negative floats the IEEE

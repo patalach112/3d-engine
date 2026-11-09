@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Physics/PhysicsComponents.h"
 #include "Scene/Components.h"
@@ -31,7 +32,7 @@ class Scene;
 // solving per island (islands can solve in parallel; bodies never repeat
 // across islands). Scratch storage is retained between steps.
 // ---------------------------------------------------------------------------
-class PhysicsSystem {
+class ENGINE_SCENE_API PhysicsSystem {
 public:
     struct Stats {
         size_t bodies = 0;

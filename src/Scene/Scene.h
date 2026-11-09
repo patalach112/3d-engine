@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include "Core/Memory/PoolAllocator.h"
 #include "Scene/Components.h"
@@ -21,7 +22,7 @@ class Scene;
 // are cheap to copy and compare; they become invalid when the entity is
 // destroyed, so check isValid() after destruction may have occurred.
 // ---------------------------------------------------------------------------
-class Entity {
+class ENGINE_SCENE_API Entity {
 public:
     Entity() = default;
     Entity(entt::entity handle, Scene* scene) : m_handle(handle), m_scene(scene) {}
@@ -60,7 +61,7 @@ private:
 // The Scene knows nothing about windows or renderers — those live in
 // systems that read the Scene.
 // ---------------------------------------------------------------------------
-class Scene {
+class ENGINE_SCENE_API Scene {
 public:
     Scene() = default;
     ~Scene() = default;
@@ -81,6 +82,11 @@ public:
     // the camera and render systems so "the active camera" is defined once.
     [[nodiscard]] CameraComponent* findActiveCamera();
     [[nodiscard]] const CameraComponent* findActiveCamera() const;
+    // Entity carrying the active camera (entt::null when there is none).
+    // Systems that need the camera's sibling Transform/RigidBody/Collider
+    // components (physical players) use this instead of duplicating the
+    // active-camera search.
+    [[nodiscard]] entt::entity findActiveCameraEntity() const;
 
     // Pre-allocates component storage for the given number of entities
     // (entities, transforms, meshes, cameras, spins) so scene building

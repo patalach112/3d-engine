@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/Export.h"
 
 #include <vulkan/vulkan.h>
 
@@ -24,7 +25,7 @@ class Swapchain;
 // costs one pipeline bind + one draw call. Must be recorded inside the
 // active render pass, after the scene draws.
 // ---------------------------------------------------------------------------
-class HudRenderer {
+class ENGINE_GRAPHICS_API HudRenderer {
 public:
     HudRenderer(VulkanContext& context, const Swapchain& swapchain);
     ~HudRenderer();

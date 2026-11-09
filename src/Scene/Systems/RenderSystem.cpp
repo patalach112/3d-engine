@@ -52,16 +52,19 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
     // name hash is the fallback for scenes built without an asset pass.
     uint32_t materialId = materialIdFor(mesh.materialName);
     uint32_t descriptorIndex = 0;
+    glm::vec4 baseColor{1.0f};
     if (assets != nullptr) {
         if (const MaterialAsset* material = assets->material(mesh.materialName)) {
             materialId = material->id;
             descriptorIndex = material->descriptorIndex;
+            baseColor = material->desc.baseColor;
         }
     }
     DrawItem item;
     item.model = model;
     item.materialId = materialId;
     item.descriptorIndex = descriptorIndex;
+    item.baseColor = baseColor;
     item.viewDepth = viewDepth;
     item.sortKey = RenderQueue::makeSortKey(materialId, viewDepth);
     outItem = item;
