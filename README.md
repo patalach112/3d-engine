@@ -1112,6 +1112,54 @@ resting stacks and plane pairing) join the suite: **492 checks,
 all passing in Debug, Release-shared and Release-static,
 CTest 1/1, zero warnings.**
 
+## Phase 15 — Collision Layers & Masks ✅
+
+Category-based collision filtering, configured per collider:
+
+- **Layer & mask data** (`Physics/PhysicsComponents.h`):
+  `ColliderComponent` gains `uint32_t layer` (the single layer the
+  collider belongs to) and `uint32_t mask` (the layers it collides
+  with), placed in the struct's tail padding so the dense 160-byte
+  component size is unchanged. The `CollisionLayer` namespace names
+  the common categories — `Default`, `Player`, `Enemy`,
+  `Environment`, `Trigger`, plus `None`/`All` bookends — and any of
+  the 32 bits can be used. Defaults (`Default` / `All`) reproduce
+  the pre-layer behaviour exactly: everything collides with
+  everything, so existing scenes are unaffected.
+- **Filtering rule**: `shouldCollide(layerA, maskA, layerB, maskB)`
+  is the standard mutual bitmask test —
+  `(layerA & maskB) != 0 && (layerB & maskA) != 0` — so either side
+  can veto a pairing and a one-way "I see you" never collides. A
+  component-level overload `shouldCollide(a, b)` reads the fields
+  directly.
+- **Physics integration**: the test runs inside
+  `PhysicsSystem::broadPhase()` — in the AABB-tree pair query and
+  in the plane-pairing loop — so a filtered pair never becomes a
+  candidate: no manifold generation, no CCD, no islands, no solver
+  work, and `Stats::candidatePairs` reflects the filtered count.
+  Values are read live from the components each step, so changing
+  a layer or mask at runtime takes effect on the next step (the
+  demo tags its player capsule `CollisionLayer::Player`, mask
+  `All`, as a usage example).
+- **Query integration**: `Scene::raycast`, `raycastAll` and
+  `raycastPrecise` accept an optional `layerMask` (default `All`).
+  An entity answers through its collider's layer; collider-less
+  pickables (mesh-only entities) answer on the `Default` layer.
+  The AABB tree itself stays layer-agnostic — layers live only in
+  the collider component, so there is no second copy to go stale;
+  filters are applied where candidates are consumed.
+
+Verification: 26 new checks (named-bit sanity, the full mutual
+truth table including symmetry over all layer/mask combinations,
+factory defaults, overlapping static bodies producing zero
+broadphase pairs until the mask re-includes their layer, a dropped
+cube passing through a platform it is masked against — from either
+direction — and resting on the floor while the unmasked control
+lands on the platform, and raycast/raycastAll/raycastPrecise layer
+filtering including mesh-only Default-layer answers) join the
+suite: **518 checks, all passing in Debug, Release-shared and
+Release-static, CTest 1/1, zero warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

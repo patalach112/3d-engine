@@ -2773,6 +2773,216 @@ void testSpatialPartitioning() {
     }
 }
 
+void testCollisionLayers() {
+    std::cout << "Collision layers & masks (Phase 15)\n";
+    using engine::ColliderComponent;
+    using engine::Ray;
+    using engine::RaycastHit;
+    using engine::TransformComponent;
+    using engine::shouldCollide;
+
+    const uint32_t LNone = engine::CollisionLayer::None;
+    const uint32_t LDefault = engine::CollisionLayer::Default;
+    const uint32_t LPlayer = engine::CollisionLayer::Player;
+    const uint32_t LEnemy = engine::CollisionLayer::Enemy;
+    const uint32_t LEnvironment = engine::CollisionLayer::Environment;
+    const uint32_t LTrigger = engine::CollisionLayer::Trigger;
+    const uint32_t LAll = engine::CollisionLayer::All;
+
+    // --- Named categories ----------------------------------------------------------
+    {
+        const uint32_t named = LDefault | LPlayer | LEnemy | LEnvironment | LTrigger;
+        check(LNone == 0u && LAll == 0xFFFFFFFFu && LDefault == (1u << 0) &&
+                  (named & (named - 1u)) != 0u && // combined, sanity
+                  (LDefault & LPlayer) == 0u && (LPlayer & LEnemy) == 0u && (LEnemy & LEnvironment) == 0u &&
+                  (LEnvironment & LTrigger) == 0u,
+              "named layers are distinct single bits with None and All bookends");
+    }
+
+    // --- The mutual bitmask rule ------------------------------------------------------
+    {
+        check(shouldCollide(LDefault, LAll, LDefault, LAll), "defaults collide with defaults");
+        check(shouldCollide(LPlayer, LAll, LEnemy, LAll), "full masks collide across layers");
+        check(!shouldCollide(LPlayer, LAll & ~LEnemy, LEnemy, LAll),
+              "excluding the other's layer from my mask blocks collision");
+        check(!shouldCollide(LPlayer, LAll, LEnemy, LAll & ~LPlayer),
+              "being excluded from the other's mask blocks collision");
+        check(!shouldCollide(LPlayer, LAll & ~LEnemy, LEnemy, LAll & ~LPlayer),
+              "mutual exclusion blocks collision");
+        check(!shouldCollide(LPlayer, LNone, LEnemy, LAll), "an empty mask collides with nothing");
+        check(!shouldCollide(LPlayer, LAll, LNone, LAll), "a collider on no layer never collides");
+        check(shouldCollide(LPlayer, LEnemy, LEnemy, LPlayer), "cross-accepting layers collide");
+        check(!shouldCollide(LPlayer, LEnemy, LEnemy, LTrigger),
+              "one-way acceptance is not enough: the check is mutual");
+        bool symmetric = true;
+        const uint32_t layers[5] = {LDefault, LPlayer, LEnemy, LEnvironment, LTrigger};
+        const uint32_t masks[4] = {LAll, LNone, LPlayer | LEnemy, LDefault | LTrigger};
+        for (const uint32_t layerA : layers) {
+            for (const uint32_t layerB : layers) {
+                for (const uint32_t maskA : masks) {
+                    for (const uint32_t maskB : masks) {
+                        symmetric = symmetric &&
+                                    shouldCollide(layerA, maskA, layerB, maskB) ==
+                                        shouldCollide(layerB, maskB, layerA, maskA);
+                    }
+                }
+            }
+        }
+        check(symmetric, "shouldCollide is symmetric over the layer/mask truth table");
+    }
+
+    // --- Component defaults ----------------------------------------------------------------
+    {
+        const ColliderComponent box = ColliderComponent::box(glm::vec3{0.5f});
+        const ColliderComponent sphere = ColliderComponent::sphere(0.5f);
+        const ColliderComponent capsule = ColliderComponent::capsule(0.3f, 0.4f);
+        const ColliderComponent plane = ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f);
+        check(box.layer == LDefault && box.mask == LAll && sphere.layer == LDefault && sphere.mask == LAll &&
+                  capsule.layer == LDefault && capsule.mask == LAll && plane.layer == LDefault &&
+                  plane.mask == LAll,
+              "every collider factory defaults to layer Default, mask All");
+        ColliderComponent a = ColliderComponent::box(glm::vec3{0.5f});
+        a.layer = LPlayer;
+        a.mask = LAll & ~LEnemy;
+        ColliderComponent b = ColliderComponent::box(glm::vec3{0.5f});
+        b.layer = LEnemy;
+        check(!shouldCollide(a, b), "component overload applies the mutual rule");
+        a.mask = LAll;
+        check(shouldCollide(a, b), "component overload accepts once the mask re-includes the layer");
+    }
+
+    // --- Broadphase filter: overlapping bodies, excluded layers -------------------------------
+    {
+        using engine::PhysicsSettings;
+        using engine::PhysicsSystem;
+        using engine::RigidBodyComponent;
+
+        engine::Scene scene;
+        auto first = scene.createEntity("LayerA");
+        first.addComponent<TransformComponent>(glm::vec3{0.0f});
+        first.addComponent<RigidBodyComponent>().setStatic(true);
+        auto& firstCollider = first.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{1.0f}));
+        firstCollider.layer = LPlayer;
+        firstCollider.mask = LAll & ~LEnemy;
+        auto second = scene.createEntity("LayerB");
+        second.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        second.addComponent<RigidBodyComponent>().setStatic(true);
+        auto& secondCollider = second.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{1.0f}));
+        secondCollider.layer = LEnemy;
+
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        const PhysicsSystem::Stats filtered = physics.update(scene, 1.0 / 60.0, settings);
+        check(filtered.bodies == 2 && filtered.candidatePairs == 0,
+              "overlapping bodies on excluded layers produce no broadphase pair");
+        first.getComponent<ColliderComponent>().mask = LAll;
+        const PhysicsSystem::Stats unfiltered = physics.update(scene, 1.0 / 60.0, settings);
+        check(unfiltered.candidatePairs == 1,
+              "re-including the layer restores the pair on the next step (filter reads live values)");
+    }
+
+    // --- Integration: pass-through vs landing ---------------------------------------------------
+    {
+        using engine::PhysicsSettings;
+        using engine::PhysicsSystem;
+        using engine::RigidBodyComponent;
+
+        // A Player-layer cube drops toward an Enemy-layer platform over
+        // an Environment-layer floor. Vary the two masks to prove that
+        // filtering (either direction) makes the cube fall through the
+        // platform and rest on the floor, while full masks land it on
+        // the platform. Rest heights: floor top y=0 -> cube centre
+        // ~0.50; platform top y=2.25 -> cube centre ~2.75.
+        struct DropResult {
+            float y = 0.0f;
+            float speed = 0.0f;
+            PhysicsSystem::Stats stats{};
+        };
+        const auto drop = [&](uint32_t cubeMask, uint32_t platformMask) -> DropResult {
+            engine::Scene scene;
+            auto floor = scene.createEntity("DropFloor");
+            floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+            floor.addComponent<RigidBodyComponent>().setStatic(true);
+            auto& floorCollider =
+                floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{5.0f, 0.5f, 5.0f}));
+            floorCollider.layer = LEnvironment;
+            auto platform = scene.createEntity("DropPlatform");
+            platform.addComponent<TransformComponent>(glm::vec3{0.0f, 2.0f, 0.0f});
+            platform.addComponent<RigidBodyComponent>().setStatic(true);
+            auto& platformCollider =
+                platform.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{2.0f, 0.25f, 2.0f}));
+            platformCollider.layer = LEnemy;
+            platformCollider.mask = platformMask;
+            auto cube = scene.createEntity("DropCube");
+            cube.addComponent<TransformComponent>(glm::vec3{0.0f, 4.0f, 0.0f});
+            auto& cubeBody = cube.addComponent<RigidBodyComponent>(1.0f);
+            auto& cubeCollider =
+                cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+            cubeCollider.layer = LPlayer;
+            cubeCollider.mask = cubeMask;
+
+            PhysicsSettings settings;
+            settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+            PhysicsSystem physics;
+            for (int step = 0; step < 150; ++step) {
+                physics.update(scene, 1.0 / 60.0, settings);
+            }
+            return DropResult{cube.getComponent<TransformComponent>().position.y,
+                              glm::length(cubeBody.velocity), physics.lastStats()};
+        };
+
+        const auto [filteredY, filteredSpeed, filteredStats] = drop(LAll & ~LEnemy, LAll);
+        check(filteredY > 0.40f && filteredY < 0.58f && filteredSpeed < 0.1f &&
+                  filteredStats.candidatePairs == 1 && filteredStats.contacts > 0,
+              "cube masked against the platform's layer falls through it and rests on the floor");
+        const auto [oneWayY, oneWaySpeed, oneWayStats] = drop(LAll, LAll & ~LPlayer);
+        check(oneWayY > 0.40f && oneWayY < 0.58f && oneWaySpeed < 0.1f && oneWayStats.candidatePairs == 1,
+              "platform masked against the cube's layer also lets it through (mutual rule)");
+        const auto [controlY, controlSpeed, controlStats] = drop(LAll, LAll);
+        check(controlY > 2.65f && controlY < 2.85f && controlSpeed < 0.1f &&
+                  controlStats.candidatePairs == 1 && controlStats.contacts > 0,
+              "with matching masks the same cube lands and rests on the platform");
+    }
+
+    // --- Raycast layer filtering ------------------------------------------------------------------
+    {
+        engine::Scene scene;
+        auto nearCube = scene.createEntity("RayNear");
+        nearCube.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -5.0f});
+        auto& nearCollider =
+            nearCube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        nearCollider.layer = LEnemy;
+        auto farCube = scene.createEntity("RayFar");
+        farCube.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -10.0f});
+        farCube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f})); // Default layer
+        auto meshOnly = scene.createEntity("RayMeshOnly");
+        meshOnly.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -15.0f});
+        meshOnly.addComponent<engine::MeshComponent>(); // no collider: answers on the Default layer
+
+        const Ray axis{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}};
+        RaycastHit hit;
+        check(scene.raycast(axis, hit, 1000.0f) && hit.entity == nearCube.handle(),
+              "unfiltered raycast picks the closest cube as before");
+        check(scene.raycast(axis, hit, 1000.0f, LEnemy) && hit.entity == nearCube.handle() &&
+                  nearlyEqual(hit.distance, 4.5, 1e-4),
+              "raycast restricted to the Enemy layer picks the enemy cube");
+        check(scene.raycast(axis, hit, 1000.0f, LDefault) && hit.entity == farCube.handle() &&
+                  nearlyEqual(hit.distance, 9.5, 1e-4),
+              "raycast restricted to Default skips the enemy cube and picks the one behind");
+        check(!scene.raycast(axis, hit, 1000.0f, LPlayer | LTrigger),
+              "raycast matching no present layer hits nothing");
+        std::vector<RaycastHit> hits;
+        check(scene.raycastAll(axis, hits, 1000.0f, LDefault) == 2 && hits[0].entity == farCube.handle() &&
+                  hits[1].entity == meshOnly.handle() && nearlyEqual(hits[1].distance, 14.5, 1e-4),
+              "raycastAll filters by layer; collider-less meshes answer on Default");
+        check(scene.raycastAll(axis, hits, 1000.0f, LNone) == 0, "an empty layer mask hits nothing");
+        const engine::Scene::MeshResolver noResolver = [](std::string_view) { return nullptr; };
+        check(scene.raycastPrecise(axis, hit, noResolver, 1000.0f, LDefault) &&
+                  hit.entity == farCube.handle(),
+              "precise raycast honours the same layer filter");
+    }
+}
+
 void testPlayerCollision() {
     std::cout << "Player collision (1:1 capsule hitbox)\n";
     using engine::ColliderComponent;
@@ -4135,6 +4345,7 @@ int main() {
     testPhysicsSettling();
     testRaycasting();
     testSpatialPartitioning();
+    testCollisionLayers();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

@@ -136,18 +136,25 @@ public:
     // maxDistance are rejected. The ray's direction must be normalized.
     using MeshResolver = std::function<const MeshAsset*(std::string_view assetId)>;
 
-    // Closest hit along the ray, if any.
+    // Closest hit along the ray, if any. `layerMask` optionally
+    // restricts hits to entities whose collision layer (their
+    // ColliderComponent's layer, CollisionLayer::Default for
+    // collider-less entities) intersects it — the same layer values
+    // physics filtering uses (Phase 15).
     [[nodiscard]] bool raycast(const Ray& ray, RaycastHit& outHit,
-                               float maxDistance = std::numeric_limits<float>::max()) const;
+                               float maxDistance = std::numeric_limits<float>::max(),
+                               uint32_t layerMask = CollisionLayer::All) const;
     // Every hit along the ray, sorted by ascending distance. Clears
     // outHits first; returns the number of hits.
     [[nodiscard]] size_t raycastAll(const Ray& ray, std::vector<RaycastHit>& outHits,
-                                    float maxDistance = std::numeric_limits<float>::max()) const;
+                                    float maxDistance = std::numeric_limits<float>::max(),
+                                    uint32_t layerMask = CollisionLayer::All) const;
     // Closest hit, testing real mesh triangles wherever resolveMesh
     // resolves a MeshComponent's asset id (entities whose asset does
     // not resolve fall back to the bounds/collider tests above).
     [[nodiscard]] bool raycastPrecise(const Ray& ray, RaycastHit& outHit, const MeshResolver& resolveMesh,
-                                      float maxDistance = std::numeric_limits<float>::max()) const;
+                                      float maxDistance = std::numeric_limits<float>::max(),
+                                      uint32_t layerMask = CollisionLayer::All) const;
 
     // Pre-allocates component storage for the given number of entities
     // (entities, transforms, meshes, cameras, spins) so scene building
@@ -186,7 +193,7 @@ private:
     // hit found tightens the traversal's clip distance, pruning
     // subtrees that cannot contain a closer hit.
     void collectBVHHits(const Ray& ray, float maxDistance, const MeshResolver* resolver, bool closestOnly,
-                        std::vector<RaycastHit>& outHits) const;
+                        uint32_t layerMask, std::vector<RaycastHit>& outHits) const;
 
     Registry m_registry;
     size_t m_entityCount = 0; // Scene-created, still-alive entities

@@ -792,19 +792,26 @@ void PhysicsSystem::broadPhase() {
                              glm::max(-geometry.displacement, glm::vec3{0.0f})};
         m_broadTree.query(swept, [this, index](entt::entity other) {
             const auto found = m_broadBodyIndex.find(entt::to_integral(other));
-            if (found != m_broadBodyIndex.end() && found->second > index) {
+            // Layer/mask filtering happens here, in the broadphase:
+            // a pair whose colliders do not mutually accept each
+            // other's layer never becomes a candidate, so it costs
+            // no manifold generation and no solver work at all.
+            if (found != m_broadBodyIndex.end() && found->second > index &&
+                shouldCollide(*m_bodies[index].collider, *m_bodies[found->second].collider)) {
                 m_candidatePairs.emplace_back(index, found->second);
             }
             return true;
         });
     }
 
-    // Planes have infinite extent: they pair against every body, as
-    // before, and are never stored in the tree.
+    // Planes have infinite extent: they pair against every body whose
+    // layers mutually accept (the same broadphase filter), and are
+    // never stored in the tree.
     for (const uint32_t planeBody : m_planeBodies) {
         for (size_t i = 0; i < m_bodies.size(); ++i) {
             const uint32_t other = static_cast<uint32_t>(i);
-            if (other == planeBody || m_geometry[other].isPlane) {
+            if (other == planeBody || m_geometry[other].isPlane ||
+                !shouldCollide(*m_bodies[planeBody].collider, *m_bodies[other].collider)) {
                 continue;
             }
             m_candidatePairs.emplace_back(std::min(planeBody, other), std::max(planeBody, other));

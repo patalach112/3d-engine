@@ -118,8 +118,9 @@ void Application::buildScene() {
     playerBody.friction = 0.25f;
     playerBody.setPrincipalInertia(glm::vec3{10000.0f}); // capsule stays upright
     playerBody.allowSleep = false; // the player must always respond to input instantly
-    player.addComponent<ColliderComponent>(
+    auto& playerCollider = player.addComponent<ColliderComponent>(
         ColliderComponent::capsule(PlayerSystem::kCapsuleRadius, PlayerSystem::kCapsuleHalfHeight));
+    playerCollider.layer = CollisionLayer::Player; // mask stays All: the player still touches everything
 
     if (m_config.physics.demoMode == PhysicsDemoMode::Space) {
         // Zero-G sandbox: the uniform field is disabled for this scene and

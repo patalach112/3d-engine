@@ -126,6 +126,38 @@ struct alignas(16) RigidBodyComponent {
 };
 
 // ---------------------------------------------------------------------------
+// Collision layers & masks (Phase 15)
+//
+// Every collider lives on exactly one layer (a single bit) and carries
+// a mask of the layers it is willing to collide with. Two colliders
+// interact only when each one's layer appears in the other's mask —
+// the check is mutual, so either side can opt out of a pairing (a
+// one-way "I see you" is never enough). Filtering happens in the
+// broadphase, before any contact manifold or solver work, and the
+// same layer values filter Scene raycast queries.
+//
+// The named categories below cover the common cases; games may use
+// any of the 32 bits. Defaults preserve the pre-layer behaviour
+// exactly: layer Default, mask All — everything collides with
+// everything.
+// ---------------------------------------------------------------------------
+namespace CollisionLayer {
+inline constexpr uint32_t None = 0u;
+inline constexpr uint32_t Default = 1u << 0;
+inline constexpr uint32_t Player = 1u << 1;
+inline constexpr uint32_t Enemy = 1u << 2;
+inline constexpr uint32_t Environment = 1u << 3;
+inline constexpr uint32_t Trigger = 1u << 4;
+inline constexpr uint32_t All = 0xFFFFFFFFu;
+} // namespace CollisionLayer
+
+// The mutual layer/mask test: A collides with B iff A's layer is in
+// B's mask AND B's layer is in A's mask.
+[[nodiscard]] constexpr bool shouldCollide(uint32_t layerA, uint32_t maskA, uint32_t layerB, uint32_t maskB) {
+    return (layerA & maskB) != 0u && (layerB & maskA) != 0u;
+}
+
+// ---------------------------------------------------------------------------
 // ColliderComponent
 //
 // Primitive/convex collider description. Dimensions are local and are
@@ -151,6 +183,10 @@ struct alignas(16) ColliderComponent {
     float planeOffset = 0.0f;
     std::array<glm::vec3, 8> hullPoints{};
     uint8_t hullPointCount = 0;
+    // Collision filtering: the single layer this collider belongs to
+    // and the set of layers it collides with (see CollisionLayer).
+    uint32_t layer = CollisionLayer::Default;
+    uint32_t mask = CollisionLayer::All;
 
     ColliderComponent() = default;
     explicit ColliderComponent(const glm::vec3& halfExtents_) : halfExtents(halfExtents_) {}
@@ -209,6 +245,11 @@ struct alignas(16) ColliderComponent {
 // Import/spawning code refers to the box configuration of this unified
 // collider component by this conventional name (ColliderComponent::box).
 using BoxColliderComponent = ColliderComponent;
+
+// Component-level form of the mutual layer/mask test above.
+[[nodiscard]] constexpr bool shouldCollide(const ColliderComponent& a, const ColliderComponent& b) {
+    return shouldCollide(a.layer, a.mask, b.layer, b.mask);
+}
 
 // A localized radial gravity source. Attach with TransformComponent to a
 // planet/field entity; no RigidBodyComponent is required.

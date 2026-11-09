@@ -220,15 +220,19 @@ void Scene::syncRaycastTree() const {
 }
 
 void Scene::collectBVHHits(const Ray& ray, float maxDistance, const MeshResolver* resolver, bool closestOnly,
-                           std::vector<RaycastHit>& outHits) const {
+                           uint32_t layerMask, std::vector<RaycastHit>& outHits) const {
     syncRaycastTree();
     float best = maxDistance;
     Candidate candidate;
     m_raycastTree.raycast(ray, maxDistance, [&](entt::entity entity) {
         const TransformComponent* transform = m_registry.try_get<TransformComponent>(entity);
-        if (transform != nullptr &&
-            testEntity(*transform, m_registry.try_get<ColliderComponent>(entity),
-                       m_registry.try_get<MeshComponent>(entity), resolver, ray,
+        const ColliderComponent* collider = m_registry.try_get<ColliderComponent>(entity);
+        // Layer filter: an entity answers queries through its
+        // collider's layer, or the Default layer when it has no
+        // collider (mesh-only pickables).
+        const uint32_t entityLayer = collider != nullptr ? collider->layer : CollisionLayer::Default;
+        if (transform != nullptr && (entityLayer & layerMask) != 0u &&
+            testEntity(*transform, collider, m_registry.try_get<MeshComponent>(entity), resolver, ray,
                        closestOnly ? best : maxDistance, candidate)) {
             outHits.push_back(RaycastHit{entity, candidate.distance, candidate.position, candidate.normal});
             if (closestOnly) {
@@ -239,9 +243,9 @@ void Scene::collectBVHHits(const Ray& ray, float maxDistance, const MeshResolver
     });
 }
 
-bool Scene::raycast(const Ray& ray, RaycastHit& outHit, float maxDistance) const {
+bool Scene::raycast(const Ray& ray, RaycastHit& outHit, float maxDistance, uint32_t layerMask) const {
     std::vector<RaycastHit> hits;
-    collectBVHHits(ray, maxDistance, nullptr, true, hits);
+    collectBVHHits(ray, maxDistance, nullptr, true, layerMask, hits);
     if (hits.empty()) {
         return false;
     }
@@ -250,18 +254,19 @@ bool Scene::raycast(const Ray& ray, RaycastHit& outHit, float maxDistance) const
     return true;
 }
 
-size_t Scene::raycastAll(const Ray& ray, std::vector<RaycastHit>& outHits, float maxDistance) const {
+size_t Scene::raycastAll(const Ray& ray, std::vector<RaycastHit>& outHits, float maxDistance,
+                         uint32_t layerMask) const {
     outHits.clear();
-    collectBVHHits(ray, maxDistance, nullptr, false, outHits);
+    collectBVHHits(ray, maxDistance, nullptr, false, layerMask, outHits);
     std::sort(outHits.begin(), outHits.end(),
               [](const RaycastHit& a, const RaycastHit& b) { return a.distance < b.distance; });
     return outHits.size();
 }
 
 bool Scene::raycastPrecise(const Ray& ray, RaycastHit& outHit, const MeshResolver& resolveMesh,
-                           float maxDistance) const {
+                           float maxDistance, uint32_t layerMask) const {
     std::vector<RaycastHit> hits;
-    collectBVHHits(ray, maxDistance, &resolveMesh, true, hits);
+    collectBVHHits(ray, maxDistance, &resolveMesh, true, layerMask, hits);
     if (hits.empty()) {
         return false;
     }
