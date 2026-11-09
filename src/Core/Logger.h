@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -108,7 +109,11 @@ private:
     ~Logger();
 
     std::vector<std::unique_ptr<detail::ILogSink>> m_sinks;
-    mutable std::mutex m_sinkMutex;
+    // Guards the sink list itself (reconfiguration is rare and takes it
+    // exclusively); ordinary log dispatch only holds a shared lock, so
+    // concurrent producers reach the sinks' lock-free ingestion queues
+    // without serializing on this mutex.
+    mutable std::shared_mutex m_sinkMutex;
     std::atomic<LogLevel> m_minimumLevel{LogLevel::Info};
     std::atomic<bool> m_initialized{false};
     std::string m_activeFilePath;

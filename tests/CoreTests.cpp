@@ -17,6 +17,7 @@
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
+#include "Core/Concurrency/LockFreeRingBuffer.h"
 #include "Core/Jobs/JobSystem.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Graphics/Frustum.h"
@@ -402,6 +403,37 @@ void testJobSystem() {
     });
     check(sum.load() == 1000LL * 999 / 2, "parallelFor reduction result is correct");
 
+    // Concurrent producers: 8 threads hammer submit() simultaneously;
+    // every job must execute exactly once (no loss, no duplication).
+    {
+        constexpr int kProducers = 8;
+        constexpr int kPerProducer = 2500;
+        constexpr int kTotal = kProducers * kPerProducer;
+        std::vector<std::atomic<int>> hits(kTotal);
+        for (auto& hit : hits) {
+            hit.store(0, std::memory_order_relaxed);
+        }
+        std::vector<std::thread> producers;
+        producers.reserve(kProducers);
+        for (int p = 0; p < kProducers; ++p) {
+            producers.emplace_back([&jobs, &hits, p] {
+                for (int i = 0; i < kPerProducer; ++i) {
+                    const int index = p * kPerProducer + i;
+                    jobs.submit([&hits, index] { hits[index].fetch_add(1, std::memory_order_relaxed); });
+                }
+            });
+        }
+        for (std::thread& producer : producers) {
+            producer.join();
+        }
+        jobs.waitForAll();
+        bool allOnce = true;
+        for (const auto& hit : hits) {
+            allOnce = allOnce && hit.load(std::memory_order_relaxed) == 1;
+        }
+        check(allOnce, "concurrent producers: 20k submitted jobs execute exactly once");
+    }
+
     // A throwing job is contained: counted, logged, workers keep going.
     jobs.submit([] { throw std::runtime_error("expected test failure"); });
     std::atomic<bool> afterThrow{false};
@@ -409,6 +441,138 @@ void testJobSystem() {
     jobs.waitForAll();
     check(afterThrow.load(), "workers survive a throwing job");
     check(jobs.failedJobCount() >= 1, "throwing job is counted as failed");
+}
+
+void testLockFreeRingBuffer() {
+    std::cout << "LockFreeRingBuffer\n";
+    using engine::concurrency::LockFreeRingBuffer;
+
+    check(alignof(LockFreeRingBuffer<int>) >= 64, "ring buffer type is cache-line aligned");
+
+    // Sequential semantics: power-of-two capacity, FIFO order, full/empty.
+    LockFreeRingBuffer<int> queue(7);
+    check(queue.capacity() == 8, "capacity rounds up to a power of two");
+    check(queue.emptyApprox(), "new ring buffer is empty");
+    bool allPushed = true;
+    for (int i = 0; i < 8; ++i) {
+        allPushed = allPushed && queue.tryPush(i);
+    }
+    check(allPushed && queue.sizeApprox() == 8, "ring buffer fills to capacity");
+    int extra = 99;
+    check(!queue.tryPush(extra) && extra == 99, "push to a full ring fails without consuming the value");
+    bool fifoOrder = true;
+    for (int i = 0; i < 8; ++i) {
+        int value = -1;
+        fifoOrder = fifoOrder && queue.tryPop(value) && value == i;
+    }
+    int value = -1;
+    check(fifoOrder && queue.emptyApprox() && !queue.tryPop(value), "ring buffer drains in FIFO order");
+
+    // Wrap-around: indices lap the ring 100k times in sequence.
+    LockFreeRingBuffer<int> wrap(8);
+    bool wrapOk = true;
+    for (int i = 0; i < 100000; ++i) {
+        int out = -1;
+        wrapOk = wrapOk && wrap.tryPush(i) && wrap.tryPop(out) && out == i;
+    }
+    check(wrapOk && wrap.emptyApprox(), "ring buffer wraps around cleanly (100k laps)");
+
+    // MPMC stress: 4 producers x 4 consumers, 20k unique items. Every
+    // item must be consumed exactly once — the definitive lost/duplicated
+    // work check for the lock-free protocol.
+    {
+        constexpr int kProducers = 4;
+        constexpr int kConsumers = 4;
+        constexpr int kPerProducer = 5000;
+        constexpr int kTotal = kProducers * kPerProducer;
+        LockFreeRingBuffer<int> mpmc(1024);
+        std::vector<std::atomic<int>> hits(kTotal);
+        for (auto& hit : hits) {
+            hit.store(0, std::memory_order_relaxed);
+        }
+        std::atomic<int> consumed{0};
+        std::vector<std::thread> threads;
+        threads.reserve(kProducers + kConsumers);
+        for (int p = 0; p < kProducers; ++p) {
+            threads.emplace_back([&mpmc, p] {
+                for (int i = 0; i < kPerProducer; ++i) {
+                    const int item = p * kPerProducer + i;
+                    while (!mpmc.tryPush(item)) {
+                        std::this_thread::yield();
+                    }
+                }
+            });
+        }
+        for (int c = 0; c < kConsumers; ++c) {
+            threads.emplace_back([&mpmc, &hits, &consumed] {
+                int item = -1;
+                while (consumed.load(std::memory_order_relaxed) < kTotal) {
+                    if (mpmc.tryPop(item)) {
+                        hits[item].fetch_add(1, std::memory_order_relaxed);
+                        consumed.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        std::this_thread::yield();
+                    }
+                }
+            });
+        }
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        bool allOnce = true;
+        for (const auto& hit : hits) {
+            allOnce = allOnce && hit.load(std::memory_order_relaxed) == 1;
+        }
+        check(allOnce, "MPMC stress: 20k items consumed exactly once (none lost, none duplicated)");
+        check(consumed.load() == kTotal && mpmc.emptyApprox(), "MPMC stress drains the ring completely");
+    }
+}
+
+void testAsyncLoggerConcurrency() {
+    std::cout << "Async logger concurrency\n";
+    const auto dir = makeTempDir("engine_test_async_logger");
+
+    engine::LoggerConfig config;
+    config.minimumLevel = engine::LogLevel::Info;
+    config.consoleEnabled = false;
+    config.fileEnabled = true;
+    config.filePath = dir / "async.log";
+    config.timestampedFileName = false;
+    config.asyncFileWrites = true;
+    config.asyncQueueCapacity = 8192;
+
+    engine::Logger& logger = engine::Logger::instance();
+    logger.initialize(config);
+
+    // Multiple producer threads log through the lock-free ingestion ring
+    // at once; after shutdown every message must be in the file.
+    constexpr int kProducers = 4;
+    constexpr int kPerProducer = 250;
+    constexpr int kTotal = kProducers * kPerProducer;
+    std::vector<std::thread> producers;
+    producers.reserve(kProducers);
+    for (int p = 0; p < kProducers; ++p) {
+        producers.emplace_back([p] {
+            for (int i = 0; i < kPerProducer; ++i) {
+                ENGINE_LOG_INFO("async-ingest-" << p << '-' << i);
+            }
+        });
+    }
+    for (std::thread& producer : producers) {
+        producer.join();
+    }
+    logger.shutdown();
+
+    const std::string contents = readWholeFile(dir / "async.log");
+    size_t found = 0;
+    size_t pos = 0;
+    while ((pos = contents.find("async-ingest-", pos)) != std::string::npos) {
+        ++found;
+        ++pos;
+    }
+    check(found == static_cast<size_t>(kTotal), "async logger delivers every concurrent message (lock-free ring)");
+
+    std::filesystem::remove_all(dir);
 }
 
 void testFrustumCulling() {
@@ -668,7 +832,9 @@ int main() {
     testCamera();
     testSceneAndSystems();
     testPoolAllocator();
+    testLockFreeRingBuffer();
     testJobSystem();
+    testAsyncLoggerConcurrency();
     testFrustumCulling();
     testParallelSystemsAndCulling();
     testDataOrientedLayout();

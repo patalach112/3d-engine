@@ -1,12 +1,13 @@
 #include "Core/Logger.h"
 
+#include "Core/Concurrency/LockFreeRingBuffer.h"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <ctime>
-#include <deque>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -279,17 +280,21 @@ private:
 };
 
 // Decorator that moves another sink's writes onto a background thread.
+// Ingestion is a bounded lock-free MPMC ring buffer: producer threads
+// (game loop, job workers, ...) publish records with atomic operations
+// only and never take a mutex on this path; a full ring drops the record
+// (counted, reported at shutdown) instead of stalling the producer. The
+// condition variable exists solely to park the consumer thread while the
+// ring is empty — it never guards ring access.
 class AsyncSink final : public ILogSink {
 public:
     AsyncSink(std::unique_ptr<ILogSink> inner, size_t queueCapacity)
-        : m_inner(std::move(inner)), m_queueCapacity(queueCapacity), m_worker([this] { run(); }) {}
+        : m_inner(std::move(inner)), m_queue(queueCapacity), m_worker([this] { run(); }) {}
 
     ~AsyncSink() override {
-        {
-            std::lock_guard lock(m_mutex);
-            m_stopping = true;
-        }
-        m_condition.notify_all();
+        m_stopping.store(true, std::memory_order_release);
+        m_wakeSequence.fetch_add(1, std::memory_order_release);
+        m_sleepCondition.notify_all();
         if (m_worker.joinable()) {
             m_worker.join();
         }
@@ -306,24 +311,24 @@ public:
     }
 
     void write(const LogRecord& record) override {
-        {
-            std::lock_guard lock(m_mutex);
-            if (m_stopping) {
-                return;
-            }
-            if (m_queue.size() >= m_queueCapacity) {
-                m_droppedCount.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-            m_queue.push_back(record);
+        if (m_stopping.load(std::memory_order_acquire)) {
+            return;
         }
-        m_condition.notify_one();
+        if (!m_queue.tryPush(record)) {
+            // Full ring: drop rather than block a producer thread.
+            m_droppedCount.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        m_wakeSequence.fetch_add(1, std::memory_order_release);
+        m_sleepCondition.notify_one();
     }
 
     void flush() override {
-        std::unique_lock lock(m_mutex);
-        m_condition.wait(lock, [this] { return m_queue.empty() && !m_writing; });
-        lock.unlock();
+        // Wait until the consumer has popped (and finished writing) every
+        // queued record. Polling two atomics avoids taking any lock here.
+        while (!m_queue.emptyApprox() || m_writing.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
         if (m_inner != nullptr) {
             m_inner->flush();
         }
@@ -331,43 +336,52 @@ public:
 
 private:
     void run() {
+        LogRecord record;
         while (true) {
-            std::deque<LogRecord> batch;
-            {
-                std::unique_lock lock(m_mutex);
-                m_condition.wait(lock, [this] { return m_stopping || !m_queue.empty(); });
-                if (m_queue.empty() && m_stopping) {
-                    return;
-                }
-                batch.swap(m_queue);
-                m_writing = true;
-            }
-            for (const LogRecord& record : batch) {
+            if (m_queue.tryPop(record)) {
+                m_writing.store(true, std::memory_order_release);
+                do {
+                    try {
+                        if (m_inner != nullptr) {
+                            m_inner->write(record);
+                        }
+                    } catch (...) {
+                        // A failing sink must never take the logging thread down.
+                    }
+                } while (m_queue.tryPop(record));
                 try {
-                    m_inner->write(record);
+                    if (m_inner != nullptr) {
+                        m_inner->flush();
+                    }
                 } catch (...) {
-                    // A failing sink must never take the logging thread down.
                 }
+                m_writing.store(false, std::memory_order_release);
+                continue;
             }
-            if (m_inner != nullptr) {
-                m_inner->flush();
+            if (m_stopping.load(std::memory_order_acquire) && m_queue.emptyApprox()) {
+                return;
             }
-            {
-                std::lock_guard lock(m_mutex);
-                m_writing = false;
-            }
-            m_condition.notify_all();
+            // Park briefly; the predicate re-checks the atomic wake
+            // sequence, so a notify racing this wait costs at most the
+            // 1 ms timeout, never a lost record.
+            const uint64_t wakeSequence = m_wakeSequence.load(std::memory_order_acquire);
+            std::unique_lock lock(m_sleepMutex);
+            m_sleepCondition.wait_for(lock, std::chrono::milliseconds(1), [this, wakeSequence] {
+                return m_stopping.load(std::memory_order_acquire) ||
+                       m_wakeSequence.load(std::memory_order_acquire) != wakeSequence ||
+                       !m_queue.emptyApprox();
+            });
         }
     }
 
     std::unique_ptr<ILogSink> m_inner;
-    size_t m_queueCapacity;
-    std::deque<LogRecord> m_queue;
-    std::mutex m_mutex;
-    std::condition_variable m_condition;
-    bool m_stopping = false;
-    bool m_writing = false;
+    concurrency::LockFreeRingBuffer<LogRecord> m_queue;
+    std::atomic<bool> m_stopping{false};
+    std::atomic<bool> m_writing{false};
     std::atomic<size_t> m_droppedCount{0};
+    std::atomic<uint64_t> m_wakeSequence{0};
+    std::mutex m_sleepMutex;
+    std::condition_variable m_sleepCondition;
     std::thread m_worker;
 };
 
@@ -388,7 +402,7 @@ Logger::~Logger() {
 void Logger::initialize(const LoggerConfig& config) {
     shutdown();
 
-    std::lock_guard lock(m_sinkMutex);
+    std::unique_lock lock(m_sinkMutex);
     m_minimumLevel.store(config.minimumLevel, std::memory_order_relaxed);
     m_activeFilePath.clear();
 
@@ -420,16 +434,17 @@ void Logger::initialize(const LoggerConfig& config) {
 }
 
 void Logger::shutdown() {
-    if (!m_initialized.exchange(false, std::memory_order_relaxed) && m_sinks.empty()) {
+    const bool wasInitialized = m_initialized.exchange(false, std::memory_order_acq_rel);
+    flush();
+    std::unique_lock lock(m_sinkMutex);
+    if (!wasInitialized && m_sinks.empty()) {
         return;
     }
-    flush();
-    std::lock_guard lock(m_sinkMutex);
     m_sinks.clear(); // AsyncSink destructors drain their queues first.
 }
 
 void Logger::flush() {
-    std::lock_guard lock(m_sinkMutex);
+    std::shared_lock lock(m_sinkMutex);
     for (const auto& sink : m_sinks) {
         try {
             sink->flush();
@@ -439,7 +454,7 @@ void Logger::flush() {
 }
 
 std::string Logger::activeFilePath() const {
-    std::lock_guard lock(m_sinkMutex);
+    std::shared_lock lock(m_sinkMutex);
     return m_activeFilePath;
 }
 
@@ -460,7 +475,7 @@ void Logger::log(LogLevel level, const char* file, int line, std::string_view me
     record.text += " (" + std::string(baseName(file)) + ":" + std::to_string(line) + ")";
 
     {
-        std::lock_guard lock(m_sinkMutex);
+        std::shared_lock lock(m_sinkMutex);
         for (const auto& sink : m_sinks) {
             try {
                 sink->write(record);

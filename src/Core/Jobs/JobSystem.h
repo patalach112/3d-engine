@@ -1,9 +1,10 @@
 #pragma once
 
+#include "Core/Concurrency/LockFreeRingBuffer.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -18,10 +19,14 @@ namespace engine {
 // Work-stealing thread pool used to parallelize data-parallel engine work
 // (transform integration, model-matrix building, future physics).
 //
-// Each worker owns a job deque: it pops its own newest job (LIFO, cache
-// friendly) and steals the oldest job (FIFO) from other workers when idle,
-// which balances load without a central bottleneck. Jobs submitted from
-// outside are distributed round-robin.
+// Each worker owns a bounded lock-free MPMC ring buffer
+// (concurrency::LockFreeRingBuffer): it pops from its own ring first and
+// steals from other workers' rings when idle, which balances load without
+// a central bottleneck or any mutex on the queue paths. Jobs submitted
+// from outside are distributed round-robin; if every ring is full the
+// submitting thread runs the job inline rather than dropping it.
+// Condition variables are used only to sleep/wake idle workers and for
+// the waitForAll barrier — never to guard queue access.
 //
 // Synchronization model:
 //   * submit()       — fire-and-forget background work.
@@ -73,12 +78,12 @@ public:
 
 private:
     struct WorkerQueue {
-        std::deque<std::function<void()>> jobs;
-        std::mutex mutex;
+        explicit WorkerQueue(size_t capacity) : jobs(capacity) {}
+        concurrency::LockFreeRingBuffer<std::function<void()>> jobs;
     };
 
     void workerLoop(uint32_t workerIndex);
-    // Executes one queued job (own queue LIFO first when workerIndex is a
+    // Executes one queued job (own ring first when workerIndex is a
     // worker, otherwise steals). Returns false when no work was found.
     bool tryRunOneJob(uint32_t preferredQueue);
     // Runs a job with exception shielding. trackedJobs are those counted

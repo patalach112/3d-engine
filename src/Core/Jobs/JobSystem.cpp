@@ -7,6 +7,11 @@
 namespace engine {
 namespace {
 
+// Bounded per-worker ring capacity. If every ring fills up, submit()
+// runs the job inline on the caller's thread instead of blocking or
+// dropping work, so the bound costs latency predictability, not jobs.
+constexpr size_t kWorkerQueueCapacity = 1024;
+
 uint32_t resolveWorkerCount(uint32_t requested) {
     if (requested > 0) {
         return requested;
@@ -25,7 +30,7 @@ JobSystem::JobSystem(const Config& config) {
     const uint32_t workerCount = resolveWorkerCount(config.workerThreads);
     m_queues.reserve(workerCount);
     for (uint32_t i = 0; i < workerCount; ++i) {
-        m_queues.push_back(std::make_unique<WorkerQueue>());
+        m_queues.push_back(std::make_unique<WorkerQueue>(kWorkerQueueCapacity));
     }
     m_workers.reserve(workerCount);
     for (uint32_t i = 0; i < workerCount; ++i) {
@@ -38,7 +43,7 @@ JobSystem::JobSystem(const Config& config) {
 JobSystem::~JobSystem() {
     // Workers drain remaining jobs before exiting (their loop only stops
     // once nothing is pending), so shutdown never drops queued work.
-    m_stopping.store(true, std::memory_order_relaxed);
+    m_stopping.store(true, std::memory_order_release);
     m_wakeCondition.notify_all();
     for (std::thread& worker : m_workers) {
         if (worker.joinable()) {
@@ -51,21 +56,28 @@ JobSystem::~JobSystem() {
 }
 
 void JobSystem::submit(std::function<void()> job) {
-    if (m_stopping.load(std::memory_order_relaxed) || m_queues.empty()) {
+    if (m_stopping.load(std::memory_order_acquire) || m_queues.empty()) {
         // Submitting during shutdown (or with no workers) must not lose
         // work: run it inline on the caller's thread.
         executeJob(std::move(job), false);
         return;
     }
 
-    m_pendingJobs.fetch_add(1, std::memory_order_relaxed);
-    const uint32_t index = m_nextQueue.fetch_add(1, std::memory_order_relaxed) %
+    m_pendingJobs.fetch_add(1, std::memory_order_acq_rel);
+    const uint32_t start = m_nextQueue.fetch_add(1, std::memory_order_relaxed) %
                            static_cast<uint32_t>(m_queues.size());
-    {
-        std::lock_guard lock(m_queues[index]->mutex);
-        m_queues[index]->jobs.push_back(std::move(job));
+    // Lock-free push, round-robin first, then any ring with room. A
+    // failed tryPush leaves `job` intact, so falling through is safe.
+    for (size_t offset = 0; offset < m_queues.size(); ++offset) {
+        WorkerQueue& queue = *m_queues[(start + offset) % m_queues.size()];
+        if (queue.jobs.tryPush(std::move(job))) {
+            m_wakeCondition.notify_one();
+            return;
+        }
     }
-    m_wakeCondition.notify_one();
+    // Every ring is full: run inline (still tracked, so waitForAll and
+    // the job counters stay exact) rather than blocking a producer.
+    executeJob(std::move(job), true);
 }
 
 void JobSystem::waitForAll() {
@@ -136,8 +148,8 @@ void JobSystem::workerLoop(uint32_t workerIndex) {
         if (tryRunOneJob(workerIndex)) {
             continue;
         }
-        if (m_stopping.load(std::memory_order_relaxed) &&
-            m_pendingJobs.load(std::memory_order_relaxed) == 0) {
+        if (m_stopping.load(std::memory_order_acquire) &&
+            m_pendingJobs.load(std::memory_order_acquire) == 0) {
             return;
         }
         // Short timed wait: workers re-scan for stealable work regularly,
@@ -156,24 +168,14 @@ bool JobSystem::tryRunOneJob(uint32_t preferredQueue) {
     for (size_t offset = 0; offset < queueCount; ++offset) {
         const size_t index = (preferredQueue + offset) % queueCount;
         WorkerQueue& queue = *m_queues[index];
+        // Lock-free pop: offset 0 drains the worker's own ring; any other
+        // ring is a steal. Ring order is FIFO, so steals take the oldest
+        // (usually largest) outstanding job first.
         std::function<void()> job;
-        {
-            std::unique_lock lock(queue.mutex, std::try_to_lock);
-            if (!lock.owns_lock() || queue.jobs.empty()) {
-                continue;
-            }
-            if (offset == 0) {
-                // Own queue: newest first (better cache locality).
-                job = std::move(queue.jobs.back());
-                queue.jobs.pop_back();
-            } else {
-                // Stealing: oldest first (usually the biggest chunk).
-                job = std::move(queue.jobs.front());
-                queue.jobs.pop_front();
-            }
+        if (queue.jobs.tryPop(job)) {
+            executeJob(std::move(job), true);
+            return true;
         }
-        executeJob(std::move(job), true);
-        return true;
     }
     return false;
 }

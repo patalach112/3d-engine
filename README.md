@@ -182,8 +182,9 @@ spins — set `[Performance] entityReserve` to your expected entity count.
 ### Work-stealing job system (`src/Core/Jobs/JobSystem.*`)
 
 A thread pool using `hardware_concurrency - 1` workers by default
-(`[Performance] jobWorkerCount` overrides). Each worker owns a deque —
-LIFO pops for itself, FIFO steals for thieves — and `parallelFor()` is a
+(`[Performance] jobWorkerCount` overrides). Each worker owns a bounded
+lock-free ring buffer (see Sub-step 2 below): it pops its own ring first
+and steals from other rings when idle, and `parallelFor()` is a
 synchronous data-parallel loop whose return acts as a **barrier**: the
 calling thread helps execute batches, so it is deadlock-safe even from
 workers. Job exceptions are caught, counted and logged; workers drain on
@@ -216,6 +217,33 @@ Hot ECS components are laid out for dense, cache-friendly iteration:
   `RenderSystem` snapshots contiguous entity handles and evaluates disjoint
   per-entity output slots before deterministic compaction.
 
+### Lock-free queues (Phase 4, Sub-step 2)
+
+`src/Core/Concurrency/LockFreeRingBuffer.h` is a bounded MPMC lock-free
+ring buffer (Vyukov sequence-stamp design): producers and consumers claim
+slots with CAS on cache-line-separated (`alignas(64)`) enqueue/dequeue
+positions and publish/consume cell values with release/acquire ordering —
+no mutex anywhere on the push/pop paths, and a failed push to a full ring
+never consumes the caller's value. It now backs the hot multithreaded
+paths:
+
+- **JobSystem:** each worker's queue is a 1024-slot ring. Submission,
+  local pops, and steals are pure atomic operations (round-robin push,
+  steal on idle); if every ring is momentarily full, the submitter runs
+  the job inline instead of blocking or dropping it. Condition variables
+  remain only for idle-worker sleep/wake and the `waitForAll` barrier.
+- **Async logger:** the file sink's ingestion queue is the same ring, so
+  logging threads publish records without taking a mutex; a full ring
+  drops (and counts) records rather than stalling a producer. The logger
+  front-end now holds only a shared lock while dispatching, so producers
+  are not serialized before reaching the ring.
+
+Stress coverage: an MPMC hammer test (4 producers × 4 consumers, 20k
+unique items, each consumed exactly once), 100k sequential wrap-around
+laps, 8 concurrent `JobSystem` producers × 2.5k jobs with exactly-once
+verification, and 4 threads × 250 async log messages delivered in full —
+all also clean under ThreadSanitizer harnesses.
+
 ### Frustum culling (`src/Graphics/Frustum.*`, `src/Geometry/Bounds.*`)
 
 View frustum planes are extracted from the view-projection matrix
@@ -228,14 +256,16 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 118 checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 129 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
 (barriers, exactly-once parallel coverage, exception containment), and
-frustum/AABB math, plus data-oriented layout checks (component size/alignment,
+frustum/AABB math, data-oriented layout checks (component size/alignment,
 dense-page pointer strides, owning-group pairing with non-spinning decoys, and
-5,000 entities × 40 parallel fixed steps) — everything verifiable without a GPU.
+5,000 entities × 40 parallel fixed steps), and lock-free stress tests (MPMC
+ring hammering, concurrent job producers, concurrent async logging) —
+everything verifiable without a GPU.
 
 ## Configuration
 
@@ -317,6 +347,7 @@ mouse (press again to quit).
     ├── Core/
     │   ├── Application.h/.cpp  # Composition root, wires loop callbacks
     │   ├── Camera.h/.cpp       # First-person yaw/pitch camera (GLM)
+    │   ├── Concurrency/LockFreeRingBuffer.h # Bounded MPMC lock-free ring buffer
     │   ├── Jobs/JobSystem.*    # Work-stealing thread pool, parallelFor
     │   ├── Memory/PoolAllocator.* # Paginated pool allocator for the ECS
     │   ├── EngineConfig.h/.cpp # INI loading, validation, fallback chain
@@ -365,8 +396,9 @@ what it depends on.
   rendering via push constants
 - **Phase 4 — Performance & memory ✅:** paginated pool allocator for ECS
   storage, work-stealing job system with parallel systems, frustum culling,
-  and strict data-oriented component layout (cache-line transforms, dense
-  paged storage, owning-group parallel iteration)
+  strict data-oriented component layout (cache-line transforms, dense
+  paged storage, owning-group parallel iteration), and lock-free ring
+  buffers on the job-system and async-logger hot paths
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.
