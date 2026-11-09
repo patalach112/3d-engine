@@ -124,6 +124,7 @@ vector — no gimbal lock, no view flipping. Yaw wraps to [-180°, 180°).
 | W / A / S / D | Move forward/left/back/right |
 | E / Q       | Move up / down            |
 | Shift       | Boost (configurable multiplier) |
+| C           | Respawn/reset physics cubes |
 | Click       | Capture the mouse         |
 | Esc         | Release mouse, again to quit |
 
@@ -408,9 +409,10 @@ and **drawn/culled** counts:
 
 Physics is ECS-native, not an external object hierarchy:
 
-- `RigidBodyComponent` (exactly one 64-byte cache line): velocity,
-  last-step acceleration, accumulated force (cleared after integration),
-  mass/inverse-mass, restitution, friction, static and gravity flags.
+- `RigidBodyComponent` (dense 80-byte value): linear velocity, angular
+  velocity (degrees/second), last-step acceleration, accumulated force
+  (cleared after integration), mass/inverse-mass, restitution, friction,
+  static and gravity flags.
 - `ColliderComponent` (dense 48-byte value): box (half-extents), sphere
   (radius), or plane (`normal·x = offset`). Box/sphere dimensions are
   local and scaled by `TransformComponent::scale`.
@@ -445,6 +447,14 @@ The startup scene now has a static floor (flattened cube + plane collider
 at `y = -1.25`) and six rigid-body cubes that fall, bounce, collide, slide,
 and stack in front of the camera. Physics statistics (body/contact counts)
 are available from `PhysicsSystem::lastStats()`.
+
+Press **C** to respawn the cubes. After scene construction,
+`PhysicsSystem::captureSpawnStates()` stores each dynamic body's entity
+handle, staggered spawn position/rotation/scale, and initial linear and
+angular velocity. A C-key edge press restores those values, clears
+acceleration, accumulated forces, and stale contact scratch, and restores
+any `SpinComponent` velocity — without creating/destroying entities or
+reallocating ECS storage, so repeated resets are stable and leak-free.
 
 ## Configuration
 

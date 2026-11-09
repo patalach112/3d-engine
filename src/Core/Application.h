@@ -51,6 +51,7 @@ private:
     void registerAssets();
     void buildScene();
     void handleMouseCapture();
+    void handlePhysicsReset();
     void logLoopStats(const char* context) const;
 
     EngineConfig m_config;

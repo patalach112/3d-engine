@@ -3,6 +3,8 @@
 #include "Physics/PhysicsComponents.h"
 #include "Scene/Components.h"
 
+#include <entt/entity/entity.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -46,9 +48,32 @@ public:
                  JobSystem* jobs = nullptr);
     Stats update(Scene& scene, double fixedDeltaSeconds, const PhysicsSettings& settings, JobSystem& jobs);
 
+    // Captures the current transform/velocity state of every dynamic
+    // physics body as its respawn state. Call after building a scene.
+    // Existing snapshots are replaced; the storage capacity is retained.
+    size_t captureSpawnStates(Scene& scene);
+
+    // Restores every captured dynamic body to its spawn transform and
+    // initial linear/angular velocity, clearing acceleration and forces.
+    // Entities are neither created nor destroyed, and stale/destroyed
+    // handles are skipped. Returns the number of bodies reset.
+    size_t resetToSpawnStates(Scene& scene);
+
     [[nodiscard]] const Stats& lastStats() const { return m_lastStats; }
+    [[nodiscard]] size_t spawnStateCount() const { return m_spawnStates.size(); }
 
 private:
+    struct SpawnState {
+        entt::entity entity = entt::null;
+        glm::vec3 position{0.0f};
+        glm::vec3 rotationDegrees{0.0f};
+        glm::vec3 scale{1.0f};
+        glm::vec3 velocity{0.0f};
+        glm::vec3 angularVelocity{0.0f};
+        glm::vec3 spinDegreesPerSecond{0.0f};
+        bool hasSpin = false;
+    };
+
     struct BodyRef {
         TransformComponent* transform = nullptr;
         RigidBodyComponent* body = nullptr;
@@ -97,6 +122,7 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> m_candidatePairs;
     std::vector<std::optional<Contact>> m_contactSlots;
     std::vector<Contact> m_contacts;
+    std::vector<SpawnState> m_spawnStates;
     Stats m_lastStats;
 };
 

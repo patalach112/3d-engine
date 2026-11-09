@@ -58,6 +58,76 @@ PhysicsSystem::Stats PhysicsSystem::update(Scene& scene, double fixedDeltaSecond
     return m_lastStats;
 }
 
+size_t PhysicsSystem::captureSpawnStates(Scene& scene) {
+    m_spawnStates.clear();
+    auto& registry = scene.registry();
+    auto view = registry.view<TransformComponent, RigidBodyComponent, ColliderComponent>();
+    m_spawnStates.reserve(view.size_hint());
+
+    size_t dynamicCount = 0;
+    for (const entt::entity entity : view) {
+        const TransformComponent& transform = view.get<TransformComponent>(entity);
+        const RigidBodyComponent& body = view.get<RigidBodyComponent>(entity);
+        SpawnState state;
+        state.entity = entity;
+        state.position = transform.position;
+        state.rotationDegrees = transform.rotationDegrees;
+        state.scale = transform.scale;
+        state.velocity = body.velocity;
+        state.angularVelocity = body.angularVelocity;
+        if (registry.all_of<SpinComponent>(entity)) {
+            state.hasSpin = true;
+            state.spinDegreesPerSecond = registry.get<SpinComponent>(entity).degreesPerSecond;
+        }
+        m_spawnStates.push_back(state);
+        if (body.dynamic()) {
+            ++dynamicCount;
+        }
+    }
+    return dynamicCount;
+}
+
+size_t PhysicsSystem::resetToSpawnStates(Scene& scene) {
+    auto& registry = scene.registry();
+    size_t resetCount = 0;
+
+    for (const SpawnState& state : m_spawnStates) {
+        if (!registry.valid(state.entity) ||
+            !registry.all_of<TransformComponent, RigidBodyComponent, ColliderComponent>(state.entity)) {
+            continue; // destroyed or structurally changed since capture: skip safely
+        }
+
+        RigidBodyComponent& body = registry.get<RigidBodyComponent>(state.entity);
+        if (!body.dynamic()) {
+            continue; // static floor/planes are never respawned
+        }
+
+        TransformComponent& transform = registry.get<TransformComponent>(state.entity);
+        transform.position = state.position;
+        transform.rotationDegrees = state.rotationDegrees;
+        transform.scale = state.scale;
+        body.velocity = state.velocity;
+        body.angularVelocity = state.angularVelocity;
+        body.acceleration = glm::vec3{0.0f};
+        body.clearForces();
+
+        if (registry.all_of<SpinComponent>(state.entity)) {
+            registry.get<SpinComponent>(state.entity).degreesPerSecond =
+                state.hasSpin ? state.spinDegreesPerSecond : glm::vec3{0.0f};
+        }
+        ++resetCount;
+    }
+
+    // Contact state from the pre-reset world is meaningless now. Clearing
+    // (but not reallocating) the scratch arrays lets the next fixed step
+    // rebuild it from the respawned transforms.
+    m_candidatePairs.clear();
+    m_contactSlots.clear();
+    m_contacts.clear();
+    m_lastStats = {};
+    return resetCount;
+}
+
 void PhysicsSystem::snapshotBodies(Scene& scene) {
     m_bodies.clear();
     auto view = scene.registry().view<TransformComponent, RigidBodyComponent, ColliderComponent>();
@@ -92,6 +162,8 @@ void PhysicsSystem::integrate(double fixedDeltaSeconds, const PhysicsSettings& s
             // is stable at the engine's fixed step and conserves the
             // contact solver's assumptions much better than explicit Euler.
             ref.transform->position += body.velocity * dt;
+            ref.transform->rotationDegrees =
+                glm::mod(ref.transform->rotationDegrees + body.angularVelocity * dt, 360.0f);
             body.clearForces();
         }
     };

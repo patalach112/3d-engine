@@ -17,14 +17,16 @@ namespace engine {
 // force/acceleration state. Forces are accumulated between fixed steps,
 // consumed by PhysicsSystem, and cleared by that step.
 //
-// The hot value is exactly one cache line. EnTT stores components in dense
-// paged arrays, so bodies are iterated as packed data rather than through
-// gameplay-object pointer graphs.
+// EnTT stores components in dense paged arrays, so bodies are iterated as
+// packed data rather than through gameplay-object pointer graphs. The hot
+// value packs all linear/angular state into five cache lines' worth of
+// four bodies (80 bytes each, 16-byte aligned).
 // ---------------------------------------------------------------------------
-struct alignas(hardware::cacheLineBytes) RigidBodyComponent {
+struct alignas(16) RigidBodyComponent {
     glm::vec3 velocity{0.0f};
-    glm::vec3 acceleration{0.0f}; // acceleration used by the most recent step
-    glm::vec3 force{0.0f};        // accumulated force, cleared after integration
+    glm::vec3 angularVelocity{0.0f}; // degrees per second, by Euler axis
+    glm::vec3 acceleration{0.0f};    // acceleration used by the most recent step
+    glm::vec3 force{0.0f};           // accumulated force, cleared after integration
 
     float mass = 1.0f;
     float inverseMass = 1.0f;
@@ -46,6 +48,7 @@ struct alignas(hardware::cacheLineBytes) RigidBodyComponent {
         inverseMass = static_ ? 0.0f : (mass > 0.0f ? 1.0f / mass : 0.0f);
         if (isStatic) {
             velocity = glm::vec3{0.0f};
+            angularVelocity = glm::vec3{0.0f};
         }
     }
 
@@ -117,9 +120,8 @@ struct PhysicsSettings {
     uint32_t parallelMinBodies = 128;    // below this, sequential batches are cheaper
 };
 
-static_assert(sizeof(RigidBodyComponent) == hardware::cacheLineBytes &&
-                  alignof(RigidBodyComponent) == hardware::cacheLineBytes,
-              "RigidBodyComponent must occupy exactly one cache line");
+static_assert(sizeof(RigidBodyComponent) == 80 && alignof(RigidBodyComponent) == 16,
+              "RigidBodyComponent must remain a dense 80-byte value");
 static_assert(sizeof(ColliderComponent) == 48 && alignof(ColliderComponent) == 16,
               "ColliderComponent must remain a dense 48-byte value");
 

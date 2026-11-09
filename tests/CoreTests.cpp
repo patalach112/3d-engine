@@ -408,7 +408,8 @@ void testPhysics() {
         engine::Scene scene;
         auto entity = scene.createEntity("Falling");
         entity.addComponent<TransformComponent>(glm::vec3{0.0f, 10.0f, 0.0f});
-        entity.addComponent<RigidBodyComponent>(1.0f);
+        auto& fallingBody = entity.addComponent<RigidBodyComponent>(1.0f);
+        fallingBody.angularVelocity = glm::vec3{0.0f, 90.0f, 0.0f};
         entity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
         PhysicsSettings settings;
         settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
@@ -420,6 +421,8 @@ void testPhysics() {
         check(nearlyEqual(rigidBody.velocity.y, -1.0), "gravity integrates velocity by delta time");
         check(nearlyEqual(transform.position.y, 9.9, 1e-4), "velocity integrates position by delta time");
         check(nearlyEqual(rigidBody.acceleration.y, -10.0), "rigid body records integrated acceleration");
+        check(nearlyEqual(entity.getComponent<TransformComponent>().rotationDegrees.y, 9.0, 1e-4),
+              "angular velocity integrates rotation by delta time");
     }
 
     // Force / mass integration, and forces are consumed exactly once.
@@ -589,6 +592,70 @@ void testPhysics() {
                          nearlyEqual(entity.getComponent<TransformComponent>().position.y, 9.9, 1e-4);
         }
         check(integrated, "JobSystem-parallel physics integrates every body exactly once");
+    }
+
+    // Respawn/reset (the C key in Application): captured dynamic bodies
+    // return to their staggered spawn transforms and initial velocities;
+    // stale motion, rotation, forces, static bodies, and entity structure
+    // are all left in a clean, reusable state.
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("RespawnFloor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+
+        auto cube = scene.createEntity("RespawnCube");
+        auto& cubeTransform = cube.addComponent<TransformComponent>(glm::vec3{1.0f, 4.0f, -2.0f});
+        cubeTransform.rotationDegrees = glm::vec3{0.0f, 15.0f, 0.0f};
+        cubeTransform.scale = glm::vec3{0.5f};
+        auto& cubeBody = cube.addComponent<RigidBodyComponent>(1.0f);
+        cubeBody.velocity = glm::vec3{0.25f, 0.0f, 0.0f};
+        cubeBody.angularVelocity = glm::vec3{0.0f, 30.0f, 0.0f};
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto& cubeSpin = cube.addComponent<engine::SpinComponent>(glm::vec3{0.0f, 45.0f, 0.0f});
+
+        PhysicsSystem physics;
+        check(physics.captureSpawnStates(scene) == 1, "respawn capture counts dynamic bodies");
+        check(physics.spawnStateCount() == 2, "respawn capture snapshots dynamic and static bodies");
+        const size_t entityCountBefore = scene.entityCount();
+
+        // Simulate a messy mid-game state, then reset twice. The second
+        // reset proves the operation is idempotent and reusable.
+        for (int resetIndex = 0; resetIndex < 2; ++resetIndex) {
+            cubeTransform.position = glm::vec3{-8.0f, -4.0f, 9.0f};
+            cubeTransform.rotationDegrees = glm::vec3{80.0f, 170.0f, 45.0f};
+            cubeBody.velocity = glm::vec3{9.0f, -12.0f, 7.0f};
+            cubeBody.angularVelocity = glm::vec3{99.0f, 88.0f, 77.0f};
+            cubeBody.acceleration = glm::vec3{1.0f, 2.0f, 3.0f};
+            cubeBody.addForce(glm::vec3{100.0f, 100.0f, 100.0f});
+            cubeSpin.degreesPerSecond = glm::vec3{300.0f, 0.0f, 0.0f};
+
+            check(physics.resetToSpawnStates(scene) == 1, "physics reset respawns one dynamic body");
+            check(nearlyVec3(cubeTransform.position, glm::vec3{1.0f, 4.0f, -2.0f}),
+                  "physics reset restores spawn position");
+            check(nearlyVec3(cubeTransform.rotationDegrees, glm::vec3{0.0f, 15.0f, 0.0f}),
+                  "physics reset restores spawn rotation");
+            check(nearlyVec3(cubeBody.velocity, glm::vec3{0.25f, 0.0f, 0.0f}),
+                  "physics reset restores initial linear velocity");
+            check(nearlyVec3(cubeBody.angularVelocity, glm::vec3{0.0f, 30.0f, 0.0f}),
+                  "physics reset restores initial angular velocity");
+            check(nearlyVec3(cubeSpin.degreesPerSecond, glm::vec3{0.0f, 45.0f, 0.0f}),
+                  "physics reset restores spin component");
+            check(nearlyVec3(cubeBody.acceleration, glm::vec3{0.0f}) &&
+                      nearlyVec3(cubeBody.force, glm::vec3{0.0f}),
+                  "physics reset clears acceleration and forces");
+        }
+        check(scene.entityCount() == entityCountBefore && cube.isValid(),
+              "physics reset preserves entity structure");
+
+        // The respawned body is immediately simulation-ready.
+        PhysicsSettings settings;
+        const auto stats = physics.update(scene, 0.1, settings);
+        check(stats.dynamicBodies == 1 && cubeBody.velocity.y < 0.0f &&
+                  cubeTransform.position.y < 4.0f,
+              "respawned body resumes falling under gravity");
     }
 }
 

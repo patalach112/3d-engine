@@ -104,25 +104,36 @@ void Application::buildScene() {
     // by TransformComponent; the box collider's local half-extents are
     // 0.5, so PhysicsSystem derives each world AABB from that same scale.
     const auto addPhysicsCube = [this](const char* name, const glm::vec3& position, float scale,
-                                       const glm::vec3& velocity) {
+                                       const glm::vec3& velocity, const glm::vec3& angularVelocity) {
         Entity entity = m_scene.createEntity(name);
         auto& transform = entity.addComponent<TransformComponent>(position);
         transform.scale = glm::vec3{scale};
         entity.addComponent<MeshComponent>("cube");
         auto& body = entity.addComponent<RigidBodyComponent>(scale * scale * scale);
         body.velocity = velocity;
+        body.angularVelocity = angularVelocity;
         body.restitution = 0.38f;
         body.friction = 0.5f;
         entity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
         return entity;
     };
 
-    addPhysicsCube("CubeCenter", glm::vec3{0.0f, 1.4f, -2.4f}, 0.65f, glm::vec3{0.15f, 0.0f, 0.0f});
-    addPhysicsCube("CubeCenterTop", glm::vec3{0.12f, 2.8f, -2.35f}, 0.65f, glm::vec3{0.0f, 0.0f, 0.0f});
-    addPhysicsCube("CubeLeft", glm::vec3{-1.25f, 1.9f, -2.2f}, 0.55f, glm::vec3{0.25f, 0.0f, 0.0f});
-    addPhysicsCube("CubeLeftTop", glm::vec3{-1.18f, 3.1f, -2.15f}, 0.55f, glm::vec3{0.0f, 0.0f, 0.0f});
-    addPhysicsCube("CubeRight", glm::vec3{1.3f, 1.6f, -2.1f}, 0.5f, glm::vec3{-0.2f, 0.0f, 0.0f});
-    addPhysicsCube("CubeRightTop", glm::vec3{1.22f, 2.75f, -2.05f}, 0.5f, glm::vec3{0.0f, 0.0f, 0.0f});
+    addPhysicsCube("CubeCenter", glm::vec3{0.0f, 1.4f, -2.4f}, 0.65f, glm::vec3{0.15f, 0.0f, 0.0f},
+                   glm::vec3{0.0f, 24.0f, 0.0f});
+    addPhysicsCube("CubeCenterTop", glm::vec3{0.12f, 2.8f, -2.35f}, 0.65f, glm::vec3{0.0f, 0.0f, 0.0f},
+                   glm::vec3{0.0f, -18.0f, 0.0f});
+    addPhysicsCube("CubeLeft", glm::vec3{-1.25f, 1.9f, -2.2f}, 0.55f, glm::vec3{0.25f, 0.0f, 0.0f},
+                   glm::vec3{0.0f, 32.0f, 0.0f});
+    addPhysicsCube("CubeLeftTop", glm::vec3{-1.18f, 3.1f, -2.15f}, 0.55f, glm::vec3{0.0f, 0.0f, 0.0f},
+                   glm::vec3{0.0f, -26.0f, 0.0f});
+    addPhysicsCube("CubeRight", glm::vec3{1.3f, 1.6f, -2.1f}, 0.5f, glm::vec3{-0.2f, 0.0f, 0.0f},
+                   glm::vec3{0.0f, 20.0f, 0.0f});
+    addPhysicsCube("CubeRightTop", glm::vec3{1.22f, 2.75f, -2.05f}, 0.5f, glm::vec3{0.0f, 0.0f, 0.0f},
+                   glm::vec3{0.0f, -30.0f, 0.0f});
+
+    // Respawn snapshots for the C key. Capturing handles + values (not
+    // component pointers) makes repeated resets allocation-free and safe.
+    m_physicsSystem.captureSpawnStates(m_scene);
 
     ENGINE_LOG_INFO("Scene built: " << m_scene.entityCount() << " entities (player camera, static physics floor, "
                                     << "6 falling rigid-body cubes)");
@@ -137,7 +148,7 @@ void Application::run() {
                     << " (vsync " << (m_config.render.vsync ? "on" : "off") << "), using "
                     << Swapchain::presentModeName(m_swapchain.presentMode()) << ", "
                     << m_renderer.framesInFlight() << " frame(s) in flight)");
-    ENGINE_LOG_INFO("Controls: WASD move, Q/E down/up, Shift boost, mouse look "
+    ENGINE_LOG_INFO("Controls: WASD move, Q/E down/up, Shift boost, C resets physics cubes, mouse look "
                     "(click window to capture mouse, Esc releases / quits)");
 
     LoopCallbacks callbacks;
@@ -162,6 +173,7 @@ void Application::run() {
     // the camera system lives in the variable update.
     callbacks.update = [this](double deltaSeconds) {
         handleMouseCapture();
+        handlePhysicsReset();
         CameraSystem::update(m_scene, m_input, deltaSeconds);
 
         if (m_config.loop.statsLogIntervalSeconds > 0.0) {
@@ -213,6 +225,17 @@ void Application::handleMouseCapture() {
         m_input.setMouseCaptured(true);
         ENGINE_LOG_DEBUG("Mouse captured (click)");
     }
+}
+
+void Application::handlePhysicsReset() {
+    // wasKeyPressed is an edge trigger: holding C must not reset every
+    // frame. The reset only rewrites existing component values, so it
+    // cannot create entities, reallocate ECS storage, or leak resources.
+    if (!m_input.wasKeyPressed(Key::C)) {
+        return;
+    }
+    const size_t resetCount = m_physicsSystem.resetToSpawnStates(m_scene);
+    ENGINE_LOG_INFO("Physics reset (C): respawned " << resetCount << " dynamic rigid bodies");
 }
 
 void Application::logLoopStats(const char* context) const {
