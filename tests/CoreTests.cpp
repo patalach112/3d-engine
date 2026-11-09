@@ -1040,6 +1040,12 @@ void testDynamicModulesAndMaterials() {
     // at link time rather than slipping through as a static-only build.
     check(engine::Window::cursorModeForCapture(true) == GLFW_CURSOR_DISABLED,
           "EnginePlatform exports window/input helpers");
+    engine::LogLevel parsedLevel = engine::LogLevel::Info;
+    check(engine::tryParseLogLevel("warning", parsedLevel) && parsedLevel == engine::LogLevel::Warning &&
+              std::string_view(engine::toString(parsedLevel)) == "WARNING",
+          "EngineFoundation exports Logger level helpers used by EngineCore");
+    check(!engine::tryParseLogLevel("not-a-level", parsedLevel) && parsedLevel == engine::LogLevel::Warning,
+          "exported Logger level parser rejects unknown levels without side effects");
     engine::Camera moduleCamera(engine::CameraConfig{});
     check(nearlyEqual(moduleCamera.movementSpeed(false), 3.0, 1e-6) &&
               nearlyEqual(moduleCamera.movementSpeed(true), 7.5, 1e-6),

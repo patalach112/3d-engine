@@ -28,8 +28,8 @@ enum class LogLevel : uint8_t {
     Off,
 };
 
-[[nodiscard]] const char* toString(LogLevel level);
-[[nodiscard]] bool tryParseLogLevel(std::string_view text, LogLevel& outLevel);
+[[nodiscard]] ENGINE_FOUNDATION_API const char* toString(LogLevel level);
+[[nodiscard]] ENGINE_FOUNDATION_API bool tryParseLogLevel(std::string_view text, LogLevel& outLevel);
 
 // ---------------------------------------------------------------------------
 // LoggerConfig — every knob of the logging system, populated from the
