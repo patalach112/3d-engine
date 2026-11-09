@@ -191,6 +191,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Systems/PlayerSystem.cpp
     src/Scene/Systems/RotationSystem.cpp
     src/Scene/Systems/RenderSystem.cpp
+    src/Scene/Systems/TransformSystem.cpp
 )
 target_link_libraries(EngineScene
     PUBLIC EngineFoundation EngineCore EnginePlatform EngineGeometry EngineGraphics EngineAssets

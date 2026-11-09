@@ -1,6 +1,7 @@
 #include "Scene/Raycast.h"
 
 #include "Scene/Scene.h"
+#include "Scene/Systems/TransformSystem.h"
 
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -142,9 +143,12 @@ bool testMeshBounds(const MeshComponent& mesh, const glm::mat4& model, const Ray
 //   3. the mesh's world bounds (visible meshes only).
 // Other collider shapes (sphere, capsule, plane, hull) are not
 // raycastable yet and fall through to the mesh test when present.
-bool testEntity(const TransformComponent& transform, const ColliderComponent* collider, const MeshComponent* mesh,
+bool testEntity(const TransformComponent& transform, const WorldTransformComponent* world,
+                const ColliderComponent* collider, const MeshComponent* mesh,
                 const Scene::MeshResolver* resolver, const Ray& ray, float maxDistance, Candidate& out) {
-    const glm::mat4 model = transform.modelMatrix();
+    // Picking tests world placement (Phase 18): the propagated
+    // matrix when TransformSystem has run, local otherwise.
+    const glm::mat4 model = TransformSystem::effectiveWorldMatrix(transform, world);
     if (resolver != nullptr && mesh != nullptr && mesh->visible) {
         if (const MeshAsset* asset = (*resolver)(mesh->assetId); asset != nullptr) {
             return testMeshTriangles(*asset, model, ray, maxDistance, out);
@@ -177,7 +181,8 @@ void Scene::syncRaycastTree() const {
         // the exact tests still decide every hit).
         bool hasBox = false;
         AABB box{};
-        const glm::mat4 model = transform.modelMatrix();
+        const glm::mat4 model = TransformSystem::effectiveWorldMatrix(
+            transform, m_registry.try_get<WorldTransformComponent>(entity));
         if (collider != nullptr &&
             (collider->type == ColliderComponent::Type::Box || collider->type == ColliderComponent::Type::Obb)) {
             const AABB localBox{collider->centerOffset - glm::abs(collider->halfExtents),
@@ -226,13 +231,14 @@ void Scene::collectBVHHits(const Ray& ray, float maxDistance, const MeshResolver
     Candidate candidate;
     m_raycastTree.raycast(ray, maxDistance, [&](entt::entity entity) {
         const TransformComponent* transform = m_registry.try_get<TransformComponent>(entity);
+        const WorldTransformComponent* world = m_registry.try_get<WorldTransformComponent>(entity);
         const ColliderComponent* collider = m_registry.try_get<ColliderComponent>(entity);
         // Layer filter: an entity answers queries through its
         // collider's layer, or the Default layer when it has no
         // collider (mesh-only pickables).
         const uint32_t entityLayer = collider != nullptr ? collider->layer : CollisionLayer::Default;
         if (transform != nullptr && (entityLayer & layerMask) != 0u &&
-            testEntity(*transform, collider, m_registry.try_get<MeshComponent>(entity), resolver, ray,
+            testEntity(*transform, world, collider, m_registry.try_get<MeshComponent>(entity), resolver, ray,
                        closestOnly ? best : maxDistance, candidate)) {
             outHits.push_back(RaycastHit{entity, candidate.distance, candidate.position, candidate.normal});
             if (closestOnly) {

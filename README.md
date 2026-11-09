@@ -1280,6 +1280,63 @@ silence, destroyed-entity cleanup with live components) join the
 suite: **566 checks, all passing in Debug, Release-shared and
 Release-static, CTest 1/1, zero warnings.**
 
+## Phase 18 — Scene Graph & Transform Hierarchy ✅
+
+Entities now form a tree. `TransformComponent` keeps its authored
+LOCAL placement; two new components encode the graph —
+`ParentComponent` (the parent handle, on the child) and
+`ChildrenComponent` (the child handle list, on the parent) — and a
+computed `WorldTransformComponent` carries the propagated result:
+world matrix plus decomposed world position/orientation/scale.
+
+- **Hierarchy API** (`Scene::setParent / removeParent / parentOf /
+  childrenOf / isDescendantOf`, mirrored on `Entity`): both sides
+  of every link are maintained atomically, reparenting moves
+  children between lists, and cycle-creating or self-parenting
+  links are rejected without side effects. `keepWorldTransform`
+  variants recompute the child's local transform so its world
+  placement survives (re)parenting or detaching.
+- **Destruction policy** (`Scene::setHierarchyDestroyMode`):
+  *Orphan* (default) detaches children to the root with their
+  world placement rewritten into their local transforms — nothing
+  visually moves; *Cascade* destroys the whole subtree, each
+  descendant publishing its own Phase 17 `EntityDestroyedEvent`.
+  Destroying a child always unlinks it from its parent's list.
+- **TransformSystem** recomputes world transforms by walking the
+  tree from the roots: `world = parentWorld * local`. Orientation
+  composes as quaternions (no gimbal lock at any depth), scale
+  inherits multiplicatively, and rotated non-uniform scale composes
+  into the matrix. The pass runs twice per fixed update in the
+  demo (before physics so parent placement is current, after every
+  transform writer so picking/rendering are fresh), and malformed
+  cycles fall back to local matrices instead of stalling.
+- **Physics integration**: the solver keeps working purely in
+  world space. `PhysicsSystem::update` converts parented bodies
+  local→world on entry (ancestors first) and writes results back
+  world→local on exit, so contacts, joints, CCD, thrusters and
+  gravity fields never see hierarchy — while colliders and bodies
+  under moved/rotated rigs collide exactly at their world
+  placement, and moving a parent carries resting child bodies.
+  Outside `update()`, transforms always hold authored local values
+  (spawn capture/reset semantics unchanged).
+- **Rendering & picking**: `RenderSystem` draws with propagated
+  world matrices (per-entity matrices resolved serially before the
+  parallel draw evaluation), and raycasts — both the BVH
+  broadphase and the exact mesh/collider tests — test world
+  placement, falling back to local matrices before the first
+  propagation pass. The demo parents a small beacon cube to the
+  tumbling centre physics cube; it rides and spins with it.
+
+Verification: 22 new checks (two-level rotation/scale composition
+with exact matrix point mapping, quaternion yaw compounding,
+eight-level depth, link/reparent/detach bookkeeping, cycle
+rejection, keep-world reparenting, orphan world-preservation and
+cascade event counts, offset-rig static colliders, a dynamic body
+falling under a 90°-rotated rig with exact local write-back,
+moving-parent carry, world-space picking) join the suite: **588
+checks, all passing in Debug, Release-shared and Release-static,
+CTest 1/1, zero warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

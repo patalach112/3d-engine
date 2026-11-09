@@ -51,6 +51,12 @@ public:
     [[nodiscard]] entt::entity handle() const { return m_handle; }
     [[nodiscard]] std::string name() const;
 
+    // Scene-graph hierarchy (Phase 18): forwards to Scene::setParent /
+    // removeParent. Returns false when the link was rejected.
+    bool setParent(Entity parent, bool keepWorldTransform = false);
+    bool removeParent(bool keepWorldTransform = false);
+    [[nodiscard]] Entity parent() const;
+
     explicit operator bool() const { return isValid(); }
     bool operator==(const Entity& other) const { return m_handle == other.m_handle && m_scene == other.m_scene; }
     bool operator!=(const Entity& other) const { return !(*this == other); }
@@ -59,6 +65,13 @@ private:
     entt::entity m_handle = entt::null;
     Scene* m_scene = nullptr;
 };
+
+// What Scene::destroyEntity does with an entity's children
+// (Phase 18): Orphan detaches them to the root, recomputing their
+// local transforms so their world placement does not change;
+// Cascade destroys the whole subtree (each descendant publishes its
+// own EntityDestroyedEvent first).
+enum class HierarchyDestroyMode { Orphan, Cascade };
 
 // ---------------------------------------------------------------------------
 // Scene
@@ -169,6 +182,31 @@ public:
     // destroyed (components still readable inside listeners).
     void setEventBus(EventBus* bus) { m_eventBus = bus; }
 
+    // --- Scene-graph hierarchy (Phase 18) --------------------------------
+    // Parent/Children components are maintained exclusively through
+    // these methods; patching them directly can desynchronize the
+    // two sides of a link. Transforms are LOCAL to the parent and
+    // are only composed into world placement by TransformSystem.
+    //
+    // Links that would create a cycle (including self-parenting) or
+    // involve invalid entities are rejected (false, nothing changes).
+    // keepWorldTransform recomputes the child's local transform so
+    // its world placement survives the (re)parenting; otherwise the
+    // authored local transform is kept as-is (the common case).
+    bool setParent(Entity child, Entity parent, bool keepWorldTransform = false);
+    // Detaches the child to the root level. Returns false when the
+    // entity was already a root (or is invalid).
+    bool removeParent(Entity child, bool keepWorldTransform = false);
+    [[nodiscard]] Entity parentOf(Entity child) const;
+    [[nodiscard]] std::vector<Entity> childrenOf(Entity parent) const;
+    [[nodiscard]] bool isDescendantOf(Entity entity, Entity ancestor) const;
+
+    // Destruction policy for children of destroyed entities
+    // (default: Orphan — children survive at the root with their
+    // world placement preserved).
+    void setHierarchyDestroyMode(HierarchyDestroyMode mode) { m_hierarchyDestroyMode = mode; }
+    [[nodiscard]] HierarchyDestroyMode hierarchyDestroyMode() const { return m_hierarchyDestroyMode; }
+
     // Memory pool backing all component storage of this scene.
     [[nodiscard]] memory::PoolStats memoryStats() const { return m_registry.get_allocator().stats(); }
 
@@ -205,6 +243,18 @@ private:
     Registry m_registry;
     size_t m_entityCount = 0; // Scene-created, still-alive entities
     EventBus* m_eventBus = nullptr;
+    HierarchyDestroyMode m_hierarchyDestroyMode = HierarchyDestroyMode::Orphan;
+
+    // World matrix of one entity computed on demand by walking its
+    // ancestor chain (root-first composition of local model
+    // matrices; transform-less ancestors contribute identity). Used
+    // by keepWorldTransform reparenting and orphan preservation,
+    // where the answer must not depend on TransformSystem having
+    // run. Cycle-safe: the walk is depth-capped.
+    [[nodiscard]] glm::mat4 computeWorldMatrix(entt::entity entity) const;
+    // Removes `child` from its current parent's ChildrenComponent
+    // (if any) without touching the child's ParentComponent.
+    void unlinkFromParent(entt::entity child);
     mutable DynamicAABBTree m_raycastTree;
     mutable std::unordered_map<uint32_t /*entt integral*/, RaycastProxyEntry> m_raycastProxies;
 };

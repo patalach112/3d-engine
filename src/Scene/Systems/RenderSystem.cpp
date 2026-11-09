@@ -1,4 +1,5 @@
 #include "Scene/Systems/RenderSystem.h"
+#include "Scene/Systems/TransformSystem.h"
 
 #include "Assets/AssetManager.h"
 #include "Core/Jobs/JobSystem.h"
@@ -33,11 +34,9 @@ uint32_t materialIdFor(std::string_view assetId) {
 // ranges are safe to run concurrently.
 template <typename View>
 void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum, const glm::mat4& viewMatrix,
-                  bool cullingEnabled, const AssetManager* assets, std::optional<DrawItem>& outItem,
-                  char& outCulled) {
-    const TransformComponent& transform = view.template get<TransformComponent>(entity);
+                  bool cullingEnabled, const AssetManager* assets, const glm::mat4& model,
+                  const glm::vec3& worldPosition, std::optional<DrawItem>& outItem, char& outCulled) {
     const MeshComponent& mesh = view.template get<MeshComponent>(entity);
-    const glm::mat4 model = transform.modelMatrix();
     outCulled = 0;
     if (cullingEnabled) {
         const AABB worldBounds = mesh.localBounds.transformed(model);
@@ -46,7 +45,7 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
             return;
         }
     }
-    const float viewDepth = -(viewMatrix * glm::vec4(transform.position, 1.0f)).z;
+    const float viewDepth = -(viewMatrix * glm::vec4(worldPosition, 1.0f)).z;
     // Stable material identity: the AssetManager's registered id (and
     // its dense descriptor index) when available; the deterministic
     // name hash is the fallback for scenes built without an asset pass.
@@ -112,15 +111,28 @@ PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
     }
     frame.meshCount = static_cast<uint32_t>(entities.size());
 
+    // World placement per entity (Phase 18): the TransformSystem-
+    // propagated matrix when present, the local model matrix
+    // otherwise. Resolved serially here so the parallel evaluation
+    // below only reads finished matrices.
+    std::vector<glm::mat4> worldMatrices(entities.size());
+    std::vector<glm::vec3> worldPositions(entities.size());
+    for (size_t i = 0; i < entities.size(); ++i) {
+        worldMatrices[i] = TransformSystem::effectiveWorldMatrix(
+            view.get<TransformComponent>(entities[i]),
+            scene.registry().try_get<WorldTransformComponent>(entities[i]));
+        worldPositions[i] = glm::vec3{worldMatrices[i][3]};
+    }
+
     const Frustum frustum{frame.projection * frame.view};
     std::vector<std::optional<DrawItem>> evaluated(entities.size());
     std::vector<char> culledFlags(entities.size(), 0); // not vector<bool>: slots written concurrently
 
-    const auto evaluateRange = [&view, &entities, &frustum, &options, &evaluated, &culledFlags,
-                                &frame](size_t begin, size_t end) {
+    const auto evaluateRange = [&view, &entities, &frustum, &options, &evaluated, &culledFlags, &frame,
+                                &worldMatrices, &worldPositions](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
             evaluateMesh(view, entities[i], frustum, frame.view, options.frustumCulling, options.assets,
-                         evaluated[i], culledFlags[i]);
+                         worldMatrices[i], worldPositions[i], evaluated[i], culledFlags[i]);
         }
     };
 

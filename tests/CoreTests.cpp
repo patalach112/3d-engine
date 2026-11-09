@@ -21,6 +21,7 @@
 #include "Scene/Scene.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
+#include "Scene/Systems/TransformSystem.h"
 #include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
@@ -4985,6 +4986,262 @@ void testPhysicsEvents() {
     }
 }
 
+void testSceneHierarchy() {
+    std::cout << "Scene graph & transform hierarchy (Phase 18)\n";
+    using engine::ColliderComponent;
+    using engine::ParentComponent;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::RigidBodyComponent;
+    using engine::TransformComponent;
+    using engine::TransformSystem;
+    using engine::WorldTransformComponent;
+
+    const auto worldOf = [](engine::Scene& scene, engine::Entity entity) {
+        return scene.registry().get<WorldTransformComponent>(entity.handle());
+    };
+
+    // --- Propagation: depth, rotation compounding, scale inheritance ----------
+    {
+        engine::Scene scene;
+        auto root = scene.createEntity("root");
+        auto& rootTransform = root.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        rootTransform.rotationDegrees = glm::vec3{0.0f, 90.0f, 0.0f};
+        rootTransform.scale = glm::vec3{2.0f};
+        auto child = scene.createEntity("child");
+        child.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        auto grand = scene.createEntity("grand");
+        auto& grandTransform = grand.addComponent<TransformComponent>(glm::vec3{0.0f, 1.0f, 0.0f});
+        grandTransform.rotationDegrees = glm::vec3{0.0f, 90.0f, 0.0f};
+        scene.setParent(child, root);
+        scene.setParent(grand, child);
+        TransformSystem::update(scene);
+
+        // Child offset (1,0,0) rotated by the parent's 90° yaw and
+        // doubled by its scale: (1,0,0) -> (0,0,-2), plus root at x=1.
+        check(nearlyVec3(worldOf(scene, child).worldPosition, glm::vec3{1.0f, 0.0f, -2.0f}, 1e-4),
+              "child world position composes parent rotation and scale");
+        check(nearlyVec3(worldOf(scene, grand).worldPosition, glm::vec3{1.0f, 2.0f, -2.0f}, 1e-4),
+              "grandchild world position composes the full chain");
+        const glm::vec3 facing = worldOf(scene, grand).worldOrientation * glm::vec3{1.0f, 0.0f, 0.0f};
+        check(nearlyVec3(facing, glm::vec3{-1.0f, 0.0f, 0.0f}, 1e-4),
+              "two 90-degree yaws compound to a 180-degree world orientation (quaternions, no gimbal lock)");
+        check(nearlyVec3(worldOf(scene, grand).worldScale, glm::vec3{2.0f}, 1e-4),
+              "world scale inherits the parent's scale");
+        const glm::vec3 mapped =
+            glm::vec3{worldOf(scene, grand).worldMatrix * glm::vec4{1.0f, 0.0f, 0.0f, 1.0f}};
+        check(nearlyVec3(mapped, glm::vec3{-1.0f, 2.0f, -2.0f}, 1e-4),
+              "world matrix maps local points through rotation + scale + translation");
+        check(nearlyVec3(worldOf(scene, root).worldPosition, glm::vec3{1.0f, 0.0f, 0.0f}, 1e-6) &&
+                  root.getComponent<TransformComponent>().modelMatrix() == worldOf(scene, root).worldMatrix,
+              "a root's world matrix is exactly its local model matrix");
+    }
+    {
+        // Arbitrary depth: eight 1 m hops straight up.
+        engine::Scene scene;
+        engine::Entity parent = scene.createEntity("level0");
+        parent.addComponent<TransformComponent>(glm::vec3{0.0f});
+        engine::Entity deepest = parent;
+        for (int level = 1; level <= 8; ++level) {
+            engine::Entity next = scene.createEntity("level");
+            next.addComponent<TransformComponent>(glm::vec3{0.0f, 1.0f, 0.0f});
+            scene.setParent(next, parent);
+            parent = next;
+            deepest = next;
+        }
+        const size_t updated = TransformSystem::update(scene);
+        check(updated == 9 && nearlyVec3(worldOf(scene, deepest).worldPosition, glm::vec3{0.0f, 8.0f, 0.0f}, 1e-4),
+              "propagation is exact through eight hierarchy levels");
+    }
+
+    // --- Lifecycle: links, cycles, reparenting, keep-world ---------------------
+    {
+        engine::Scene scene;
+        auto a = scene.createEntity("a");
+        a.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto b = scene.createEntity("b");
+        b.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto child = scene.createEntity("child");
+        child.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+
+        check(scene.setParent(child, a) && child.hasComponent<ParentComponent>() &&
+                  scene.parentOf(child) == a && scene.childrenOf(a).size() == 1 &&
+                  scene.childrenOf(a).front() == child,
+              "setParent links both sides of the relationship");
+        check(scene.isDescendantOf(child, a) && !scene.isDescendantOf(a, child),
+              "descendant queries follow the chain direction");
+
+        check(scene.setParent(child, b) && scene.childrenOf(a).empty() && scene.childrenOf(b).size() == 1 &&
+                  scene.parentOf(child) == b,
+              "reparenting moves the child between child lists atomically");
+        check(child.removeParent() && !child.hasComponent<ParentComponent>() && scene.childrenOf(b).empty() &&
+                  !child.removeParent(),
+              "removeParent detaches to root; a second detach is a no-op");
+
+        scene.setParent(child, a);
+        check(!scene.setParent(a, child) && !scene.setParent(a, a) && scene.parentOf(child) == a &&
+                  scene.childrenOf(a).size() == 1,
+              "cycle-creating and self-parenting links are rejected without side effects");
+
+        // keepWorldTransform: reparent under a rotated, offset parent
+        // and the world placement must not move.
+        auto rig = scene.createEntity("rig");
+        auto& rigTransform = rig.addComponent<TransformComponent>(glm::vec3{10.0f, 0.0f, 0.0f});
+        rigTransform.rotationDegrees = glm::vec3{0.0f, 90.0f, 0.0f};
+        TransformSystem::update(scene);
+        const glm::vec3 worldBefore = worldOf(scene, child).worldPosition;
+        scene.setParent(child, rig, true);
+        TransformSystem::update(scene);
+        check(nearlyVec3(worldOf(scene, child).worldPosition, worldBefore, 1e-4) &&
+                  !nearlyVec3(child.getComponent<TransformComponent>().position, glm::vec3{1.0f, 0.0f, 0.0f}, 1e-6),
+              "keepWorldTransform reparenting preserves world placement by rewriting the local transform");
+
+        scene.destroyEntity(child);
+        check(scene.childrenOf(rig).empty(), "destroying a child unlinks it from its parent's list");
+    }
+
+    // --- Lifecycle: destroy modes ----------------------------------------------
+    {
+        engine::Scene scene;
+        engine::EventBus bus;
+        scene.setEventBus(&bus);
+        int destroyed = 0;
+        bus.subscribe<engine::EntityDestroyedEvent>(
+            [&destroyed](const engine::EntityDestroyedEvent&) { ++destroyed; });
+        auto root = scene.createEntity("root");
+        root.addComponent<TransformComponent>(glm::vec3{5.0f, 0.0f, 0.0f});
+        auto child = scene.createEntity("child");
+        child.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        auto grand = scene.createEntity("grand");
+        grand.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        scene.setParent(child, root);
+        scene.setParent(grand, child);
+
+        scene.destroyEntity(root); // default mode: Orphan
+        check(scene.isValid(child) && scene.isValid(grand) && destroyed == 1 &&
+                  !child.hasComponent<ParentComponent>() &&
+                  nearlyVec3(child.getComponent<TransformComponent>().position, glm::vec3{6.0f, 0.0f, 0.0f}, 1e-4),
+              "orphan destroy: children survive at root with world placement preserved, one event");
+
+        engine::Scene cascadeScene;
+        engine::EventBus cascadeBus;
+        cascadeScene.setEventBus(&cascadeBus);
+        int cascadeDestroyed = 0;
+        cascadeBus.subscribe<engine::EntityDestroyedEvent>(
+            [&cascadeDestroyed](const engine::EntityDestroyedEvent&) { ++cascadeDestroyed; });
+        cascadeScene.setHierarchyDestroyMode(engine::HierarchyDestroyMode::Cascade);
+        auto cRoot = cascadeScene.createEntity("root");
+        cRoot.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto cChild = cascadeScene.createEntity("child");
+        cChild.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto cGrand = cascadeScene.createEntity("grand");
+        cGrand.addComponent<TransformComponent>(glm::vec3{0.0f});
+        cascadeScene.setParent(cChild, cRoot);
+        cascadeScene.setParent(cGrand, cChild);
+        cascadeScene.destroyEntity(cRoot);
+        check(!cascadeScene.isValid(cChild) && !cascadeScene.isValid(cGrand) && cascadeDestroyed == 3 &&
+                  cascadeScene.entityCount() == 0,
+              "cascade destroy: the whole subtree is destroyed, one event per entity");
+    }
+
+    // --- Physics integration ------------------------------------------------------
+    const auto stepPhysics = [](PhysicsSystem& physics, engine::Scene& scene, const PhysicsSettings& settings,
+                                int steps) {
+        for (int i = 0; i < steps; ++i) {
+            physics.update(scene, 1.0 / 60.0, settings, nullptr);
+        }
+    };
+    {
+        // A static collider carried by a transform-only rig at x=5:
+        // a root body dropped over the rig lands on the CHILD's
+        // world position, proving colliders inherit world placement.
+        engine::Scene scene;
+        PhysicsSystem physics;
+        PhysicsSettings settings;
+        settings.subSteps = 4;
+        settings.sleepEnabled = false;
+
+        auto rig = scene.createEntity("rig");
+        rig.addComponent<TransformComponent>(glm::vec3{5.0f, 0.0f, 0.0f});
+        auto shelf = scene.createEntity("shelf");
+        shelf.addComponent<TransformComponent>(glm::vec3{0.0f, 0.5f, 0.0f});
+        auto& shelfBody = shelf.addComponent<RigidBodyComponent>(0.0f);
+        shelfBody.setStatic(true);
+        shelf.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{1.0f, 0.5f, 1.0f}));
+        scene.setParent(shelf, rig);
+
+        auto boxEntity = scene.createEntity("box");
+        auto& boxTransform = boxEntity.addComponent<TransformComponent>(glm::vec3{5.0f, 3.0f, 0.0f});
+        auto& boxBody = boxEntity.addComponent<RigidBodyComponent>(1.0f);
+        boxBody.restitution = 0.0f;
+        boxEntity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        stepPhysics(physics, scene, settings, 150);
+        check(nearlyVec3(boxTransform.position, glm::vec3{5.0f, 1.5f, 0.0f}, 0.05f),
+              "a collider child of an offset rig collides at its world position");
+    }
+    {
+        // A dynamic body under a rotated rig: physics converts it to
+        // world space, solves, and writes the result back to local.
+        engine::Scene scene;
+        PhysicsSystem physics;
+        PhysicsSettings settings;
+        settings.subSteps = 4;
+        settings.sleepEnabled = false;
+
+        auto floorEntity = scene.createEntity("floor");
+        floorEntity.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+        floorEntity.addComponent<RigidBodyComponent>(0.0f);
+        floorEntity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{10.0f, 0.5f, 10.0f}));
+
+        auto rig = scene.createEntity("rig");
+        auto& rigTransform = rig.addComponent<TransformComponent>(glm::vec3{0.0f});
+        rigTransform.rotationDegrees = glm::vec3{0.0f, 90.0f, 0.0f};
+        auto boxEntity = scene.createEntity("box");
+        auto& boxTransform = boxEntity.addComponent<TransformComponent>(glm::vec3{1.0f, 3.0f, 0.0f});
+        auto& boxBody = boxEntity.addComponent<RigidBodyComponent>(1.0f);
+        boxBody.restitution = 0.0f;
+        boxEntity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        scene.setParent(boxEntity, rig);
+
+        TransformSystem::update(scene);
+        check(nearlyVec3(worldOf(scene, boxEntity).worldPosition, glm::vec3{0.0f, 3.0f, -1.0f}, 1e-4),
+              "parented body starts at the rotated rig's world position");
+        stepPhysics(physics, scene, settings, 150);
+        TransformSystem::update(scene);
+        check(nearlyVec3(worldOf(scene, boxEntity).worldPosition, glm::vec3{0.0f, 0.5f, -1.0f}, 0.05f) &&
+                  nearlyVec3(boxTransform.position, glm::vec3{1.0f, 0.5f, 0.0f}, 0.05f),
+              "parented body falls in world space and is written back to exact local placement");
+
+        // Moving the parent carries the resting body with it.
+        rigTransform.position = glm::vec3{3.0f, 0.0f, 0.0f};
+        stepPhysics(physics, scene, settings, 30);
+        TransformSystem::update(scene);
+        check(nearlyVec3(worldOf(scene, boxEntity).worldPosition, glm::vec3{3.0f, 0.5f, -1.0f}, 0.05f),
+              "moving a parent rig carries its child bodies along");
+    }
+
+    // --- Picking integration -------------------------------------------------------
+    {
+        engine::Scene scene;
+        auto parent = scene.createEntity("parent");
+        parent.addComponent<TransformComponent>(glm::vec3{10.0f, 0.0f, 0.0f});
+        auto child = scene.createEntity("childMesh");
+        child.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -5.0f});
+        auto& mesh = child.addComponent<engine::MeshComponent>();
+        mesh.localBounds = engine::AABB{glm::vec3{-0.5f}, glm::vec3{0.5f}};
+        scene.setParent(child, parent);
+        TransformSystem::update(scene);
+
+        engine::RaycastHit hit;
+        check(scene.raycast(engine::Ray{{10.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit) &&
+                  hit.entity == child.handle() && nearlyEqual(hit.distance, 4.5, 1e-3),
+              "raycast picks a parented mesh at its world position");
+        check(!scene.raycast(engine::Ray{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f}}, hit),
+              "raycast does not pick the mesh at its local position");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -5004,6 +5261,7 @@ int main() {
     testEventBus();
     testInputSystem();
     testPhysicsEvents();
+    testSceneHierarchy();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

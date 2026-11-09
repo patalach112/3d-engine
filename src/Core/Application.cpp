@@ -1,6 +1,7 @@
 #include "Core/Application.h"
 
 #include "Physics/PhysicsEvents.h"
+#include "Scene/Systems/TransformSystem.h"
 
 #include "Core/Logger.h"
 #include "Graphics/HudFont.h"
@@ -273,8 +274,20 @@ void Application::buildScene() {
         return entity;
     };
 
-    addPhysicsCube("CubeCenter", glm::vec3{0.0f, 1.4f, -2.4f}, 0.65f, glm::vec3{0.15f, 0.0f, 0.0f},
-                   glm::vec3{0.0f, 24.0f, 0.0f});
+    Entity centerCube = addPhysicsCube("CubeCenter", glm::vec3{0.0f, 1.4f, -2.4f}, 0.65f,
+                                       glm::vec3{0.15f, 0.0f, 0.0f}, glm::vec3{0.0f, 24.0f, 0.0f});
+
+    // Scene-graph showcase (Phase 18): a small visual cube parented
+    // to the tumbling physics cube. It carries no body or collider —
+    // TransformSystem composes its world matrix from the parent's
+    // physics-driven transform every step, so it rides and spins
+    // with the cube exactly.
+    Entity beacon = m_scene.createEntity("CubeCenterBeacon");
+    auto& beaconTransform = beacon.addComponent<TransformComponent>(glm::vec3{0.0f, 0.75f, 0.0f});
+    beaconTransform.scale = glm::vec3{0.35f};
+    auto& beaconMesh = beacon.addComponent<MeshComponent>("cube");
+    beaconMesh.materialName = "player";
+    m_scene.setParent(beacon, centerCube);
     addPhysicsCube("CubeCenterTop", glm::vec3{0.12f, 2.8f, -2.35f}, 0.65f, glm::vec3{0.0f, 0.0f, 0.0f},
                    glm::vec3{0.0f, -18.0f, 0.0f});
     addPhysicsCube("CubeLeft", glm::vec3{-1.25f, 1.9f, -2.2f}, 0.55f, glm::vec3{0.25f, 0.0f, 0.0f},
@@ -347,6 +360,9 @@ void Application::run() {
     // integration is data-parallel across worker threads, and
     // parallelFor()'s return is the barrier before the variable update.
     callbacks.fixedUpdate = [this](double fixedDeltaSeconds) {
+        // Propagate the scene graph first so physics sees current
+        // parent placements (Phase 18).
+        TransformSystem::update(m_scene);
         // Rigid-body physics is deterministic simulation, so it lives in
         // the fixed step (never the variable/render-rate update). Its
         // parallel phases return at JobSystem barriers before rendering.
@@ -356,6 +372,9 @@ void Application::run() {
         m_physicsSystem.update(m_scene, fixedDeltaSeconds, m_config.physics, m_jobSystem);
         PlayerSystem::syncCamera(m_scene);
         RotationSystem::update(m_scene, fixedDeltaSeconds, m_jobSystem);
+        // Re-propagate after every writer of local transforms so
+        // picking and rendering consume this step's world matrices.
+        TransformSystem::update(m_scene);
     };
     // Player control is frame-rate dependent by nature (mouse look), so
     // the camera system lives in the variable update.

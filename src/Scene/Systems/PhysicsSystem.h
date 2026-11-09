@@ -310,6 +310,12 @@ private:
     // integrals) as of the previous update, diffed against the
     // current sets at the end of update() to derive began/entered
     // and ended/exited transitions.
+    // Hierarchy sandbox (Phase 18): parented bodies converted to
+    // world space for the duration of update(), in ascending
+    // hierarchy depth (restored in reverse). See convert/restore.
+    std::vector<entt::entity> m_parentedBodies;
+    void convertParentedBodiesToWorld(Scene& scene);
+    void restoreParentedBodiesToLocal(Scene& scene);
     EventBus* m_eventBus = nullptr;
     std::unordered_set<uint64_t> m_activeContactPairs;
     std::unordered_set<uint64_t> m_activeTriggerPairs;

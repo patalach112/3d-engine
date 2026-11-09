@@ -2,6 +2,7 @@
 #define GLM_ENABLE_EXPERIMENTAL
 #endif
 #include "Scene/Systems/PhysicsSystem.h"
+#include "Scene/Systems/TransformSystem.h"
 
 #include "Core/Jobs/JobSystem.h"
 #include "Scene/Scene.h"
@@ -251,6 +252,14 @@ PhysicsSystem::Stats PhysicsSystem::update(Scene& scene, double fixedDeltaSecond
         return m_lastStats;
     }
 
+    // Scene-graph hierarchy (Phase 18): the solver below works
+    // purely in world space, so bodies parented under other
+    // entities are converted local -> world here and restored
+    // world -> local before this function returns. Outside
+    // update(), a TransformComponent always holds authored LOCAL
+    // placement (spawn capture/reset keep their local semantics).
+    convertParentedBodiesToWorld(scene);
+
     // Internal sub-stepping: the caller's fixed step is split into
     // settings.subSteps full simulation passes. Every sub-step
     // re-integrates, re-derives world geometry (including the swept CCD
@@ -269,6 +278,7 @@ PhysicsSystem::Stats PhysicsSystem::update(Scene& scene, double fixedDeltaSecond
     }
     m_subStepIndex = 0;
     m_subStepCount = 1;
+    restoreParentedBodiesToLocal(scene);
     publishPhysicsEvents(scene);
     return m_lastStats;
 }
@@ -2963,6 +2973,101 @@ void PhysicsSystem::resolveJointPosition(const JointRef& ref) {
     }
     rotateJointBody(ref.bodyB, glm::angleAxis(angle * strength * (weightB / weightSum), axis));
     rotateJointBody(ref.bodyA, glm::angleAxis(-angle * strength * (weightA / weightSum), axis));
+}
+
+namespace {
+
+// World matrix of `entity`'s parent chain, composed from the
+// CURRENT TransformComponents root-first. Called while parented
+// bodies are mid-conversion/restore, where body ancestors already
+// hold world placement in their transforms and non-body ancestors
+// still hold local placement — both compose correctly.
+glm::mat4 ancestorWorldMatrix(engine::Scene::Registry& registry, entt::entity entity) {
+    std::vector<entt::entity> chain;
+    entt::entity current = entity;
+    for (int depth = 0; depth < 1024; ++depth) {
+        const engine::ParentComponent* parent = registry.try_get<engine::ParentComponent>(current);
+        if (parent == nullptr || parent->parent == entt::null || !registry.valid(parent->parent)) {
+            break;
+        }
+        current = parent->parent;
+        chain.push_back(current);
+    }
+    glm::mat4 world{1.0f};
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if (const engine::TransformComponent* transform =
+                registry.try_get<engine::TransformComponent>(*it);
+            transform != nullptr) {
+            world = world * transform->modelMatrix();
+        }
+    }
+    return world;
+}
+
+int hierarchyDepth(engine::Scene::Registry& registry, entt::entity entity) {
+    int depth = 0;
+    entt::entity current = entity;
+    for (int guard = 0; guard < 1024; ++guard) {
+        const engine::ParentComponent* parent = registry.try_get<engine::ParentComponent>(current);
+        if (parent == nullptr || parent->parent == entt::null || !registry.valid(parent->parent)) {
+            break;
+        }
+        current = parent->parent;
+        ++depth;
+    }
+    return depth;
+}
+
+} // namespace
+
+void PhysicsSystem::convertParentedBodiesToWorld(Scene& scene) {
+    m_parentedBodies.clear();
+    auto& registry = scene.registry();
+    const auto view = registry.view<TransformComponent, RigidBodyComponent, ParentComponent>();
+    std::vector<std::pair<int, entt::entity>> byDepth;
+    for (const entt::entity entity : view) {
+        byDepth.emplace_back(hierarchyDepth(registry, entity), entity);
+    }
+    std::sort(byDepth.begin(), byDepth.end(),
+              [](const auto& left, const auto& right) { return left.first < right.first; });
+    for (const auto& [depth, entity] : byDepth) {
+        (void)depth;
+        TransformComponent& transform = registry.get<TransformComponent>(entity);
+        const glm::mat4 world = ancestorWorldMatrix(registry, entity) * transform.modelMatrix();
+        glm::vec3 position;
+        glm::vec3 scale;
+        glm::quat orientation;
+        TransformSystem::decompose(world, position, orientation, scale);
+        transform.position = position;
+        transform.scale = scale;
+        transform.setOrientation(orientation);
+        m_parentedBodies.push_back(entity);
+    }
+}
+
+void PhysicsSystem::restoreParentedBodiesToLocal(Scene& scene) {
+    auto& registry = scene.registry();
+    // Reverse depth order: a child is re-localized while its body
+    // ancestors still hold world placement, so its parent's world
+    // matrix composes correctly.
+    for (auto it = m_parentedBodies.rbegin(); it != m_parentedBodies.rend(); ++it) {
+        if (!registry.valid(*it)) {
+            continue;
+        }
+        TransformComponent* transform = registry.try_get<TransformComponent>(*it);
+        if (transform == nullptr) {
+            continue;
+        }
+        const glm::mat4 local = glm::inverse(ancestorWorldMatrix(registry, *it)) * transform->modelMatrix();
+        glm::vec3 position;
+        glm::vec3 scale;
+        glm::quat orientation;
+        TransformSystem::decompose(local, position, orientation, scale);
+        transform->position = position;
+        transform->scale = scale;
+        transform->setOrientation(orientation);
+    }
+    m_parentedBodies.clear();
 }
 
 void PhysicsSystem::publishPhysicsEvents(Scene& scene) {

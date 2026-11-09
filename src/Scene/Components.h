@@ -10,7 +10,10 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/vec3.hpp>
 
+#include <entt/entity/entity.hpp>
+
 #include <string>
+#include <vector>
 
 namespace engine {
 
@@ -70,6 +73,35 @@ struct alignas(64) TransformComponent {
     // when useQuaternionOrientation is set, else R(yaw) * R(pitch) *
     // R(roll) from rotationDegrees.
     [[nodiscard]] ENGINE_SCENE_API glm::mat4 modelMatrix() const;
+};
+
+// ---------------------------------------------------------------------------
+// Scene-graph hierarchy (Phase 18)
+//
+// TransformComponent above holds LOCAL placement (relative to the
+// parent). These two components encode the tree itself; both sides
+// are kept consistent exclusively by Scene::setParent /
+// removeParent / destroyEntity — user code must never patch them
+// directly. Entities without a ParentComponent are roots.
+// ---------------------------------------------------------------------------
+struct ParentComponent {
+    entt::entity parent = entt::null;
+};
+
+struct ChildrenComponent {
+    std::vector<entt::entity> children;
+};
+
+// Computed world placement, (re)built by TransformSystem from the
+// local transform and the ancestor chain:
+// worldMatrix = rootLocal * ... * parentLocal * local. Decomposed
+// fields serve systems that need position/orientation/scale without
+// touching the matrix. Never authored by user code.
+struct WorldTransformComponent {
+    glm::mat4 worldMatrix{1.0f};
+    glm::vec3 worldPosition{0.0f};
+    glm::quat worldOrientation{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::vec3 worldScale{1.0f};
 };
 
 // Wraps the first-person Camera. The first component with isActive = true
