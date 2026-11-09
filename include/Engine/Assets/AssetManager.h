@@ -114,6 +114,23 @@ struct MaterialLighting {
     float ambientStrength = 0.28f;
 };
 
+// Metallic-roughness PBR parameters (Phase 22). Texture slots name
+// registered TextureAssets (empty = untextured; the packed push
+// constants carry scalar factors, so untextured materials still
+// shade fully). Maps follow the glTF packing: metallicRoughness
+// stores roughness in G and metallic in B; occlusion uses R;
+// normals are tangent-space RGB. Albedo texels are treated as sRGB
+// and decoded in the shader.
+struct MaterialPbr {
+    float metallic = 0.0f;
+    float roughness = 0.55f;
+    float occlusionStrength = 1.0f;
+    std::string albedoTexture;
+    std::string metallicRoughnessTexture;
+    std::string normalTexture;
+    std::string occlusionTexture;
+};
+
 // Everything a material needs: shader pair, a base color and lighting
 // parameters (the first entries of the future material descriptor array),
 // and its pipeline state.
@@ -123,6 +140,7 @@ struct MaterialDesc {
     std::string fragmentShader = "cube.frag.spv";
     glm::vec4 baseColor{1.0f};
     MaterialLighting lighting{};
+    MaterialPbr pbr{};
     PipelineStateDesc pipeline{};
 };
 
@@ -203,6 +221,12 @@ public:
     [[nodiscard]] size_t shaderCount() const { return m_shaders.size(); }
     [[nodiscard]] size_t materialCount() const { return m_materials.size(); }
     [[nodiscard]] size_t textureCount() const { return m_textures.size(); }
+    // Dense texture table in id order (slot = id - 1): the renderer
+    // mirrors this into the material texture array (Phase 22).
+    [[nodiscard]] const std::vector<TextureAsset>& textures() const { return m_textures; }
+    // Bumps on every texture register/replace, so GPU mirrors can
+    // skip re-uploads when nothing changed.
+    [[nodiscard]] uint64_t textureRegistryVersion() const { return m_textureRegistryVersion; }
     [[nodiscard]] uint64_t reservedVramBytes() const { return m_reservedVramBytes; }
 
     // --- Textures (synchronous registration, Phase 20) -------------------
@@ -317,6 +341,7 @@ private:
     std::vector<ShaderAsset> m_shaders;
     std::vector<MaterialAsset> m_materials;
     std::vector<TextureAsset> m_textures;
+    uint64_t m_textureRegistryVersion = 0;
     std::unordered_map<std::string, MeshId> m_meshIds;
     std::unordered_map<std::string, ShaderId> m_shaderIds;
     std::unordered_map<std::string, MaterialId> m_materialIds;

@@ -160,6 +160,7 @@ engine_module(EngineGeometry ENGINE_BUILDING_GEOMETRY
 target_link_libraries(EngineGeometry PUBLIC EngineFoundation glm::glm Vulkan::Vulkan)
 
 engine_module(EngineGraphics ENGINE_BUILDING_GRAPHICS
+    src/Graphics/EnvironmentMap.cpp
     src/Graphics/Frustum.cpp
     src/Graphics/RenderQueue.cpp
     src/Graphics/ShadowMap.cpp
@@ -239,6 +240,12 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/cube.vert
     ${SHADER_SOURCE_DIR}/cube.frag
     ${SHADER_SOURCE_DIR}/shadow.vert
+    ${SHADER_SOURCE_DIR}/skybox.vert
+    ${SHADER_SOURCE_DIR}/skybox.frag
+    ${SHADER_SOURCE_DIR}/post.vert
+    ${SHADER_SOURCE_DIR}/bloomDown.frag
+    ${SHADER_SOURCE_DIR}/bloomUp.frag
+    ${SHADER_SOURCE_DIR}/composite.frag
     ${SHADER_SOURCE_DIR}/hud.vert
     ${SHADER_SOURCE_DIR}/hud.frag
 )

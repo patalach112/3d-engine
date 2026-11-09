@@ -56,6 +56,18 @@ public:
     VkPipeline createShadowPipeline(VkRenderPass shadowRenderPass);
     [[nodiscard]] VkPipeline shadowPipeline() const { return m_shadowPipeline; }
 
+    // Phase 22: scene geometry renders into the renderer's HDR
+    // offscreen pass instead of the swapchain pass. Retargets every
+    // pipeline (the render-pass attachment formats differ, so old
+    // pipelines are destroyed and recreated). Call before any
+    // material pipelines are created.
+    void setSceneRenderPass(VkRenderPass sceneRenderPass);
+
+    // Creates the skybox pipeline (inside-out cube, depth-write off,
+    // samples the environment cubemap through the shared layout).
+    VkPipeline createSkyboxPipeline(VkRenderPass sceneRenderPass);
+    [[nodiscard]] VkPipeline skyboxPipeline() const { return m_skyboxPipeline; }
+
     [[nodiscard]] VkPipeline handle() const { return m_pipeline; }
     [[nodiscard]] VkPipelineLayout layout() const { return m_layout; }
     [[nodiscard]] VkDescriptorSetLayout descriptorSetLayout() const { return m_descriptorSetLayout; }
@@ -65,7 +77,7 @@ public:
 private:
     void createDescriptorSetLayout();
     void createPipelineCache();
-    VkPipeline createPipeline(const Swapchain& swapchain, const PipelineStateDesc& state,
+    VkPipeline createPipeline(VkRenderPass renderPass, const PipelineStateDesc& state,
                               const std::string& vertexShaderFile, const std::string& fragmentShaderFile);
     [[nodiscard]] VkShaderModule createShaderModule(const char* fileName) const;
 
@@ -75,6 +87,8 @@ private:
     VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
     VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
+    VkPipeline m_skyboxPipeline = VK_NULL_HANDLE;
+    VkRenderPass m_sceneRenderPass = VK_NULL_HANDLE;
     PipelineStateCache m_stateCache;
     std::unordered_map<uint32_t, VkPipeline> m_materialPipelines;
     std::unordered_map<uint64_t, VkPipeline> m_pipelinesByState; // (state, shaders) -> pipeline

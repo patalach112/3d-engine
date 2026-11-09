@@ -1505,6 +1505,64 @@ mirrors, UBO byte-budget) join the suite: **661 checks, all passing
 in Debug, Release-shared and Release-static, CTest 1/1, zero
 warnings.**
 
+## Phase 22 — Metallic-Roughness PBR, Image-Based Lighting & Cinematic Post ✅
+
+The renderer grew from a fixed-function-style Blinn-Phong sandbox
+into a physically based, HDR pipeline:
+
+- **Cook-Torrance PBR**: GGX/Trowbridge-Reitz distribution, Smith
+  geometry (Schlick-GGX), Schlick Fresnel — evaluated for the
+  cascaded directional key light and the nearest-16 point/spot
+  lights from Phase 21, all in linear HDR. Materials are
+  metallic-roughness (`MaterialDesc::pbr`): scalar metal/rough
+  factors plus optional texture maps (albedo [sRGB-decoded in
+  shader], metallic-roughness [glTF G/B packing], tangent-space
+  normal [derivative cotangent frame — no vertex tangents needed],
+  ambient occlusion), resolved per draw into the same 112-byte
+  push payload (indices into a 32-slot material texture array,
+  -1 = untextured). The CPU mirror in `Graphics/Pbr.h` is the
+  testable ground truth for the shader formulas.
+- **IBL & skybox**: a procedural HDR sky (gradient + sun disc that
+  matches the key light) is generated deterministically on the CPU
+  (Hammersley quasi-random sampling throughout — bit-identical
+  every run), convolved into a cosine-weighted irradiance cube
+  (stored as E/π) and a 5-level GGX-prefiltered reflection cube,
+  and integrated into the standard split-sum BRDF LUT. The
+  fragment shader combines them as
+  `prefiltered * (F * LUT.x + LUT.y)` plus irradiance diffuse, so
+  metals tint their reflections and rough surfaces blur them. The
+  same environment cube renders as an inside-out skybox at the
+  far plane (`z = w`, depth-write off).
+- **Cinematic post chain**: the scene now renders into an
+  RGBA16F HDR offscreen target (one per frame in flight, rebuilt
+  on resize) instead of the swapchain. A 5-level bloom chain
+  (soft-knee bright-pass + 3×3 tent downsample, additive tent
+  upsample) extracts the glow; a fullscreen composite applies
+  exposure, folds bloom in, compresses with the ACES filmic curve
+  (Narkowicz fit) and encodes sRGB — the HUD draws after the
+  composite, on the presented image. Everything is tunable from
+  `[Render]` (`exposure`, `bloomEnabled/Strength/Threshold`,
+  `skyboxEnabled`, `environmentIntensity`). Scene pipelines were
+  retargeted to the HDR pass via `GraphicsPipeline::
+  setSceneRenderPass` (called by the Renderer before materials
+  register); the UBO grew one vec4 (1472 bytes, still byte-matched
+  to GLSL). Material textures mirror from the asset registry into
+  the GPU array on a version counter — hot reloads re-upload
+  automatically.
+
+Verification: 42 new checks (GGX/Smith/Fresnel closed forms and
+behavioral metal/dielectric cases, ACES/sRGB/bright-pass exact
+values, cube-mapping round-trips, constant-environment
+convolutions reproducing the constant exactly, LUT bounds +
+determinism, sky sun peak, prefilter blur variance, material →
+draw-item PBR/texture mapping, registry version bumps, INI
+parsing) join the suite: **703 checks, all passing in Debug,
+Release-shared and Release-static, CTest 1/1, zero warnings.**
+Additionally, every shader now compiles and link-checks with a
+real glslangValidator (built from the KhronosGroup/glslang 15.4
+sources; the sandbox SDK validator is a stub), including the
+dynamically-indexed material texture array.
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
@@ -1591,8 +1649,12 @@ releases the mouse (press again to quit).
 │   └── engine.ini            # All engine tuning (window, render, logger, loop)
 ├── shaders/
 │   ├── cube.vert             # MVP, inverse-transpose normals, world/camera + material lighting varyings
-│   ├── cube.frag             # Ambient + Lambert diffuse + Blinn-Phong specular + rim + PCF shadows
-│   └── shadow.vert           # Depth-only directional shadow pass
+│   ├── cube.frag             # Cook-Torrance PBR + CSM + 16 dynamic lights + split-sum IBL
+│   ├── shadow.vert           # Depth-only directional shadow pass
+│   ├── skybox.vert/.frag     # Inside-out environment cubemap background
+│   ├── post.vert             # Fullscreen triangle for the post chain
+│   ├── bloomDown/bloomUp.frag # Multi-scale bloom (bright-pass, tent blur)
+│   └── composite.frag        # Exposure + ACES tone mapping + sRGB output
 ├── tests/
 │   └── CoreTests.cpp         # Config/logger/physics/player/material tests (CTest)
 ├── include/Engine/           # Public headers (Phase 21): subsystem tree,
@@ -1636,6 +1698,7 @@ releases the mouse (press again to quit).
         ├── Buffer.cpp          # RAII VkBuffer + staging uploads
         ├── Swapchain.cpp       # Swapchain, depth, render pass, framebuffers
         ├── GraphicsPipeline.cpp# Shader modules, pipeline state, UBO layout
+        ├── EnvironmentMap.cpp  # Procedural sky, irradiance/prefilter convolution, BRDF LUT
         ├── Frustum.cpp         # View frustum extraction + AABB/sphere tests
         ├── RenderQueue.cpp     # CPU render command stream + parallel sort
         ├── PipelineState.cpp   # PSO descriptions, hashing, state cache

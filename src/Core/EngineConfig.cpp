@@ -245,6 +245,18 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             reader.apply(value, config.render.frustumCulling);
         } else if (key == "occlusionculling") {
             reader.apply(value, config.render.occlusionCulling);
+        } else if (key == "exposure") {
+            reader.applyDouble(value, config.render.exposure, 0.01, 8.0);
+        } else if (key == "bloomenabled") {
+            reader.apply(value, config.render.bloomEnabled);
+        } else if (key == "bloomstrength") {
+            reader.applyDouble(value, config.render.bloomStrength, 0.0, 4.0);
+        } else if (key == "bloomthreshold") {
+            reader.applyDouble(value, config.render.bloomThreshold, 0.0, 16.0);
+        } else if (key == "skyboxenabled") {
+            reader.apply(value, config.render.skyboxEnabled);
+        } else if (key == "environmentintensity") {
+            reader.applyDouble(value, config.render.environmentIntensity, 0.0, 8.0);
         } else if (key == "sortdrawitems") {
             reader.apply(value, config.render.sortDrawItems);
         } else if (key == "vrambudgetmib") {

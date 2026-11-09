@@ -17,6 +17,7 @@ layout(set = 0, binding = 0) uniform UniformBufferObject {
     vec4 lightColorIntensity[16];
     vec4 lightDirectionType[16];
     vec4 lightCone[16];
+    vec4 environmentParams;
 } ubo;
 
 // Same 112-byte draw payload as the main pass (only the model matrix
@@ -24,8 +25,8 @@ layout(set = 0, binding = 0) uniform UniformBufferObject {
 layout(push_constant) uniform PushConstants {
     mat4 model;
     vec4 baseColor;
-    vec4 specular;
-    vec4 surface;
+    vec4 pbrParams;
+    ivec4 textureIndices;
     uint cascadeIndex;
 } push;
 

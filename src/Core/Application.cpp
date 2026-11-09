@@ -38,6 +38,13 @@ Application::Application(EngineConfig config)
       m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
                      m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems, &m_assets,
                      m_config.render.occlusionCulling) {
+    m_renderer.setPostSettings(PostSettings{static_cast<float>(m_config.render.exposure),
+                                            m_config.render.bloomEnabled,
+                                            static_cast<float>(m_config.render.bloomStrength),
+                                            static_cast<float>(m_config.render.bloomThreshold),
+                                            m_config.render.skyboxEnabled,
+                                            static_cast<float>(m_config.render.environmentIntensity)});
+
     ENGINE_LOG_INFO("Hardware profile: JobSystem workers "
                     << m_jobSystem.workerCount() << " (+ main thread), parallel batch "
                     << m_config.performance.parallelBatchSize << " items, VRAM budget "

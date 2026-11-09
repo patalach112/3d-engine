@@ -4,6 +4,7 @@
 #include <glm/mat4x4.hpp>
 #include <glm/vec4.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -12,6 +13,11 @@
 namespace engine {
 
 class JobSystem;
+
+// Size of the material texture array bound at descriptor binding 2
+// (must match cube.frag). Draw items carry indices into it; -1 means
+// "no texture, use the scalar factor".
+inline constexpr uint32_t kMaxMaterialTextures = 32;
 
 // One drawable entity for a frame, in CPU-side submission order.
 //
@@ -40,21 +46,28 @@ struct DrawItem {
     // Surface response: x = specular strength, y = rim strength,
     // z = rim power, w = ambient strength.
     glm::vec4 surface{0.35f, 0.10f, 3.0f, 0.28f};
+    // Metallic-roughness factors (Phase 22): x = metallic,
+    // y = roughness, z = occlusion strength, w unused.
+    glm::vec4 pbrParams{0.0f, 0.55f, 1.0f, 0.0f};
+    // Material texture array slots: albedo, metallicRoughness,
+    // normal, occlusion. -1 = untextured slot.
+    std::array<int32_t, 4> textureIndices{-1, -1, -1, -1};
 };
 
-// Push-constant payload for one draw: model matrix, material base color,
-// and the two packed lighting vec4s above. 112 bytes, inside Vulkan's
-// guaranteed 128-byte push-constant minimum, so richer per-material
-// lighting costs no descriptor updates and no extra draw calls.
+// Push-constant payload for one draw: model matrix, material base
+// color, metallic-roughness factors, and material texture indices.
+// 112 bytes, inside Vulkan's guaranteed 128-byte push-constant
+// minimum, so richer per-material PBR data costs no descriptor
+// updates and no extra draw calls.
 struct DrawPushConstants {
     glm::mat4 model{1.0f};
     glm::vec4 baseColor{1.0f};
-    glm::vec4 specular{0.35f, 0.35f, 0.35f, 32.0f};
-    glm::vec4 surface{0.35f, 0.10f, 3.0f, 0.28f};
+    glm::vec4 pbrParams{0.0f, 0.55f, 1.0f, 0.0f}; // x metallic, y roughness, z occlusion strength
+    glm::ivec4 textureIndices{-1, -1, -1, -1};    // albedo, metallicRoughness, normal, occlusion
 };
 static_assert(sizeof(DrawPushConstants) == 112, "DrawPushConstants must stay a compact 112-byte payload");
 static_assert(offsetof(DrawPushConstants, model) == 0 && offsetof(DrawPushConstants, baseColor) == 64 &&
-                  offsetof(DrawPushConstants, specular) == 80 && offsetof(DrawPushConstants, surface) == 96,
+                  offsetof(DrawPushConstants, pbrParams) == 80 && offsetof(DrawPushConstants, textureIndices) == 96,
               "DrawPushConstants layout must match the shader push-constant block");
 
 // ---------------------------------------------------------------------------

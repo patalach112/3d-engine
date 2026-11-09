@@ -475,7 +475,10 @@ MaterialDesc makeSandboxFloorMaterial() {
     lighting.rimStrength = 0.035f;
     lighting.rimPower = 4.0f;
     lighting.ambientStrength = 0.34f;
-    return sandboxMaterial("floor", glm::vec4{0.10f, 0.115f, 0.135f, 1.0f}, lighting);
+    MaterialDesc desc = sandboxMaterial("floor", glm::vec4{0.10f, 0.115f, 0.135f, 1.0f}, lighting);
+    desc.pbr.metallic = 0.0f; // asphalt: dielectric, almost fully rough
+    desc.pbr.roughness = 0.95f;
+    return desc;
 }
 
 MaterialDesc makeSandboxCubeMaterial() {
@@ -488,7 +491,10 @@ MaterialDesc makeSandboxCubeMaterial() {
     lighting.rimStrength = 0.16f;
     lighting.rimPower = 3.0f;
     lighting.ambientStrength = 0.24f;
-    return sandboxMaterial("cube", glm::vec4{0.84f, 0.43f, 0.18f, 1.0f}, lighting);
+    MaterialDesc desc = sandboxMaterial("cube", glm::vec4{0.84f, 0.43f, 0.18f, 1.0f}, lighting);
+    desc.pbr.metallic = 0.9f; // warm copper: tinted metal reflections
+    desc.pbr.roughness = 0.32f;
+    return desc;
 }
 
 MaterialDesc makeSandboxStackMaterial() {
@@ -501,7 +507,10 @@ MaterialDesc makeSandboxStackMaterial() {
     lighting.rimStrength = 0.22f;
     lighting.rimPower = 3.5f;
     lighting.ambientStrength = 0.27f;
-    return sandboxMaterial("stackCube", glm::vec4{0.08f, 0.52f, 0.58f, 1.0f}, lighting);
+    MaterialDesc desc = sandboxMaterial("stackCube", glm::vec4{0.08f, 0.52f, 0.58f, 1.0f}, lighting);
+    desc.pbr.metallic = 0.05f; // painted teal dielectric
+    desc.pbr.roughness = 0.45f;
+    return desc;
 }
 
 MaterialDesc makeSandboxEnvironmentMaterial() {
@@ -513,7 +522,10 @@ MaterialDesc makeSandboxEnvironmentMaterial() {
     lighting.rimStrength = 0.18f;
     lighting.rimPower = 3.0f;
     lighting.ambientStrength = 0.28f;
-    return sandboxMaterial("environment", glm::vec4{0.27f, 0.33f, 0.58f, 1.0f}, lighting);
+    MaterialDesc desc = sandboxMaterial("environment", glm::vec4{0.27f, 0.33f, 0.58f, 1.0f}, lighting);
+    desc.pbr.metallic = 0.25f;
+    desc.pbr.roughness = 0.5f;
+    return desc;
 }
 
 MaterialDesc makeSandboxPlayerMaterial() {
@@ -526,7 +538,10 @@ MaterialDesc makeSandboxPlayerMaterial() {
     lighting.rimStrength = 0.30f;
     lighting.rimPower = 2.6f;
     lighting.ambientStrength = 0.26f;
-    return sandboxMaterial("player", glm::vec4{0.16f, 0.76f, 0.46f, 1.0f}, lighting);
+    MaterialDesc desc = sandboxMaterial("player", glm::vec4{0.16f, 0.76f, 0.46f, 1.0f}, lighting);
+    desc.pbr.metallic = 0.35f;
+    desc.pbr.roughness = 0.35f;
+    return desc;
 }
 
 MaterialId AssetManager::registerMaterial(MaterialDesc desc) {
@@ -931,6 +946,7 @@ void AssetManager::finishTextureLoad(const std::shared_ptr<TextureLoadRecord>& r
         asset.height = height;
         asset.pixels = std::move(pixels);
         asset.vramBytes = newBytes;
+        ++m_textureRegistryVersion;
     } else {
         const TextureId id = registerTexture(record->name, width, height, pixels);
         if (id == kInvalidAssetId) {
@@ -1100,6 +1116,7 @@ TextureId AssetManager::registerTexture(std::string name, uint32_t width, uint32
     asset.vramBytes = vramBytes;
     m_textureIds.emplace(asset.name, asset.id);
     m_textures.push_back(std::move(asset));
+    ++m_textureRegistryVersion;
     return m_textures.back().id;
 }
 

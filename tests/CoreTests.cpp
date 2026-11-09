@@ -40,6 +40,9 @@
 #include "Core/Memory/PoolAllocator.h"
 #include "Graphics/Frustum.h"
 #include "Graphics/OcclusionCulling.h"
+#include "Graphics/EnvironmentMap.h"
+#include "Graphics/Pbr.h"
+#include "Graphics/ToneMapping.h"
 #include "Scene/Systems/LightingSystem.h"
 
 #include <atomic>
@@ -1107,9 +1110,9 @@ void testDynamicModulesAndMaterials() {
           "draw items carry specular and rim surface parameters across modules");
     check(sizeof(engine::DrawPushConstants) == 112 && offsetof(engine::DrawPushConstants, model) == 0 &&
               offsetof(engine::DrawPushConstants, baseColor) == 64 &&
-              offsetof(engine::DrawPushConstants, specular) == 80 &&
-              offsetof(engine::DrawPushConstants, surface) == 96,
-          "push constants pack the 112-byte lighting payload inside the Vulkan minimum");
+              offsetof(engine::DrawPushConstants, pbrParams) == 80 &&
+              offsetof(engine::DrawPushConstants, textureIndices) == 96,
+          "push constants pack the 112-byte PBR payload inside the Vulkan minimum");
 
     // Solid-material pipeline contract: depth test + depth write on, Less
     // comparison, back-face culling. This is what prevents light/color
@@ -5936,9 +5939,241 @@ void testPhase21CullingAndLighting() {
         check(midway > 0.0f && midway < 1.0f, "spot: between the cones the factor fades smoothly");
 
         // UBO layout contract: view+proj (128) + 4 cascade matrices
-        // (256) + three vec4s (48) + 4x16 light vec4s (1024) = 1456.
-        check(sizeof(engine::UniformBufferObject) == static_cast<size_t>(128 + 256 + 48 + 1024),
-              "ubo: C++ layout matches the GLSL byte budget (1456 bytes)");
+        // (256) + three vec4s + environmentParams (64) + 4x16 light
+        // vec4s (1024) = 1472 (Phase 22 added the environment vec4).
+        check(sizeof(engine::UniformBufferObject) == static_cast<size_t>(128 + 256 + 64 + 1024) &&
+                  offsetof(engine::UniformBufferObject, environmentParams) == 1456,
+              "ubo: C++ layout matches the GLSL byte budget (1472 bytes)");
+    }
+}
+
+void testPhase22PbrIblPost() {
+    std::cout << "Phase 22: PBR, IBL & post-processing\n";
+
+    // --- (1) Cook-Torrance BRDF terms ----------------------------------
+    {
+        // GGX distribution: closed form at NoH = 1, roughness = 0.5 is
+        // alpha^2 / (pi * alpha^4) = 16/pi with alpha = roughness^2.
+        check(nearlyEqual(engine::distributionGGX(1.0f, 0.5f), 16.0 / 3.14159265358979, 1e-3),
+              "pbr: GGX distribution matches its closed form at the peak");
+        check(engine::distributionGGX(1.0f, 0.5f) > engine::distributionGGX(0.5f, 0.5f) &&
+                  engine::distributionGGX(0.5f, 0.5f) > engine::distributionGGX(0.1f, 0.5f),
+              "pbr: GGX distribution falls off away from the half-vector");
+        check(nearlyEqual(engine::geometrySmith(1.0f, 1.0f, 0.4f), 1.0, 1e-6),
+              "pbr: Smith geometry is 1 at normal incidence");
+        const float smith = engine::geometrySmith(0.3f, 0.4f, 0.7f);
+        check(smith > 0.0f && smith <= 1.0f, "pbr: Smith geometry stays inside (0, 1]");
+
+        const glm::vec3 f0{0.04f};
+        check(glm::length(engine::fresnelSchlick(1.0f, f0) - f0) < 1e-6f, "pbr: Fresnel is F0 at normal incidence");
+        check(nearlyEqual(engine::fresnelSchlick(0.0f, f0).x, 1.0, 1e-6), "pbr: Fresnel reaches 1 at grazing");
+        check(nearlyEqual(engine::fresnelSchlickRoughness(0.0f, f0, 0.5f).x, 0.5, 1e-5),
+              "pbr: roughness-aware Fresnel caps the grazing value");
+
+        const glm::vec3 up{0.0f, 1.0f, 0.0f};
+        const glm::vec3 white{1.0f};
+        // Dielectric head-on: diffuse + a small dielectric specular.
+        const glm::vec3 dielectric = engine::evaluateDirectLight(up, up, up, white, white, 0.0f, 0.5f);
+        check(dielectric.x > 0.30f && dielectric.x < 0.42f && std::isfinite(dielectric.x),
+              "pbr: dielectric head-on response matches the analytic sum");
+        // Pure metal tinted red: no green diffuse at all, reflections
+        // carry the albedo tint.
+        const glm::vec3 metal = engine::evaluateDirectLight(up, up, up, white, glm::vec3{1.0f, 0.0f, 0.0f}, 1.0f, 0.5f);
+        check(metal.y == 0.0f && metal.x > 0.0f, "pbr: metals have no diffuse and tint their reflections");
+        // Back-facing light contributes nothing.
+        const glm::vec3 backlit = engine::evaluateDirectLight(up, up, glm::vec3{0.0f, -1.0f, 0.0f}, white, white,
+                                                              0.0f, 0.5f);
+        check(backlit == glm::vec3{0.0f}, "pbr: back-facing lights are dark");
+        // Sharp metals spike; rough metals spread and dim.
+        const glm::vec3 sharp = engine::evaluateDirectLight(up, up, up, white, white, 1.0f, 0.2f);
+        const glm::vec3 rough = engine::evaluateDirectLight(up, up, up, white, white, 1.0f, 0.9f);
+        check(sharp.x > rough.x * 10.0f, "pbr: low roughness concentrates the specular peak");
+    }
+
+    // --- (2) Tone mapping + bright-pass --------------------------------
+    {
+        check(engine::acesFilmic(glm::vec3{0.0f}) == glm::vec3{0.0f}, "aces: black stays black");
+        check(nearlyEqual(engine::acesFilmic(glm::vec3{1.0f}).x, 2.54 / 3.16, 1e-3),
+              "aces: unit exposure matches the Narkowicz fit");
+        check(engine::acesFilmic(glm::vec3{0.2f}).x < engine::acesFilmic(glm::vec3{0.8f}).x &&
+                  engine::acesFilmic(glm::vec3{0.8f}).x < engine::acesFilmic(glm::vec3{2.0f}).x,
+              "aces: monotonic over the working range");
+        const float hot = engine::acesFilmic(glm::vec3{100.0f}).x;
+        check(hot > 0.99f && hot <= 1.0f, "aces: HDR highlights roll off to white");
+
+        check(engine::linearToSrgb(0.0f) == 0.0f && nearlyEqual(engine::linearToSrgb(1.0f), 1.0, 1e-6),
+              "srgb: endpoints are exact");
+        check(nearlyEqual(engine::linearToSrgb(0.5f), 0.73535698, 1e-4), "srgb: midpoint matches the standard");
+        check(nearlyEqual(engine::srgbToLinear(engine::linearToSrgb(0.35f)), 0.35, 1e-5),
+              "srgb: encode/decode round-trips");
+        check(nearlyEqual(engine::linearToSrgb(0.002f), 0.002 * 12.92, 1e-7), "srgb: linear toe segment");
+
+        check(engine::extractBright(glm::vec3{0.5f}, 1.0f, 0.5f) == glm::vec3{0.0f},
+              "bloom: sub-threshold colors are rejected");
+        const glm::vec3 bright = engine::extractBright(glm::vec3{4.0f}, 1.0f, 0.5f);
+        check(nearlyEqual(bright.x, 3.0, 1e-4), "bloom: soft-knee weight matches the closed form");
+        check(engine::extractBright(glm::vec3{2.0f, 3.0f, 4.0f}, 0.0f, 0.5f) == glm::vec3{2.0f, 3.0f, 4.0f},
+              "bloom: above the knee band colors pass unweighted");
+    }
+
+    // --- (3) Environment generation -------------------------------------
+    {
+        // Cube mapping round-trips through face selection.
+        bool roundTrips = true;
+        const glm::vec3 directions[] = {glm::vec3{1, 0, 0},  glm::vec3{-1, 0, 0}, glm::vec3{0, 1, 0},
+                                        glm::vec3{0, -1, 0}, glm::vec3{0, 0, 1},  glm::vec3{0, 0, -1},
+                                        glm::normalize(glm::vec3{1, 2, 3}), glm::normalize(glm::vec3{-0.3f, 0.8f, -0.52f})};
+        for (const glm::vec3& direction : directions) {
+            uint32_t face = 0;
+            float u = 0.0f;
+            float v = 0.0f;
+            engine::directionToCubeFace(direction, face, u, v);
+            roundTrips = roundTrips && glm::length(engine::cubeFaceDirection(face, u, v) - direction) < 1e-4f;
+        }
+        check(roundTrips, "env: cube face mapping round-trips for axis and diagonal directions");
+
+        // Constant environment: every convolution reproduces it exactly.
+        engine::CubeMapData constant;
+        constant.size = 8;
+        const glm::vec3 c{0.3f, 0.5f, 0.7f};
+        for (auto& faceData : constant.faces) {
+            faceData.assign(64, c);
+        }
+        const engine::CubeMapData constIrradiance = engine::generateIrradiance(constant, 4, 256);
+        bool irradianceConstant = constIrradiance.size == 4;
+        for (const auto& faceData : constIrradiance.faces) {
+            for (const glm::vec3& texel : faceData) {
+                irradianceConstant = irradianceConstant && glm::length(texel - c) < 1e-5f;
+            }
+        }
+        check(irradianceConstant, "env: irradiance of a constant environment is the constant");
+        const std::vector<engine::CubeMapData> constPrefilter = engine::generatePrefiltered(constant, 8, 3, 128);
+        bool prefilterConstant = constPrefilter.size() == 3;
+        for (const engine::CubeMapData& level : constPrefilter) {
+            for (const auto& faceData : level.faces) {
+                for (const glm::vec3& texel : faceData) {
+                    prefilterConstant = prefilterConstant && glm::length(texel - c) < 1e-4f;
+                }
+            }
+        }
+        check(prefilterConstant, "env: prefiltered levels of a constant environment are the constant");
+
+        // BRDF LUT: bounded, mirror-like at smooth+head-on, deterministic.
+        const std::vector<glm::vec2> lut = engine::integrateBrdfLut(16, 256);
+        bool lutBounded = lut.size() == 256;
+        for (const glm::vec2& entry : lut) {
+            lutBounded = lutBounded && entry.x >= 0.0f && entry.x <= 1.001f && entry.y >= 0.0f &&
+                          entry.y <= 1.001f && std::isfinite(entry.x) && std::isfinite(entry.y);
+        }
+        check(lutBounded, "env: BRDF LUT entries stay inside [0, 1]");
+        const glm::vec2 smooth = lut[15];        // roughness ~0.03, NoV ~0.97
+        const glm::vec2 rough = lut[15 * 16 + 15]; // roughness ~0.97, NoV ~0.97
+        check(smooth.x > 0.85f && smooth.y < 0.2f, "env: smooth head-on LUT is nearly (1, 0)");
+        check(rough.x < smooth.x, "env: roughness reduces the LUT specular scale");
+        check(engine::integrateBrdfLut(8, 128) == engine::integrateBrdfLut(8, 128),
+              "env: LUT generation is deterministic");
+
+        // Procedural sky: the sun disc is an HDR peak; up beats down.
+        const glm::vec3 sunDirection = engine::directionalLightDirection();
+        const float peak = engine::skyRadiance(sunDirection, sunDirection).x;
+        const float side = engine::skyRadiance(glm::vec3{1.0f, 0.0f, 0.0f}, sunDirection).x;
+        check(peak > 8.0f && peak > side * 5.0f, "env: sky has an HDR sun peak (feeds bloom)");
+        check(engine::skyRadiance(glm::vec3{0.0f, 1.0f, 0.0f}, sunDirection).z >
+                  engine::skyRadiance(glm::vec3{0.0f, -1.0f, 0.0f}, sunDirection).z,
+              "env: sky zenith is brighter than the ground bounce");
+
+        // Prefiltering blurs: texel variance shrinks with roughness.
+        const engine::CubeMapData sky = engine::generateEnvironmentCube(16, sunDirection);
+        const std::vector<engine::CubeMapData> skyPrefilter = engine::generatePrefiltered(sky, 16, 4, 192);
+        const auto faceVariance = [](const engine::CubeMapData& map, uint32_t face) {
+            glm::vec3 mean{0.0f};
+            for (const glm::vec3& texel : map.faces[face]) {
+                mean += texel;
+            }
+            mean /= static_cast<float>(map.faces[face].size());
+            float variance = 0.0f;
+            for (const glm::vec3& texel : map.faces[face]) {
+                const glm::vec3 delta = texel - mean;
+                variance += glm::dot(delta, delta);
+            }
+            return variance / static_cast<float>(map.faces[face].size());
+        };
+        check(faceVariance(skyPrefilter.front(), 2) > faceVariance(skyPrefilter.back(), 2),
+              "env: higher roughness levels are blurrier (variance drops)");
+        const engine::CubeMapData skyIrradiance = engine::generateIrradiance(sky, 8, 256);
+        const glm::vec3 upIrradiance = skyIrradiance.texel(2, 4, 4);
+        const glm::vec3 downIrradiance = skyIrradiance.texel(3, 4, 4);
+        check(glm::dot(upIrradiance, glm::vec3{1.0f}) > glm::dot(downIrradiance, glm::vec3{1.0f}),
+              "env: up-facing irradiance exceeds down-facing (sky dome)");
+    }
+
+    // --- (4) Material -> draw item PBR mapping --------------------------
+    {
+        engine::VramBudget vram(64 * 1024 * 1024);
+        engine::VramBudget staging(64 * 1024 * 1024);
+        engine::AssetManager assets(vram, staging);
+
+        const std::vector<uint8_t> pixels(2 * 2 * 4, 200);
+        const uint64_t versionBefore = assets.textureRegistryVersion();
+        check(assets.registerTexture("albedoTex", 2, 2, pixels) == 1, "pbr: texture registers with dense id 1");
+        check(assets.textureRegistryVersion() > versionBefore && assets.textures().size() == 1,
+              "pbr: texture registry version bumps and the table is enumerable");
+
+        engine::MaterialDesc desc;
+        desc.name = "pbrMat";
+        desc.baseColor = glm::vec4{0.8f, 0.3f, 0.2f, 1.0f};
+        desc.pbr.metallic = 0.8f;
+        desc.pbr.roughness = 0.3f;
+        desc.pbr.occlusionStrength = 0.7f;
+        desc.pbr.albedoTexture = "albedoTex";
+        desc.pbr.metallicRoughnessTexture = "notRegistered";
+        check(assets.registerMaterial(desc) == 1, "pbr: material registers");
+
+        engine::Scene scene;
+        engine::Entity player = scene.createEntity("Player");
+        player.addComponent<engine::CameraComponent>(engine::CameraConfig{});
+        engine::Entity cube = scene.createEntity("Cube");
+        cube.addComponent<engine::TransformComponent>(glm::vec3{0.0f, 0.0f, -5.0f});
+        auto& mesh = cube.addComponent<engine::MeshComponent>("cube");
+        mesh.materialName = "pbrMat";
+
+        engine::FramePrepareOptions options;
+        options.assets = &assets;
+        const engine::PreparedFrame frame = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+        check(frame.renderQueue.size() == 1, "pbr: textured material produces a draw item");
+        if (frame.renderQueue.size() == 1) {
+            const engine::DrawItem& item = frame.renderQueue.items()[0];
+            check(nearlyEqual(item.pbrParams.x, 0.8f, 1e-6) && nearlyEqual(item.pbrParams.y, 0.3f, 1e-6) &&
+                      nearlyEqual(item.pbrParams.z, 0.7f, 1e-6),
+                  "pbr: metallic/roughness/occlusion reach the draw item");
+            check(item.textureIndices[0] == 0 && item.textureIndices[1] == -1 && item.textureIndices[2] == -1 &&
+                      item.textureIndices[3] == -1,
+                  "pbr: albedo resolves to slot 0; unknown textures stay untextured");
+        }
+
+        // Sandbox palette PBR character (demo wiring).
+        check(engine::makeSandboxFloorMaterial().pbr.metallic == 0.0f &&
+                  nearlyEqual(engine::makeSandboxFloorMaterial().pbr.roughness, 0.95f, 1e-6) &&
+                  nearlyEqual(engine::makeSandboxCubeMaterial().pbr.metallic, 0.9f, 1e-6),
+              "pbr: sandbox materials carry metallic-roughness identities");
+
+        // Post defaults + config parsing for the new [Render] keys.
+        const engine::PostSettings post;
+        check(post.bloomEnabled && post.skyboxEnabled && nearlyEqual(post.exposure, 1.0f, 1e-6),
+              "post: default settings are cinematic-on with unit exposure");
+        const auto dir = std::filesystem::temp_directory_path() / "engine_p22_cfg";
+        std::filesystem::create_directories(dir);
+        const auto path = dir / "engine.ini";
+        {
+            std::ofstream out(path);
+            out << "[Render]\nexposure = 2.5\nbloomEnabled = false\nbloomStrength = 1.25\n"
+                   "skyboxEnabled = false\nenvironmentIntensity = 0.5\n";
+        }
+        const engine::EngineConfig parsed = engine::EngineConfig::loadFromFile(path);
+        check(nearlyEqual(parsed.render.exposure, 2.5) && !parsed.render.bloomEnabled &&
+                  nearlyEqual(parsed.render.bloomStrength, 1.25) && !parsed.render.skyboxEnabled &&
+                  nearlyEqual(parsed.render.environmentIntensity, 0.5),
+              "post: [Render] post-processing keys parse from the INI file");
     }
 }
 
@@ -5963,6 +6198,7 @@ int main() {
     testSceneSerialization();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
+    testPhase22PbrIblPost();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

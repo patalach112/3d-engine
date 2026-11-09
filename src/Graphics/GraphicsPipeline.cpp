@@ -73,7 +73,7 @@ uint64_t pipelineKey(const PipelineStateDesc& state, const std::string& vertexSh
 GraphicsPipeline::GraphicsPipeline(VulkanContext& context, const Swapchain& swapchain) : m_context(context) {
     createDescriptorSetLayout();
     createPipelineCache();
-    m_pipeline = createPipeline(swapchain, PipelineStateDesc{}, "cube.vert.spv", "cube.frag.spv");
+    m_pipeline = createPipeline(swapchain.renderPass(), PipelineStateDesc{}, "cube.vert.spv", "cube.frag.spv");
     m_stateCache.intern(PipelineStateDesc{});
     m_pipelinesByState.emplace(pipelineKey(PipelineStateDesc{}, "cube.vert.spv", "cube.frag.spv"), m_pipeline);
     m_distinctPipelines = 1;
@@ -90,6 +90,7 @@ GraphicsPipeline::~GraphicsPipeline() {
     };
     destroyOnce(m_pipeline);
     destroyOnce(m_shadowPipeline);
+    destroyOnce(m_skyboxPipeline);
     for (const auto& [materialId, pipeline] : m_materialPipelines) {
         (void)materialId;
         destroyOnce(pipeline);
@@ -130,7 +131,8 @@ VkPipeline GraphicsPipeline::getOrCreatePipeline(uint32_t materialId, const Pipe
     if (const auto found = m_pipelinesByState.find(key); found != m_pipelinesByState.end()) {
         pipeline = found->second;
     } else {
-        pipeline = createPipeline(swapchain, state, vertexShaderFile, fragmentShaderFile);
+        const VkRenderPass pass = m_sceneRenderPass != VK_NULL_HANDLE ? m_sceneRenderPass : swapchain.renderPass();
+        pipeline = createPipeline(pass, state, vertexShaderFile, fragmentShaderFile);
         m_pipelinesByState.emplace(key, pipeline);
         ++m_distinctPipelines;
     }
@@ -166,7 +168,22 @@ void GraphicsPipeline::createDescriptorSetLayout() {
     shadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     shadowBinding.pImmutableSamplers = nullptr;
 
-    const std::array<VkDescriptorSetLayoutBinding, 2> bindings = {uboBinding, shadowBinding};
+    // Phase 22 bindings (all fragment-side): the material texture
+    // array, the image-based-lighting set (irradiance / prefiltered
+    // specular / BRDF LUT) and the raw environment cube the skybox
+    // samples.
+    const auto samplerBinding = [](uint32_t binding, uint32_t count) {
+        VkDescriptorSetLayoutBinding result{};
+        result.binding = binding;
+        result.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        result.descriptorCount = count;
+        result.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        result.pImmutableSamplers = nullptr;
+        return result;
+    };
+    const std::array<VkDescriptorSetLayoutBinding, 7> bindings = {
+        uboBinding, shadowBinding, samplerBinding(2, kMaxMaterialTextures), samplerBinding(3, 1),
+        samplerBinding(4, 1),      samplerBinding(5, 1),                    samplerBinding(6, 1)};
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -281,6 +298,134 @@ VkPipeline GraphicsPipeline::createShadowPipeline(VkRenderPass shadowRenderPass)
     return m_shadowPipeline;
 }
 
+void GraphicsPipeline::setSceneRenderPass(VkRenderPass sceneRenderPass) {
+    m_sceneRenderPass = sceneRenderPass;
+    const VkDevice device = m_context.device();
+    // Attachment formats changed (HDR offscreen), so every existing
+    // pipeline is incompatible: destroy each distinct handle once
+    // and recreate the default pipeline against the scene pass.
+    std::unordered_set<VkPipeline> destroyed;
+    const auto destroyOnce = [&destroyed, device](VkPipeline pipeline) {
+        if (pipeline != VK_NULL_HANDLE && destroyed.insert(pipeline).second) {
+            vkDestroyPipeline(device, pipeline, nullptr);
+        }
+    };
+    destroyOnce(m_pipeline);
+    for (const auto& [materialId, pipeline] : m_materialPipelines) {
+        (void)materialId;
+        destroyOnce(pipeline);
+    }
+    for (const auto& [key, pipeline] : m_pipelinesByState) {
+        (void)key;
+        destroyOnce(pipeline);
+    }
+    m_materialPipelines.clear();
+    m_pipelinesByState.clear();
+    m_pipeline = createPipeline(sceneRenderPass, PipelineStateDesc{}, "cube.vert.spv", "cube.frag.spv");
+    m_pipelinesByState.emplace(pipelineKey(PipelineStateDesc{}, "cube.vert.spv", "cube.frag.spv"), m_pipeline);
+    m_distinctPipelines = 1;
+}
+
+VkPipeline GraphicsPipeline::createSkyboxPipeline(VkRenderPass sceneRenderPass) {
+    if (m_skyboxPipeline != VK_NULL_HANDLE) {
+        return m_skyboxPipeline;
+    }
+    const VkDevice device = m_context.device();
+
+    VkShaderModule vertexShader = createShaderModule("skybox.vert.spv");
+    VkShaderModule fragmentShader = createShaderModule("skybox.frag.spv");
+
+    std::array<VkPipelineShaderStageCreateInfo, 2> shaderStages{};
+    shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    shaderStages[0].module = vertexShader;
+    shaderStages[0].pName = "main";
+    shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    shaderStages[1].module = fragmentShader;
+    shaderStages[1].pName = "main";
+
+    const VkVertexInputBindingDescription bindingDescription = Vertex::bindingDescription();
+    const auto attributeDescriptions = Vertex::attributeDescriptions();
+    VkPipelineVertexInputStateCreateInfo vertexInput{};
+    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInput.vertexBindingDescriptionCount = 1;
+    vertexInput.pVertexBindingDescriptions = &bindingDescription;
+    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
+    vertexInput.pVertexAttributeDescriptions = attributeDescriptions.data();
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    const std::array<VkDynamicState, 2> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    // Inside-out cube: front faces cull, so only the far inside of
+    // the sky cube rasterizes; depth is written by the real scene.
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_FRONT_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // Skybox vertices sit at the far plane (z = w trick), so the
+    // depth test is LessOrEqual against the cleared 1.0 and nothing
+    // is written back.
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_FALSE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.blendEnable = VK_FALSE;
+    VkPipelineColorBlendStateCreateInfo colorBlending{};
+    colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAttachment;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount = static_cast<uint32_t>(shaderStages.size());
+    pipelineInfo.pStages = shaderStages.data();
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = m_layout;
+    pipelineInfo.renderPass = sceneRenderPass;
+    pipelineInfo.subpass = 0;
+
+    const VkResult result =
+        vkCreateGraphicsPipelines(device, m_pipelineCache, 1, &pipelineInfo, nullptr, &m_skyboxPipeline);
+    vkDestroyShaderModule(device, vertexShader, nullptr);
+    vkDestroyShaderModule(device, fragmentShader, nullptr);
+    if (result != VK_SUCCESS) {
+        throw std::runtime_error("GraphicsPipeline: failed to create skybox pipeline");
+    }
+    return m_skyboxPipeline;
+}
+
 VkShaderModule GraphicsPipeline::createShaderModule(const char* fileName) const {
     const std::string path = std::string(ENGINE_SHADER_DIR) + "/" + fileName;
     const std::vector<char> code = helpers::readFile(path);
@@ -297,7 +442,7 @@ VkShaderModule GraphicsPipeline::createShaderModule(const char* fileName) const 
     return shaderModule;
 }
 
-VkPipeline GraphicsPipeline::createPipeline(const Swapchain& swapchain, const PipelineStateDesc& state,
+VkPipeline GraphicsPipeline::createPipeline(VkRenderPass renderPass, const PipelineStateDesc& state,
                                             const std::string& vertexShaderFile,
                                             const std::string& fragmentShaderFile) {
     const VkDevice device = m_context.device();
@@ -429,7 +574,7 @@ VkPipeline GraphicsPipeline::createPipeline(const Swapchain& swapchain, const Pi
     pipelineInfo.pColorBlendState = &colorBlending;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = m_layout;
-    pipelineInfo.renderPass = swapchain.renderPass();
+    pipelineInfo.renderPass = renderPass;
     pipelineInfo.subpass = 0;
 
     VkPipeline pipeline = VK_NULL_HANDLE;

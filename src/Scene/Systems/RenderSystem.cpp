@@ -85,6 +85,8 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
     // built without an asset pass still shade with the full model.
     glm::vec4 specular{0.35f, 0.35f, 0.35f, 32.0f};
     glm::vec4 surface{0.35f, 0.10f, 3.0f, 0.28f};
+    glm::vec4 pbrParams{0.0f, 0.55f, 1.0f, 0.0f};
+    std::array<int32_t, 4> textureIndices{-1, -1, -1, -1};
     if (assets != nullptr) {
         if (const MaterialAsset* material = assets->material(mesh.materialName)) {
             materialId = material->id;
@@ -94,6 +96,23 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
             specular = glm::vec4{lighting.specularColor, lighting.shininess};
             surface = glm::vec4{lighting.specularStrength, lighting.rimStrength, lighting.rimPower,
                                 lighting.ambientStrength};
+            const MaterialPbr& pbr = material->desc.pbr;
+            pbrParams = glm::vec4{pbr.metallic, pbr.roughness, pbr.occlusionStrength, 0.0f};
+            // Dense texture slots (id - 1) into the renderer's
+            // material texture array; unknown/oversized stays -1.
+            const auto resolveTexture = [assets](const std::string& name) -> int32_t {
+                if (name.empty()) {
+                    return -1;
+                }
+                const TextureAsset* texture = assets->texture(name);
+                if (texture == nullptr || texture->id == kInvalidAssetId ||
+                    texture->id - 1 >= kMaxMaterialTextures) {
+                    return -1;
+                }
+                return static_cast<int32_t>(texture->id - 1);
+            };
+            textureIndices = {resolveTexture(pbr.albedoTexture), resolveTexture(pbr.metallicRoughnessTexture),
+                              resolveTexture(pbr.normalTexture), resolveTexture(pbr.occlusionTexture)};
         }
     }
     DrawItem item;
@@ -103,6 +122,8 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
     item.baseColor = baseColor;
     item.specular = specular;
     item.surface = surface;
+    item.pbrParams = pbrParams;
+    item.textureIndices = textureIndices;
     item.viewDepth = viewDepth;
     item.sortKey = RenderQueue::makeSortKey(materialId, viewDepth);
     outItem = item;
@@ -260,6 +281,20 @@ bool RenderSystem::render(Scene& scene) {
     m_lastDrawnCount = static_cast<uint32_t>(frame.renderQueue.size());
     m_lastCulledCount = frame.culledCount;
     m_lastOccludedCount = frame.occludedCount;
+
+    if (m_assets != nullptr) {
+        // Mirror the CPU texture table into the GPU material array;
+        // a no-op unless the registry version moved (Phase 22).
+        std::vector<MaterialTextureUpload> textureUploads;
+        const std::vector<TextureAsset>& textures = m_assets->textures();
+        textureUploads.reserve(textures.size());
+        for (const TextureAsset& texture : textures) {
+            textureUploads.push_back(MaterialTextureUpload{
+                texture.width, texture.height,
+                std::span<const uint8_t>{texture.pixels.data(), texture.pixels.size()}});
+        }
+        m_renderer.syncMaterialTextures(textureUploads, m_assets->textureRegistryVersion());
+    }
 
     FrameLighting frameLighting;
     frameLighting.cascadeCount = frame.lighting.cascadeCount;

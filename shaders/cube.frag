@@ -1,35 +1,98 @@
 #version 450
 
-// Per-frame uniform block — byte-identical with the C++
-// UniformBufferObject (Renderer.h): camera matrices, cascaded shadow
-// matrices, and the packed dynamic-light arrays (Phase 21).
+// Metallic-roughness PBR (Phase 22): Cook-Torrance microfacet BRDF
+// (GGX distribution, Smith geometry, Schlick Fresnel) for the key
+// directional light (cascaded-shadowed) and up to 16 dynamic
+// point/spot lights, plus split-sum image-based lighting from the
+// prefiltered environment. Mirrors the CPU reference in
+// Graphics/Pbr.h formula for formula. Output is linear HDR; tone
+// mapping + sRGB happen in the composite pass.
+
 layout(set = 0, binding = 0) uniform UniformBufferObject {
     mat4 view;
     mat4 proj;
     mat4 lightViewProj[4];
-    vec4 lightDirection;
+    vec4 lightDirection; // xyz toward the key light, w radiance scale
     vec4 cascadeSplits;
     vec4 lightCounts; // x point count, y spot count, z total
     vec4 lightPositionRange[16];
     vec4 lightColorIntensity[16];
     vec4 lightDirectionType[16];
     vec4 lightCone[16];
+    vec4 environmentParams; // x intensity, y prefilter max LOD, z skybox on
 } ubo;
 
 layout(set = 0, binding = 1) uniform sampler2D shadowMaps[4];
+layout(set = 0, binding = 2) uniform sampler2D materialTextures[32];
+layout(set = 0, binding = 3) uniform samplerCube irradianceMap;
+layout(set = 0, binding = 4) uniform samplerCube prefilteredMap;
+layout(set = 0, binding = 5) uniform sampler2D brdfLut;
 
 layout(location = 0) in vec3 fragColor;
 layout(location = 1) in vec3 fragNormal;
 layout(location = 2) in vec3 fragWorldPosition;
 layout(location = 3) in vec3 fragCameraPosition;
-layout(location = 4) in vec4 fragSpecular;
-layout(location = 5) in vec4 fragSurface;
+layout(location = 4) in vec3 fragPbrParams;
+layout(location = 5) flat in ivec4 fragTextureIndices;
 layout(location = 6) in float viewDepth;
+layout(location = 7) in vec2 fragTexCoord;
 
 layout(location = 0) out vec4 outColor;
 
-// Picks the cascade that owns this fragment's view depth: the first
-// slice whose far plane is at or beyond the fragment.
+const float PI = 3.14159265359;
+
+// --- Cook-Torrance terms (mirror Graphics/Pbr.h) -------------------
+float distributionGGX(float noH, float roughness) {
+    float alpha = roughness * roughness;
+    float alpha2 = alpha * alpha;
+    float denom = noH * noH * (alpha2 - 1.0) + 1.0;
+    return alpha2 / (PI * denom * denom);
+}
+
+float geometrySchlickGGX(float noX, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return noX / (noX * (1.0 - k) + k);
+}
+
+float geometrySmith(float noV, float noL, float roughness) {
+    return geometrySchlickGGX(noV, roughness) * geometrySchlickGGX(noL, roughness);
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 f0) {
+    float m = clamp(1.0 - cosTheta, 0.0, 1.0);
+    float m2 = m * m;
+    return f0 + (vec3(1.0) - f0) * (m2 * m2 * m);
+}
+
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 f0, float roughness) {
+    float m = clamp(1.0 - cosTheta, 0.0, 1.0);
+    float m2 = m * m;
+    return f0 + (max(vec3(1.0 - roughness), f0) - f0) * (m2 * m2 * m);
+}
+
+// Outgoing radiance for one light (radiance already includes color,
+// intensity, attenuation and the spot cone factor).
+vec3 evaluateDirectLight(vec3 normal, vec3 viewDir, vec3 lightDir, vec3 radiance, vec3 albedo, float metallic,
+                         float roughness) {
+    vec3 halfVec = normalize(lightDir + viewDir);
+    float noL = clamp(dot(normal, lightDir), 0.0, 1.0);
+    float noV = clamp(dot(normal, viewDir), 0.0, 1.0);
+    float noH = clamp(dot(normal, halfVec), 0.0, 1.0);
+    float voH = clamp(dot(viewDir, halfVec), 0.0, 1.0);
+    if (noL <= 0.0 || noV <= 0.0) {
+        return vec3(0.0);
+    }
+    vec3 f0 = mix(vec3(0.04), albedo, metallic);
+    vec3 fresnel = fresnelSchlick(voH, f0);
+    float distribution = distributionGGX(noH, roughness);
+    float geometry = geometrySmith(noV, noL, roughness);
+    vec3 specular = (distribution * geometry) * fresnel / (4.0 * noV * noL);
+    vec3 diffuseWeight = (vec3(1.0) - fresnel) * (1.0 - metallic);
+    return (diffuseWeight * albedo / PI + specular) * radiance * noL;
+}
+
+// --- Cascaded shadows (Phase 21) ------------------------------------
 int cascadeIndexFor(float depth) {
     if (depth <= ubo.cascadeSplits.x) return 0;
     if (depth <= ubo.cascadeSplits.y) return 1;
@@ -37,16 +100,8 @@ int cascadeIndexFor(float depth) {
     return 3;
 }
 
-// Directional shadow lookup with a 3x3 PCF kernel against one
-// cascade. Returns 1.0 when the fragment is lit, 0.0 when fully
-// shadowed. Fragments outside the light frustum are treated as lit,
-// and the slope-scaled bias keeps surfaces that face the light from
-// shadowing themselves (acne), complementing the shadow pass's
-// front-face culling and depth bias.
 float shadowFactor(vec3 worldPosition, vec3 normal, vec3 lightDirection, float depth) {
     int cascade = cascadeIndexFor(depth);
-    // Small normal offset pushes the sample point off the surface
-    // along its normal, the standard cure for acne on grazing faces.
     vec4 lightPosition = ubo.lightViewProj[cascade] * vec4(worldPosition + normal * 0.02, 1.0);
     vec3 projected = lightPosition.xyz / lightPosition.w;
     vec2 uv = projected.xy * 0.5 + 0.5;
@@ -67,8 +122,7 @@ float shadowFactor(vec3 worldPosition, vec3 normal, vec3 lightDirection, float d
     return shadow / 9.0;
 }
 
-// Smooth windowed inverse-square attenuation — mirrors the CPU-side
-// lightAttenuation() exactly (LightingSystem.h).
+// Smooth windowed inverse-square attenuation (mirrors LightingSystem.h).
 float attenuation(float dist, float range) {
     if (range <= 0.0) return 0.0;
     float ratio = clamp(dist / range, 0.0, 1.0);
@@ -76,40 +130,58 @@ float attenuation(float dist, float range) {
     return (window * window) / (dist * dist + 1.0);
 }
 
+// Tangent-space normal mapping without vertex tangents: build the
+// cotangent frame from screen-space derivatives of position and UV.
+vec3 perturbNormal(vec3 normal, vec3 worldPosition, vec2 uv, vec3 tangentNormal) {
+    vec3 q0 = dFdx(worldPosition);
+    vec3 q1 = dFdy(worldPosition);
+    vec2 st0 = dFdx(uv);
+    vec2 st1 = dFdy(uv);
+    vec3 tangent = normalize(q0 * st1.t - q1 * st0.t);
+    vec3 bitangent = normalize(-q0 * st1.s + q1 * st0.s);
+    return normalize(mat3(tangent, bitangent, normal) * tangentNormal);
+}
+
 void main() {
-    // Lighting model: ambient + Lambert diffuse + Blinn-Phong
-    // specular + a subtle rim term. The directional key light is
-    // attenuated by its cascade shadow; dynamic point/spot lights
-    // add unshadowed local terms. Per-material data arrives through
-    // push constants, so distinct materials separate by hue,
-    // brightness gradient, highlight, and silhouette rim while the
-    // draw stays a single cheap pass. Because the pipeline writes
-    // depth and culls back faces, a face is only ever shaded when it
-    // is the nearest visible surface — light and color cannot bleed
-    // through solid geometry.
+    vec3 albedo = fragColor;
+    float metallic = clamp(fragPbrParams.x, 0.0, 1.0);
+    float roughness = clamp(fragPbrParams.y, 0.045, 1.0);
+    float occlusion = 1.0;
+
+    if (fragTextureIndices.x >= 0) {
+        // Albedo maps are authored sRGB; decode to linear.
+        albedo *= pow(texture(materialTextures[fragTextureIndices.x], fragTexCoord).rgb, vec3(2.2));
+    }
+    if (fragTextureIndices.y >= 0) {
+        vec3 metallicRoughness = texture(materialTextures[fragTextureIndices.y], fragTexCoord).rgb;
+        roughness = clamp(roughness * metallicRoughness.g, 0.045, 1.0);
+        metallic = clamp(metallic * metallicRoughness.b, 0.0, 1.0);
+    }
+
     vec3 normal = normalize(fragNormal);
     if (!gl_FrontFacing) {
-        normal = -normal; // double-sided materials light their back faces correctly
+        normal = -normal;
     }
-    vec3 lightDirection = normalize(ubo.lightDirection.xyz); // toward the key light
-    vec3 lightColor = vec3(1.0, 0.96, 0.88);
-    vec3 viewDirection = normalize(fragCameraPosition - fragWorldPosition);
+    if (fragTextureIndices.z >= 0) {
+        vec3 tangentNormal = texture(materialTextures[fragTextureIndices.z], fragTexCoord).rgb * 2.0 - 1.0;
+        normal = perturbNormal(normal, fragWorldPosition, fragTexCoord, tangentNormal);
+    }
+    if (fragTextureIndices.w >= 0) {
+        occlusion = mix(1.0, texture(materialTextures[fragTextureIndices.w], fragTexCoord).r, fragPbrParams.z);
+    }
+
+    vec3 viewDir = normalize(fragCameraPosition - fragWorldPosition);
+    vec3 f0 = mix(vec3(0.04), albedo, metallic);
+    vec3 outgoing = vec3(0.0);
+
+    // Key directional light, cascaded-shadowed.
+    vec3 lightDirection = normalize(ubo.lightDirection.xyz);
+    vec3 keyRadiance = vec3(1.0, 0.96, 0.88) * ubo.lightDirection.w;
     float shadow = shadowFactor(fragWorldPosition, normal, lightDirection, viewDepth);
+    outgoing += evaluateDirectLight(normal, viewDir, lightDirection, keyRadiance, albedo, metallic, roughness) *
+                shadow;
 
-    float diffuseFactor = max(dot(normal, lightDirection), 0.0);
-    vec3 ambient = fragColor * fragSurface.w;
-    vec3 diffuse = fragColor * lightColor * (diffuseFactor * 0.82) * shadow;
-
-    vec3 halfDirection = normalize(lightDirection + viewDirection);
-    float specularFactor = pow(max(dot(normal, halfDirection), 0.0), max(fragSpecular.a, 1.0)) * diffuseFactor;
-    vec3 specular = fragSpecular.rgb * lightColor * (specularFactor * fragSurface.x) * shadow;
-
-    float rimBase = 1.0 - clamp(dot(normal, viewDirection), 0.0, 1.0);
-    float rimFactor = pow(rimBase, max(fragSurface.z, 0.1));
-    vec3 rim = fragSpecular.rgb * (rimFactor * fragSurface.y * (0.30 + 0.70 * diffuseFactor));
-
-    // Dynamic lights: nearest-first packed arrays; type 0 = point,
-    // type 1 = spot (cone fade between the packed cosines).
+    // Dynamic point/spot lights (nearest 16, gathered per frame).
     int lightTotal = int(ubo.lightCounts.z + 0.5);
     for (int i = 0; i < lightTotal; ++i) {
         vec3 lightPosition = ubo.lightPositionRange[i].xyz;
@@ -131,13 +203,24 @@ void main() {
                 continue;
             }
         }
-        vec3 lightRadiance = ubo.lightColorIntensity[i].rgb * (ubo.lightColorIntensity[i].w * falloff * spotFactor);
-        float nDotL = max(dot(normal, dirToLight), 0.0);
-        diffuse += fragColor * lightRadiance * nDotL;
-        vec3 halfVec = normalize(dirToLight + viewDirection);
-        float spec = pow(max(dot(normal, halfVec), 0.0), max(fragSpecular.a, 1.0)) * nDotL;
-        specular += fragSpecular.rgb * lightRadiance * spec * fragSurface.x;
+        vec3 radiance = ubo.lightColorIntensity[i].rgb * (ubo.lightColorIntensity[i].w * falloff * spotFactor);
+        outgoing += evaluateDirectLight(normal, viewDir, dirToLight, radiance, albedo, metallic, roughness);
     }
 
-    outColor = vec4(ambient + diffuse + specular + rim, 1.0);
+    // Image-based lighting (split-sum): irradiance for diffuse,
+    // roughness-blurred reflection modulated by the BRDF LUT.
+    float noV = clamp(dot(normal, viewDir), 0.0, 1.0);
+    vec3 fresnel = fresnelSchlickRoughness(noV, f0, roughness);
+    vec3 diffuseWeight = (vec3(1.0) - fresnel) * (1.0 - metallic);
+    vec3 irradiance = texture(irradianceMap, normal).rgb;
+    vec3 diffuseIbl = irradiance * albedo * diffuseWeight;
+
+    vec3 reflection = reflect(-viewDir, normal);
+    vec3 prefiltered = textureLod(prefilteredMap, reflection, roughness * ubo.environmentParams.y).rgb;
+    vec2 brdf = texture(brdfLut, vec2(noV, roughness)).rg;
+    vec3 specularIbl = prefiltered * (fresnel * brdf.x + vec3(brdf.y));
+
+    vec3 ambient = (diffuseIbl + specularIbl) * occlusion * ubo.environmentParams.x;
+
+    outColor = vec4(ambient + outgoing, 1.0);
 }

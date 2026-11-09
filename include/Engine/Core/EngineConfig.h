@@ -36,6 +36,15 @@ struct RenderConfig {
     bool occlusionCulling = false;
     // Sort draw items by material, then front-to-back, before submission.
     bool sortDrawItems = true;
+    // Cinematic post-processing (Phase 22): HDR exposure multiplier,
+    // multi-scale bloom (bright-pass threshold + composite strength),
+    // the procedural skybox, and image-based-lighting intensity.
+    double exposure = 1.0;
+    bool bloomEnabled = true;
+    double bloomStrength = 0.55;
+    double bloomThreshold = 1.0;
+    bool skyboxEnabled = true;
+    double environmentIntensity = 1.0;
     // On-screen FPS HUD (bitmap-font overlay): live FPS / frame time /
     // worker count / VRAM usage, refreshed at this interval (seconds).
     bool hudEnabled = true;
