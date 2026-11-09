@@ -1,12 +1,11 @@
 #pragma once
 
-#include "Graphics/Renderer.h" // DrawItem
+#include "Graphics/RenderQueue.h" // DrawItem + RenderQueue
 
 #include <glm/mat4x4.hpp>
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 
 namespace engine {
 
@@ -22,7 +21,7 @@ struct PreparedFrame {
     bool hasCamera = false;
     glm::mat4 view{1.0f};
     glm::mat4 projection{1.0f};
-    std::vector<DrawItem> drawItems;
+    RenderQueue renderQueue; // draw items, sorted ready for submission
     uint32_t meshCount = 0;   // visible mesh entities considered
     uint32_t culledCount = 0; // of those, removed by frustum culling
 };
@@ -31,6 +30,7 @@ struct PreparedFrame {
 struct FramePrepareOptions {
     JobSystem* jobs = nullptr;      // parallelize matrix/bounds work when set
     bool frustumCulling = true;     // from [Render] config
+    bool sortDrawItems = true;      // sort the render queue before submission
     size_t parallelMinItems = 128;  // below this, sequential is cheaper
 };
 
@@ -39,15 +39,17 @@ struct FramePrepareOptions {
 //
 // Bridges the ECS world and the Vulkan renderer: finds the active camera,
 // culls mesh entities whose world bounds fall outside the view frustum,
-// builds model matrices for the survivors, and submits everything to the
-// Renderer. Model/bounds computation is data-parallel over entities when
-// a JobSystem is provided (disjoint writes into pre-sized slots), with
-// deterministic ordering restored by sequential compaction afterwards.
+// builds model matrices for the survivors, and aggregates them into a
+// RenderQueue sorted by material, then front-to-back depth (minimizing
+// GPU state changes and maximizing Early-Z rejection). Model/bounds
+// computation is data-parallel over entities when a JobSystem is
+// provided (disjoint writes into pre-sized slots), and the queue sort
+// parallelizes through the same JobSystem for large frames.
 // ---------------------------------------------------------------------------
 class RenderSystem {
 public:
     RenderSystem(Renderer& renderer, const Swapchain& swapchain, JobSystem* jobs = nullptr,
-                 bool frustumCulling = true, size_t parallelMinItems = 128);
+                 bool frustumCulling = true, size_t parallelMinItems = 128, bool sortDrawItems = true);
 
     // Draws the current scene state. Must run after update systems so it
     // never renders a half-updated world.
@@ -67,6 +69,7 @@ private:
     JobSystem* m_jobs;
     bool m_frustumCulling;
     size_t m_parallelMinItems;
+    bool m_sortDrawItems;
     bool m_warnedNoCamera = false;
     uint32_t m_lastDrawnCount = 0;
     uint32_t m_lastCulledCount = 0;

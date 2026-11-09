@@ -26,6 +26,8 @@ struct RenderConfig {
     bool vsync = true;
     // Skip drawing entities whose bounds are outside the view frustum.
     bool frustumCulling = true;
+    // Sort draw items by material, then front-to-back, before submission.
+    bool sortDrawItems = true;
 };
 
 // Performance & memory tuning (see config/engine.ini, [Performance]).

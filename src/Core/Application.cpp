@@ -21,7 +21,7 @@ Application::Application(EngineConfig config)
       m_gameLoop(m_config.loop),
       m_jobSystem(JobSystem::Config{m_config.performance.jobWorkerCount}),
       m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
-                     m_config.performance.parallelMinDrawItems) {
+                     m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems) {
     // Reserve pooled component storage before populating the scene.
     m_scene.reserveCapacity(m_config.performance.entityReserve);
     buildScene();

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "Graphics/Buffer.h"
+#include "Graphics/RenderQueue.h"
 
 namespace engine {
 
@@ -23,11 +24,6 @@ class GraphicsPipeline;
 struct UniformBufferObject {
     glm::mat4 view{1.0f};
     glm::mat4 proj{1.0f};
-};
-
-// One drawable entity for a frame.
-struct DrawItem {
-    glm::mat4 model{1.0f};
 };
 
 // ---------------------------------------------------------------------------

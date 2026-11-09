@@ -93,6 +93,7 @@ add_executable(3d-engine
     src/Geometry/Bounds.cpp
     src/Geometry/Cube.cpp
     src/Graphics/Frustum.cpp
+    src/Graphics/RenderQueue.cpp
     src/Graphics/VulkanContext.cpp
     src/Graphics/VulkanHelpers.cpp
     src/Graphics/Swapchain.cpp
@@ -226,6 +227,7 @@ if(BUILD_TESTING)
         src/Geometry/Bounds.cpp
         src/Geometry/Cube.cpp
         src/Graphics/Frustum.cpp
+    src/Graphics/RenderQueue.cpp
         src/Scene/Scene.cpp
         src/Scene/Components.cpp
         src/Scene/Systems/CameraSystem.cpp

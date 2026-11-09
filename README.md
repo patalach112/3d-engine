@@ -244,6 +244,29 @@ laps, 8 concurrent `JobSystem` producers × 2.5k jobs with exactly-once
 verification, and 4 threads × 250 async log messages delivered in full —
 all also clean under ThreadSanitizer harnesses.
 
+### Render queue & CPU command stream (Phase 4, Sub-step 3)
+
+Draw submission now goes through a CPU-side render queue
+(`src/Graphics/RenderQueue.*`) instead of handing the renderer entities
+in ECS collection order:
+
+- Each `DrawItem` carries a packed 64-bit sort key — material identity
+  (stable FNV-1a of the mesh's asset id until real material slots exist)
+  in the high bits, quantized view depth in the low bits. Sorting
+  therefore groups identical GPU state together (fewer pipeline/material
+  changes) and draws front-to-back inside each group, so the depth
+  buffer rejects occluded fragments as early as possible (Early-Z).
+- `RenderSystem` computes material/depth during its existing parallel
+  evaluation (the same disjoint-slot pass that does frustum culling),
+  compacts survivors into the queue in deterministic order, and sorts.
+  Push constants, view/projection UBOs, and culling results are
+  unchanged downstream — the `Renderer` just records the sorted span.
+- Sorting is allocation-free after `reserve()` (items + scratch are
+  preallocated, `clear()` retains capacity): a stable LSD radix sort
+  sequentially, and for large frames a JobSystem-parallel segmented
+  sort + stable merge through `parallelFor`. Toggle with
+  `[Render] sortDrawItems`.
+
 ### Frustum culling (`src/Graphics/Frustum.*`, `src/Geometry/Bounds.*`)
 
 View frustum planes are extracted from the view-projection matrix
@@ -256,7 +279,7 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 129 checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 143 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
@@ -264,8 +287,10 @@ behavior (block reuse, alignment, fallback), job system correctness
 frustum/AABB math, data-oriented layout checks (component size/alignment,
 dense-page pointer strides, owning-group pairing with non-spinning decoys, and
 5,000 entities × 40 parallel fixed steps), and lock-free stress tests (MPMC
-ring hammering, concurrent job producers, concurrent async logging) —
-everything verifiable without a GPU.
+ring hammering, concurrent job producers, concurrent async logging), and
+render-queue checks (sort-key ordering, stable ties, 5,000-item parallel
+sort integrity/determinism, material grouping with front-to-back order in
+integrated frames) — everything verifiable without a GPU.
 
 ## Configuration
 
@@ -376,6 +401,7 @@ mouse (press again to quit).
         ├── Swapchain.h/.cpp      # Swapchain, depth, render pass, framebuffers
         ├── GraphicsPipeline.h/.cpp # Shader modules, pipeline state, UBO layout
         ├── Frustum.h/.cpp        # View frustum extraction + AABB/sphere tests
+        ├── RenderQueue.h/.cpp    # CPU render command stream + parallel sort
         └── Renderer.h/.cpp       # Frames-in-flight, command recording, present
 ```
 
@@ -397,8 +423,9 @@ what it depends on.
 - **Phase 4 — Performance & memory ✅:** paginated pool allocator for ECS
   storage, work-stealing job system with parallel systems, frustum culling,
   strict data-oriented component layout (cache-line transforms, dense
-  paged storage, owning-group parallel iteration), and lock-free ring
-  buffers on the job-system and async-logger hot paths
+  paged storage, owning-group parallel iteration), lock-free ring
+  buffers on the job-system and async-logger hot paths, and a sorted
+  CPU-side render queue (material grouping + front-to-back Early-Z)
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.

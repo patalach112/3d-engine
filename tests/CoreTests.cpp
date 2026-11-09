@@ -19,6 +19,7 @@
 
 #include "Core/Concurrency/LockFreeRingBuffer.h"
 #include "Core/Jobs/JobSystem.h"
+#include "Graphics/RenderQueue.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Graphics/Frustum.h"
 
@@ -72,7 +73,7 @@ void testConfigLoading() {
     {
         std::ofstream file(path);
         file << "[Window]\nwidth = 800\nheight = 600\ntitle = Test Title\nresizable = false\n"
-             << "[Render]\nvsync = false\n"
+             << "[Render]\nvsync = false\nsortDrawItems = false\n"
              << "[Logger]\nlevel = Warning\nconsole = false\n"
              << "[Loop]\nfixedDeltaSeconds = 0.01\nmaxFps = 144\nmaxFixedStepsPerFrame = 3\n"
              << "bogusKey = 1\n"
@@ -88,6 +89,7 @@ void testConfigLoading() {
     check(config.window.title == "Test Title", "window title parsed");
     check(!config.window.resizable, "window resizable parsed");
     check(!config.render.vsync, "vsync parsed");
+    check(!config.render.sortDrawItems, "render queue sorting flag parsed");
     check(config.logger.minimumLevel == engine::LogLevel::Warning, "log level parsed");
     check(!config.logger.consoleEnabled, "logger console flag parsed");
     check(nearlyEqual(config.loop.fixedDeltaSeconds, 0.01), "fixed delta parsed");
@@ -293,7 +295,7 @@ void testSceneAndSystems() {
     noCulling.frustumCulling = false;
     const engine::PreparedFrame before = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, noCulling);
     check(before.hasCamera, "render prep finds the active camera");
-    check(before.drawItems.size() == 1, "render prep collects visible mesh entities");
+    check(before.renderQueue.size() == 1, "render prep collects visible mesh entities");
 
     // This is what CameraSystem does with input each frame (look + move);
     // exercised through the camera's window-free API here.
@@ -301,7 +303,7 @@ void testSceneAndSystems() {
     const engine::PreparedFrame after = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, noCulling);
     check(!nearlyEqual(after.view[3][2], before.view[3][2], 1e-6),
           "render prep after camera update uses the new view matrix");
-    check(nearlyEqual(after.drawItems[0].model[3][0], before.drawItems[0].model[3][0]),
+    check(nearlyEqual(after.renderQueue.items()[0].model[3][0], before.renderQueue.items()[0].model[3][0]),
           "camera movement does not disturb entity transforms");
 
     // Hidden entities are excluded from rendering.
@@ -309,7 +311,7 @@ void testSceneAndSystems() {
     hidden.addComponent<engine::TransformComponent>();
     auto& hiddenMesh = hidden.addComponent<engine::MeshComponent>("cube");
     hiddenMesh.visible = false;
-    check(engine::RenderSystem::prepareFrame(scene, 1.0f, noCulling).drawItems.size() == 1,
+    check(engine::RenderSystem::prepareFrame(scene, 1.0f, noCulling).renderQueue.size() == 1,
           "invisible entities are skipped by render prep");
 
     // --- Lifetime -------------------------------------------------------------
@@ -575,6 +577,151 @@ void testAsyncLoggerConcurrency() {
     std::filesystem::remove_all(dir);
 }
 
+void testRenderQueue() {
+    std::cout << "RenderQueue sorting\n";
+
+    const auto makeItem = [](uint32_t material, float depth, float id) {
+        engine::DrawItem item;
+        item.model[3][0] = id; // encode identity in the translation
+        item.materialId = material;
+        item.viewDepth = depth;
+        item.sortKey = engine::RenderQueue::makeSortKey(material, depth);
+        return item;
+    };
+
+    // Sort key structure: material dominates, depth orders within it.
+    check(engine::RenderQueue::makeSortKey(1, 100.0f) < engine::RenderQueue::makeSortKey(2, 0.5f),
+          "sort key orders by material before depth");
+    check(engine::RenderQueue::makeSortKey(1, 0.5f) < engine::RenderQueue::makeSortKey(1, 2.0f),
+          "sort key orders front-to-back within a material");
+
+    engine::RenderQueue queue;
+    queue.reserve(6);
+    queue.push(makeItem(2, 1.0f, 0));
+    queue.push(makeItem(1, 5.0f, 1));
+    queue.push(makeItem(1, 2.0f, 2));
+    queue.push(makeItem(2, 0.5f, 3));
+    queue.push(makeItem(1, 2.0f, 4)); // exact key tie with id 2: stability check
+    queue.push(makeItem(3, 0.1f, 5));
+    queue.sort();
+
+    // Expected: mat1 {id2, id4 (tie, stable), id1}, mat2 {id3, id0}, mat3 {id5}.
+    const std::vector<float> expectedIds = {2, 4, 1, 3, 0, 5};
+    bool orderOk = queue.size() == expectedIds.size();
+    bool keysAscending = true;
+    for (size_t i = 0; i < queue.size() && i < expectedIds.size(); ++i) {
+        orderOk = orderOk && queue.items()[i].model[3][0] == expectedIds[i];
+        keysAscending = keysAscending && (i == 0 || queue.items()[i - 1].sortKey <= queue.items()[i].sortKey);
+    }
+    check(orderOk, "sequential sort: material groups, front-to-back, stable ties");
+    check(keysAscending, "sorted queue keys are non-decreasing");
+
+    // Command-stream integrity under the parallel sort: 5000 unique keys,
+    // every item present exactly once, fully ordered, deterministic.
+    engine::JobSystem jobs(engine::JobSystem::Config{4});
+    const auto buildQueue = [&makeItem] {
+        engine::RenderQueue big;
+        big.reserve(5000);
+        for (int i = 0; i < 5000; ++i) {
+            // (i * 37) % 5000 is a permutation (gcd(37,5000)=1): unique keys.
+            const float keyDepth = static_cast<float>((i * 37) % 5000);
+            big.push(makeItem(static_cast<uint32_t>(i % 7), keyDepth, static_cast<float>(i)));
+        }
+        return big;
+    };
+    engine::RenderQueue parallel = buildQueue();
+    parallel.sort(&jobs, 1); // force the parallel path
+    bool sorted = true;
+    std::vector<int> seen(5000, 0);
+    for (size_t i = 0; i < parallel.size(); ++i) {
+        sorted = sorted && (i == 0 || parallel.items()[i - 1].sortKey <= parallel.items()[i].sortKey);
+        seen[static_cast<size_t>(parallel.items()[i].model[3][0])] += 1;
+    }
+    bool allOnce = true;
+    for (const int count : seen) {
+        allOnce = allOnce && count == 1;
+    }
+    check(sorted && allOnce, "parallel sort: 5000 items ordered, none lost or duplicated");
+
+    engine::RenderQueue parallelAgain = buildQueue();
+    parallelAgain.sort(&jobs, 1);
+    bool deterministic = parallelAgain.size() == parallel.size();
+    for (size_t i = 0; i < parallel.size() && i < parallelAgain.size(); ++i) {
+        deterministic = deterministic && parallelAgain.items()[i].sortKey == parallel.items()[i].sortKey &&
+                        parallelAgain.items()[i].model[3][0] == parallel.items()[i].model[3][0];
+    }
+    check(deterministic, "parallel sort is deterministic across runs");
+
+    queue.clear();
+    check(queue.empty(), "cleared render queue is empty (capacity retained for reuse)");
+}
+
+void testRenderSortingIntegration() {
+    std::cout << "Render queue integration\n";
+    engine::JobSystem jobs(engine::JobSystem::Config{4});
+    engine::Scene scene;
+
+    engine::Entity player = scene.createEntity("Player");
+    player.addComponent<engine::CameraComponent>(engine::CameraConfig{});
+
+    // Two materials interleaved in depth; default camera at (0,0,3)
+    // looking down -Z, so view depth = 3 - z.
+    const auto addCube = [&scene](float x, float z, const char* asset) {
+        engine::Entity cube = scene.createEntity("Cube");
+        cube.addComponent<engine::TransformComponent>(glm::vec3{x, 0.0f, z});
+        cube.addComponent<engine::MeshComponent>(asset);
+    };
+    addCube(0.0f, -1.0f, "matA"); // depth 4
+    addCube(1.0f, 1.0f, "matB");  // depth 2
+    addCube(-1.0f, -4.0f, "matA"); // depth 7
+    addCube(2.0f, 0.0f, "matB");  // depth 3
+
+    engine::FramePrepareOptions options;
+    options.jobs = &jobs;
+    options.frustumCulling = false;
+    options.parallelMinItems = 1;
+
+    const engine::PreparedFrame frame = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+    check(frame.renderQueue.size() == 4, "sorted frame contains every visible mesh");
+
+    bool keysAscending = true;
+    bool groupsContiguous = true;
+    bool depthsAscendingInGroup = true;
+    std::vector<uint32_t> seenMaterials;
+    for (size_t i = 0; i < frame.renderQueue.size(); ++i) {
+        const engine::DrawItem& item = frame.renderQueue.items()[i];
+        if (i > 0) {
+            const engine::DrawItem& prev = frame.renderQueue.items()[i - 1];
+            keysAscending = keysAscending && prev.sortKey <= item.sortKey;
+            if (item.materialId == prev.materialId) {
+                depthsAscendingInGroup = depthsAscendingInGroup && prev.viewDepth <= item.viewDepth;
+            }
+        }
+        if (std::find(seenMaterials.begin(), seenMaterials.end(), item.materialId) == seenMaterials.end()) {
+            seenMaterials.push_back(item.materialId);
+        } else if (seenMaterials.back() != item.materialId) {
+            groupsContiguous = false; // a material reappears after another group
+        }
+    }
+    check(keysAscending, "integrated frame: sort keys non-decreasing");
+    check(groupsContiguous && seenMaterials.size() == 2, "integrated frame: materials form contiguous groups");
+    check(depthsAscendingInGroup, "integrated frame: front-to-back inside each material");
+
+    // Deterministic across repeated parallel preparation.
+    const engine::PreparedFrame again = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+    bool sameOrder = again.renderQueue.size() == frame.renderQueue.size();
+    for (size_t i = 0; i < frame.renderQueue.size() && i < again.renderQueue.size(); ++i) {
+        sameOrder = sameOrder && again.renderQueue.items()[i].sortKey == frame.renderQueue.items()[i].sortKey &&
+                    again.renderQueue.items()[i].model[3][0] == frame.renderQueue.items()[i].model[3][0];
+    }
+    check(sameOrder, "integrated frame: repeated parallel preparation is deterministic");
+
+    // Sorting can be switched off (collection order preserved, all items kept).
+    options.sortDrawItems = false;
+    const engine::PreparedFrame unsorted = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+    check(unsorted.renderQueue.size() == 4, "unsorted frame keeps every mesh");
+}
+
 void testFrustumCulling() {
     std::cout << "Frustum culling\n";
     engine::CameraConfig cameraConfig;
@@ -649,13 +796,13 @@ void testParallelSystemsAndCulling() {
     check(frame.hasCamera, "render prep finds camera in populated scene");
     check(frame.meshCount == static_cast<uint32_t>(kCubes) + 1, "render prep counts all visible meshes");
     check(frame.culledCount >= 1, "behind-camera cube is frustum-culled");
-    check(frame.drawItems.size() + frame.culledCount == frame.meshCount,
+    check(frame.renderQueue.size() + frame.culledCount == frame.meshCount,
           "drawn + culled accounts for every mesh");
 
     // Without culling, everything is drawn.
     options.frustumCulling = false;
     const engine::PreparedFrame unculled = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
-    check(unculled.culledCount == 0 && unculled.drawItems.size() == frame.meshCount,
+    check(unculled.culledCount == 0 && unculled.renderQueue.size() == frame.meshCount,
           "disabling culling draws every mesh");
 }
 
@@ -835,6 +982,8 @@ int main() {
     testLockFreeRingBuffer();
     testJobSystem();
     testAsyncLoggerConcurrency();
+    testRenderQueue();
+    testRenderSortingIntegration();
     testFrustumCulling();
     testParallelSystemsAndCulling();
     testDataOrientedLayout();
