@@ -1,6 +1,5 @@
 #pragma once
 
-#include "Core/Camera.h"
 #include "Core/EngineConfig.h"
 #include "Core/GameLoop.h"
 #include "Graphics/GraphicsPipeline.h"
@@ -9,6 +8,8 @@
 #include "Graphics/VulkanContext.h"
 #include "Platform/Input.h"
 #include "Platform/Window.h"
+#include "Scene/Scene.h"
+#include "Scene/Systems/RenderSystem.h"
 
 namespace engine {
 
@@ -19,14 +20,16 @@ namespace engine {
 // on member declaration order for both construction and destruction:
 //
 //   construct:  config -> Window -> Input -> VulkanContext -> swapchain ->
-//               GraphicsPipeline -> Renderer -> GameLoop -> Camera
+//               GraphicsPipeline -> Renderer -> GameLoop -> Scene ->
+//               RenderSystem
 //   destruct:   exact reverse, so GPU resources are always released before
 //               the device, surface, instance and window they depend on.
 //               (Input unregisters itself from the Window while the Window
 //               is still alive.)
 //
-// All tuning (window, presentation, logging, loop rates, camera, input)
-// arrives through EngineConfig — this class contains no hardcoded settings.
+// The Application no longer contains gameplay or camera logic: it builds
+// the Scene, then lets ECS systems (camera, rotation, render) update and
+// draw the world each frame. All tuning arrives through EngineConfig.
 // ---------------------------------------------------------------------------
 class Application {
 public:
@@ -41,7 +44,7 @@ public:
     void run();
 
 private:
-    [[nodiscard]] UniformBufferObject computeTransforms() const;
+    void buildScene();
     void handleMouseCapture();
     void logLoopStats(const char* context) const;
 
@@ -53,7 +56,8 @@ private:
     GraphicsPipeline m_pipeline;
     Renderer m_renderer;
     GameLoop m_gameLoop;
-    Camera m_camera;
+    Scene m_scene;
+    RenderSystem m_renderSystem;
 
     double m_secondsSinceStatsLog = 0.0;
 };

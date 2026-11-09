@@ -6,6 +6,7 @@
 #include "Graphics/VulkanHelpers.h"
 
 #include <array>
+#include <glm/mat4x4.hpp>
 #include <stdexcept>
 #include <string>
 
@@ -163,10 +164,19 @@ void GraphicsPipeline::createPipeline(const Swapchain& swapchain) {
     colorBlending.pAttachments = &colorBlendAttachment;
 
     // --- Pipeline layout ------------------------------------------------------
+    // Per-entity model matrices arrive as push constants (one mat4, which
+    // fits comfortably in the guaranteed 128-byte push constant minimum).
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstantRange.offset = 0;
+    pushConstantRange.size = sizeof(glm::mat4);
+
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layoutInfo.setLayoutCount = 1;
     layoutInfo.pSetLayouts = &m_descriptorSetLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushConstantRange;
 
     if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &m_layout) != VK_SUCCESS) {
         vkDestroyShaderModule(device, vertexShader, nullptr);

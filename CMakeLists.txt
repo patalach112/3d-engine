@@ -47,7 +47,28 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-FetchContent_MakeAvailable(glfw glm)
+FetchContent_Declare(
+    entt
+    GIT_REPOSITORY https://github.com/skypjack/entt.git
+    GIT_TAG        v3.14.0
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(glfw glm entt)
+
+# EnTT is a third-party header library: consume its headers as SYSTEM so
+# warnings inside EnTT don't break this project's zero-warning policy
+# (our own code is still fully warned). The real target behind the
+# EnTT::EnTT alias carries the include directories.
+if(TARGET EnTT)
+    get_target_property(ENTT_INCLUDE_DIRS EnTT INTERFACE_INCLUDE_DIRECTORIES)
+    if(ENTT_INCLUDE_DIRS)
+        # Added (not moved): compilers ignore -I for directories that are
+        # also passed with -isystem, so EnTT headers become system headers.
+        set_target_properties(EnTT PROPERTIES
+            INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${ENTT_INCLUDE_DIRS}")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Engine executable (Phase 1: first render)
@@ -56,6 +77,11 @@ add_executable(3d-engine
     src/main.cpp
     src/Core/Application.cpp
     src/Core/Camera.cpp
+    src/Scene/Scene.cpp
+    src/Scene/Components.cpp
+    src/Scene/Systems/CameraSystem.cpp
+    src/Scene/Systems/RotationSystem.cpp
+    src/Scene/Systems/RenderSystem.cpp
     src/Core/EngineConfig.cpp
     src/Core/Logger.cpp
     src/Core/Time.cpp
@@ -78,6 +104,7 @@ target_link_libraries(3d-engine
         Vulkan::Vulkan
         glfw
         glm::glm
+        EnTT::EnTT
         Threads::Threads
 )
 
@@ -190,9 +217,23 @@ if(BUILD_TESTING)
         src/Core/GameLoop.cpp
         src/Platform/Input.cpp
         src/Platform/Window.cpp
+        src/Geometry/Cube.cpp
+        src/Scene/Scene.cpp
+        src/Scene/Components.cpp
+        src/Scene/Systems/CameraSystem.cpp
+        src/Scene/Systems/RotationSystem.cpp
+        src/Scene/Systems/RenderSystem.cpp
+        src/Graphics/VulkanContext.cpp
+        src/Graphics/VulkanHelpers.cpp
+        src/Graphics/Swapchain.cpp
+        src/Graphics/GraphicsPipeline.cpp
+        src/Graphics/Buffer.cpp
+        src/Graphics/Renderer.cpp
     )
     target_include_directories(engine-core-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(engine-core-tests PRIVATE Threads::Threads Vulkan::Vulkan glfw glm::glm)
+    target_compile_definitions(engine-core-tests PRIVATE GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE)
+    target_link_libraries(engine-core-tests
+        PRIVATE Threads::Threads Vulkan::Vulkan glfw glm::glm EnTT::EnTT)
     if(MSVC)
         target_compile_options(engine-core-tests PRIVATE /W4 /permissive-)
     else()

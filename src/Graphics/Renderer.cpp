@@ -170,12 +170,14 @@ void Renderer::createDescriptorSets() {
     }
 }
 
-void Renderer::updateUniformBuffer(const UniformBufferObject& ubo) {
+void Renderer::updateUniformBuffer(const glm::mat4& view, const glm::mat4& projection) {
+    const UniformBufferObject ubo{view, projection};
     void* mapped = m_uniformBuffers[m_currentFrame].mappedData();
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
 
-void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
+void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
+                                   std::span<const DrawItem> drawItems) {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
@@ -223,7 +225,11 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.layout(), 0, 1,
                             &m_descriptorSets[m_currentFrame], 0, nullptr);
 
-    vkCmdDrawIndexed(commandBuffer, m_indexCount, 1, 0, 0, 0);
+    for (const DrawItem& item : drawItems) {
+        vkCmdPushConstants(commandBuffer, m_pipeline.layout(), VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(glm::mat4), &item.model);
+        vkCmdDrawIndexed(commandBuffer, m_indexCount, 1, 0, 0, 0);
+    }
 
     vkCmdEndRenderPass(commandBuffer);
 
@@ -232,7 +238,8 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     }
 }
 
-void Renderer::drawFrame(const UniformBufferObject& ubo) {
+void Renderer::drawFrame(const glm::mat4& view, const glm::mat4& projection,
+                         std::span<const DrawItem> drawItems) {
     const VkDevice device = m_context.device();
 
     vkWaitForFences(device, 1, &m_inFlightFences[m_currentFrame], VK_TRUE, UINT64_MAX);
@@ -253,11 +260,11 @@ void Renderer::drawFrame(const UniformBufferObject& ubo) {
     // otherwise a failed acquire would leave the fence unsignaled forever.
     vkResetFences(device, 1, &m_inFlightFences[m_currentFrame]);
 
-    updateUniformBuffer(ubo);
+    updateUniformBuffer(view, projection);
 
     VkCommandBuffer commandBuffer = m_commandBuffers[m_currentFrame];
     vkResetCommandBuffer(commandBuffer, 0);
-    recordCommandBuffer(commandBuffer, imageIndex);
+    recordCommandBuffer(commandBuffer, imageIndex, drawItems);
 
     const VkSemaphore waitSemaphores[] = {m_imageAvailableSemaphores[m_currentFrame]};
     const VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};

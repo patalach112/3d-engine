@@ -12,6 +12,10 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/vec4.hpp>
 
+#include "Scene/Scene.h"
+#include "Scene/Systems/RenderSystem.h"
+#include "Scene/Systems/RotationSystem.h"
+
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -224,6 +228,82 @@ void testCamera() {
           "reset restores start position and orientation");
 }
 
+void testSceneAndSystems() {
+    std::cout << "Scene / ECS systems\n";
+    engine::Scene scene;
+    check(scene.entityCount() == 0, "new scene is empty");
+
+    // --- Entity creation and component attachment/retrieval -----------------
+    engine::Entity cube = scene.createEntity("Cube");
+    check(cube.isValid(), "created entity is valid");
+    check(cube.name() == "Cube", "entity carries its tag name");
+    check(scene.entityCount() == 1, "entity count tracks creation");
+
+    auto& transform = cube.addComponent<engine::TransformComponent>(glm::vec3{1.0f, 2.0f, 3.0f});
+    cube.addComponent<engine::MeshComponent>("cube");
+    check(cube.hasComponent<engine::TransformComponent>(), "attached component is present");
+    check(!cube.hasComponent<engine::CameraComponent>(), "unattached component is absent");
+    check(nearlyVec3(cube.getComponent<engine::TransformComponent>().position, glm::vec3{1.0f, 2.0f, 3.0f}),
+          "component data round-trips through the registry");
+    transform.scale = glm::vec3{2.0f};
+    const glm::mat4 model = cube.getComponent<engine::TransformComponent>().modelMatrix();
+    check(nearlyEqual(model[3][0], 1.0) && nearlyEqual(model[3][1], 2.0) && nearlyEqual(model[3][2], 3.0),
+          "model matrix contains the translation");
+    check(nearlyEqual(model[0][0], 2.0), "model matrix contains the scale");
+
+    cube.removeComponent<engine::MeshComponent>();
+    check(!cube.hasComponent<engine::MeshComponent>(), "removed component is gone");
+    cube.addComponent<engine::MeshComponent>("cube");
+
+    // --- Cameras: active selection -------------------------------------------
+    engine::Entity inactiveCam = scene.createEntity("InactiveCamera");
+    auto& inactive = inactiveCam.addComponent<engine::CameraComponent>(engine::CameraConfig{});
+    inactive.isActive = false;
+    check(scene.findActiveCamera() == nullptr, "inactive camera is not selected");
+
+    engine::Entity player = scene.createEntity("Player");
+    auto& playerCamera = player.addComponent<engine::CameraComponent>(engine::CameraConfig{});
+    check(scene.findActiveCamera() == &playerCamera, "first active camera is selected");
+
+    // --- System execution order: update systems, then render prep ------------
+    // Spinning cube integrated by the fixed-step rotation system.
+    cube.addComponent<engine::SpinComponent>(glm::vec3{0.0f, 90.0f, 0.0f});
+    engine::RotationSystem::update(scene, 0.5); // half a second at 90 deg/s
+    check(nearlyEqual(cube.getComponent<engine::TransformComponent>().rotationDegrees.y, 45.0),
+          "rotation system integrates spin at the fixed rate");
+
+    const engine::PreparedFrame before = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f);
+    check(before.hasCamera, "render prep finds the active camera");
+    check(before.drawItems.size() == 1, "render prep collects visible mesh entities");
+
+    // This is what CameraSystem does with input each frame (look + move);
+    // exercised through the camera's window-free API here.
+    playerCamera.camera.translate(glm::vec3{0.0f, 0.0f, 1.0f}, 1.0); // 3 units forward
+    const engine::PreparedFrame after = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f);
+    check(!nearlyEqual(after.view[3][2], before.view[3][2], 1e-6),
+          "render prep after camera update uses the new view matrix");
+    check(nearlyEqual(after.drawItems[0].model[3][0], before.drawItems[0].model[3][0]),
+          "camera movement does not disturb entity transforms");
+
+    // Hidden entities are excluded from rendering.
+    engine::Entity hidden = scene.createEntity("Hidden");
+    hidden.addComponent<engine::TransformComponent>();
+    auto& hiddenMesh = hidden.addComponent<engine::MeshComponent>("cube");
+    hiddenMesh.visible = false;
+    check(engine::RenderSystem::prepareFrame(scene, 1.0f).drawItems.size() == 1,
+          "invisible entities are skipped by render prep");
+
+    // --- Lifetime -------------------------------------------------------------
+    const engine::Entity doomed = scene.createEntity("Doomed");
+    const size_t countBeforeDestroy = scene.entityCount();
+    scene.destroyEntity(doomed);
+    check(!doomed.isValid(), "destroyed entity handle reports invalid");
+    check(!scene.isValid(doomed), "scene agrees the entity is gone");
+    check(scene.entityCount() == countBeforeDestroy - 1, "entity count tracks destruction");
+    scene.destroyEntity(doomed); // stale handle: must be a safe no-op
+    check(scene.entityCount() == countBeforeDestroy - 1, "double destroy is a no-op");
+}
+
 void testTime() {
     std::cout << "Time\n";
     engine::Time time;
@@ -272,6 +352,7 @@ int main() {
     testConfigLoading();
     testLogger();
     testCamera();
+    testSceneAndSystems();
     testFixedTimestep();
     testTime();
     testGameLoop();

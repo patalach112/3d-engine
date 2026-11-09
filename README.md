@@ -14,7 +14,8 @@ and fully functional. No legacy OpenGL, no bloated frameworks.
 | Windowing | GLFW                                      |
 | Math      | GLM (configured for Vulkan: radians, depth range `[0, 1]`) |
 | Language  | C++20                                     |
-| Build     | CMake ≥ 3.24 (GLFW and GLM are fetched automatically) |
+| ECS       | EnTT (header-only, fetched automatically) |
+| Build     | CMake ≥ 3.24 (GLFW, GLM and EnTT are fetched automatically) |
 
 ## Phase 1 — First Render ✅
 
@@ -130,6 +131,39 @@ view/projection matrices feed the existing UBO each frame — the cube is
 static now and the player flies around it. Periodic loop statistics now
 also report camera position/yaw/pitch.
 
+## Phase 3, Step 2 — ECS Architecture (EnTT) ✅
+
+The engine is now entity-component-system driven. Game state lives in a
+`Scene` (RAII owner of an `entt::registry`); hardcoded per-object logic in
+the application is gone.
+
+- **Scene / Entity** (`src/Scene/Scene.*`): entity creation/destruction with
+  lifetime tracking, fluent component handles (`addComponent<T>` /
+  `getComponent<T>` / `hasComponent<T>`), tag names, and one shared definition
+  of the *active camera*. The Scene knows nothing about windows or Vulkan.
+- **Components** (`src/Scene/Components.h`): `TagComponent`,
+  `TransformComponent` (position / Euler rotation / scale → model matrix),
+  `CameraComponent` (wraps the Phase 3 camera, `isActive` flag),
+  `MeshComponent` (asset-id placeholder until the asset system arrives),
+  `SpinComponent` (angular velocity for deterministic spin).
+- **Systems** (`src/Scene/Systems/`), executed in a strict order each frame:
+  1. `RotationSystem` (fixed update) — integrates spins into transforms
+  2. `CameraSystem` (variable update) — input-driven look/movement on the
+     active camera
+  3. `RenderSystem` (render) — derives view/projection + per-entity model
+     matrices from the scene and submits them to the Renderer
+
+  The renderer itself was generalized to match: the uniform buffer now
+  carries only view/projection, and each entity's model matrix is delivered
+  per draw via **push constants**, so one frame draws any number of
+  entities. `RenderSystem::prepareFrame()` isolates the scene→matrices
+  step so it is unit-testable without a GPU.
+
+The demo scene is built declaratively in `Application::buildScene()`: a
+player camera entity, the original cube at the origin, and two spinning
+companion cubes — fly around and watch them rotate at a fixed 60 Hz
+regardless of frame rate.
+
 ### Unit tests
 
 `tests/CoreTests.cpp` (CTest: `engine-core-tests`) covers configuration
@@ -210,7 +244,7 @@ mouse (press again to quit).
 │   ├── cube.vert             # MVP transform (UBO) + color passthrough
 │   └── cube.frag             # Flat per-face color output
 ├── tests/
-│   └── CoreTests.cpp         # Config/logger/timing/loop unit tests (CTest)
+│   └── CoreTests.cpp         # Config/logger/timing/loop/ECS tests (CTest)
 └── src/
     ├── main.cpp              # Bootstrap: arguments -> config -> logger -> app
     ├── Core/
@@ -223,6 +257,13 @@ mouse (press again to quit).
     ├── Platform/
     │   ├── Window.h/.cpp       # GLFW window, surface, resize/input callbacks
     │   └── Input.h/.cpp        # Key/mouse state, transitions, mouse delta
+    ├── Scene/
+    │   ├── Scene.h/.cpp        # RAII ECS world (entt::registry), Entity handle
+    │   ├── Components.h/.cpp   # Tag/Transform/Camera/Mesh/Spin components
+    │   └── Systems/
+    │       ├── CameraSystem.*  # Input-driven active camera (variable update)
+    │       ├── RotationSystem.*# Spin integration (fixed update)
+    │       └── RenderSystem.*  # Scene -> view/projection + draw items
     ├── Geometry/
     │   ├── Vertex.h            # Interleaved position+color vertex layout
     │   └── Cube.h/.cpp         # Colored cube geometry (24 verts, 36 indices)
@@ -247,6 +288,9 @@ what it depends on.
   robust fixed/variable game loop, data-driven configuration
 - **Phase 3, Step 1 — Input & first-person camera ✅:** GLFW-callback input
   system, yaw/pitch FPP camera wired into the UBO update loop
+- **Phase 3, Step 2 — ECS architecture ✅:** EnTT-backed Scene/Entity,
+  foundation components, camera/rotation/render systems, multi-entity
+  rendering via push constants
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.

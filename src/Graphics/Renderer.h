@@ -5,6 +5,7 @@
 #include <glm/mat4x4.hpp>
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "Graphics/Buffer.h"
@@ -16,11 +17,17 @@ class Window;
 class Swapchain;
 class GraphicsPipeline;
 
-// Per-frame data consumed by cube.vert.
+// Per-frame data consumed by cube.vert: camera matrices only. Per-entity
+// model matrices travel through push constants instead, so one frame can
+// draw any number of entities with a single uniform buffer update.
 struct UniformBufferObject {
-    glm::mat4 model{1.0f};
     glm::mat4 view{1.0f};
     glm::mat4 proj{1.0f};
+};
+
+// One drawable entity for a frame.
+struct DrawItem {
+    glm::mat4 model{1.0f};
 };
 
 // ---------------------------------------------------------------------------
@@ -45,9 +52,10 @@ public:
     Renderer(Renderer&&) = delete;
     Renderer& operator=(Renderer&&) = delete;
 
-    // Draws one frame with the given transforms. Transparently recreates
+    // Draws one frame: camera matrices go to the uniform buffer, each
+    // item's model matrix is pushed per draw. Transparently recreates
     // the swapchain when the window has been resized.
-    void drawFrame(const UniformBufferObject& ubo);
+    void drawFrame(const glm::mat4& view, const glm::mat4& projection, std::span<const DrawItem> drawItems);
 
 private:
     void createCommandBuffers();
@@ -58,8 +66,9 @@ private:
     void createDescriptorPool();
     void createDescriptorSets();
 
-    void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex);
-    void updateUniformBuffer(const UniformBufferObject& ubo);
+    void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
+                             std::span<const DrawItem> drawItems);
+    void updateUniformBuffer(const glm::mat4& view, const glm::mat4& projection);
     void recreateSwapchain();
     void createRenderFinishedSemaphores();
 
