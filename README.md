@@ -1160,6 +1160,66 @@ filtering including mesh-only Default-layer answers) join the
 suite: **518 checks, all passing in Debug, Release-shared and
 Release-static, CTest 1/1, zero warnings.**
 
+## Phase 16 — Physics Constraints & Joints ✅
+
+`JointComponent` (Physics) now implements four constraint types
+between two bodies — or a body and the world — solved by a proper
+sequential-impulse joint solver in `PhysicsSystem`:
+
+- **Joint types** (factories `JointComponent::distance / hinge /
+  fixed / springDamper`, mirroring the collider factories):
+  *Distance* holds the anchor separation at `restLength` (negative
+  captures the initial separation once), or inside
+  `[minDistance, maxDistance]` when bounds are set — a rope when
+  only `maxDistance` is given, a strut when only `minDistance` is.
+  *Hinge* is a true revolute joint: anchor points coincide and the
+  only free relative motion is rotation about `hingeAxis`, with
+  optional twist limits (`enableLimits`, `min/maxAngleDegrees`,
+  measured from the relative orientation captured when the solver
+  first sees the joint). *Fixed* welds the pair to the relative
+  position and orientation captured at first sight. *SpringDamper*
+  remains the force-based spring. `compliance` (0..1) softens the
+  rigid types by scaling the error feedback.
+- **Solver**: every rigid type is built from scalar impulse rows
+  with full point Jacobians — anchor lever arms, world inverse
+  inertias, effective-mass denominators — solved alongside contacts
+  in each island's velocity iterations. Distance bounds and hinge
+  limits are unilateral rows (accumulated impulse clamped to one
+  sign); everything else is bilateral. Hinge adds two
+  axis-alignment angular rows; Fixed adds three orientation rows
+  against the captured relative orientation; both share the three
+  anchor-coincidence rows. A positional pass projects anchor
+  errors and axis/orientation misalignment each sub-step, and the
+  Baumgarte bias is clamped to a 2 m/s correction speed so spawn
+  errors can never launch a body (a 1 m error previously became a
+  48 m/s target velocity).
+- **Warm starting**: accumulated impulses, captured rest lengths
+  and captured reference orientations persist per joint (keyed by
+  the joint-owning entity) across sub-steps and steps, are
+  re-applied through the current Jacobians before velocities are
+  measured — the same protocol as contact warm starting — and are
+  pruned when a joint disappears. Joint-linked bodies were already
+  grouped into single solver islands and already woke each other;
+  both are covered by tests, so multi-body structures sleep, wake
+  and solve cohesively. (The pre-existing placeholder hinge, which
+  behaved as a world tether, became a real revolute joint; its
+  legacy test now uses an offset anchor and keeps the same
+  swing-radius assertion.)
+
+Verification: 17 new checks (factories/defaults, exact distance
+radius through a gravity swing, captured rest length, rope
+slack-then-taut, min-distance strut behaviour, hinge anchor
+coincidence and axis purity, ±30° hinge limits crossed and held,
+a welded pair holding zero relative transform through a drop,
+landing and a 120°/s initial spin, island grouping and
+joint-partner waking, compliance softness that still converges,
+and a double pendulum whose total energy over 3 s at 8 sub-steps
+drifts < 15 % of its 40 J potential range with no energy gain and
+< 1 mm anchor gaps — the bounded first-order dissipation any
+impulse solver shows, verified rather than assumed) join the
+suite: **535 checks, all passing in Debug, Release-shared and
+Release-static, CTest 1/1, zero warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

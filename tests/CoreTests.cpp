@@ -935,8 +935,9 @@ void testPhysics() {
         pendulum.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
         auto& joint = pendulum.addComponent<engine::JointComponent>();
         joint.type = engine::JointType::Hinge;
+        joint.anchorA = glm::vec3{-1.0f, 0.0f, 0.0f}; // hinge point sits at the world origin
         joint.anchorB = glm::vec3{0.0f};
-        joint.restLength = 1.0f;
+        joint.hingeAxis = glm::vec3{0.0f, 0.0f, 1.0f}; // swing in the XY plane
         PhysicsSettings settings;
         settings.gravity = glm::vec3{0.0f};
         PhysicsSystem physics;
@@ -2983,6 +2984,382 @@ void testCollisionLayers() {
     }
 }
 
+void testJointConstraints() {
+    std::cout << "Physics constraints & joints (Phase 16)\n";
+    using engine::ColliderComponent;
+    using engine::JointComponent;
+    using engine::JointType;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::RigidBodyComponent;
+    using engine::TransformComponent;
+
+    // --- Factories and defaults -------------------------------------------------
+    {
+        const JointComponent distance =
+            JointComponent::distance(static_cast<entt::entity>(3), glm::vec3{1.0f, 0.0f, 0.0f},
+                                     glm::vec3{-1.0f, 0.0f, 0.0f}, 2.5f);
+        const JointComponent hinge = JointComponent::hinge(entt::null, glm::vec3{0.0f}, glm::vec3{0.0f},
+                                                           glm::vec3{0.0f, 0.0f, 1.0f});
+        const JointComponent fixed = JointComponent::fixed(static_cast<entt::entity>(4), glm::vec3{0.5f},
+                                                           glm::vec3{-0.5f});
+        const JointComponent spring = JointComponent::springDamper(entt::null, glm::vec3{0.0f}, glm::vec3{0.0f},
+                                                                   1.0f, 50.0f, 2.0f);
+        check(distance.type == JointType::Distance && distance.restLength == 2.5f &&
+                  hinge.type == JointType::Hinge && fixed.type == JointType::Fixed &&
+                  spring.type == JointType::SpringDamper && spring.stiffness == 50.0f,
+              "joint factories configure their type and parameters");
+        check(distance.minDistance < 0.0f && distance.maxDistance < 0.0f && !distance.enableLimits &&
+                  distance.compliance == 0.0f && distance.enabled,
+              "joint defaults: unbounded, rigid, limits off");
+    }
+
+    // --- Distance joint: exact radius under gravity, explicit and captured ---------
+    {
+        engine::Scene scene;
+        auto bob = scene.createEntity("DistanceBob");
+        bob.addComponent<TransformComponent>(glm::vec3{2.0f, 0.0f, 0.0f});
+        bob.addComponent<RigidBodyComponent>(1.0f);
+        bob.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        bob.addComponent<JointComponent>(
+            JointComponent::distance(entt::null, glm::vec3{0.0f}, glm::vec3{0.0f}, 2.0f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        bool radiusHeld = true;
+        for (int step = 0; step < 180; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            if (step % 15 == 0) {
+                const float distance = glm::length(bob.getComponent<TransformComponent>().position);
+                radiusHeld = radiusHeld && distance > 1.98f && distance < 2.02f;
+            }
+        }
+        check(radiusHeld, "distance joint holds an exact 2 m radius through a gravity swing");
+    }
+    {
+        engine::Scene scene;
+        auto bob = scene.createEntity("CaptureBob");
+        bob.addComponent<TransformComponent>(glm::vec3{0.0f, -1.5f, 0.0f});
+        bob.addComponent<RigidBodyComponent>(1.0f);
+        bob.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        auto joint = JointComponent::distance(entt::null, glm::vec3{0.0f}, glm::vec3{0.0f}, -1.0f);
+        bob.addComponent<JointComponent>(joint); // restLength captured at first sight: 1.5
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        for (int step = 0; step < 120; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float distance = glm::length(bob.getComponent<TransformComponent>().position);
+        check(distance > 1.47f && distance < 1.53f,
+              "negative rest length captures the initial separation once and holds it");
+    }
+
+    // --- Bounded distance: rope slack, then taut; strut push-apart -------------------
+    {
+        engine::Scene scene;
+        auto bob = scene.createEntity("RopeBob");
+        bob.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+        auto& body = bob.addComponent<RigidBodyComponent>(1.0f);
+        bob.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        auto joint = JointComponent::distance(entt::null, glm::vec3{0.0f}, glm::vec3{0.0f}, -1.0f);
+        joint.maxDistance = 2.0f;
+        bob.addComponent<JointComponent>(joint);
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        for (int step = 0; step < 15; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float slackDistance = glm::length(bob.getComponent<TransformComponent>().position);
+        for (int step = 0; step < 165; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const auto& transform = bob.getComponent<TransformComponent>();
+        const float tautDistance = glm::length(transform.position);
+        check(slackDistance < 1.0f, "rope joint is slack while the body is inside max distance");
+        check(tautDistance > 1.97f && tautDistance < 2.03f && transform.position.y < -1.9f &&
+                  glm::length(body.velocity) < 0.3f,
+              "rope joint catches at max distance and hangs");
+    }
+    {
+        engine::Scene scene;
+        auto a = scene.createEntity("StrutA");
+        a.addComponent<TransformComponent>(glm::vec3{-0.25f, 0.0f, 0.0f});
+        a.addComponent<RigidBodyComponent>(1.0f);
+        a.addComponent<ColliderComponent>(ColliderComponent::sphere(0.2f));
+        auto b = scene.createEntity("StrutB");
+        b.addComponent<TransformComponent>(glm::vec3{0.25f, 0.0f, 0.0f});
+        auto& bodyB = b.addComponent<RigidBodyComponent>(1.0f);
+        b.addComponent<ColliderComponent>(ColliderComponent::sphere(0.2f));
+        auto joint = JointComponent::distance(b.handle(), glm::vec3{0.0f}, glm::vec3{0.0f}, -1.0f);
+        joint.minDistance = 1.5f;
+        a.addComponent<JointComponent>(joint);
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        float minDistanceAfterEngage = 10.0f;
+        for (int step = 0; step < 90; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            if (step >= 5) {
+                minDistanceAfterEngage =
+                    std::min(minDistanceAfterEngage,
+                             glm::length(b.getComponent<TransformComponent>().position -
+                                         a.getComponent<TransformComponent>().position));
+            }
+        }
+        const float distance = glm::length(b.getComponent<TransformComponent>().position -
+                                           a.getComponent<TransformComponent>().position);
+        // A min-distance bound is unilateral: it pushes the bodies
+        // apart and never lets them re-approach under it, but in
+        // zero-G they keep whatever modest separation speed remains.
+        check(distance > 1.45f && minDistanceAfterEngage > 1.40f && glm::length(bodyB.velocity) < 2.5f,
+              "min-distance strut pushes bodies apart to the bound and never lets them back under it");
+    }
+
+    // --- Hinge: revolute pendulum ------------------------------------------------------
+    {
+        engine::Scene scene;
+        auto bob = scene.createEntity("HingeBob");
+        bob.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        auto& body = bob.addComponent<RigidBodyComponent>(1.0f);
+        bob.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        bob.addComponent<JointComponent>(JointComponent::hinge(entt::null, glm::vec3{-1.0f, 0.0f, 0.0f},
+                                                               glm::vec3{0.0f}, glm::vec3{0.0f, 0.0f, 1.0f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        float minY = 0.0f;
+        float maxGap = 0.0f;
+        for (int step = 0; step < 240; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            const auto& transform = bob.getComponent<TransformComponent>();
+            minY = std::min(minY, transform.position.y);
+            maxGap = std::max(maxGap, glm::length(transform.position +
+                                                  body.orientation * glm::vec3{-1.0f, 0.0f, 0.0f}));
+        }
+        const auto& transform = bob.getComponent<TransformComponent>();
+        const float radius = glm::length(transform.position);
+        const float axisDot = (body.orientation * glm::vec3{0.0f, 0.0f, 1.0f}).z;
+        check(maxGap < 0.01f && radius > 0.98f && radius < 1.02f,
+              "hinge anchor stays coincident and the bob keeps its swing radius");
+        check(minY < -0.95f && axisDot > 0.99f,
+              "hinge pendulum swings through the bottom rotating only about the hinge axis");
+    }
+
+    // --- Hinge limits ---------------------------------------------------------------------
+    {
+        engine::Scene scene;
+        auto bob = scene.createEntity("LimitBob");
+        bob.addComponent<TransformComponent>(glm::vec3{0.0f, -1.0f, 0.0f});
+        auto& body = bob.addComponent<RigidBodyComponent>(1.0f);
+        bob.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        auto joint = JointComponent::hinge(entt::null, glm::vec3{0.0f, 1.0f, 0.0f}, glm::vec3{0.0f},
+                                           glm::vec3{0.0f, 0.0f, 1.0f});
+        joint.enableLimits = true;
+        joint.minAngleDegrees = -30.0f;
+        joint.maxAngleDegrees = 30.0f;
+        bob.addComponent<JointComponent>(joint);
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 1.0 / 60.0, settings); // captures the limit zero at the bottom
+        // Teleport the bob to -80 degrees, rotated about the hinge point.
+        auto& transform = bob.getComponent<TransformComponent>();
+        transform.position = glm::vec3{-0.9848f, -0.17365f, 0.0f};
+        body.orientation = glm::angleAxis(glm::radians(-80.0f), glm::vec3{0.0f, 0.0f, 1.0f});
+        body.orientationInitialized = true;
+        body.velocity = glm::vec3{0.0f};
+        body.angularVelocity = glm::vec3{0.0f};
+        body.angularMomentum = glm::vec3{0.0f};
+        transform.setOrientation(body.orientation);
+        float maxAbsTheta = 0.0f;
+        float minTheta = 0.0f;
+        for (int step = 0; step < 240; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            if (step < 30) {
+                continue; // the release correction transient is not the limit's steady behaviour
+            }
+            const float theta = glm::degrees(std::atan2(transform.position.x, -transform.position.y));
+            maxAbsTheta = std::max(maxAbsTheta, std::abs(theta));
+            minTheta = std::min(minTheta, theta);
+        }
+        check(maxAbsTheta < 36.0f && minTheta < -18.0f,
+              "hinge limits confine the swing to +-30 degrees while letting it cross the bottom");
+    }
+
+    // --- Fixed joint: welded pair keeps zero relative transform ------------------------------
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("WeldFloor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+        floor.addComponent<RigidBodyComponent>().setStatic(true);
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{6.0f, 0.5f, 6.0f}));
+        auto a = scene.createEntity("WeldA");
+        a.addComponent<TransformComponent>(glm::vec3{0.0f, 4.0f, 0.0f});
+        auto& bodyA = a.addComponent<RigidBodyComponent>(1.0f);
+        a.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto b = scene.createEntity("WeldB");
+        b.addComponent<TransformComponent>(glm::vec3{1.3f, 4.0f, 0.0f});
+        auto& bodyB = b.addComponent<RigidBodyComponent>(1.0f);
+        bodyB.angularVelocity = glm::vec3{0.0f, 0.0f, 120.0f}; // must be cancelled by the weld
+        b.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        a.addComponent<JointComponent>(JointComponent::fixed(b.handle(), glm::vec3{0.65f, 0.0f, 0.0f},
+                                                             glm::vec3{-0.65f, 0.0f, 0.0f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        for (int step = 0; step < 150; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const auto& transformA = a.getComponent<TransformComponent>();
+        const auto& transformB = b.getComponent<TransformComponent>();
+        const glm::vec3 localOffset =
+            glm::transpose(glm::mat3_cast(bodyA.orientation)) * (transformB.position - transformA.position);
+        const glm::quat relativeOrientation = glm::inverse(bodyA.orientation) * bodyB.orientation;
+        const float relativeAngle =
+            glm::degrees(2.0f * std::acos(std::min(1.0f, std::abs(relativeOrientation.w))));
+        check(std::abs(localOffset.x - 1.3f) < 0.02f && std::abs(localOffset.y) < 0.02f &&
+                  std::abs(localOffset.z) < 0.02f && relativeAngle < 2.0f,
+              "fixed joint holds zero relative transform through a drop, landing, and an initial spin");
+        check(transformA.position.y > 0.44f && transformA.position.y < 0.56f &&
+                  glm::length(bodyB.angularVelocity) < 5.0f && glm::length(bodyA.velocity) < 0.2f,
+              "welded pair lands as one rigid unit and settles");
+    }
+
+    // --- Double pendulum: bounded energy error, links attached ---------------------------------
+    {
+        engine::Scene scene;
+        auto link1 = scene.createEntity("DPLink1");
+        link1.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        auto& body1 = link1.addComponent<RigidBodyComponent>(1.0f);
+        link1.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        link1.addComponent<JointComponent>(JointComponent::hinge(entt::null, glm::vec3{-1.0f, 0.0f, 0.0f},
+                                                                 glm::vec3{0.0f}, glm::vec3{0.0f, 0.0f, 1.0f}));
+        auto link2 = scene.createEntity("DPLink2");
+        link2.addComponent<TransformComponent>(glm::vec3{3.0f, 0.0f, 0.0f});
+        auto& body2 = link2.addComponent<RigidBodyComponent>(1.0f);
+        link2.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        link2.addComponent<JointComponent>(JointComponent::hinge(link1.handle(), glm::vec3{-1.0f, 0.0f, 0.0f},
+                                                                 glm::vec3{1.0f, 0.0f, 0.0f},
+                                                                 glm::vec3{0.0f, 0.0f, 1.0f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        settings.subSteps = 8;
+        PhysicsSystem physics;
+        // Point-mass energy (the small sphere spin term included via
+        // I = 0.4 m r^2 = 0.025). Released horizontally: E0 = 0, and
+        // the reachable potential range is 40 J.
+        const auto energy = [](const RigidBodyComponent& body, const TransformComponent& transform) {
+            const glm::vec3 omega = glm::radians(body.angularVelocity);
+            return 0.5 * static_cast<double>(glm::dot(body.velocity, body.velocity)) +
+                   0.5 * 0.025 * static_cast<double>(glm::dot(omega, omega)) +
+                   10.0 * static_cast<double>(transform.position.y);
+        };
+        double maxDrift = 0.0;
+        double maxGain = 0.0;
+        double maxKinetic = 0.0;
+        double maxGap = 0.0;
+        bool finite = true;
+        for (int step = 0; step < 180; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+            const auto& transform1 = link1.getComponent<TransformComponent>();
+            const auto& transform2 = link2.getComponent<TransformComponent>();
+            const double total = energy(body1, transform1) + energy(body2, transform2);
+            maxDrift = std::max(maxDrift, std::abs(total));
+            maxGain = std::max(maxGain, total);
+            maxKinetic = std::max(maxKinetic, 0.5 * static_cast<double>(glm::dot(body1.velocity, body1.velocity) +
+                                                                        glm::dot(body2.velocity, body2.velocity)));
+            const glm::vec3 gap1 = transform1.position + body1.orientation * glm::vec3{-1.0f, 0.0f, 0.0f};
+            const glm::vec3 gap2 = (transform2.position + body2.orientation * glm::vec3{-1.0f, 0.0f, 0.0f}) -
+                                   (transform1.position + body1.orientation * glm::vec3{1.0f, 0.0f, 0.0f});
+            maxGap = std::max({maxGap, static_cast<double>(glm::length(gap1)),
+                               static_cast<double>(glm::length(gap2))});
+            finite = finite && std::isfinite(transform1.position.x) && std::isfinite(transform2.position.x);
+        }
+        check(finite && maxGap < 0.01, "double pendulum hinges stay coincident (no stretch or blow-up)");
+        check(maxKinetic > 8.0 && maxGain < 0.5 && maxDrift < 6.0,
+              "double pendulum energy is conserved within impulse-solver tolerance (no pump, bounded loss)");
+    }
+
+    // --- Islands & waking through joints ---------------------------------------------------------
+    {
+        engine::Scene scene;
+        auto a = scene.createEntity("IslandA");
+        a.addComponent<TransformComponent>(glm::vec3{-1.0f, 0.0f, 0.0f});
+        a.addComponent<RigidBodyComponent>(1.0f);
+        a.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        a.addComponent<JointComponent>(
+            JointComponent::hinge(entt::null, glm::vec3{1.0f, 0.0f, 0.0f}, glm::vec3{0.0f},
+                                  glm::vec3{0.0f, 0.0f, 1.0f}));
+        auto b = scene.createEntity("IslandB");
+        b.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        b.addComponent<RigidBodyComponent>(1.0f);
+        b.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        b.addComponent<JointComponent>(
+            JointComponent::distance(a.handle(), glm::vec3{-1.0f, 0.0f, 0.0f}, glm::vec3{1.0f, 0.0f, 0.0f}, 2.0f));
+        auto lone = scene.createEntity("IslandLone");
+        lone.addComponent<TransformComponent>(glm::vec3{20.0f, 0.0f, 0.0f});
+        lone.addComponent<RigidBodyComponent>(1.0f);
+        lone.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        const PhysicsSystem::Stats stats = physics.update(scene, 1.0 / 60.0, settings);
+        check(stats.joints == 2 && stats.islands == 1 && stats.largestIsland == 2,
+              "joint-linked bodies form one island; the unconnected body forms none");
+    }
+    {
+        engine::Scene scene;
+        auto a = scene.createEntity("WakeA");
+        a.addComponent<TransformComponent>(glm::vec3{-1.0f, 0.0f, 0.0f});
+        auto& bodyA = a.addComponent<RigidBodyComponent>(1.0f);
+        bodyA.velocity = glm::vec3{1.5f, 0.0f, 0.0f};
+        a.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        auto b = scene.createEntity("WakeB");
+        b.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        auto& bodyB = b.addComponent<RigidBodyComponent>(1.0f);
+        bodyB.sleeping = true;
+        b.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        a.addComponent<JointComponent>(
+            JointComponent::distance(b.handle(), glm::vec3{0.0f}, glm::vec3{0.0f}, -1.0f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 1.0 / 60.0, settings);
+        const bool woke = !bodyB.sleeping;
+        for (int step = 0; step < 60; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        check(woke && bodyB.velocity.x > 0.05f, "an awake joint partner wakes and drags a sleeping body");
+    }
+
+    // --- Compliance: soft joints stretch measurably more, still converge ------------------------
+    {
+        const auto dropStretch = [](float compliance) {
+            engine::Scene scene;
+            auto bob = scene.createEntity("ComplianceBob");
+            bob.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, 0.0f});
+            bob.addComponent<RigidBodyComponent>(1.0f);
+            bob.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+            auto joint = JointComponent::distance(entt::null, glm::vec3{0.0f}, glm::vec3{0.0f}, 2.0f);
+            joint.compliance = compliance;
+            bob.addComponent<JointComponent>(joint);
+            PhysicsSettings settings;
+            settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+            PhysicsSystem physics;
+            for (int step = 0; step < 300; ++step) {
+                physics.update(scene, 1.0 / 60.0, settings);
+            }
+            return std::abs(glm::length(bob.getComponent<TransformComponent>().position) - 2.0f);
+        };
+        const float rigidError = dropStretch(0.0f);
+        const float softError = dropStretch(0.95f);
+        check(rigidError < 0.001f && softError > rigidError + 0.0005f && softError < 0.01f,
+              "compliance softens the joint measurably while it still converges to rest length");
+    }
+}
+
 void testPlayerCollision() {
     std::cout << "Player collision (1:1 capsule hitbox)\n";
     using engine::ColliderComponent;
@@ -4346,6 +4723,7 @@ int main() {
     testRaycasting();
     testSpatialPartitioning();
     testCollisionLayers();
+    testJointConstraints();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

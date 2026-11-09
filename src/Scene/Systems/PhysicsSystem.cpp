@@ -25,6 +25,47 @@ namespace {
 
 constexpr float kEpsilon = 1e-6f;
 
+// Shortest-arc rotation vector of a quaternion (2*sin(theta/2) * axis,
+// sign-normalized): the orientation error measure the fixed/hinge
+// angular rows feed back on.
+[[nodiscard]] glm::vec3 quatErrorVector(const glm::quat& quaternion) {
+    glm::quat normalized = glm::normalize(quaternion);
+    if (normalized.w < 0.0f) {
+        normalized = glm::quat{-normalized.w, -normalized.x, -normalized.y, -normalized.z};
+    }
+    return 2.0f * glm::vec3{normalized.x, normalized.y, normalized.z};
+}
+
+void quatToAxisAngle(const glm::quat& quaternion, glm::vec3& axis, float& angle) {
+    glm::quat normalized = glm::normalize(quaternion);
+    if (normalized.w < 0.0f) {
+        normalized = glm::quat{-normalized.w, -normalized.x, -normalized.y, -normalized.z};
+    }
+    const float halfSin = std::sqrt(std::max(0.0f, 1.0f - normalized.w * normalized.w));
+    angle = 2.0f * std::atan2(halfSin, normalized.w);
+    axis = halfSin > 1e-8f ? glm::vec3{normalized.x, normalized.y, normalized.z} / halfSin
+                           : glm::vec3{1.0f, 0.0f, 0.0f};
+}
+
+// Twist of the relative orientation (current vs captured reference)
+// about the hinge axis, in degrees, in [-180, 180].
+[[nodiscard]] float twistAngleDegrees(const glm::quat& relative, const glm::quat& captured,
+                                      const glm::vec3& axisLocal) {
+    glm::quat delta = glm::normalize(relative * glm::inverse(captured));
+    if (delta.w < 0.0f) {
+        delta = glm::quat{-delta.w, -delta.x, -delta.y, -delta.z};
+    }
+    const float twist = glm::dot(glm::vec3{delta.x, delta.y, delta.z}, axisLocal);
+    return glm::degrees(2.0f * std::atan2(twist, delta.w));
+}
+
+// Orthonormal basis perpendicular to a unit axis.
+void perpendicularBasis(const glm::vec3& axis, glm::vec3& tangent1, glm::vec3& tangent2) {
+    const glm::vec3 reference = std::abs(axis.y) < 0.9f ? glm::vec3{0.0f, 1.0f, 0.0f} : glm::vec3{1.0f, 0.0f, 0.0f};
+    tangent1 = glm::normalize(glm::cross(axis, reference));
+    tangent2 = glm::cross(axis, tangent1);
+}
+
 [[nodiscard]] float combinedRestitution(const RigidBodyComponent& a, const RigidBodyComponent& b) {
     return std::sqrt(std::clamp(a.restitution, 0.0f, 1.0f) * std::clamp(b.restitution, 0.0f, 1.0f));
 }
@@ -353,6 +394,7 @@ size_t PhysicsSystem::resetToSpawnStates(Scene& scene) {
     // (but not reallocating) the scratch arrays lets the next fixed step
     // rebuild it from the respawned transforms.
     m_candidatePairs.clear();
+    m_jointStates.clear();
     m_broadTree.clear();
     m_broadProxies.clear();
     m_broadBodyIndex.clear();
@@ -415,6 +457,7 @@ void PhysicsSystem::snapshotConstraints(Scene& scene) {
         JointRef ref;
         ref.bodyA = *bodyA;
         ref.joint = &joint;
+        ref.jointEntity = entity;
         const glm::vec3 pointA = m_bodies[ref.bodyA].transform->position +
                                  m_bodies[ref.bodyA].body->orientation * joint.anchorA;
         glm::vec3 pointB = joint.anchorB;
@@ -428,8 +471,47 @@ void PhysicsSystem::snapshotConstraints(Scene& scene) {
             pointB = m_bodies[ref.bodyB].transform->position +
                      m_bodies[ref.bodyB].body->orientation * joint.anchorB;
         }
-        ref.restLength = joint.restLength >= 0.0f ? joint.restLength : glm::length(pointB - pointA);
+        // One-time captures live in the persistent solver state: a
+        // negative rest length measures the separation ONCE (not
+        // every step, which would make the error identically zero),
+        // and fixed joints / hinge limits remember the relative
+        // orientation they were created in.
+        JointSolverState& state = m_jointStates[entt::to_integral(entity)];
+        if (joint.restLength >= 0.0f) {
+            ref.restLength = joint.restLength;
+        } else {
+            if (!state.restCaptured) {
+                state.capturedRestLength = glm::length(pointB - pointA);
+                state.restCaptured = true;
+            }
+            ref.restLength = state.capturedRestLength;
+        }
+        if ((joint.type == JointType::Fixed || (joint.type == JointType::Hinge && joint.enableLimits)) &&
+            !state.orientationCaptured) {
+            const glm::quat orientationA = m_bodies[ref.bodyA].body->orientation;
+            const glm::quat orientationB =
+                ref.hasBodyB ? m_bodies[ref.bodyB].body->orientation : glm::quat{1.0f, 0.0f, 0.0f, 0.0f};
+            state.capturedRelativeOrientation = glm::normalize(glm::inverse(orientationA) * orientationB);
+            state.orientationCaptured = true;
+        }
         m_joints.push_back(ref);
+    }
+    // Prune solver state for joints that vanished (destroyed,
+    // disabled, or no longer attached to a body).
+    {
+        std::vector<uint32_t> liveKeys;
+        liveKeys.reserve(m_joints.size());
+        for (const JointRef& ref : m_joints) {
+            liveKeys.push_back(entt::to_integral(ref.jointEntity));
+        }
+        std::sort(liveKeys.begin(), liveKeys.end());
+        for (auto it = m_jointStates.begin(); it != m_jointStates.end();) {
+            if (!std::binary_search(liveKeys.begin(), liveKeys.end(), it->first)) {
+                it = m_jointStates.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     std::sort(m_joints.begin(), m_joints.end(), [](const JointRef& a, const JointRef& b) {
         const uint32_t aB = a.hasBodyB ? a.bodyB : 0u;
@@ -2139,10 +2221,11 @@ void PhysicsSystem::solveConstraints(const PhysicsSettings& settings, JobSystem*
     }
 
     prepareWarmStarting(settings);
-    const auto solveOneIsland = [this, &settings](SolverIsland& island) {
+    prepareJointWarmStarting();
+    const auto solveOneIsland = [this, &settings, dt](SolverIsland& island) {
         for (uint32_t iteration = 0; iteration < settings.solverIterations; ++iteration) {
             for (const size_t jointIndex : island.joints) {
-                resolveJointVelocity(m_joints[jointIndex]);
+                resolveJointVelocity(m_joints[jointIndex], dt);
             }
             for (const size_t contactIndex : island.contacts) {
                 resolveVelocity(m_contacts[contactIndex], settings);
@@ -2476,95 +2559,386 @@ void PhysicsSystem::resolvePosition(Contact& contact, const PhysicsSettings& set
     }
 }
 
-void PhysicsSystem::resolveJointVelocity(const JointRef& ref) {
-    JointComponent& joint = *ref.joint;
-    RigidBodyComponent& a = *m_bodies[ref.bodyA].body;
-    RigidBodyComponent* b = ref.hasBodyB ? m_bodies[ref.bodyB].body : nullptr;
-    const float invA = inverseMass(ref.bodyA);
-    const float invB = ref.hasBodyB ? inverseMass(ref.bodyB) : 0.0f;
-    const float inverseMassSum = invA + invB;
-    if (inverseMassSum <= 0.0f || joint.type == JointType::SpringDamper) {
-        return; // spring-dampers are force constraints, applied before integration
-    }
-
-    const glm::vec3 pointA = m_bodies[ref.bodyA].transform->position + a.orientation * joint.anchorA;
-    glm::vec3 pointB = joint.anchorB;
-    if (ref.hasBodyB && b != nullptr) {
-        pointB = m_bodies[ref.bodyB].transform->position + b->orientation * joint.anchorB;
-    }
-    const glm::vec3 axis = pointB - pointA;
-    const float distance = glm::length(axis);
-    const glm::vec3 direction = distance > kEpsilon ? axis / distance : glm::vec3{1.0f, 0.0f, 0.0f};
-
-    if (joint.type == JointType::Hinge) {
-        const glm::vec3 hingeAxis = glm::dot(joint.hingeAxis, joint.hingeAxis) > kEpsilon
-                                        ? glm::normalize(joint.hingeAxis)
-                                        : glm::vec3{0.0f, 0.0f, 1.0f};
-        (void)hingeAxis;
-        const float scalarError = distance - ref.restLength;
-        const float velocityError = glm::dot((b != nullptr ? b->velocity : glm::vec3{0.0f}) - a.velocity, direction);
-        const float impulse = (-velocityError - scalarError * 0.2f) / inverseMassSum;
-        a.velocity -= direction * impulse * invA;
-        if (b != nullptr) {
-            b->velocity += direction * impulse * invB;
+void PhysicsSystem::prepareJointWarmStarting() {
+    for (const JointRef& ref : m_joints) {
+        JointComponent& joint = *ref.joint;
+        if (joint.type == JointType::SpringDamper) {
+            continue;
         }
-        return;
-    }
-
-    {
-        const int constraintPasses = (joint.type == JointType::Distance) ? 8 : 1;
-        for (int pass = 0; pass < constraintPasses; ++pass) {
-            const glm::vec3 currentPointA =
-                m_bodies[ref.bodyA].transform->position + a.orientation * joint.anchorA;
-            glm::vec3 currentPointB = joint.anchorB;
-            if (ref.hasBodyB && b != nullptr) {
-                currentPointB = m_bodies[ref.bodyB].transform->position + b->orientation * joint.anchorB;
+        const auto found = m_jointStates.find(entt::to_integral(ref.jointEntity));
+        if (found == m_jointStates.end()) {
+            continue;
+        }
+        const JointSolverState& state = found->second;
+        RigidBodyComponent& bodyA = *m_bodies[ref.bodyA].body;
+        const glm::vec3 pointA = m_bodies[ref.bodyA].transform->position + bodyA.orientation * joint.anchorA;
+        glm::vec3 pointB = joint.anchorB;
+        glm::quat orientationB{1.0f, 0.0f, 0.0f, 0.0f};
+        if (ref.hasBodyB) {
+            RigidBodyComponent& bodyB = *m_bodies[ref.bodyB].body;
+            pointB = m_bodies[ref.bodyB].transform->position + bodyB.orientation * joint.anchorB;
+            orientationB = bodyB.orientation;
+        }
+        // Re-apply the accumulated impulses through the CURRENT
+        // Jacobians, as one set, before any velocity error is
+        // measured — the same protocol as contact warm starting.
+        if (joint.type == JointType::Distance) {
+            const glm::vec3 axis = pointB - pointA;
+            const float distance = glm::length(axis);
+            if (distance > kEpsilon && state.distanceImpulse != 0.0f) {
+                const glm::vec3 impulse = (axis / distance) * state.distanceImpulse;
+                applyImpulseAtPoint(ref.bodyA, pointA, impulse, -1.0f);
+                if (ref.hasBodyB) {
+                    applyImpulseAtPoint(ref.bodyB, pointB, impulse, 1.0f);
+                }
             }
-            const glm::vec3 currentAxis = currentPointB - currentPointA;
-            const float currentDistance = glm::length(currentAxis);
-            const glm::vec3 currentDirection =
-                currentDistance > kEpsilon ? currentAxis / currentDistance : glm::vec3{1.0f, 0.0f, 0.0f};
-            const float error = currentDistance - ref.restLength;
-            const glm::vec3 velocity = (b != nullptr ? b->velocity : glm::vec3{0.0f}) - a.velocity;
-            const float velocityError = glm::dot(velocity, currentDirection);
-            const float stiffnessFactor = joint.type == JointType::Distance
-                                             ? 1.0f
-                                             : glm::clamp(joint.stiffness / std::max(1.0f, joint.stiffness), 0.1f, 1.0f);
-            const float bias = joint.type == JointType::Distance ? error * 0.8f : error * joint.stiffness * 0.002f;
-            const float impulse = (-velocityError - bias) * stiffnessFactor / inverseMassSum;
-            a.velocity -= currentDirection * impulse * invA;
-            if (b != nullptr) {
-                b->velocity += currentDirection * impulse * invB;
+            continue;
+        }
+        if (glm::dot(state.pointImpulse, state.pointImpulse) > 0.0f) {
+            applyImpulseAtPoint(ref.bodyA, pointA, state.pointImpulse, -1.0f);
+            if (ref.hasBodyB) {
+                applyImpulseAtPoint(ref.bodyB, pointB, state.pointImpulse, 1.0f);
+            }
+        }
+        glm::vec3 angularImpulse = state.angularImpulse;
+        if (joint.type == JointType::Hinge) {
+            const glm::vec3 axisLocal = glm::dot(joint.hingeAxis, joint.hingeAxis) > kEpsilon
+                                            ? glm::normalize(joint.hingeAxis)
+                                            : glm::vec3{0.0f, 0.0f, 1.0f};
+            const glm::vec3 axisA = glm::normalize(bodyA.orientation * axisLocal);
+            glm::vec3 tangent1;
+            glm::vec3 tangent2;
+            perpendicularBasis(axisA, tangent1, tangent2);
+            angularImpulse = tangent1 * state.axisImpulse.x + tangent2 * state.axisImpulse.y +
+                             axisA * state.limitImpulse;
+        }
+        if (glm::dot(angularImpulse, angularImpulse) > 0.0f) {
+            if (solverInverseMass(ref.bodyA) > 0.0f) {
+                bodyA.angularMomentum -= angularImpulse;
+            }
+            if (ref.hasBodyB && solverInverseMass(ref.bodyB) > 0.0f) {
+                m_bodies[ref.bodyB].body->angularMomentum += angularImpulse;
             }
         }
     }
 }
 
+void PhysicsSystem::solveJointLinearRow(const JointRef& ref, const glm::vec3& pointA, const glm::vec3& pointB,
+                                        const glm::vec3& direction, float biasVelocity, float& accumulated,
+                                        float minAccumulated, float maxAccumulated) {
+    // Cap the Baumgarte correction speed: an unclamped beta*C/dt bias
+    // turns a large positional error (teleport, spawn overlap) into an
+    // equally large target velocity and launches the bodies; the
+    // position pass removes bulk error without adding energy.
+    biasVelocity = glm::clamp(biasVelocity, -2.0f, 2.0f);
+    const float invA = solverInverseMass(ref.bodyA);
+    const float invB = ref.hasBodyB ? solverInverseMass(ref.bodyB) : 0.0f;
+    // Effective-mass denominator: inverse masses plus the angular
+    // response of both bodies to an impulse at their anchor points.
+    float denominator = invA + invB;
+    if (invA > 0.0f) {
+        const glm::vec3 lever = glm::cross(pointA - m_bodies[ref.bodyA].transform->position, direction);
+        denominator += glm::dot(lever, inverseInertiaWorld(ref.bodyA, lever));
+    }
+    if (ref.hasBodyB && invB > 0.0f) {
+        const glm::vec3 lever = glm::cross(pointB - m_bodies[ref.bodyB].transform->position, direction);
+        denominator += glm::dot(lever, inverseInertiaWorld(ref.bodyB, lever));
+    }
+    if (denominator <= kEpsilon) {
+        return;
+    }
+    glm::vec3 relativeVelocity = -pointVelocity(ref.bodyA, pointA);
+    if (ref.hasBodyB) {
+        relativeVelocity += pointVelocity(ref.bodyB, pointB);
+    }
+    const float lambda = -(glm::dot(relativeVelocity, direction) + biasVelocity) / denominator;
+    const float newAccumulated = glm::clamp(accumulated + lambda, minAccumulated, maxAccumulated);
+    const float applied = newAccumulated - accumulated;
+    accumulated = newAccumulated;
+    if (applied == 0.0f) {
+        return;
+    }
+    const glm::vec3 impulse = direction * applied;
+    if (invA > 0.0f) {
+        applyImpulseAtPoint(ref.bodyA, pointA, impulse, -1.0f);
+    }
+    if (ref.hasBodyB && invB > 0.0f) {
+        applyImpulseAtPoint(ref.bodyB, pointB, impulse, 1.0f);
+    }
+}
+
+void PhysicsSystem::solveJointAngularRow(const JointRef& ref, const glm::vec3& axis, float biasVelocity,
+                                         float& accumulated, float minAccumulated, float maxAccumulated) {
+    biasVelocity = glm::clamp(biasVelocity, -2.0f, 2.0f); // see solveJointLinearRow
+    const bool activeA = solverInverseMass(ref.bodyA) > 0.0f;
+    const bool activeB = ref.hasBodyB && solverInverseMass(ref.bodyB) > 0.0f;
+    float denominator = 0.0f;
+    if (activeA) {
+        denominator += glm::dot(axis, inverseInertiaWorld(ref.bodyA, axis));
+    }
+    if (activeB) {
+        denominator += glm::dot(axis, inverseInertiaWorld(ref.bodyB, axis));
+    }
+    if (denominator <= kEpsilon) {
+        return;
+    }
+    glm::vec3 relativeAngular = -angularVelocityRad(ref.bodyA);
+    if (ref.hasBodyB) {
+        relativeAngular += angularVelocityRad(ref.bodyB);
+    }
+    const float lambda = -(glm::dot(relativeAngular, axis) + biasVelocity) / denominator;
+    const float newAccumulated = glm::clamp(accumulated + lambda, minAccumulated, maxAccumulated);
+    const float applied = newAccumulated - accumulated;
+    accumulated = newAccumulated;
+    if (applied == 0.0f) {
+        return;
+    }
+    const glm::vec3 impulse = axis * applied;
+    if (activeA) {
+        m_bodies[ref.bodyA].body->angularMomentum -= impulse;
+    }
+    if (activeB) {
+        m_bodies[ref.bodyB].body->angularMomentum += impulse;
+    }
+}
+
+void PhysicsSystem::resolveJointVelocity(const JointRef& ref, float dt) {
+    JointComponent& joint = *ref.joint;
+    if (joint.type == JointType::SpringDamper) {
+        return; // spring-dampers are force constraints, applied before integration
+    }
+    if (solverInverseMass(ref.bodyA) <= 0.0f && (!ref.hasBodyB || solverInverseMass(ref.bodyB) <= 0.0f)) {
+        return; // both sides immovable (static or asleep): nothing can move
+    }
+    JointSolverState& state = m_jointStates[entt::to_integral(ref.jointEntity)];
+    RigidBodyComponent& bodyA = *m_bodies[ref.bodyA].body;
+    const glm::quat orientationA = bodyA.orientation;
+    const glm::vec3 pointA = m_bodies[ref.bodyA].transform->position + orientationA * joint.anchorA;
+    glm::vec3 pointB = joint.anchorB;
+    glm::quat orientationB{1.0f, 0.0f, 0.0f, 0.0f};
+    if (ref.hasBodyB) {
+        RigidBodyComponent& bodyB = *m_bodies[ref.bodyB].body;
+        pointB = m_bodies[ref.bodyB].transform->position + bodyB.orientation * joint.anchorB;
+        orientationB = bodyB.orientation;
+    }
+    // Baumgarte-style error feedback, softened by compliance.
+    const float compliance = glm::clamp(joint.compliance, 0.0f, 1.0f);
+    const float biasScale = dt > 0.0f ? 0.2f * (1.0f - 0.9f * compliance) / dt : 0.0f;
+    const float kInfinite = std::numeric_limits<float>::infinity();
+
+    if (joint.type == JointType::Distance) {
+        const glm::vec3 axis = pointB - pointA;
+        const float distance = glm::length(axis);
+        if (distance <= kEpsilon) {
+            return;
+        }
+        const glm::vec3 direction = axis / distance;
+        const bool bounded = joint.minDistance >= 0.0f || joint.maxDistance >= 0.0f;
+        if (!bounded) {
+            solveJointLinearRow(ref, pointA, pointB, direction, biasScale * (distance - ref.restLength),
+                                state.distanceImpulse, -kInfinite, kInfinite);
+        } else if (joint.maxDistance >= 0.0f && distance > joint.maxDistance) {
+            // Rope taut: only pull together (accumulated <= 0).
+            solveJointLinearRow(ref, pointA, pointB, direction, biasScale * (distance - joint.maxDistance),
+                                state.distanceImpulse, -kInfinite, 0.0f);
+        } else if (joint.minDistance >= 0.0f && distance < joint.minDistance) {
+            // Strut compressed: only push apart (accumulated >= 0).
+            solveJointLinearRow(ref, pointA, pointB, direction, biasScale * (distance - joint.minDistance),
+                                state.distanceImpulse, 0.0f, kInfinite);
+        } else {
+            state.distanceImpulse = 0.0f; // slack: forget the warm impulse
+        }
+        return;
+    }
+
+    // Hinge and Fixed share the anchor-coincidence (point) rows.
+    const glm::vec3 anchorError = pointB - pointA;
+    const glm::vec3 basis[3] = {glm::vec3{1.0f, 0.0f, 0.0f}, glm::vec3{0.0f, 1.0f, 0.0f},
+                                glm::vec3{0.0f, 0.0f, 1.0f}};
+    for (int row = 0; row < 3; ++row) {
+        solveJointLinearRow(ref, pointA, pointB, basis[row], biasScale * anchorError[row],
+                            state.pointImpulse[row], -kInfinite, kInfinite);
+    }
+
+    if (joint.type == JointType::Hinge) {
+        const glm::vec3 axisLocal = glm::dot(joint.hingeAxis, joint.hingeAxis) > kEpsilon
+                                        ? glm::normalize(joint.hingeAxis)
+                                        : glm::vec3{0.0f, 0.0f, 1.0f};
+        const glm::vec3 axisA = glm::normalize(orientationA * axisLocal);
+        const glm::vec3 axisB = glm::normalize(orientationB * axisLocal);
+        glm::vec3 tangent1;
+        glm::vec3 tangent2;
+        perpendicularBasis(axisA, tangent1, tangent2);
+        // Lock the two angular degrees of freedom perpendicular to
+        // the hinge axis; rotation about the axis itself stays free.
+        const glm::vec3 misalignment = glm::cross(axisA, axisB);
+        solveJointAngularRow(ref, tangent1, biasScale * glm::dot(misalignment, tangent1), state.axisImpulse.x,
+                             -kInfinite, kInfinite);
+        solveJointAngularRow(ref, tangent2, biasScale * glm::dot(misalignment, tangent2), state.axisImpulse.y,
+                             -kInfinite, kInfinite);
+        if (joint.enableLimits && state.orientationCaptured) {
+            const glm::quat relative = glm::normalize(glm::inverse(orientationA) * orientationB);
+            const float angle = twistAngleDegrees(relative, state.capturedRelativeOrientation, axisLocal);
+            if (angle > joint.maxAngleDegrees) {
+                solveJointAngularRow(ref, axisA, biasScale * glm::radians(angle - joint.maxAngleDegrees),
+                                     state.limitImpulse, -kInfinite, 0.0f);
+            } else if (angle < joint.minAngleDegrees) {
+                solveJointAngularRow(ref, axisA, biasScale * glm::radians(angle - joint.minAngleDegrees),
+                                     state.limitImpulse, 0.0f, kInfinite);
+            } else {
+                state.limitImpulse = 0.0f;
+            }
+        }
+        return;
+    }
+
+    // Fixed: lock the relative orientation to the captured one. The
+    // error is measured on body B against its target orientation
+    // (for a world joint, body B is the identity frame and the same
+    // formula reduces to locking body A's captured orientation).
+    if (state.orientationCaptured) {
+        const glm::quat targetB = glm::normalize(orientationA * state.capturedRelativeOrientation);
+        const glm::vec3 error = quatErrorVector(glm::normalize(orientationB * glm::inverse(targetB)));
+        for (int row = 0; row < 3; ++row) {
+            solveJointAngularRow(ref, basis[row], biasScale * error[row], state.angularImpulse[row],
+                                 -kInfinite, kInfinite);
+        }
+    }
+}
+
+void PhysicsSystem::rotateJointBody(uint32_t bodyIndex, const glm::quat& worldDelta) {
+    if (solverInverseMass(bodyIndex) <= 0.0f) {
+        return;
+    }
+    RigidBodyComponent& body = *m_bodies[bodyIndex].body;
+    body.orientation = glm::normalize(worldDelta * body.orientation);
+    m_bodies[bodyIndex].transform->setOrientation(body.orientation);
+}
+
 void PhysicsSystem::resolveJointPosition(const JointRef& ref) {
     JointComponent& joint = *ref.joint;
-    RigidBodyComponent& a = *m_bodies[ref.bodyA].body;
-    RigidBodyComponent* b = ref.hasBodyB ? m_bodies[ref.bodyB].body : nullptr;
-    const float invA = inverseMass(ref.bodyA);
-    const float invB = ref.hasBodyB ? inverseMass(ref.bodyB) : 0.0f;
+    if (joint.type == JointType::SpringDamper) {
+        return;
+    }
+    const float invA = solverInverseMass(ref.bodyA);
+    const float invB = ref.hasBodyB ? solverInverseMass(ref.bodyB) : 0.0f;
     const float inverseMassSum = invA + invB;
     if (inverseMassSum <= 0.0f) {
         return;
     }
-    const glm::vec3 pointA = m_bodies[ref.bodyA].transform->position + a.orientation * joint.anchorA;
+    RigidBodyComponent& bodyA = *m_bodies[ref.bodyA].body;
+    const glm::quat orientationA = bodyA.orientation;
+    const glm::vec3 pointA = m_bodies[ref.bodyA].transform->position + orientationA * joint.anchorA;
     glm::vec3 pointB = joint.anchorB;
-    if (ref.hasBodyB && b != nullptr) {
-        pointB = m_bodies[ref.bodyB].transform->position + b->orientation * joint.anchorB;
+    glm::quat orientationB{1.0f, 0.0f, 0.0f, 0.0f};
+    if (ref.hasBodyB) {
+        RigidBodyComponent& bodyB = *m_bodies[ref.bodyB].body;
+        pointB = m_bodies[ref.bodyB].transform->position + bodyB.orientation * joint.anchorB;
+        orientationB = bodyB.orientation;
     }
-    const glm::vec3 axis = pointB - pointA;
-    const float distance = glm::length(axis);
-    const float strength = joint.type == JointType::Distance ? 0.35f : 0.05f;
-    const glm::vec3 correction = axis * ((distance - ref.restLength) / distance * strength);
-    if (invA > 0.0f) {
+    const float compliance = glm::clamp(joint.compliance, 0.0f, 1.0f);
+    const float strength = 0.8f * (1.0f - 0.9f * compliance);
+
+    if (joint.type == JointType::Distance) {
+        const glm::vec3 axis = pointB - pointA;
+        const float distance = glm::length(axis);
+        if (distance <= kEpsilon) {
+            return;
+        }
+        float error = distance - ref.restLength;
+        if (joint.minDistance >= 0.0f || joint.maxDistance >= 0.0f) {
+            error = 0.0f;
+            if (joint.maxDistance >= 0.0f && distance > joint.maxDistance) {
+                error = distance - joint.maxDistance;
+            } else if (joint.minDistance >= 0.0f && distance < joint.minDistance) {
+                error = distance - joint.minDistance;
+            }
+            if (error == 0.0f) {
+                return;
+            }
+        }
+        const glm::vec3 correction = (axis / distance) * (error * strength);
         m_bodies[ref.bodyA].transform->position += correction * (invA / inverseMassSum);
+        if (ref.hasBodyB) {
+            m_bodies[ref.bodyB].transform->position -= correction * (invB / inverseMassSum);
+        }
+        return;
     }
-    if (ref.hasBodyB && invB > 0.0f) {
-        m_bodies[ref.bodyB].transform->position -= correction * (invB / inverseMassSum);
+
+    // Hinge/Fixed: project the anchor points together (mass-shared
+    // translation; orientation is handled below).
+    const glm::vec3 delta = (pointB - pointA) * strength;
+    m_bodies[ref.bodyA].transform->position += delta * (invA / inverseMassSum);
+    if (ref.hasBodyB) {
+        m_bodies[ref.bodyB].transform->position -= delta * (invB / inverseMassSum);
     }
+
+    const auto inertiaWeight = [this](uint32_t bodyIndex, const glm::vec3& axis) {
+        return solverInverseMass(bodyIndex) > 0.0f
+                   ? std::max(0.0f, glm::dot(axis, inverseInertiaWorld(bodyIndex, axis)))
+                   : 0.0f;
+    };
+
+    if (joint.type == JointType::Hinge) {
+        const glm::vec3 axisLocal = glm::dot(joint.hingeAxis, joint.hingeAxis) > kEpsilon
+                                        ? glm::normalize(joint.hingeAxis)
+                                        : glm::vec3{0.0f, 0.0f, 1.0f};
+        const glm::vec3 axisA = glm::normalize(orientationA * axisLocal);
+        const glm::vec3 axisB = glm::normalize(orientationB * axisLocal);
+        const glm::vec3 cross = glm::cross(axisB, axisA);
+        const float sine = glm::length(cross);
+        if (sine > 1e-6f) {
+            const glm::vec3 axis = cross / sine;
+            const float angle = std::atan2(sine, glm::clamp(glm::dot(axisA, axisB), -1.0f, 1.0f));
+            const float weightA = inertiaWeight(ref.bodyA, axis);
+            const float weightB = ref.hasBodyB ? inertiaWeight(ref.bodyB, axis) : 0.0f;
+            const float weightSum = weightA + weightB;
+            if (weightSum > kEpsilon) {
+                // Rotating B about cross(B, A) by +angle aligns the
+                // axes; A counter-rotates by its inertia share.
+                if (ref.hasBodyB) {
+                    rotateJointBody(ref.bodyB, glm::angleAxis(angle * strength * (weightB / weightSum), axis));
+                }
+                rotateJointBody(ref.bodyA, glm::angleAxis(-angle * strength * (weightA / weightSum), axis));
+            }
+        }
+        return;
+    }
+
+    // Fixed: rotate both bodies toward the captured relative
+    // orientation (the rotation taking B to its target, shared by
+    // inverse inertia; a world joint spends it all on body A).
+    const auto found = m_jointStates.find(entt::to_integral(ref.jointEntity));
+    if (found == m_jointStates.end() || !found->second.orientationCaptured) {
+        return;
+    }
+    const glm::quat captured = found->second.capturedRelativeOrientation;
+    glm::quat deltaRotation;
+    if (ref.hasBodyB) {
+        const glm::quat targetB = glm::normalize(orientationA * captured);
+        deltaRotation = glm::normalize(targetB * glm::inverse(orientationB));
+    } else {
+        const glm::quat targetA = glm::normalize(glm::inverse(captured));
+        deltaRotation = glm::normalize(targetA * glm::inverse(orientationA));
+    }
+    glm::vec3 axis;
+    float angle = 0.0f;
+    quatToAxisAngle(deltaRotation, axis, angle);
+    if (angle <= 1e-6f) {
+        return;
+    }
+    if (!ref.hasBodyB) {
+        rotateJointBody(ref.bodyA, glm::angleAxis(angle * strength, axis));
+        return;
+    }
+    const float weightA = inertiaWeight(ref.bodyA, axis);
+    const float weightB = inertiaWeight(ref.bodyB, axis);
+    const float weightSum = weightA + weightB;
+    if (weightSum <= kEpsilon) {
+        return;
+    }
+    rotateJointBody(ref.bodyB, glm::angleAxis(angle * strength * (weightB / weightSum), axis));
+    rotateJointBody(ref.bodyA, glm::angleAxis(-angle * strength * (weightA / weightSum), axis));
 }
 
 } // namespace engine

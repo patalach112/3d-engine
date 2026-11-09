@@ -259,19 +259,104 @@ struct GravityFieldComponent {
     bool enabled = true;
 };
 
-enum class JointType : uint8_t { Distance, Hinge, SpringDamper };
+enum class JointType : uint8_t { Distance, Hinge, Fixed, SpringDamper };
 
-// Constraint between the entity carrying this component and `other`.
+// ---------------------------------------------------------------------------
+// JointComponent (Phase 16: constraints & joints)
+//
+// A constraint between the entity carrying this component (body A) and
+// `other` (body B), or the world when `other` is null (anchorB and
+// hingeAxis are then world-space). Anchors are points in each body's
+// local frame; hingeAxis is the rotation axis in both bodies' local
+// frames. Joint types:
+//
+//   Distance    — holds the anchor separation at restLength (a rigid
+//                 rod), or inside [minDistance, maxDistance] when
+//                 bounds are set (a rope/cable when only maxDistance
+//                 is given). Negative restLength captures the
+//                 separation when the solver first sees the joint.
+//   Hinge       — a revolute joint: the anchor points coincide and
+//                 the bodies can only rotate relative to each other
+//                 about hingeAxis (doors, pendulums). enableLimits
+//                 clamps the twist angle about the axis, measured in
+//                 degrees from the relative orientation captured when
+//                 the solver first sees the joint.
+//   Fixed       — a weld: relative position and orientation are
+//                 locked to the configuration captured when the
+//                 solver first sees the joint.
+//   SpringDamper— a force spring between the anchors (stiffness in
+//                 N/m, damping in N*s/m); the only non-rigid type,
+//                 applied as an external force before integration.
+//
+// `compliance` (0..1) softens the rigid types: 0 is a hard constraint,
+// higher values scale down the solver's error feedback so the joint
+// yields elastically. All rigid types are solved with sequential
+// impulses (full point Jacobians with angular terms, effective-mass
+// denominators, accumulated-impulse clamping) and are warm-started
+// across sub-steps from persistent per-joint impulse state.
+// ---------------------------------------------------------------------------
 struct JointComponent {
     entt::entity other = entt::null;
     JointType type = JointType::Distance;
     glm::vec3 anchorA{0.0f};
     glm::vec3 anchorB{0.0f};
     glm::vec3 hingeAxis{0.0f, 1.0f, 0.0f};
-    float restLength = -1.0f; // negative: capture the current distance
-    float stiffness = 100.0f; // SpringDamper: N/m
-    float damping = 5.0f;     // SpringDamper: N*s/m
+    float restLength = -1.0f; // Distance: negative captures the current separation
+    float minDistance = -1.0f; // Distance: lower bound (negative: unbounded below)
+    float maxDistance = -1.0f; // Distance: upper bound (negative: unbounded above)
+    float minAngleDegrees = -180.0f; // Hinge twist limits (from the captured zero)
+    float maxAngleDegrees = 180.0f;
+    bool enableLimits = false; // Hinge: enforce the twist limits
+    float compliance = 0.0f;   // rigid types: 0 hard .. 1 very soft
+    float stiffness = 100.0f;  // SpringDamper: N/m
+    float damping = 5.0f;      // SpringDamper: N*s/m
     bool enabled = true;
+
+    [[nodiscard]] static JointComponent distance(entt::entity other_, const glm::vec3& anchorA_,
+                                                 const glm::vec3& anchorB_, float restLength_) {
+        JointComponent joint;
+        joint.other = other_;
+        joint.type = JointType::Distance;
+        joint.anchorA = anchorA_;
+        joint.anchorB = anchorB_;
+        joint.restLength = restLength_;
+        return joint;
+    }
+
+    [[nodiscard]] static JointComponent hinge(entt::entity other_, const glm::vec3& anchorA_,
+                                              const glm::vec3& anchorB_, const glm::vec3& axis_) {
+        JointComponent joint;
+        joint.other = other_;
+        joint.type = JointType::Hinge;
+        joint.anchorA = anchorA_;
+        joint.anchorB = anchorB_;
+        joint.hingeAxis = axis_;
+        return joint;
+    }
+
+    [[nodiscard]] static JointComponent fixed(entt::entity other_, const glm::vec3& anchorA_,
+                                              const glm::vec3& anchorB_) {
+        JointComponent joint;
+        joint.other = other_;
+        joint.type = JointType::Fixed;
+        joint.anchorA = anchorA_;
+        joint.anchorB = anchorB_;
+        return joint;
+    }
+
+    [[nodiscard]] static JointComponent springDamper(entt::entity other_, const glm::vec3& anchorA_,
+                                                     const glm::vec3& anchorB_, float restLength_,
+                                                     float stiffness_, float damping_) {
+        JointComponent joint;
+        joint.other = other_;
+        joint.type = JointType::SpringDamper;
+        joint.anchorA = anchorA_;
+        joint.anchorB = anchorB_;
+        joint.restLength = restLength_;
+        joint.stiffness = stiffness_;
+        joint.damping = damping_;
+        return joint;
+    }
 };
 
 // Local-space propulsion. Force is applied at localPosition, so offset

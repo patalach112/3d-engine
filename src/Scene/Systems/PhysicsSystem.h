@@ -181,8 +181,27 @@ private:
         uint32_t bodyA = 0; // entity carrying the JointComponent
         uint32_t bodyB = 0; // JointComponent::other, when present
         JointComponent* joint = nullptr;
+        entt::entity jointEntity = entt::null; // key into m_jointStates
         bool hasBodyB = false;
-        float restLength = 0.0f; // resolved from a negative component value
+        float restLength = 0.0f; // resolved (explicit, or captured once)
+    };
+
+    // Persistent per-joint solver state, keyed by the joint-owning
+    // entity: warm-start impulses (accumulated, clamped during the
+    // velocity solve) and one-time captures (rest length and the
+    // reference relative orientation that hinge limits and fixed
+    // joints measure their error against). Lives across sub-steps
+    // and steps; pruned when a joint disappears.
+    struct JointSolverState {
+        float distanceImpulse = 0.0f;      // Distance row accumulator
+        glm::vec3 pointImpulse{0.0f};      // Hinge/Fixed anchor rows (world axes)
+        glm::vec2 axisImpulse{0.0f};       // Hinge axis-alignment rows
+        glm::vec3 angularImpulse{0.0f};    // Fixed orientation rows (world axes)
+        float limitImpulse = 0.0f;         // Hinge twist-limit row
+        bool restCaptured = false;
+        float capturedRestLength = 0.0f;
+        bool orientationCaptured = false;
+        glm::quat capturedRelativeOrientation{1.0f, 0.0f, 0.0f, 0.0f}; // inverse(qA) * qB
     };
 
     struct SolverIsland {
@@ -235,8 +254,23 @@ private:
                              float sign);
     void wakeBody(uint32_t bodyIndex);
     void stepOnce(Scene& scene, double fixedDeltaSeconds, const PhysicsSettings& settings, JobSystem* jobs);
-    void resolveJointVelocity(const JointRef& joint);
+    void prepareJointWarmStarting();
+    void resolveJointVelocity(const JointRef& joint, float dt);
     void resolveJointPosition(const JointRef& joint);
+    // One scalar sequential-impulse row along `direction` acting at
+    // the two anchor points, with the accumulated impulse clamped to
+    // [minAccumulated, maxAccumulated] (bilateral rows pass infinite
+    // bounds; unilateral bound/limit rows clamp one side to zero).
+    // biasVelocity is the Baumgarte error feedback (beta * C / dt).
+    void solveJointLinearRow(const JointRef& ref, const glm::vec3& pointA, const glm::vec3& pointB,
+                             const glm::vec3& direction, float biasVelocity, float& accumulated,
+                             float minAccumulated, float maxAccumulated);
+    // The angular twin: a row on the relative angular velocity along
+    // a world axis, for hinge axis alignment, hinge limits and fixed
+    // orientation locking.
+    void solveJointAngularRow(const JointRef& ref, const glm::vec3& axis, float biasVelocity,
+                              float& accumulated, float minAccumulated, float maxAccumulated);
+    void rotateJointBody(uint32_t bodyIndex, const glm::quat& worldDelta);
     [[nodiscard]] float inverseMass(uint32_t bodyIndex) const;
     [[nodiscard]] glm::vec3 inverseInertiaWorld(uint32_t bodyIndex, const glm::vec3& vector) const;
     [[nodiscard]] std::optional<uint32_t> bodyIndexFor(entt::entity entity) const;
@@ -260,6 +294,7 @@ private:
     std::vector<GravitySource> m_gravitySources;
     std::vector<ThrusterRef> m_thrusters;
     std::vector<JointRef> m_joints;
+    std::unordered_map<uint32_t, JointSolverState> m_jointStates; // key: joint entity integral
     std::vector<SolverIsland> m_islands;
     std::vector<SpawnState> m_spawnStates;
     // Force/torque accumulated by gameplay code before an update: these
