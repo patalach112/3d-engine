@@ -31,6 +31,9 @@ struct RenderConfig {
     PresentationMode presentMode = PresentationMode::Auto;
     // Skip drawing entities whose bounds are outside the view frustum.
     bool frustumCulling = true;
+    // Additionally skip entities fully occluded (conservative
+    // screen-space test) by static box/OBB colliders.
+    bool occlusionCulling = false;
     // Sort draw items by material, then front-to-back, before submission.
     bool sortDrawItems = true;
     // On-screen FPS HUD (bitmap-font overlay): live FPS / frame time /

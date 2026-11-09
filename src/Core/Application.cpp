@@ -36,7 +36,8 @@ Application::Application(EngineConfig config)
       m_stagingBudget(static_cast<uint64_t>(m_config.render.stagingBufferBudgetMiB) * 1024 * 1024),
       m_assets(m_vramBudget, m_stagingBudget),
       m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
-                     m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems, &m_assets) {
+                     m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems, &m_assets,
+                     m_config.render.occlusionCulling) {
     ENGINE_LOG_INFO("Hardware profile: JobSystem workers "
                     << m_jobSystem.workerCount() << " (+ main thread), parallel batch "
                     << m_config.performance.parallelBatchSize << " items, VRAM budget "
@@ -298,6 +299,28 @@ void Application::buildScene() {
     floorBody.restitution = 0.35f;
     floorBody.friction = 0.6f;
     floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+    // Dynamic lights (Phase 21): a warm point light hovering over
+    // the sandbox and a downward spotlight aimed at the floor.
+    // LightingSystem gathers them every frame; the fragment shader
+    // applies smooth distance attenuation, so pools of light move
+    // correctly as the camera flies around.
+    Entity pointLight = m_scene.createEntity("WarmPointLight");
+    pointLight.addComponent<TransformComponent>(glm::vec3{0.0f, 3.0f, -2.0f});
+    auto& warmLight = pointLight.addComponent<PointLightComponent>();
+    warmLight.color = glm::vec3{1.0f, 0.72f, 0.42f};
+    warmLight.intensity = 42.0f;
+    warmLight.range = 14.0f;
+
+    Entity spotLight = m_scene.createEntity("FloorSpotLight");
+    auto& spotTransform = spotLight.addComponent<TransformComponent>(glm::vec3{2.5f, 5.0f, -1.0f});
+    spotTransform.rotationDegrees = glm::vec3{-90.0f, 0.0f, 0.0f}; // aim -Z downward
+    auto& spot = spotLight.addComponent<SpotLightComponent>();
+    spot.color = glm::vec3{0.75f, 0.85f, 1.0f};
+    spot.intensity = 55.0f;
+    spot.range = 16.0f;
+    spot.innerConeRadians = 0.45f;
+    spot.outerConeRadians = 0.75f;
 
     // Falling/bouncing rigid-body cubes. Their unit-cube mesh is scaled
     // by TransformComponent; the box collider's local half-extents are

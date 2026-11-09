@@ -3,6 +3,7 @@
 
 #include "Geometry/Bounds.h"
 #include "Geometry/Ray.h"
+#include "Graphics/Frustum.h"
 
 #include <entt/entt.hpp>
 
@@ -84,6 +85,36 @@ public:
             stack.pop_back();
             const Node& node = m_nodes[static_cast<size_t>(nodeIndex)];
             if (!node.box.overlaps(queryBox)) {
+                continue;
+            }
+            if (node.isLeaf()) {
+                if (!callback(node.entity)) {
+                    return;
+                }
+            } else {
+                stack.push_back(node.child1);
+                stack.push_back(node.child2);
+            }
+        }
+    }
+
+    // Calls `callback(entity)` for every leaf whose fat box
+    // intersects the view frustum. Internal nodes are tested with
+    // the same p-vertex AABB test, so subtrees lying fully outside
+    // are pruned at their root and never descended. Fat boxes make
+    // the result a conservative superset, exactly like query().
+    template <typename Callback>
+    void queryFrustum(const Frustum& frustum, Callback&& callback) const {
+        if (m_root == kNullProxy) {
+            return;
+        }
+        std::vector<int32_t> stack;
+        stack.push_back(m_root);
+        while (!stack.empty()) {
+            const int32_t nodeIndex = stack.back();
+            stack.pop_back();
+            const Node& node = m_nodes[static_cast<size_t>(nodeIndex)];
+            if (!frustum.intersects(node.box)) {
                 continue;
             }
             if (node.isLeaf()) {

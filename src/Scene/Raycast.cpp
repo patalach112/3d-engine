@@ -2,6 +2,7 @@
 
 #include "Scene/Scene.h"
 #include "Scene/Systems/TransformSystem.h"
+#include "Graphics/Frustum.h"
 
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -279,6 +280,16 @@ bool Scene::raycastPrecise(const Ray& ray, RaycastHit& outHit, const MeshResolve
     outHit = *std::min_element(hits.begin(), hits.end(),
                                [](const RaycastHit& a, const RaycastHit& b) { return a.distance < b.distance; });
     return true;
+}
+
+std::vector<entt::entity> Scene::queryFrustum(const Frustum& frustum) const {
+    syncRaycastTree();
+    std::vector<entt::entity> visible;
+    m_raycastTree.queryFrustum(frustum, [&visible](entt::entity entity) {
+        visible.push_back(entity);
+        return true;
+    });
+    return visible;
 }
 
 } // namespace engine

@@ -102,7 +102,7 @@ endif()
 function(engine_module target building_macro)
     add_library(${target} ${ENGINE_LIBRARY_TYPE} ${ARGN})
     add_library(Engine::${target} ALIAS ${target})
-    target_include_directories(${target} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(${target} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/Engine)
     target_compile_definitions(${target}
         PUBLIC GLM_FORCE_RADIANS GLM_FORCE_DEPTH_ZERO_TO_ONE
         PRIVATE ${building_macro}=1)
@@ -188,6 +188,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Raycast.cpp
     src/Scene/DynamicAABBTree.cpp
     src/Scene/Systems/CameraSystem.cpp
+    src/Scene/Systems/LightingSystem.cpp
     src/Scene/Systems/PhysicsSystem.cpp
     src/Scene/Systems/PlayerSystem.cpp
     src/Scene/Systems/RotationSystem.cpp

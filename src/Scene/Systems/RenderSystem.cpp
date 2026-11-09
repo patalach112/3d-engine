@@ -5,12 +5,17 @@
 #include "Core/Jobs/JobSystem.h"
 #include "Core/Logger.h"
 #include "Graphics/Frustum.h"
+#include "Graphics/OcclusionCulling.h"
+
+#include <glm/geometric.hpp>
 #include "Graphics/Renderer.h"
 #include "Graphics/Swapchain.h"
 #include "Scene/Scene.h"
 
+#include <algorithm>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 
 namespace engine {
 namespace {
@@ -32,18 +37,42 @@ uint32_t materialIdFor(std::string_view assetId) {
 // fetched by entity handle through the view (read-only sparse-array
 // lookups into dense storage); writes go to a disjoint output slot, so
 // ranges are safe to run concurrently.
+// Largest world-space stretch of a model matrix (max basis length):
+// scales a local bounding sphere into world space.
+float maxBasisScale(const glm::mat4& model) {
+    return std::max({glm::length(glm::vec3{model[0]}), glm::length(glm::vec3{model[1]}),
+                     glm::length(glm::vec3{model[2]})});
+}
+
 template <typename View>
 void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum, const glm::mat4& viewMatrix,
-                  bool cullingEnabled, const AssetManager* assets, const glm::mat4& model,
-                  const glm::vec3& worldPosition, std::optional<DrawItem>& outItem, char& outCulled) {
+                  const glm::mat4& viewProjection, bool cullingEnabled, const AssetManager* assets,
+                  const glm::mat4& model, const glm::vec3& worldPosition,
+                  const std::vector<AABB>& occluders, bool isOccluder, std::optional<DrawItem>& outItem,
+                  char& outCulled, char& outOccluded) {
     const MeshComponent& mesh = view.template get<MeshComponent>(entity);
     outCulled = 0;
+    outOccluded = 0;
+    const bool occlusionActive = !occluders.empty() && !isOccluder;
+    AABB worldBounds;
+    bool haveWorldBounds = false;
+    if (cullingEnabled || occlusionActive) {
+        worldBounds = mesh.localBounds.transformed(model);
+        haveWorldBounds = true;
+    }
     if (cullingEnabled) {
-        const AABB worldBounds = mesh.localBounds.transformed(model);
-        if (!frustum.intersects(worldBounds)) {
+        // Cheap bounding-sphere reject first (one plane test set
+        // against a sphere), then the exact p-vertex AABB test.
+        const glm::vec3 sphereCenter = glm::vec3{model * glm::vec4{mesh.localBounds.center(), 1.0f}};
+        const float sphereRadius = glm::length(mesh.localBounds.extents()) * maxBasisScale(model);
+        if (!frustum.intersectsSphere(sphereCenter, sphereRadius) || !frustum.intersects(worldBounds)) {
             outCulled = 1;
             return;
         }
+    }
+    if (occlusionActive && haveWorldBounds && isOccludedByAny(viewProjection, occluders, worldBounds)) {
+        outOccluded = 1;
+        return;
     }
     const float viewDepth = -(viewMatrix * glm::vec4(worldPosition, 1.0f)).z;
     // Stable material identity: the AssetManager's registered id (and
@@ -83,9 +112,10 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
 
 RenderSystem::RenderSystem(Renderer& renderer, const Swapchain& swapchain, JobSystem* jobs,
                            bool frustumCulling, size_t parallelMinItems, bool sortDrawItems,
-                           const AssetManager* assets)
+                           const AssetManager* assets, bool occlusionCulling)
     : m_renderer(renderer), m_swapchain(swapchain), m_jobs(jobs), m_frustumCulling(frustumCulling),
-      m_parallelMinItems(parallelMinItems), m_sortDrawItems(sortDrawItems), m_assets(assets) {}
+      m_occlusionCulling(occlusionCulling), m_parallelMinItems(parallelMinItems),
+      m_sortDrawItems(sortDrawItems), m_assets(assets) {}
 
 PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
                                          const FramePrepareOptions& options) {
@@ -124,15 +154,53 @@ PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
         worldPositions[i] = glm::vec3{worldMatrices[i][3]};
     }
 
-    const Frustum frustum{frame.projection * frame.view};
+    // Occlusion culling (Phase 21): world boxes of static box/OBB
+    // colliders act as occluders for the conservative screen-space
+    // test. Occluder entities themselves are never occlusion-culled.
+    const glm::mat4 viewProjection = frame.projection * frame.view;
+    std::vector<AABB> occluderBoxes;
+    std::vector<char> occluderFlags(entities.size(), 0);
+    if (options.occlusionCulling) {
+        std::unordered_map<uint32_t, size_t> entityIndex;
+        entityIndex.reserve(entities.size());
+        for (size_t i = 0; i < entities.size(); ++i) {
+            entityIndex[entt::to_integral(entities[i])] = i;
+        }
+        const auto colliderView =
+            scene.registry().view<TransformComponent, RigidBodyComponent, ColliderComponent>();
+        for (const entt::entity entity : colliderView) {
+            const RigidBodyComponent& body = colliderView.get<RigidBodyComponent>(entity);
+            const ColliderComponent& collider = colliderView.get<ColliderComponent>(entity);
+            if (!body.isStatic ||
+                (collider.type != ColliderComponent::Type::Box && collider.type != ColliderComponent::Type::Obb)) {
+                continue;
+            }
+            const glm::mat4 world = TransformSystem::effectiveWorldMatrix(
+                colliderView.get<TransformComponent>(entity),
+                scene.registry().try_get<WorldTransformComponent>(entity));
+            const AABB localBox{collider.centerOffset - glm::abs(collider.halfExtents),
+                                collider.centerOffset + glm::abs(collider.halfExtents)};
+            occluderBoxes.push_back(localBox.transformed(world));
+            if (const auto found = entityIndex.find(entt::to_integral(entity)); found != entityIndex.end()) {
+                occluderFlags[found->second] = 1;
+            }
+        }
+    }
+
+    frame.lighting = LightingSystem::gather(scene, aspectRatio);
+
+    const Frustum frustum{viewProjection};
     std::vector<std::optional<DrawItem>> evaluated(entities.size());
     std::vector<char> culledFlags(entities.size(), 0); // not vector<bool>: slots written concurrently
+    std::vector<char> occludedFlags(entities.size(), 0);
 
     const auto evaluateRange = [&view, &entities, &frustum, &options, &evaluated, &culledFlags, &frame,
-                                &worldMatrices, &worldPositions](size_t begin, size_t end) {
+                                &worldMatrices, &worldPositions, &viewProjection, &occluderBoxes,
+                                &occluderFlags, &occludedFlags](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
-            evaluateMesh(view, entities[i], frustum, frame.view, options.frustumCulling, options.assets,
-                         worldMatrices[i], worldPositions[i], evaluated[i], culledFlags[i]);
+            evaluateMesh(view, entities[i], frustum, frame.view, viewProjection, options.frustumCulling,
+                         options.assets, worldMatrices[i], worldPositions[i], occluderBoxes,
+                         occluderFlags[i] != 0, evaluated[i], culledFlags[i], occludedFlags[i]);
         }
     };
 
@@ -151,6 +219,8 @@ PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
     for (size_t i = 0; i < entities.size(); ++i) {
         if (culledFlags[i] != 0) {
             ++frame.culledCount;
+        } else if (occludedFlags[i] != 0) {
+            ++frame.occludedCount;
         } else if (evaluated[i].has_value()) {
             frame.renderQueue.push(*evaluated[i]);
         }
@@ -171,6 +241,7 @@ bool RenderSystem::render(Scene& scene) {
     options.jobs = m_jobs;
     options.assets = m_assets;
     options.frustumCulling = m_frustumCulling;
+    options.occlusionCulling = m_occlusionCulling;
     options.parallelMinItems = m_parallelMinItems;
     options.sortDrawItems = m_sortDrawItems;
 
@@ -188,8 +259,21 @@ bool RenderSystem::render(Scene& scene) {
     m_warnedNoCamera = false;
     m_lastDrawnCount = static_cast<uint32_t>(frame.renderQueue.size());
     m_lastCulledCount = frame.culledCount;
+    m_lastOccludedCount = frame.occludedCount;
 
-    return m_renderer.drawFrame(frame.view, frame.projection, frame.renderQueue.items());
+    FrameLighting frameLighting;
+    frameLighting.cascadeCount = frame.lighting.cascadeCount;
+    frameLighting.cascadesFilled = frame.lighting.cascadesFilled;
+    frameLighting.cascadeSplits = frame.lighting.cascadeSplits;
+    frameLighting.cascades = frame.lighting.cascadeMatrices;
+    frameLighting.lightCounts = frame.lighting.lightCounts;
+    frameLighting.lightPositionRange = frame.lighting.lightPositionRange;
+    frameLighting.lightColorIntensity = frame.lighting.lightColorIntensity;
+    frameLighting.lightDirectionType = frame.lighting.lightDirectionType;
+    frameLighting.lightCone = frame.lighting.lightCone;
+    frameLighting.directionalDirection = frame.lighting.directionalDirection;
+    frameLighting.directionalRadiance = frame.lighting.directionalRadiance;
+    return m_renderer.drawFrame(frame.view, frame.projection, frame.renderQueue.items(), frameLighting);
 }
 
 } // namespace engine

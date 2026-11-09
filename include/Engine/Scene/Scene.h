@@ -22,6 +22,7 @@
 
 namespace engine {
 
+class Frustum;
 class Scene;
 
 // ---------------------------------------------------------------------------
@@ -170,6 +171,11 @@ public:
     [[nodiscard]] bool raycastPrecise(const Ray& ray, RaycastHit& outHit, const MeshResolver& resolveMesh,
                                       float maxDistance = std::numeric_limits<float>::max(),
                                       uint32_t layerMask = CollisionLayer::All) const;
+
+    // Entities whose world bounds (the same BVH the raycasts use)
+    // intersect the frustum — a conservative superset of the visible
+    // set, gathered in one pruned tree traversal (Phase 21).
+    [[nodiscard]] std::vector<entt::entity> queryFrustum(const Frustum& frustum) const;
 
     // Pre-allocates component storage for the given number of entities
     // (entities, transforms, meshes, cameras, spins) so scene building

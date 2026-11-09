@@ -4,6 +4,7 @@
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
 
+#include <array>
 #include <cstdint>
 
 namespace engine {
@@ -51,5 +52,41 @@ inline constexpr float kShadowFarPlane = 40.0f;
                                                                            const glm::vec3& center, float extent,
                                                                            float lightDistance, float nearPlane,
                                                                            float farPlane);
+
+// ---------------------------------------------------------------------------
+// Cascaded shadow maps (Phase 21)
+//
+// The single fixed light frustum above aliases badly: one 2048 map
+// spread over the whole scene gives centimeter texels everywhere.
+// CSM splits the camera frustum into depth slices, each with its own
+// light view-projection fitted tightly around the slice — texel
+// density stays roughly constant with distance, so near geometry
+// gets crisp shadows and far geometry keeps coverage. The renderer
+// renders one depth target per cascade; the fragment shader picks
+// the cascade by view-space depth.
+// ---------------------------------------------------------------------------
+inline constexpr uint32_t kMaxShadowCascades = 4;
+
+struct ShadowCascade {
+    glm::mat4 lightViewProj{1.0f};
+    // View-space depth (positive, in front of the camera) up to
+    // which this cascade applies.
+    float splitFarDepth = 0.0f;
+};
+
+// Practical split scheme: a blend (splitLambda 0 = uniform,
+// 1 = logarithmic) of the two classic distributions. Entry i is the
+// view-space far depth of cascade i; entries at and beyond
+// cascadeCount are pinned to farPlane.
+[[nodiscard]] ENGINE_GRAPHICS_API std::array<float, kMaxShadowCascades>
+computeCascadeSplits(float nearPlane, float farPlane, uint32_t cascadeCount, float splitLambda);
+
+// Fits one light view-projection per cascade around its frustum
+// slice (bounding-sphere fit, texel-snapped against shimmer).
+// cameraUp need not be orthogonal to cameraFront.
+[[nodiscard]] ENGINE_GRAPHICS_API std::array<ShadowCascade, kMaxShadowCascades> computeShadowCascades(
+    const glm::vec3& cameraPosition, const glm::vec3& cameraFront, const glm::vec3& cameraUp,
+    float fieldOfViewYRadians, float aspectRatio, float nearPlane, float farPlane,
+    const glm::vec3& lightDirection, uint32_t cascadeCount, float splitLambda, uint32_t shadowMapSize);
 
 } // namespace engine

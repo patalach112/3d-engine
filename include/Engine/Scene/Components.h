@@ -114,6 +114,31 @@ struct CameraComponent {
     explicit CameraComponent(const CameraConfig& config) : camera(config) {}
 };
 
+// Dynamic point light (Phase 21): radiates in all directions from
+// the entity's world position with smooth distance attenuation
+// (windowed inverse-square). Gathered by the LightingSystem into the
+// renderer's light arrays; position comes from the entity's
+// transform (world-aware through the hierarchy).
+struct PointLightComponent {
+    glm::vec3 color{1.0f};
+    float intensity = 30.0f; // physical-ish scale for the 1/d^2 term
+    float range = 12.0f;     // hard cutoff radius in meters
+    bool enabled = true;
+};
+
+// Dynamic spot light (Phase 21): a cone from the entity's world
+// position along its world forward (-Z of the entity orientation,
+// the same convention cameras use), fading smoothly between the
+// inner and outer cone half-angles.
+struct SpotLightComponent {
+    glm::vec3 color{1.0f};
+    float intensity = 40.0f;
+    float range = 18.0f;
+    float innerConeRadians = 0.35f; // full-intensity cone half-angle
+    float outerConeRadians = 0.6f;  // fade to zero here
+    bool enabled = true;
+};
+
 // Placeholder for the future asset system: identifies which mesh the
 // entity wants to draw. Until real mesh assets exist, the renderer
 // substitutes its built-in cube geometry for any MeshComponent, so the

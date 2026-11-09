@@ -1444,6 +1444,67 @@ assets submitted concurrently from 4 threads registering exactly
 once) join the suite: **629 checks, all passing in Debug,
 Release-shared and Release-static, CTest 1/1, zero warnings.**
 
+## Phase 21 — Modular Layout, Spatial Culling & Advanced Lighting ✅
+
+A structural phase: the codebase moved to a production public/private
+layout, visibility became a two-stage spatial pipeline, and shadow
+quality plus per-object dynamic lights landed without touching the
+performance-critical cores (lock-free rings, work-stealing jobs,
+paginated pools are byte-for-byte the same code):
+
+- **Public header tree**: every public header moved from `src/` to
+  `include/Engine/<Subsystem>/` (`Core`, `Platform`, `Geometry`,
+  `Graphics`, `Assets`, `Scene/Systems`, `Physics`), keeping the
+  existing module directory names and every `#include "Scene/Scene.h"`
+  -style string — the only build change is the include root in
+  `engine_module()`. `src/` holds implementations only. One
+  deliberate trade is documented here rather than hidden: the
+  namespace stays flat `engine::`. Subsystem separation is already
+  enforced physically — the Phase 8 DLL-module link layering makes
+  cycles link errors (e.g. `EngineScene` may use `EngineGraphics`,
+  never the reverse) — while a namespace rename would churn all 661
+  checks and every call site for zero functional gain; the
+  include-path hierarchy carries the module identity instead.
+- **Two-stage culling** (before any command buffer is recorded, so
+  culled geometry costs zero GPU cycles): frustum tests now reject
+  with a cheap bounding-sphere sweep before the exact p-vertex AABB
+  test, and `Scene::queryFrustum` gathers visible entities in one
+  pruned `DynamicAABBTree` traversal (the same BVH the raycasts
+  use). A conservative screen-space occlusion pass (default off,
+  `[Render] occlusionCulling`) drops meshes whose NDC rect sits
+  fully inside a static box/OBB occluder's rect and strictly behind
+  its far depth; it never culls partially visible geometry and is
+  reported separately (`occludedCount`), never folded into the
+  frustum `culledCount`. Occluder entities exempt themselves.
+- **Cascaded shadow maps**: the single fixed light frustum became
+  4 cascades fitted per-frame to the camera's frustum slices
+  (practical log/uniform split, λ = 0.7; bounding-sphere fit with
+  texel snapping against shimmer), one 2048² depth target each,
+  sampled as a `sampler2D` array; the shadow pass selects its
+  cascade through an extended push-constant word at byte offset
+  112 (range now 116 of the guaranteed 128 bytes). The fragment
+  shader picks the cascade by view depth and runs the same 3×3 PCF
+  kernel per slice — near shadows stay crisp, far coverage is kept.
+- **Dynamic lights**: `PointLightComponent` / `SpotLightComponent`
+  are gathered by the new `LightingSystem` each frame — world-aware
+  positions (hierarchy included), nearest-16 selection to the
+  camera, packed vec4 arrays in the UBO (1456 bytes, asserted
+  against the GLSL block in tests) with a smooth windowed
+  inverse-square attenuation mirrored exactly on the CPU for tests
+  and tooling, and a cosine-eased spot cone (inner/outer half-angles;
+  entity orientation aims the spot, −Z forward like the camera).
+  Demo scene: a warm point light over the sandbox and a cool
+  downward spot on the floor.
+
+Verification: 32 new checks (split-scheme ordering and blend,
+cascade matrix validity and slice containment, BVH `queryFrustum`
+exactness, occlusion unit cases + end-to-end `prepareFrame`
+accounting with occlusion on/off, light packing order, 16-light
+nearest cap, disabled-light skipping, attenuation/spot closed-form
+mirrors, UBO byte-budget) join the suite: **661 checks, all passing
+in Debug, Release-shared and Release-static, CTest 1/1, zero
+warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
@@ -1534,52 +1595,53 @@ releases the mouse (press again to quit).
 │   └── shadow.vert           # Depth-only directional shadow pass
 ├── tests/
 │   └── CoreTests.cpp         # Config/logger/physics/player/material tests (CTest)
+├── include/Engine/           # Public headers (Phase 21): subsystem tree,
+│   ├── Core/                 #   installed-style; src/ holds .cpp only
+│   ├── Platform/
+│   ├── Geometry/
+│   ├── Graphics/
+│   ├── Assets/
+│   ├── Scene/                # + Scene/Systems/
+│   └── Physics/
 └── src/
     ├── main.cpp              # Bootstrap: arguments -> config -> logger -> app
     ├── Core/
-    │   ├── Application.h/.cpp  # Composition root, wires loop callbacks
-    │   ├── Export.h            # Per-module DLL export/import macros
-    │   ├── Camera.h/.cpp       # First-person yaw/pitch camera (GLM)
-    │   ├── Concurrency/LockFreeRingBuffer.h # Bounded MPMC lock-free ring buffer
-    │   ├── HardwareProfile.h   # i5-3470/GTX 970 target constants + tuning policy
-    │   ├── Jobs/JobSystem.*    # Work-stealing thread pool, parallelFor
-    │   ├── Memory/PoolAllocator.* # Paginated pool allocator for the ECS
-    │   ├── EngineConfig.h/.cpp # INI loading, validation, fallback chain
-    │   ├── Logger.h/.cpp       # Levels, console/file/async sinks, macros
-    │   ├── Time.h/.cpp         # steady_clock frame timing, delta, FPS
-    │   └── GameLoop.h/.cpp     # Fixed/variable loop, FPS cap, statistics
+    │   ├── Application.cpp   # Composition root, wires loop callbacks
+    │   ├── Camera.cpp        # First-person yaw/pitch camera (GLM)
+    │   ├── EngineConfig.cpp  # INI loading, validation, fallback chain
+    │   ├── Logger.cpp        # Levels, console/file/async sinks, macros
+    │   ├── Time.cpp          # steady_clock frame timing, delta, FPS
+    │   └── GameLoop.cpp      # Fixed/variable loop, FPS cap, statistics
     ├── Platform/
-    │   ├── Window.h/.cpp       # GLFW window, surface, resize/input callbacks
-    │   └── Input.h/.cpp        # Key/mouse state, transitions, mouse delta
+    │   ├── Window.cpp        # GLFW window, surface, resize/input callbacks
+    │   └── Input.cpp         # Key/mouse state, transitions, mouse delta
     ├── Assets/
-    │   └── AssetManager.h/.cpp # Mesh/shader/material registry, VRAM-budgeted
+    │   └── AssetManager.cpp  # Mesh/shader/material registry, VRAM-budgeted
     ├── Scene/
-    │   ├── Scene.h/.cpp        # RAII ECS world (entt::registry), Entity handle
-    │   ├── DenseIteration.h    # Dense-index access into EnTT's paged storage
-    │   ├── Components.h/.cpp   # Tag/Transform/Camera/Mesh/Spin components
+    │   ├── Scene.cpp         # RAII ECS world (entt::registry), Entity handle
+    │   ├── Components.cpp    # Tag/Transform/Camera/Mesh/Spin components
     │   └── Systems/
-    │       ├── CameraSystem.*  # Look + physical-player camera follow
-    │       ├── PhysicsSystem.* # Rigid-body solver (fixed update)
-    │       ├── PlayerSystem.*  # Physical capsule player controller
-    │       ├── RotationSystem.*# Spin integration (fixed update)
-    │       └── RenderSystem.*  # Scene -> view/projection + draw items
+    │       ├── CameraSystem.cpp  # Look + physical-player camera follow
+    │       ├── PhysicsSystem.cpp # Rigid-body solver (fixed update)
+    │       ├── PlayerSystem.cpp  # Physical capsule player controller
+    │       ├── RotationSystem.cpp# Spin integration (fixed update)
+    │       ├── LightingSystem.cpp# Point/spot gather + shadow cascades
+    │       └── RenderSystem.cpp  # Scene -> view/projection + draw items
     ├── Geometry/
-    │   ├── Vertex.h            # Interleaved position+normal+color layout
-    │   ├── Bounds.h/.cpp       # AABB + world-space transformation
-    │   └── Cube.h/.cpp         # Uniform-material cube (24 verts, 36 indices)
+    │   ├── Bounds.cpp        # AABB + world-space transformation
+    │   └── Cube.cpp          # Uniform-material cube (24 verts, 36 indices)
     └── Graphics/
-        ├── VulkanContext.h/.cpp  # Instance, devices, queues, command pool
-        ├── VulkanHelpers.h/.cpp  # Buffers/images, one-off transfers, file IO
-        ├── Buffer.h/.cpp         # RAII VkBuffer + staging uploads
-        ├── Swapchain.h/.cpp      # Swapchain, depth, render pass, framebuffers
-        ├── GraphicsPipeline.h/.cpp # Shader modules, pipeline state, UBO layout
-        ├── Frustum.h/.cpp        # View frustum extraction + AABB/sphere tests
-        ├── RenderQueue.h/.cpp    # CPU render command stream + parallel sort
-        ├── VramBudget.h          # CAS-based VRAM accounting policy (GTX 970)
-        ├── PipelineState.h/.cpp  # PSO descriptions, hashing, state cache
-        ├── HudFont.h/.cpp        # 5x7 bitmap font + HUD text layout (pure CPU)
-        ├── HudRenderer.h/.cpp    # Screen-space FPS HUD overlay pipeline
-        └── Renderer.h/.cpp       # Frames-in-flight, command recording, present
+        ├── VulkanContext.cpp   # Instance, devices, queues, command pool
+        ├── VulkanHelpers.cpp   # Buffers/images, one-off transfers, file IO
+        ├── Buffer.cpp          # RAII VkBuffer + staging uploads
+        ├── Swapchain.cpp       # Swapchain, depth, render pass, framebuffers
+        ├── GraphicsPipeline.cpp# Shader modules, pipeline state, UBO layout
+        ├── Frustum.cpp         # View frustum extraction + AABB/sphere tests
+        ├── RenderQueue.cpp     # CPU render command stream + parallel sort
+        ├── PipelineState.cpp   # PSO descriptions, hashing, state cache
+        ├── HudFont.cpp         # 5x7 bitmap font + HUD text layout (pure CPU)
+        ├── HudRenderer.cpp     # Screen-space FPS HUD overlay pipeline
+        └── Renderer.cpp        # Frames-in-flight, command recording, present
 ```
 
 Ownership is strictly RAII and ordered by member declaration in

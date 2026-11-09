@@ -1,4 +1,5 @@
 #include "Graphics/GraphicsPipeline.h"
+#include "Graphics/ShadowMap.h"
 
 #include "Geometry/Vertex.h"
 #include "Graphics/RenderQueue.h"
@@ -161,7 +162,7 @@ void GraphicsPipeline::createDescriptorSetLayout() {
     VkDescriptorSetLayoutBinding shadowBinding{};
     shadowBinding.binding = 1;
     shadowBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    shadowBinding.descriptorCount = 1;
+    shadowBinding.descriptorCount = kMaxShadowCascades; // cascade depth array (Phase 21)
     shadowBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     shadowBinding.pImmutableSamplers = nullptr;
 
@@ -394,10 +395,12 @@ VkPipeline GraphicsPipeline::createPipeline(const Swapchain& swapchain, const Pi
     // default pipeline state is a solid material: depth test + depth write
     // enabled with Less comparison and back-face culling, so nearer solid
     // geometry always occludes what is behind it.
+    // 112 bytes of draw data + a 4-byte cascade index at offset 112
+    // (shadow-pass only), still inside the guaranteed 128-byte minimum.
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pushConstantRange.offset = 0;
-    pushConstantRange.size = sizeof(DrawPushConstants);
+    pushConstantRange.size = sizeof(DrawPushConstants) + sizeof(uint32_t);
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;

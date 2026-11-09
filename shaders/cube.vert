@@ -1,10 +1,19 @@
 #version 450
 
+// Per-frame uniform block — byte-identical with the C++
+// UniformBufferObject (Renderer.h): camera matrices, cascaded shadow
+// matrices, and the packed dynamic-light arrays (Phase 21).
 layout(set = 0, binding = 0) uniform UniformBufferObject {
     mat4 view;
     mat4 proj;
-    mat4 lightViewProj;
+    mat4 lightViewProj[4];
     vec4 lightDirection;
+    vec4 cascadeSplits;
+    vec4 lightCounts; // x point count, y spot count, z total
+    vec4 lightPositionRange[16];
+    vec4 lightColorIntensity[16];
+    vec4 lightDirectionType[16];
+    vec4 lightCone[16];
 } ubo;
 
 layout(push_constant) uniform PushConstants {
@@ -24,10 +33,13 @@ layout(location = 2) out vec3 fragWorldPosition;
 layout(location = 3) out vec3 fragCameraPosition;
 layout(location = 4) out vec4 fragSpecular;
 layout(location = 5) out vec4 fragSurface;
+layout(location = 6) out float viewDepth; // positive distance in front of the camera
 
 void main() {
     vec4 worldPosition = push.model * vec4(inPosition, 1.0);
-    gl_Position = ubo.proj * ubo.view * worldPosition;
+    vec4 viewPosition = ubo.view * worldPosition;
+    gl_Position = ubo.proj * viewPosition;
+    viewDepth = -viewPosition.z;
     fragColor = push.baseColor.rgb * inColor;
     // Correct world-space normal (inverse-transpose handles non-uniform
     // scale, e.g. the flattened floor, without skewing the lighting).

@@ -2,6 +2,7 @@
 #include "Core/Export.h"
 
 #include "Graphics/RenderQueue.h" // DrawItem + RenderQueue
+#include "Scene/Systems/LightingSystem.h"
 
 #include <glm/mat4x4.hpp>
 
@@ -23,9 +24,11 @@ struct PreparedFrame {
     bool hasCamera = false;
     glm::mat4 view{1.0f};
     glm::mat4 projection{1.0f};
+    SceneLightData lighting{}; // cascades + dynamic lights for this frame
     RenderQueue renderQueue; // draw items, sorted ready for submission
     uint32_t meshCount = 0;   // visible mesh entities considered
     uint32_t culledCount = 0; // of those, removed by frustum culling
+    uint32_t occludedCount = 0; // of the survivors, removed by occlusion culling
 };
 
 // Knobs for frame preparation.
@@ -33,6 +36,7 @@ struct FramePrepareOptions {
     JobSystem* jobs = nullptr;      // parallelize matrix/bounds work when set
     const AssetManager* assets = nullptr; // resolves stable material ids/indices
     bool frustumCulling = true;     // from [Render] config
+    bool occlusionCulling = false;  // screen-space occlusion vs static box occluders
     bool sortDrawItems = true;      // sort the render queue before submission
     size_t parallelMinItems = 128;  // below this, sequential is cheaper
 };
@@ -53,7 +57,7 @@ class ENGINE_SCENE_API RenderSystem {
 public:
     RenderSystem(Renderer& renderer, const Swapchain& swapchain, JobSystem* jobs = nullptr,
                  bool frustumCulling = true, size_t parallelMinItems = 128, bool sortDrawItems = true,
-                 const AssetManager* assets = nullptr);
+                 const AssetManager* assets = nullptr, bool occlusionCulling = false);
 
     // Draws the current scene state. Must run after update systems so it
     // never renders a half-updated world. Returns false when no frame
@@ -68,18 +72,21 @@ public:
     // Statistics of the most recent render() call, for loop logging.
     [[nodiscard]] uint32_t lastDrawnCount() const { return m_lastDrawnCount; }
     [[nodiscard]] uint32_t lastCulledCount() const { return m_lastCulledCount; }
+    [[nodiscard]] uint32_t lastOccludedCount() const { return m_lastOccludedCount; }
 
 private:
     Renderer& m_renderer;
     const Swapchain& m_swapchain;
     JobSystem* m_jobs;
     bool m_frustumCulling;
+    bool m_occlusionCulling;
     size_t m_parallelMinItems;
     bool m_sortDrawItems;
     const AssetManager* m_assets;
     bool m_warnedNoCamera = false;
     uint32_t m_lastDrawnCount = 0;
     uint32_t m_lastCulledCount = 0;
+    uint32_t m_lastOccludedCount = 0;
 };
 
 } // namespace engine

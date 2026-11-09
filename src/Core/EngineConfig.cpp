@@ -243,6 +243,8 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             }
         } else if (key == "frustumculling") {
             reader.apply(value, config.render.frustumCulling);
+        } else if (key == "occlusionculling") {
+            reader.apply(value, config.render.occlusionCulling);
         } else if (key == "sortdrawitems") {
             reader.apply(value, config.render.sortDrawItems);
         } else if (key == "vrambudgetmib") {

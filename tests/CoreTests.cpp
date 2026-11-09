@@ -39,6 +39,8 @@
 #include "Graphics/Swapchain.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Graphics/Frustum.h"
+#include "Graphics/OcclusionCulling.h"
+#include "Scene/Systems/LightingSystem.h"
 
 #include <atomic>
 
@@ -5717,6 +5719,229 @@ void testAsyncAssetPipeline() {
 
 } // namespace
 
+void testPhase21CullingAndLighting() {
+    std::cout << "Phase 21: culling, CSM & dynamic lights\n";
+
+    // --- (1) Cascaded shadow split scheme -----------------------------
+    {
+        const auto splits = engine::computeCascadeSplits(0.1f, 100.0f, 4, 0.7f);
+        check(nearlyEqual(splits[3], 100.0, 1e-3), "csm: last cascade ends at the far plane");
+        check(splits[0] > 0.1f && splits[0] < splits[1] && splits[1] < splits[2] && splits[2] < splits[3],
+              "csm: cascade splits strictly increase");
+        // Log-heavy blend: the first slice is far tighter than uniform.
+        check(splits[0] < 25.0f, "csm: first cascade slice is tight (uniform would give 25.0m)");
+
+        const auto cascades = engine::computeShadowCascades(
+            glm::vec3{0.0f, 0.0f, 3.0f}, glm::vec3{0.0f, 0.0f, -1.0f}, glm::vec3{0.0f, 1.0f, 0.0f},
+            glm::radians(45.0f), 16.0f / 9.0f, 0.1f, 100.0f, glm::vec3{0.35f, 0.8f, 0.45f}, 4, 0.7f, 2048);
+        bool allWellFormed = true;
+        for (size_t i = 0; i < cascades.size(); ++i) {
+            const glm::mat4& m = cascades[i].lightViewProj;
+            for (int col = 0; col < 4; ++col) {
+                for (int row = 0; row < 4; ++row) {
+                    allWellFormed = allWellFormed && std::isfinite(m[col][row]);
+                }
+            }
+            allWellFormed = allWellFormed && std::abs(m[3][3]) > 1e-6f &&
+                            nearlyEqual(cascades[i].splitFarDepth, splits[i], 1e-3);
+        }
+        check(allWellFormed, "csm: every cascade matrix is finite and matches its split depth");
+
+        // The camera origin maps inside the first cascade's light
+        // frustum (the slice surrounds it).
+        const glm::vec4 clipped = cascades[0].lightViewProj * glm::vec4{0.0f, 0.0f, 3.0f, 1.0f};
+        check(clipped.w > 0.0f && std::abs(clipped.x / clipped.w) <= 1.0001f &&
+                  std::abs(clipped.y / clipped.w) <= 1.0001f,
+              "csm: camera position projects inside cascade 0");
+
+        // Texel density: for the same world distance, projecting a
+        // point slightly further from the camera stays inside the
+        // owning cascade near the sweet spot.
+        const glm::vec4 nearClip = cascades[0].lightViewProj * glm::vec4{0.0f, 0.0f, 0.0f, 1.0f};
+        check(nearClip.w > 0.0f && std::abs(nearClip.x / nearClip.w) <= 1.0001f,
+              "csm: frustum-center point projects inside cascade 0");
+    }
+
+    // --- (2) BVH frustum query ----------------------------------------
+    {
+        engine::Scene scene;
+        engine::CameraConfig cameraConfig;
+        cameraConfig.startPosition = glm::vec3{0.0f, 0.0f, 3.0f};
+        engine::Entity player = scene.createEntity("Player");
+        player.addComponent<engine::CameraComponent>(cameraConfig);
+
+        const auto addCube = [&scene](const char* name, const glm::vec3& position) {
+            engine::Entity cube = scene.createEntity(name);
+            cube.addComponent<engine::TransformComponent>(position);
+            cube.addComponent<engine::MeshComponent>("cube");
+            return cube;
+        };
+        engine::Entity visible = addCube("Visible", glm::vec3{0.0f, 0.0f, -5.0f});
+        addCube("Behind", glm::vec3{0.0f, 0.0f, 10.0f});
+        addCube("FarRight", glm::vec3{60.0f, 0.0f, -5.0f});
+
+        const engine::Camera& camera = player.getComponent<engine::CameraComponent>().camera;
+        const engine::Frustum frustum{camera.projectionMatrix(16.0f / 9.0f) * camera.viewMatrix()};
+        const std::vector<entt::entity> hits = scene.queryFrustum(frustum);
+        auto contains = [&hits](const engine::Entity& e) {
+            return std::find(hits.begin(), hits.end(), e.handle()) != hits.end();
+        };
+        check(hits.size() == 1 && contains(visible), "bvh queryFrustum returns exactly the visible entity");
+    }
+
+    // --- (3) Occluder unit test + occlusion integration ---------------
+    {
+        engine::CameraConfig cameraConfig;
+        cameraConfig.startPosition = glm::vec3{0.0f, 0.0f, 0.0f};
+        const engine::Camera camera(cameraConfig); // origin, looking -Z
+        const glm::mat4 vp = camera.projectionMatrix(16.0f / 9.0f) * camera.viewMatrix();
+
+        // The camera's projection flips NDC Y for Vulkan, so rect
+        // comparisons still hold per-axis; this 2m wall screens the
+        // hidden cube exactly while the peeking cube's NDC rect
+        // (-0.64..-0.45) clears the wall's (-0.39..0.39).
+        const engine::AABB wall{glm::vec3{-1.0f, -1.0f, -4.5f}, glm::vec3{1.0f, 1.0f, -3.5f}};
+        const engine::AABB hiddenBehind{glm::vec3{-0.5f, -0.5f, -10.5f}, glm::vec3{0.5f, 0.5f, -9.5f}};
+        // 4m left of the axis: clear of the wall's screen rect even
+        // after perspective widening (verified against projected NDC).
+        const engine::AABB peeking{glm::vec3{-4.5f, -0.5f, -10.5f}, glm::vec3{-3.5f, 0.5f, -9.5f}};
+        const engine::AABB inFrontOfWall{glm::vec3{-0.5f, -0.5f, -2.5f}, glm::vec3{0.5f, 0.5f, -1.5f}};
+        check(engine::isOccludedBy(vp, wall, hiddenBehind), "occlusion: cube fully behind a wall is occluded");
+        check(!engine::isOccludedBy(vp, wall, peeking), "occlusion: cube sticking out sideways stays visible");
+        check(!engine::isOccludedBy(vp, wall, inFrontOfWall), "occlusion: cube in front of the wall stays visible");
+        check(!engine::isOccludedBy(vp, hiddenBehind, wall), "occlusion: the wall itself is not occluded by what hides behind it");
+    }
+
+    {
+        engine::Scene scene;
+        engine::CameraConfig cameraConfig;
+        cameraConfig.startPosition = glm::vec3{0.0f, 0.0f, 3.0f};
+        engine::Entity player = scene.createEntity("Player");
+        player.addComponent<engine::CameraComponent>(cameraConfig);
+
+        // Static wall with a box collider (also drawn as a cube mesh).
+        engine::Entity wall = scene.createEntity("Wall");
+        auto& wallTransform = wall.addComponent<engine::TransformComponent>(glm::vec3{0.0f, 0.0f, -6.0f});
+        wallTransform.scale = glm::vec3{6.0f, 6.0f, 1.0f};
+        wall.addComponent<engine::MeshComponent>("cube");
+        auto& wallBody = wall.addComponent<engine::RigidBodyComponent>();
+        wallBody.setStatic(true);
+        wall.addComponent<engine::ColliderComponent>(engine::ColliderComponent::box(glm::vec3{0.5f}));
+
+        engine::Entity hidden = scene.createEntity("HiddenCube");
+        hidden.addComponent<engine::TransformComponent>(glm::vec3{0.0f, 0.0f, -12.0f});
+        hidden.addComponent<engine::MeshComponent>("cube");
+
+        engine::Entity visibleBeside = scene.createEntity("VisibleCube");
+        visibleBeside.addComponent<engine::TransformComponent>(glm::vec3{-5.0f, 0.0f, -12.0f});
+        visibleBeside.addComponent<engine::MeshComponent>("cube");
+
+        engine::FramePrepareOptions options;
+        options.frustumCulling = true;
+        const engine::PreparedFrame blind = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+        check(blind.meshCount == 3 && blind.occludedCount == 0 && blind.renderQueue.size() == 3,
+              "occlusion off: wall and both cubes are drawn");
+
+        options.occlusionCulling = true;
+        const engine::PreparedFrame culled = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+        check(culled.meshCount == 3 && culled.culledCount == 0, "occlusion on: nothing frustum-culled here");
+        check(culled.occludedCount == 1, "occlusion on: the hidden cube is occlusion-culled");
+        check(culled.renderQueue.size() == 2, "occlusion on: wall and visible cube remain");
+        check(culled.renderQueue.size() + culled.occludedCount + culled.culledCount == culled.meshCount,
+              "occlusion on: drawn + occluded + culled accounts for every mesh");
+    }
+
+    // --- (4) Dynamic-light gathering ----------------------------------
+    {
+        engine::Scene scene;
+        engine::CameraConfig cameraConfig;
+        cameraConfig.startPosition = glm::vec3{0.0f, 0.0f, 3.0f};
+        engine::Entity player = scene.createEntity("Player");
+        player.addComponent<engine::CameraComponent>(cameraConfig);
+
+        const auto addLight = [&scene](const glm::vec3& position, float intensity) {
+            engine::Entity light = scene.createEntity("PointLight");
+            light.addComponent<engine::TransformComponent>(position);
+            auto& component = light.addComponent<engine::PointLightComponent>();
+            component.intensity = intensity;
+            component.color = glm::vec3{1.0f, 0.5f, 0.25f};
+            component.range = 9.0f;
+            return light;
+        };
+        addLight(glm::vec3{0.0f, 1.0f, 0.0f}, 10.0f);   // nearest to the camera
+        addLight(glm::vec3{0.0f, 0.0f, -30.0f}, 20.0f); // farthest
+        addLight(glm::vec3{0.0f, 0.0f, -5.0f}, 30.0f);  // middle
+
+        engine::Entity spotEntity = scene.createEntity("Spot");
+        spotEntity.addComponent<engine::TransformComponent>(glm::vec3{0.0f, 4.0f, -2.0f});
+        auto& spot = spotEntity.addComponent<engine::SpotLightComponent>();
+        spot.innerConeRadians = 0.3f;
+        spot.outerConeRadians = 0.9f;
+
+        const engine::SceneLightData lighting = engine::LightingSystem::gather(scene);
+        check(lighting.lightCounts.x == 3.0f && lighting.lightCounts.y == 1.0f && lighting.lightCounts.z == 4.0f,
+              "lights: three points plus one spot are packed");
+        check(lighting.lightPositionRange[0].x == 0.0f && lighting.lightPositionRange[0].y == 1.0f &&
+                  lighting.lightPositionRange[0].z == 0.0f && lighting.lightPositionRange[0].w == 9.0f,
+              "lights: nearest point light is packed first at its position and range");
+        check(lighting.lightColorIntensity[0].w == 10.0f, "lights: first slot holds the nearest light's intensity");
+        size_t spotIndex = 99;
+        for (size_t i = 0; i < 4; ++i) {
+            if (lighting.lightDirectionType[i].w == 1.0f) {
+                spotIndex = i;
+            }
+        }
+        check(spotIndex != 99, "lights: a spot slot is marked with type 1");
+        check(lighting.lightDirectionType[spotIndex].x == 0.0f && lighting.lightDirectionType[spotIndex].y == 0.0f &&
+                  nearlyEqual(lighting.lightDirectionType[spotIndex].z, -1.0, 1e-4),
+              "lights: default-orientation spot shines along -Z");
+
+        // Over-budget scenes keep only the 16 nearest lights.
+        for (int i = 0; i < 20; ++i) {
+            addLight(glm::vec3{static_cast<float>(i) * 10.0f, 0.0f, -100.0f}, 5.0f);
+        }
+        const engine::SceneLightData capped = engine::LightingSystem::gather(scene);
+        check(capped.lightCounts.z == 16.0f && capped.lightCounts.x == 15.0f && capped.lightCounts.y == 1.0f,
+              "lights: scene is capped at the 16 nearest lights");
+
+        // Disabled lights are skipped entirely.
+        scene.registry().view<engine::PointLightComponent>().each(
+            [](engine::PointLightComponent& light) { light.enabled = false; });
+        scene.registry().view<engine::SpotLightComponent>().each(
+            [](engine::SpotLightComponent& light) { light.enabled = false; });
+        const engine::SceneLightData empty = engine::LightingSystem::gather(scene);
+        check(empty.lightCounts.z == 0.0f, "lights: disabled lights are not gathered");
+    }
+
+    // --- (5) Attenuation + spot-cone mirror ---------------------------
+    {
+        {
+            const double r = 1.0 / 10.0;
+            const double windowed = std::pow(std::max(0.0, 1.0 - std::pow(r, 4.0)), 2.0);
+            check(nearlyEqual(engine::lightAttenuation(1.0f, 10.0f), windowed / 2.0, 1e-5),
+                  "attenuation: d=1 matches the closed-form windowed value");
+        }
+        check(engine::lightAttenuation(10.0f, 10.0f) == 0.0f, "attenuation: zero at the light range");
+        check(engine::lightAttenuation(25.0f, 10.0f) == 0.0f, "attenuation: zero beyond the light range");
+        check(engine::lightAttenuation(1.0f, 10.0f) > engine::lightAttenuation(3.0f, 10.0f) &&
+                  engine::lightAttenuation(3.0f, 10.0f) > engine::lightAttenuation(6.0f, 10.0f) &&
+                  engine::lightAttenuation(6.0f, 10.0f) > 0.0f,
+              "attenuation: monotonically decreasing before the cutoff");
+        check(engine::lightAttenuation(5.0f, 0.0f) == 0.0f, "attenuation: zero range is dark");
+
+        check(nearlyEqual(engine::spotConeFactor(1.0f, 0.3f, 0.9f), 1.0, 1e-9), "spot: on-axis is full strength");
+        check(nearlyEqual(engine::spotConeFactor(std::cos(0.9f), 0.3f, 0.9f), 0.0, 1e-4),
+              "spot: at the outer cone edge the factor is zero");
+        const float midway = engine::spotConeFactor(std::cos(0.6f), 0.3f, 0.9f);
+        check(midway > 0.0f && midway < 1.0f, "spot: between the cones the factor fades smoothly");
+
+        // UBO layout contract: view+proj (128) + 4 cascade matrices
+        // (256) + three vec4s (48) + 4x16 light vec4s (1024) = 1456.
+        check(sizeof(engine::UniformBufferObject) == static_cast<size_t>(128 + 256 + 48 + 1024),
+              "ubo: C++ layout matches the GLSL byte budget (1456 bytes)");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -5737,6 +5962,7 @@ int main() {
     testSceneHierarchy();
     testSceneSerialization();
     testAsyncAssetPipeline();
+    testPhase21CullingAndLighting();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();
