@@ -1337,6 +1337,56 @@ moving-parent carry, world-space picking) join the suite: **588
 checks, all passing in Debug, Release-shared and Release-static,
 CTest 1/1, zero warnings.**
 
+## Phase 19 — Scene Serialization & Asset Persistence ✅
+
+A scene is now a document. `Scene::saveToString / loadFromString`
+and `Scene::saveToFile / loadFromFile` serialize the entire world
+to JSON and back:
+
+- **Format machinery** (`src/Core/Json.h`): a small self-contained
+  RFC 8259 value model, parser and pretty-writer — no external
+  dependency. Objects preserve insertion order, strings handle full
+  escaping (including surrogate pairs), and numbers print in the
+  shortest representation that round-trips — values that are
+  exactly a float print in float form (`0.123`, not
+  `0.12300000298023224`), so files stay readable *and* float fields
+  survive bit-for-bit.
+- **What's stored**: every entity with its tag, transform (TRS plus
+  the authoritative quaternion and its flag), camera (full
+  `CameraConfig` plus live pose), mesh (asset and material by
+  stable name, visibility, local bounds), spin, rigid body
+  (velocities, momentum, orientation, both inertia tensors, mass
+  and inverse mass, material, gravity/sleep flags), collider (all
+  six shapes' dimensions, hull point cloud, layer/mask, isTrigger),
+  gravity field, thruster, and joints (type, anchors, limits,
+  compliance, spring parameters). Entities are referenced by
+  document index — EnTT handles recycle and are never persisted.
+- **Reconstruction**: loading validates the document
+  (format tag + version) and leaves the scene untouched on
+  malformed input; on success the registry is cleared wholesale
+  (silently, no destroyed-events) and rebuilt in two passes —
+  entities and their own components first, then hierarchy through
+  `Scene::setParent` and joint partner remapping — so document
+  order never matters. `ChildrenComponent` and
+  `WorldTransformComponent` are derived state and are rebuilt by
+  their systems, never stored. Transient solver accumulators
+  (force/torque) restart at zero, as they do every step boundary.
+
+Demo integration: at startup the application serializes the
+freshly built sandbox scene, reloads it into a scratch scene, and
+logs the verified round-trip (entity count and document size) —
+the live scene and its physics spawn snapshots are never touched.
+
+Verification: 23 new checks (bit-exact field comparisons across
+transforms, bodies, all collider shapes, layers/masks/triggers,
+hull clouds, hierarchy relinking, all joint types with remapped
+partners, camera pose + config, mesh references; a reloaded scene
+that lands two jointed bodies at exactly their 2 m separation;
+file round-trip through a temp path; malformed JSON, wrong
+versions and missing files rejected with the scene untouched)
+join the suite: **611 checks, all passing in Debug, Release-shared
+and Release-static, CTest 1/1, zero warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

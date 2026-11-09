@@ -66,6 +66,19 @@ Application::Application(EngineConfig config)
     // Reserve pooled component storage before populating the scene.
     m_scene.reserveCapacity(m_config.performance.entityReserve);
     buildScene();
+    // Phase 19 startup proof: serialize the freshly built scene and
+    // reload it into a scratch scene. The live scene (and the
+    // physics spawn snapshots captured from it) is never touched --
+    // this only proves the document round-trips losslessly.
+    const std::string sceneSnapshot = m_scene.saveToString();
+    Scene scratchScene;
+    if (scratchScene.loadFromString(sceneSnapshot) && scratchScene.entityCount() == m_scene.entityCount()) {
+        ENGINE_LOG_INFO("Scene serialization round-trip verified at startup (" << m_scene.entityCount()
+                                                                               << " entities, "
+                                                                               << sceneSnapshot.size() << " bytes of JSON)");
+    } else {
+        ENGINE_LOG_WARNING("Scene serialization round-trip FAILED at startup");
+    }
     // No late cursor-capture call is needed here: Window already applied
     // GLFW_CURSOR_DISABLED during construction when captureMouseOnStart
     // was enabled, and Input adopted that state.

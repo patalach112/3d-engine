@@ -5242,6 +5242,295 @@ void testSceneHierarchy() {
     }
 }
 
+void testSceneSerialization() {
+    std::cout << "Scene serialization (Phase 19)\n";
+    using engine::CameraComponent;
+    using engine::ColliderComponent;
+    using engine::GravityFieldComponent;
+    using engine::JointComponent;
+    using engine::JointType;
+    using engine::MeshComponent;
+    using engine::ParentComponent;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::RigidBodyComponent;
+    using engine::SpinComponent;
+    using engine::ThrusterComponent;
+    using engine::TransformComponent;
+
+    const auto findByTag = [](engine::Scene& scene, const std::string& tag) -> engine::Entity {
+        auto& registry = scene.registry();
+        for (const entt::entity entity : registry.view<engine::TagComponent>()) {
+            if (registry.get<engine::TagComponent>(entity).tag == tag) {
+                return engine::Entity{entity, &scene};
+            }
+        }
+        return engine::Entity{};
+    };
+    const auto exactVec3 = [](const glm::vec3& a, const glm::vec3& b) { return a == b; };
+
+    // --- Build a scene exercising every serialized component -------------------
+    engine::Scene scene;
+    scene.setHierarchyDestroyMode(engine::HierarchyDestroyMode::Cascade);
+
+    auto rig = scene.createEntity("Rig");
+    auto& rigTransform = rig.addComponent<TransformComponent>(glm::vec3{1.5f, -2.25f, 3.75f});
+    rigTransform.rotationDegrees = glm::vec3{10.0f, 45.0f, -30.0f};
+    rigTransform.scale = glm::vec3{1.5f, 0.5f, 2.0f};
+
+    auto crate = scene.createEntity("Crate");
+    auto& crateTransform = crate.addComponent<TransformComponent>(glm::vec3{0.1f, 2.0f, -0.3f});
+    crateTransform.setOrientation(glm::quat{0.9239f, 0.1f, 0.2f, 0.3f});
+    auto& crateBody = crate.addComponent<RigidBodyComponent>(2.5f);
+    crateBody.velocity = glm::vec3{1.0f, -2.0f, 3.5f};
+    crateBody.restitution = 0.123f;
+    crateBody.friction = 0.987f;
+    crateBody.anisotropicFriction = glm::vec2{0.11f, 0.22f};
+    crateBody.gravityScale = 0.5f;
+    crateBody.allowSleep = false;
+    crateBody.setPrincipalInertia(glm::vec3{3.0f, 4.0f, 5.0f});
+    auto& crateCollider =
+        crate.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.4f, 0.5f, 0.6f},
+                                                                    glm::vec3{0.01f, 0.02f, 0.03f}));
+    crateCollider.layer = 0x4u;
+    crateCollider.mask = 0x9u;
+    auto& crateMesh = crate.addComponent<MeshComponent>();
+    crateMesh.assetId = "crateMesh";
+    crateMesh.materialName = "woodMat";
+    crateMesh.visible = false;
+    crateMesh.localBounds = engine::AABB{glm::vec3{-1.0f, -2.0f, -3.0f}, glm::vec3{4.0f, 5.0f, 6.0f}};
+    scene.setParent(crate, rig);
+
+    auto ball = scene.createEntity("Ball");
+    ball.addComponent<TransformComponent>(glm::vec3{4.0f, 2.0f, 0.0f});
+    ball.addComponent<RigidBodyComponent>(1.0f);
+    ball.addComponent<ColliderComponent>(ColliderComponent::sphere(0.75f));
+
+    auto linkA = scene.createEntity("LinkA");
+    linkA.addComponent<TransformComponent>(glm::vec3{0.0f, 5.0f, 0.0f});
+    linkA.addComponent<RigidBodyComponent>(1.0f);
+    linkA.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+    auto linkB = scene.createEntity("LinkB");
+    linkB.addComponent<TransformComponent>(glm::vec3{2.0f, 5.0f, 0.0f});
+    linkB.addComponent<RigidBodyComponent>(1.0f);
+    linkB.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+    linkA.addComponent<JointComponent>(
+        JointComponent::distance(linkB.handle(), glm::vec3{0.0f}, glm::vec3{0.0f}, 2.0f));
+
+    auto hingeLink = scene.createEntity("HingeLink");
+    hingeLink.addComponent<TransformComponent>(glm::vec3{0.0f});
+    auto& hinge = hingeLink.addComponent<JointComponent>(JointComponent::hinge(
+        crate.handle(), glm::vec3{0.5f, 0.0f, 0.0f}, glm::vec3{-0.5f, 0.0f, 0.0f}, glm::vec3{0.0f, 0.0f, 1.0f}));
+    hinge.enableLimits = true;
+    hinge.minAngleDegrees = -30.0f;
+    hinge.maxAngleDegrees = 45.0f;
+    hinge.compliance = 0.25f;
+
+    auto springLink = scene.createEntity("SpringLink");
+    springLink.addComponent<TransformComponent>(glm::vec3{0.0f});
+    springLink.addComponent<JointComponent>(JointComponent::springDamper(
+        entt::null, glm::vec3{0.0f}, glm::vec3{1.0f, 5.0f, 1.0f}, 2.0f, 42.0f, 3.5f));
+
+    auto pad = scene.createEntity("Pad");
+    pad.addComponent<TransformComponent>(glm::vec3{0.0f});
+    auto& padCollider = pad.addComponent<ColliderComponent>(ColliderComponent::capsule(0.3f, 0.7f));
+    padCollider.isTrigger = true;
+    padCollider.layer = 0x10u;
+
+    auto hullBody = scene.createEntity("HullBody");
+    hullBody.addComponent<TransformComponent>(glm::vec3{-3.0f, 1.0f, 0.0f});
+    hullBody.addComponent<RigidBodyComponent>(1.5f);
+    auto& hull = hullBody.addComponent<ColliderComponent>();
+    hull.type = ColliderComponent::Type::ConvexHull;
+    hull.hullPoints = {glm::vec3{0.0f, 0.0f, 0.0f}, glm::vec3{1.0f, 0.0f, 0.0f}, glm::vec3{0.0f, 1.0f, 0.0f},
+                       glm::vec3{0.0f, 0.0f, 1.0f}};
+    hull.hullPointCount = 4;
+
+    auto ground = scene.createEntity("Ground");
+    ground.addComponent<TransformComponent>(glm::vec3{0.0f, -1.0f, 0.0f});
+    auto& groundBody = ground.addComponent<RigidBodyComponent>(0.0f);
+    groundBody.setStatic(true);
+    auto& groundCollider = ground.addComponent<ColliderComponent>();
+    groundCollider.type = ColliderComponent::Type::Plane;
+    groundCollider.planeNormal = glm::vec3{0.0f, 1.0f, 0.0f};
+    groundCollider.planeOffset = -1.0f;
+
+    auto cam = scene.createEntity("Cam");
+    cam.addComponent<TransformComponent>(glm::vec3{0.0f});
+    engine::CameraConfig cameraConfig;
+    cameraConfig.movementSpeed = 7.5f;
+    cameraConfig.fieldOfViewDegrees = 60.0f;
+    auto& cameraComponent = cam.addComponent<CameraComponent>(cameraConfig);
+    cameraComponent.camera.setPosition(glm::vec3{9.0f, 8.0f, 7.0f});
+    cameraComponent.camera.setOrientation(-45.0f, 15.0f);
+
+    auto spinner = scene.createEntity("Spinner");
+    spinner.addComponent<TransformComponent>(glm::vec3{0.0f});
+    spinner.addComponent<SpinComponent>(glm::vec3{0.0f, 90.0f, 0.0f});
+
+    auto planet = scene.createEntity("Planet");
+    planet.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -20.0f});
+    auto& gravity = planet.addComponent<GravityFieldComponent>();
+    gravity.gravitationalParameter = 123.5f;
+    gravity.radius = 50.0f;
+
+    auto drone = scene.createEntity("Drone");
+    drone.addComponent<TransformComponent>(glm::vec3{1.0f, 1.0f, 1.0f});
+    drone.addComponent<RigidBodyComponent>(3.0f);
+    auto& thruster = drone.addComponent<ThrusterComponent>();
+    thruster.force = glm::vec3{0.0f, 25.0f, 0.0f};
+    thruster.localPosition = glm::vec3{0.0f, -0.5f, 0.0f};
+    thruster.throttle = 0.75f;
+
+    const std::string document = scene.saveToString();
+    check(document.find("\"format\": \"engine-scene\"") != std::string::npos &&
+              document.find("\"Crate\"") != std::string::npos,
+          "saved document is tagged JSON carrying the scene's entities");
+
+    // --- Round-trip into a scene that must be cleared first -----------------------
+    engine::Scene loaded;
+    loaded.createEntity("Junk");
+    check(loaded.loadFromString(document) && loaded.entityCount() == scene.entityCount(),
+          "load replaces the previous scene wholesale and restores every entity");
+    check(loaded.hierarchyDestroyMode() == engine::HierarchyDestroyMode::Cascade,
+          "hierarchy destroy mode round-trips");
+
+    engine::Entity lRig = findByTag(loaded, "Rig");
+    engine::Entity lCrate = findByTag(loaded, "Crate");
+    const TransformComponent& lCrateTransform = lCrate.getComponent<TransformComponent>();
+    check(exactVec3(lCrateTransform.position, crateTransform.position) &&
+              exactVec3(lCrateTransform.scale, crateTransform.scale) &&
+              lCrateTransform.orientation == crateTransform.orientation &&
+              lCrateTransform.useQuaternionOrientation == crateTransform.useQuaternionOrientation,
+          "transform (position, scale, quaternion orientation) is bit-exact after round-trip");
+    check(lCrate.hasComponent<ParentComponent>() &&
+              lCrate.getComponent<ParentComponent>().parent == lRig.handle() &&
+              loaded.childrenOf(lRig).size() == 1,
+          "hierarchy is rebuilt with both link sides consistent");
+
+    const RigidBodyComponent& lBody = lCrate.getComponent<RigidBodyComponent>();
+    check(lBody.mass == 2.5f && lBody.inverseMass == crateBody.inverseMass && lBody.velocity == crateBody.velocity &&
+              lBody.restitution == 0.123f && lBody.friction == 0.987f &&
+              lBody.anisotropicFriction == glm::vec2{0.11f, 0.22f} && lBody.gravityScale == 0.5f &&
+              !lBody.autoInertia && lBody.inertiaTensor[1][1] == 4.0f && !lBody.allowSleep,
+          "rigid body state and material fields are bit-exact after round-trip");
+
+    const ColliderComponent& lCollider = lCrate.getComponent<ColliderComponent>();
+    check(lCollider.type == ColliderComponent::Type::Box && lCollider.halfExtents == glm::vec3{0.4f, 0.5f, 0.6f} &&
+              lCollider.centerOffset == glm::vec3{0.01f, 0.02f, 0.03f} && lCollider.layer == 0x4u &&
+              lCollider.mask == 0x9u && !lCollider.isTrigger,
+          "collider shape, offset, layer and mask are bit-exact after round-trip");
+
+    const MeshComponent& lMesh = lCrate.getComponent<MeshComponent>();
+    check(lMesh.assetId == "crateMesh" && lMesh.materialName == "woodMat" && !lMesh.visible &&
+              lMesh.localBounds.min == glm::vec3{-1.0f, -2.0f, -3.0f} &&
+              lMesh.localBounds.max == glm::vec3{4.0f, 5.0f, 6.0f},
+          "mesh asset/material references and bounds round-trip by name");
+
+    const ColliderComponent& lPad = findByTag(loaded, "Pad").getComponent<ColliderComponent>();
+    check(lPad.type == ColliderComponent::Type::Capsule && lPad.isTrigger && lPad.radius == 0.3f &&
+              lPad.capsuleHalfHeight == 0.7f && lPad.layer == 0x10u,
+          "trigger capsule (type, isTrigger, dimensions, layer) round-trips");
+
+    const ColliderComponent& lHull = findByTag(loaded, "HullBody").getComponent<ColliderComponent>();
+    check(lHull.type == ColliderComponent::Type::ConvexHull && lHull.hullPointCount == 4 &&
+              lHull.hullPoints[2] == glm::vec3{0.0f, 1.0f, 0.0f},
+          "convex hull point cloud round-trips");
+
+    const ColliderComponent& lGround = findByTag(loaded, "Ground").getComponent<ColliderComponent>();
+    const RigidBodyComponent& lGroundBody = findByTag(loaded, "Ground").getComponent<RigidBodyComponent>();
+    check(lGround.type == ColliderComponent::Type::Plane && lGround.planeOffset == -1.0f && lGroundBody.isStatic,
+          "static plane collider round-trips");
+
+    engine::Entity lLinkA = findByTag(loaded, "LinkA");
+    engine::Entity lLinkB = findByTag(loaded, "LinkB");
+    const JointComponent& lDistance = lLinkA.getComponent<JointComponent>();
+    check(lDistance.type == JointType::Distance && lDistance.other == lLinkB.handle() &&
+              lDistance.restLength == 2.0f,
+          "distance joint re-links to the remapped partner handle");
+
+    const JointComponent& lHinge = findByTag(loaded, "HingeLink").getComponent<JointComponent>();
+    check(lHinge.type == JointType::Hinge && lHinge.other == lCrate.handle() && lHinge.enableLimits &&
+              lHinge.minAngleDegrees == -30.0f && lHinge.maxAngleDegrees == 45.0f && lHinge.compliance == 0.25f &&
+              lHinge.hingeAxis == glm::vec3{0.0f, 0.0f, 1.0f},
+          "hinge joint (partner, limits, compliance, axis) round-trips");
+
+    const JointComponent& lSpring = findByTag(loaded, "SpringLink").getComponent<JointComponent>();
+    check(lSpring.type == JointType::SpringDamper && lSpring.other == entt::null && lSpring.stiffness == 42.0f &&
+              lSpring.damping == 3.5f && lSpring.anchorB == glm::vec3{1.0f, 5.0f, 1.0f},
+          "world-anchored spring keeps its null partner and parameters");
+
+    const CameraComponent& lCamera = findByTag(loaded, "Cam").getComponent<CameraComponent>();
+    check(lCamera.camera.position() == glm::vec3{9.0f, 8.0f, 7.0f} && lCamera.camera.yawDegrees() == -45.0f &&
+              lCamera.camera.pitchDegrees() == 15.0f && lCamera.camera.config().movementSpeed == 7.5f &&
+              lCamera.camera.config().fieldOfViewDegrees == 60.0f && lCamera.isActive,
+          "camera pose and full config round-trip");
+
+    check(findByTag(loaded, "Spinner").getComponent<SpinComponent>().degreesPerSecond == glm::vec3{0.0f, 90.0f, 0.0f} &&
+              findByTag(loaded, "Planet").getComponent<GravityFieldComponent>().gravitationalParameter == 123.5f &&
+              findByTag(loaded, "Planet").getComponent<GravityFieldComponent>().radius == 50.0f &&
+              findByTag(loaded, "Drone").getComponent<ThrusterComponent>().force == glm::vec3{0.0f, 25.0f, 0.0f} &&
+              findByTag(loaded, "Drone").getComponent<ThrusterComponent>().throttle == 0.75f,
+          "spin, gravity-field and thruster components round-trip");
+
+    // --- A loaded scene is fully functional -----------------------------------------
+    {
+        engine::Scene simScene;
+        auto floorEntity = simScene.createEntity("Floor");
+        floorEntity.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+        floorEntity.addComponent<RigidBodyComponent>(0.0f);
+        floorEntity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{10.0f, 0.5f, 10.0f}));
+        auto simA = simScene.createEntity("SimA");
+        simA.addComponent<TransformComponent>(glm::vec3{0.0f, 3.0f, 0.0f});
+        auto& simBodyA = simA.addComponent<RigidBodyComponent>(1.0f);
+        simBodyA.restitution = 0.0f;
+        simA.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto simB = simScene.createEntity("SimB");
+        simB.addComponent<TransformComponent>(glm::vec3{2.0f, 3.0f, 0.0f});
+        auto& simBodyB = simB.addComponent<RigidBodyComponent>(1.0f);
+        simBodyB.restitution = 0.0f;
+        simB.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        simA.addComponent<JointComponent>(
+            JointComponent::distance(simB.handle(), glm::vec3{0.0f}, glm::vec3{0.0f}, 2.0f));
+
+        engine::Scene loadedSim;
+        check(loadedSim.loadFromString(simScene.saveToString()), "simulation scene loads");
+        PhysicsSystem physics;
+        PhysicsSettings settings;
+        settings.subSteps = 4;
+        settings.sleepEnabled = false;
+        for (int i = 0; i < 150; ++i) {
+            physics.update(loadedSim, 1.0 / 60.0, settings, nullptr);
+        }
+        const glm::vec3 posA = findByTag(loadedSim, "SimA").getComponent<TransformComponent>().position;
+        const glm::vec3 posB = findByTag(loadedSim, "SimB").getComponent<TransformComponent>().position;
+        const float separation = glm::length(posB - posA);
+        check(std::isfinite(posA.x) && std::isfinite(posA.y) && nearlyEqual(separation, 2.0, 0.05) &&
+                  nearlyEqual(posA.y, 0.5, 0.05),
+              "loaded scene simulates: bodies land and the remapped distance joint holds its 2 m separation");
+    }
+
+    // --- Files and failure handling --------------------------------------------------
+    {
+        const std::filesystem::path path = std::filesystem::temp_directory_path() / "engine_scene_phase19.json";
+        check(scene.saveToFile(path.string()), "saveToFile writes the document");
+        engine::Scene fromFile;
+        check(fromFile.loadFromFile(path.string()) && fromFile.entityCount() == scene.entityCount() &&
+                  findByTag(fromFile, "Crate").getComponent<ColliderComponent>().layer == 0x4u,
+              "loadFromFile restores the scene from disk");
+        std::filesystem::remove(path);
+
+        const size_t countBefore = loaded.entityCount();
+        check(!loaded.loadFromString("{ not json") && loaded.entityCount() == countBefore,
+              "malformed JSON is rejected and leaves the scene untouched");
+        check(!loaded.loadFromString("{\"format\":\"engine-scene\",\"version\":99,\"entities\":[]}") &&
+                  loaded.entityCount() == countBefore,
+              "an unsupported format version is rejected and leaves the scene untouched");
+        check(!loaded.loadFromFile("/tmp/engine-scene-definitely-missing-12345.json"),
+              "a missing scene file is rejected");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -5262,6 +5551,7 @@ int main() {
     testInputSystem();
     testPhysicsEvents();
     testSceneHierarchy();
+    testSceneSerialization();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

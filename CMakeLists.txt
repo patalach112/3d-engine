@@ -183,6 +183,7 @@ target_link_libraries(EngineAssets PUBLIC EngineFoundation EngineGeometry Engine
 
 engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Scene.cpp
+    src/Scene/SceneSerialization.cpp
     src/Scene/Components.cpp
     src/Scene/Raycast.cpp
     src/Scene/DynamicAABBTree.cpp

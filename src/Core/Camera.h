@@ -103,6 +103,7 @@ public:
     // including the clip-space Y flip Vulkan requires.
     [[nodiscard]] glm::mat4 projectionMatrix(float aspectRatio) const;
 
+    [[nodiscard]] const CameraConfig& config() const { return m_config; }
     [[nodiscard]] const glm::vec3& position() const { return m_position; }
     [[nodiscard]] const glm::vec3& front() const { return m_front; }
     [[nodiscard]] const glm::vec3& right() const { return m_right; }

@@ -207,6 +207,27 @@ public:
     void setHierarchyDestroyMode(HierarchyDestroyMode mode) { m_hierarchyDestroyMode = mode; }
     [[nodiscard]] HierarchyDestroyMode hierarchyDestroyMode() const { return m_hierarchyDestroyMode; }
 
+    // --- Scene serialization (Phase 19) --------------------------------
+    // The whole scene as a JSON document: every entity with its
+    // components (tag, transform, camera, mesh, spin, rigid body,
+    // collider, gravity field, joint, thruster), the hierarchy
+    // (stored as parent indices, rebuilt through setParent) and
+    // joint links (entity indices, remapped to the fresh handles).
+    // ChildrenComponent and WorldTransformComponent are derived
+    // state and are reconstructed, never stored. Floats print in
+    // shortest round-trip form, so values survive bit-for-bit.
+    //
+    // loadFromString/loadFromFile validate the document first and
+    // leave the scene untouched on malformed input; on success the
+    // current registry is cleared wholesale (silently — no
+    // EntityDestroyedEvents) and rebuilt. PhysicsSystem spawn
+    // snapshots belong to the old entities: re-capture after a load
+    // before resetting.
+    [[nodiscard]] std::string saveToString() const;
+    bool loadFromString(std::string_view text);
+    bool saveToFile(const std::string& filepath) const;
+    bool loadFromFile(const std::string& filepath);
+
     // Memory pool backing all component storage of this scene.
     [[nodiscard]] memory::PoolStats memoryStats() const { return m_registry.get_allocator().stats(); }
 
