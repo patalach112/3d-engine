@@ -5,6 +5,7 @@
 
 #include <entt/entity/entity.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -19,20 +20,16 @@ class Scene;
 // ---------------------------------------------------------------------------
 // PhysicsSystem
 //
-// Fixed-timestep rigid-body physics for ECS entities carrying
+// Fixed-timestep, data-oriented rigid-body physics for ECS entities with
 // TransformComponent + RigidBodyComponent + ColliderComponent.
 //
-// Pipeline for one fixed step:
-//   1. snapshot the three dense component arrays as a flat body list;
-//   2. integrate forces/gravity/velocity/position in parallel;
-//   3. build world bounds in parallel and run an X-axis sweep broad-phase;
-//   4. evaluate candidate pairs in parallel into disjoint contact slots;
-//   5. solve contacts sequentially in deterministic candidate order.
-//
-// Sequential impulse resolution is deliberate: contacts are coupled, and a
-// deterministic solver gives reproducible stacking without atomics or
-// contact-graph coloring. All scratch arrays are members and retain their
-// capacity between steps.
+// Pipeline: snapshot bodies/fields/joints/thrusters -> apply thruster and
+// spring forces -> parallel semi-implicit integration (linear + quaternion
+// rotational dynamics) -> parallel world-geometry construction -> X-axis
+// sweep broad phase -> parallel narrow phase/CCD into disjoint slots ->
+// deterministic island generation -> warm-started sequential-impulse
+// solving per island (islands can solve in parallel; bodies never repeat
+// across islands). Scratch storage is retained between steps.
 // ---------------------------------------------------------------------------
 class PhysicsSystem {
 public:
@@ -41,6 +38,9 @@ public:
         size_t dynamicBodies = 0;
         size_t candidatePairs = 0;
         size_t contacts = 0;
+        size_t islands = 0;
+        size_t largestIsland = 0;
+        size_t joints = 0;
         uint32_t solverIterations = 0;
     };
 
@@ -48,15 +48,7 @@ public:
                  JobSystem* jobs = nullptr);
     Stats update(Scene& scene, double fixedDeltaSeconds, const PhysicsSettings& settings, JobSystem& jobs);
 
-    // Captures the current transform/velocity state of every dynamic
-    // physics body as its respawn state. Call after building a scene.
-    // Existing snapshots are replaced; the storage capacity is retained.
     size_t captureSpawnStates(Scene& scene);
-
-    // Restores every captured dynamic body to its spawn transform and
-    // initial linear/angular velocity, clearing acceleration and forces.
-    // Entities are neither created nor destroyed, and stale/destroyed
-    // handles are skipped. Returns the number of bodies reset.
     size_t resetToSpawnStates(Scene& scene);
 
     [[nodiscard]] const Stats& lastStats() const { return m_lastStats; }
@@ -70,21 +62,34 @@ private:
         glm::vec3 scale{1.0f};
         glm::vec3 velocity{0.0f};
         glm::vec3 angularVelocity{0.0f};
+        glm::vec3 angularMomentum{0.0f};
+        glm::quat orientation{1.0f, 0.0f, 0.0f, 0.0f};
         glm::vec3 spinDegreesPerSecond{0.0f};
         bool hasSpin = false;
     };
 
     struct BodyRef {
+        entt::entity entity = entt::null;
         TransformComponent* transform = nullptr;
         RigidBodyComponent* body = nullptr;
         ColliderComponent* collider = nullptr;
     };
 
     struct BodyGeometry {
+        ColliderComponent::Type type = ColliderComponent::Type::Box;
         glm::vec3 center{0.0f};
+        glm::vec3 previousCenter{0.0f};
+        glm::vec3 displacement{0.0f};
+        glm::vec3 boundsCenter{0.0f};
+        glm::vec3 boundsHalf{0.5f};
         glm::vec3 halfExtents{0.5f};
+        glm::mat3 axes{1.0f};
         glm::vec3 planeNormal{0.0f, 1.0f, 0.0f};
+        glm::vec3 capsuleAxis{0.0f, 1.0f, 0.0f};
         float radius = 0.5f;
+        float capsuleHalfHeight = 0.0f;
+        std::array<glm::vec3, 8> points{};
+        uint8_t pointCount = 0;
         bool isPlane = false;
     };
 
@@ -97,23 +102,73 @@ private:
     struct Contact {
         uint32_t bodyA = 0;
         uint32_t bodyB = 0;
-        glm::vec3 normal{1.0f, 0.0f, 0.0f}; // from body A to body B
+        glm::vec3 normal{1.0f, 0.0f, 0.0f};
         float penetration = 0.0f;
         float restitution = 0.0f;
         float friction = 0.0f;
+        glm::vec2 anisotropicFriction{-1.0f, -1.0f};
+        float normalImpulse = 0.0f;
+        float restitutionTarget = 0.0f;
+        glm::vec3 tangentImpulse{0.0f};
+        bool continuous = false;
+        float timeOfImpact = 1.0f;
+    };
+
+    struct WarmContact {
+        uint64_t pairKey = 0;
+        glm::vec3 normal{1.0f, 0.0f, 0.0f};
+        float normalImpulse = 0.0f;
+        float restitutionTarget = 0.0f;
+        glm::vec3 tangentImpulse{0.0f};
+    };
+
+    struct GravitySource {
+        glm::vec3 position{0.0f};
+        float gravitationalParameter = 0.0f;
+        float radius = 0.0f;
+    };
+
+    struct ThrusterRef {
+        uint32_t bodyIndex = 0;
+        ThrusterComponent* thruster = nullptr;
+    };
+
+    struct JointRef {
+        uint32_t bodyA = 0; // entity carrying the JointComponent
+        uint32_t bodyB = 0; // JointComponent::other, when present
+        JointComponent* joint = nullptr;
+        bool hasBodyB = false;
+        float restLength = 0.0f; // resolved from a negative component value
+    };
+
+    struct SolverIsland {
+        std::vector<size_t> contacts;
+        std::vector<size_t> joints;
     };
 
     void snapshotBodies(Scene& scene);
+    void snapshotConstraints(Scene& scene);
+    void applyExternalForces();
     void integrate(double fixedDeltaSeconds, const PhysicsSettings& settings, JobSystem* jobs);
-    void buildGeometry(JobSystem* jobs, uint32_t parallelMinBodies);
+    void buildGeometry(JobSystem* jobs, uint32_t parallelMinBodies, float dt);
     void broadPhase();
     void narrowPhase(JobSystem* jobs, uint32_t parallelMinBodies);
-    void solveContacts(const PhysicsSettings& settings);
+    void applyContinuousCollisionStops();
+    void buildIslands();
+    void solveConstraints(const PhysicsSettings& settings, JobSystem* jobs);
 
     [[nodiscard]] std::optional<Contact> collide(uint32_t bodyA, uint32_t bodyB) const;
-    void resolveVelocity(const Contact& contact, const PhysicsSettings& settings);
+    [[nodiscard]] std::optional<Contact> sweptCollide(uint32_t bodyA, uint32_t bodyB, const Contact& base) const;
+    void prepareWarmStarting(const PhysicsSettings& settings);
+    void storeWarmStarting();
+    void applyWarmStart(Contact& contact);
+    void resolveVelocity(Contact& contact, const PhysicsSettings& settings);
     void resolvePosition(const Contact& contact, const PhysicsSettings& settings);
+    void resolveJointVelocity(const JointRef& joint);
+    void resolveJointPosition(const JointRef& joint);
     [[nodiscard]] float inverseMass(uint32_t bodyIndex) const;
+    [[nodiscard]] glm::vec3 inverseInertiaWorld(uint32_t bodyIndex, const glm::vec3& vector) const;
+    [[nodiscard]] std::optional<uint32_t> bodyIndexFor(entt::entity entity) const;
 
     std::vector<BodyRef> m_bodies;
     std::vector<BodyGeometry> m_geometry;
@@ -122,7 +177,13 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> m_candidatePairs;
     std::vector<std::optional<Contact>> m_contactSlots;
     std::vector<Contact> m_contacts;
+    std::vector<WarmContact> m_warmContacts;
+    std::vector<GravitySource> m_gravitySources;
+    std::vector<ThrusterRef> m_thrusters;
+    std::vector<JointRef> m_joints;
+    std::vector<SolverIsland> m_islands;
     std::vector<SpawnState> m_spawnStates;
+    bool m_ccdEnabled = true;
     Stats m_lastStats;
 };
 

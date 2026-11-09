@@ -403,58 +403,93 @@ and **drawn/culled** counts:
   recorded last inside the scene's render pass.
 - Toggle with `[Render] hudEnabled`.
 
-## Phase 7 — Custom Physics & Rigid-Body Collisions ✅
+## Phase 7 — Production-Grade Physics & Rigid-Body Simulation ✅
 
 ### Components (`src/Physics/PhysicsComponents.h`)
 
-Physics is ECS-native, not an external object hierarchy:
+Physics is ECS-native and data-oriented, not an external object hierarchy:
 
-- `RigidBodyComponent` (dense 80-byte value): linear velocity, angular
-  velocity (degrees/second), last-step acceleration, accumulated force
-  (cleared after integration), mass/inverse-mass, restitution, friction,
-  static and gravity flags.
-- `ColliderComponent` (dense 48-byte value): box (half-extents), sphere
-  (radius), or plane (`normal·x = offset`). Box/sphere dimensions are
-  local and scaled by `TransformComponent::scale`.
-- `PhysicsSettings`: gravity, damping, restitution velocity threshold,
-  contact slop, position-correction factor, solver iterations, and the
-  parallel batching threshold — all configurable under `[Physics]`.
+- `RigidBodyComponent` is a dense, 192-byte value containing linear and
+  angular velocity, world-space angular momentum, acceleration, accumulated
+  force/torque, an authoritative quaternion orientation, full 3×3 local
+  inertia and inverse-inertia tensors, mass/inverse-mass, restitution,
+  scalar plus anisotropic friction, gravity scale, and static/gravity flags.
+  Automatic inertia is derived from the collider (box/OBB, sphere, capsule,
+  or convex-hull bounds); explicit principal/full tensors can replace it.
+- `ColliderComponent` is a dense, 144-byte value supporting **Box, Sphere,
+  Plane, OBB, Capsule, and ConvexHull** (up to eight hull points). Local
+  dimensions are scaled by `TransformComponent::scale`; the derived world
+  geometry carries oriented axes, swept bounds, capsule axes, and hull points.
+- `GravityFieldComponent` attaches a localized radial field
+  (`mu = G*M`, optional finite radius with smooth falloff) to any entity
+  with a transform — planets do not need rigid bodies. `PhysicsSettings`
+  also supports a global point-mass field with softening.
+- `JointComponent` supports **Distance, Hinge, and SpringDamper**
+  constraints between two bodies or a body and a world anchor. A negative
+  rest length captures the current anchor distance.
+- `ThrusterComponent` applies a local force at a local offset point (plus
+  optional local torque), so offset propulsion naturally spins a craft.
+- `PhysicsSettings` covers uniform/zero gravity, global radial gravity,
+  linear damping, restitution threshold, contact slop, position correction,
+  solver iterations, parallel thresholds, CCD, and the demo mode — all
+  configurable under `[Physics]`.
 
-Scene storage reservation now includes rigid bodies and colliders, so
-their EnTT dense paged arrays are preallocated with the other hot ECS data.
+Scene storage reservation includes rigid bodies, colliders, gravity fields,
+joints, and thrusters, so their EnTT dense paged arrays are preallocated
+with the other hot ECS data.
 
 ### PhysicsSystem (`src/Scene/Systems/PhysicsSystem.*`)
 
-Runs only in the fixed timestep. Each step snapshots
-`Transform + RigidBody + Collider` entities into a flat body list, then:
+The solver runs only in the fixed timestep. Each step snapshots bodies,
+gravity fields, joints, and thrusters into flat arrays, then:
 
-1. integrates gravity/forces with semi-implicit Euler in parallel,
-2. computes world collider geometry in parallel,
-3. runs an X-axis sort-and-sweep broad phase (planes handled separately),
-4. evaluates box/box, sphere/sphere, box/sphere, and shape/plane narrow
-   phase pairs in parallel into disjoint contact slots, and
-5. resolves contacts sequentially in deterministic order with normal
-   impulses, restitution, Coulomb friction, and penetration correction.
+1. applies thruster and spring-damper forces,
+2. integrates forces with semi-implicit Euler in parallel — linear motion
+   plus quaternion rotational dynamics. Angular momentum is the conserved
+   world quantity, `omega = I_world^-1 * L` is re-derived each step from
+   the rotated inverse-inertia tensor, so asymmetric bodies exhibit
+   torque-free gyroscopic precession while momentum is conserved,
+3. builds world collider geometry in parallel,
+4. runs an X-axis sort-and-sweep broad phase (planes paired separately),
+   with swept expansion so fast bodies stay candidates against obstacles
+   they crossed during the step,
+5. evaluates narrow phase in parallel into disjoint contact slots,
+   including SAT OBB/OBB, capsule/sphere, hull support geometry, and
+   **swept CCD**: fast spheres are ray-cast against planes and expanded
+   box slabs, bodies are rolled back to the time of impact, and approach
+   velocity is cancelled so projectiles cannot tunnel through thin walls,
+6. builds solver **islands** from the contact/joint graph and solves each
+   island with accumulated Sequential Impulses — restitution targets,
+   non-negative normal-impulse clamping, anisotropic Coulomb friction in
+   two tangent directions, positional correction, and **warm starting**
+   from the previous step's impulses. Islands are disjoint by
+   construction, so they can solve in parallel without races while the
+   result stays deterministic across worker counts.
 
-Slow impacts use zero restitution and a small contact slop, so cubes can
-settle and stack without micro-bouncing. Scratch vectors retain capacity
-between steps, and `parallelFor()` barriers separate every parallel phase
-from sequential solver work.
+Slow impacts use zero restitution and a small contact slop, so stacks
+settle without micro-bouncing. Scratch vectors retain capacity between
+steps, and `parallelFor()` barriers separate every parallel phase from
+solver work. Statistics (bodies, candidate pairs, contacts, islands,
+largest island, joints) are available from `PhysicsSystem::lastStats()`.
 
-### Demo scene
+### Demo scenes (`[Physics] demoMode`)
 
-The startup scene now has a static floor (flattened cube + plane collider
-at `y = -1.25`) and six rigid-body cubes that fall, bounce, collide, slide,
-and stack in front of the camera. Physics statistics (body/contact counts)
-are available from `PhysicsSystem::lastStats()`.
+- **Terrestrial** (default): a static floor plus six falling cubes and a
+  twelve-cube stacking stress scene that settles under gravity.
+- **Space** (`demoMode = space`): zero uniform gravity with a localized
+  radial-gravity planet, an orbiting capsule craft at circular-orbit
+  velocity, an offset-thruster drone, distance-jointed cargo, a
+  spring-anchored craft, and a 35 m/s projectile fired at a thin OBB wall
+  to demonstrate CCD.
 
-Press **C** to respawn the cubes. After scene construction,
-`PhysicsSystem::captureSpawnStates()` stores each dynamic body's entity
-handle, staggered spawn position/rotation/scale, and initial linear and
-angular velocity. A C-key edge press restores those values, clears
-acceleration, accumulated forces, and stale contact scratch, and restores
-any `SpinComponent` velocity — without creating/destroying entities or
-reallocating ECS storage, so repeated resets are stable and leak-free.
+Press **C** to respawn the dynamic bodies. After scene construction,
+`PhysicsSystem::captureSpawnStates()` stores each body's entity handle,
+spawn transform, and initial linear/angular velocity, angular momentum,
+and orientation. A C-key edge press restores those values, clears
+acceleration, accumulated forces/torques, and stale contact/warm-start
+scratch, and restores any `SpinComponent` velocity — without
+creating/destroying entities or reallocating ECS storage, so repeated
+resets are stable and leak-free.
 
 ## Configuration
 

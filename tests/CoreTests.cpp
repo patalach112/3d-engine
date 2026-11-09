@@ -92,6 +92,7 @@ void testConfigLoading() {
              << "lookSmoothingSeconds = 0.04\nmovementSmoothingSeconds = 0.09\n"
              << "[Input]\ncaptureMouseOnStart = false\n"
              << "[Physics]\ngravityY = -12.5\nsolverIterations = 7\nparallelMinBodies = 32\n"
+             << "demoMode = space\nccdEnabled = false\ngravitationalParameter = 42\ngravitySoftening = 0.25\n"
              << "[Render]\nfrustumCulling = false\n"
              << "[Performance]\njobWorkerCount = 2\nentityReserve = 4096\nparallelBatchSize = 512\n"
              << "[Render]\nvramBudgetMiB = 2048\nstagingBufferBudgetMiB = 128\nhudEnabled = false\n";
@@ -119,6 +120,10 @@ void testConfigLoading() {
     check(nearlyEqual(config.physics.gravity.y, -12.5f, 1e-6), "physics gravity parsed");
     check(config.physics.solverIterations == 7, "physics solver iterations parsed");
     check(config.physics.parallelMinBodies == 32, "physics parallel threshold parsed");
+    check(config.physics.demoMode == engine::PhysicsDemoMode::Space, "physics demo mode parsed");
+    check(!config.physics.ccdEnabled, "physics CCD flag parsed");
+    check(nearlyEqual(config.physics.gravitationalParameter, 42.0f, 1e-6), "physics radial gravity parsed");
+    check(nearlyEqual(config.physics.gravitySoftening, 0.25f, 1e-6), "physics gravity softening parsed");
     check(!config.render.frustumCulling, "frustum culling flag parsed");
     check(config.performance.jobWorkerCount == 2, "job worker count parsed");
     check(config.performance.parallelBatchSize == 512, "parallel batch size parsed");
@@ -397,6 +402,22 @@ void testPhysics() {
     using engine::RigidBodyComponent;
     using engine::TransformComponent;
 
+    check(sizeof(RigidBodyComponent) == 192, "rigid body remains a dense 192-byte component");
+    check(sizeof(ColliderComponent) == 144, "collider remains a dense 144-byte component");
+    {
+        RigidBodyComponent inertiaBody(2.0f);
+        inertiaBody.setPrincipalInertia(glm::vec3{2.0f, 4.0f, 6.0f});
+        check(nearlyEqual(inertiaBody.inertiaTensor[0][0], 2.0) &&
+                  nearlyEqual(inertiaBody.inverseInertiaTensor[1][1], 0.25) &&
+                  nearlyEqual(inertiaBody.inverseInertiaTensor[2][2], 1.0 / 6.0, 1e-6),
+              "principal inertia tensor stores and inverts all axes");
+        check(ColliderComponent::obb(glm::vec3{0.5f}).type == ColliderComponent::Type::Obb,
+              "OBB collider factory selects the oriented-box type");
+        const std::vector<glm::vec3> hullPoints = {{-0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, 0.5f}};
+        check(ColliderComponent::convexHull(hullPoints).hullPointCount == 2,
+              "convex hull collider stores supplied points");
+    }
+
     // Component API and layout are part of the DOD contract.
     RigidBodyComponent body(2.0f);
     check(nearlyEqual(body.inverseMass, 0.5), "rigid body inverse mass follows mass");
@@ -656,6 +677,357 @@ void testPhysics() {
         check(stats.dynamicBodies == 1 && cubeBody.velocity.y < 0.0f &&
                   cubeTransform.position.y < 4.0f,
               "respawned body resumes falling under gravity");
+    }
+
+    // Quaternion rotational dynamics: with no torque, world angular
+    // momentum is conserved while omega precesses through the changing
+    // world inertia tensor of an asymmetric body.
+    {
+        engine::Scene scene;
+        auto entity = scene.createEntity("Gyroscope");
+        entity.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& rigidBody = entity.addComponent<RigidBodyComponent>(1.0f);
+        rigidBody.setPrincipalInertia(glm::vec3{1.0f, 2.0f, 4.0f});
+        rigidBody.angularVelocity = glm::vec3{90.0f, 0.0f, 90.0f};
+        entity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        for (int step = 0; step < 60; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float expectedMomentum = std::sqrt(1.5708f * 1.5708f + 6.2832f * 6.2832f);
+        check(nearlyEqual(glm::length(rigidBody.angularMomentum), expectedMomentum, 0.01),
+              "torque-free motion conserves angular momentum magnitude");
+        check(nearlyEqual(glm::length(rigidBody.orientation), 1.0, 1e-5),
+              "quaternion orientation remains normalized");
+        check(glm::length(entity.getComponent<TransformComponent>().rotationDegrees) > 1.0f,
+              "quaternion integration writes back Euler transform rotation");
+    }
+
+    // Radial gravity from a GravityFieldComponent points at the field
+    // source; a finite radius localizes the same field to zero outside it.
+    {
+        engine::Scene scene;
+        auto planet = scene.createEntity("Planet");
+        planet.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& field = planet.addComponent<engine::GravityFieldComponent>();
+        field.gravitationalParameter = 100.0f;
+        auto satellite = scene.createEntity("Satellite");
+        satellite.addComponent<TransformComponent>(glm::vec3{10.0f, 0.0f, 0.0f});
+        auto& satelliteBody = satellite.addComponent<RigidBodyComponent>(1.0f);
+        satellite.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 0.1, settings);
+        check(nearlyEqual(satelliteBody.velocity.x, -0.1, 1e-5),
+              "radial gravity field accelerates toward its source");
+    }
+    {
+        engine::Scene scene;
+        auto planet = scene.createEntity("LocalizedPlanet");
+        planet.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& field = planet.addComponent<engine::GravityFieldComponent>();
+        field.gravitationalParameter = 100.0f;
+        field.radius = 5.0f;
+        auto satellite = scene.createEntity("OutsideField");
+        satellite.addComponent<TransformComponent>(glm::vec3{10.0f, 0.0f, 0.0f});
+        auto& satelliteBody = satellite.addComponent<RigidBodyComponent>(1.0f);
+        satellite.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 0.1, settings);
+        check(nearlyEqual(satelliteBody.velocity.x, 0.0, 1e-6),
+              "localized gravity field has no force outside its radius");
+    }
+    {
+        engine::Scene scene;
+        auto satellite = scene.createEntity("GlobalRadialSatellite");
+        satellite.addComponent<TransformComponent>(glm::vec3{5.0f, 0.0f, 0.0f});
+        auto& satelliteBody = satellite.addComponent<RigidBodyComponent>(1.0f);
+        satellite.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        settings.gravitationalParameter = 50.0f;
+        settings.gravityCenter = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 0.1, settings);
+        check(nearlyEqual(satelliteBody.velocity.x, -0.2, 1e-5),
+              "global point-mass gravity uses inverse-square acceleration");
+    }
+
+    // Zero-G drift: no gravity means velocities and total momentum persist.
+    {
+        engine::Scene scene;
+        auto left = scene.createEntity("ZeroGLeft");
+        left.addComponent<TransformComponent>(glm::vec3{-10.0f, 0.0f, 0.0f});
+        auto& leftBody = left.addComponent<RigidBodyComponent>(2.0f);
+        leftBody.velocity = glm::vec3{1.0f, 2.0f, 3.0f};
+        left.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+        auto right = scene.createEntity("ZeroGRight");
+        right.addComponent<TransformComponent>(glm::vec3{10.0f, 0.0f, 0.0f});
+        auto& rightBody = right.addComponent<RigidBodyComponent>(2.0f);
+        rightBody.velocity = glm::vec3{-1.0f, -2.0f, -3.0f};
+        right.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        for (int step = 0; step < 10; ++step) {
+            physics.update(scene, 0.1, settings);
+        }
+        const glm::vec3 momentum = leftBody.velocity * 2.0f + rightBody.velocity * 2.0f;
+        check(nearlyVec3(momentum, glm::vec3{0.0f}), "zero-G motion conserves total momentum");
+        check(left.getComponent<TransformComponent>().position.x > -10.0f,
+              "zero-G bodies keep drifting without gravity");
+    }
+
+    // New narrow-phase shapes: rotated OBB, capsule/sphere, hull/box.
+    {
+        engine::Scene scene;
+        auto a = scene.createEntity("ObbA");
+        auto& aTransform = a.addComponent<TransformComponent>(glm::vec3{0.0f});
+        aTransform.rotationDegrees = glm::vec3{0.0f, 0.0f, 45.0f};
+        a.addComponent<RigidBodyComponent>(1.0f);
+        a.addComponent<ColliderComponent>(ColliderComponent::obb(glm::vec3{0.5f}));
+        auto b = scene.createEntity("ObbB");
+        b.addComponent<TransformComponent>(glm::vec3{0.8f, 0.0f, 0.0f});
+        b.addComponent<RigidBodyComponent>(1.0f);
+        b.addComponent<ColliderComponent>(ColliderComponent::obb(glm::vec3{0.5f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        check(physics.update(scene, 0.01, settings).contacts == 1, "rotated OBB pair generates a contact");
+    }
+    {
+        engine::Scene scene;
+        auto capsule = scene.createEntity("Capsule");
+        capsule.addComponent<TransformComponent>(glm::vec3{0.0f});
+        capsule.addComponent<RigidBodyComponent>(1.0f);
+        capsule.addComponent<ColliderComponent>(ColliderComponent::capsule(0.3f, 0.5f));
+        auto sphere = scene.createEntity("CapsuleSphere");
+        sphere.addComponent<TransformComponent>(glm::vec3{0.0f, 0.9f, 0.0f});
+        sphere.addComponent<RigidBodyComponent>(1.0f);
+        sphere.addComponent<ColliderComponent>(ColliderComponent::sphere(0.3f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        check(physics.update(scene, 0.01, settings).contacts == 1, "capsule-sphere pair generates a contact");
+    }
+    {
+        engine::Scene scene;
+        const std::vector<glm::vec3> points = {{-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f},
+                                               {-0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, -0.5f},
+                                               {-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f},
+                                               {-0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}};
+        auto hull = scene.createEntity("Hull");
+        hull.addComponent<TransformComponent>(glm::vec3{0.0f});
+        hull.addComponent<RigidBodyComponent>(1.0f);
+        hull.addComponent<ColliderComponent>(ColliderComponent::convexHull(points));
+        auto box = scene.createEntity("HullBox");
+        box.addComponent<TransformComponent>(glm::vec3{0.8f, 0.0f, 0.0f});
+        box.addComponent<RigidBodyComponent>(1.0f);
+        box.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        check(physics.update(scene, 0.01, settings).contacts == 1, "convex hull-box pair generates a contact");
+    }
+
+    // CCD: a 120 m/s projectile crosses a 0.1 m wall in one step. Swept
+    // sphere/box collision stops it on the incoming side; disabling CCD
+    // lets the same discrete step tunnel through.
+    const auto runProjectile = [](bool ccdEnabled, float& outX, float& outVelocityX) {
+        engine::Scene scene;
+        auto wall = scene.createEntity("CcdWall");
+        wall.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& wallBody = wall.addComponent<RigidBodyComponent>();
+        wallBody.setStatic(true);
+        wall.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.05f, 1.0f, 1.0f}));
+        auto projectile = scene.createEntity("CcdProjectile");
+        projectile.addComponent<TransformComponent>(glm::vec3{-3.0f, 0.0f, 0.0f});
+        auto& projectileBody = projectile.addComponent<RigidBodyComponent>(1.0f);
+        projectileBody.velocity = glm::vec3{120.0f, 0.0f, 0.0f};
+        projectileBody.useGravity = false;
+        projectile.addComponent<ColliderComponent>(ColliderComponent::sphere(0.1f));
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        settings.ccdEnabled = ccdEnabled;
+        PhysicsSystem physics;
+        const auto stats = physics.update(scene, 1.0 / 30.0, settings);
+        outX = projectile.getComponent<TransformComponent>().position.x;
+        outVelocityX = projectileBody.velocity.x;
+        return stats.contacts;
+    };
+    {
+        float x = 0.0f;
+        float velocityX = 0.0f;
+        const size_t contacts = runProjectile(true, x, velocityX);
+        check(contacts >= 1 && x < 0.0f && velocityX <= 0.1f,
+              "CCD stops a fast projectile before a thin wall");
+        const size_t tunneledContacts = runProjectile(false, x, velocityX);
+        check(tunneledContacts == 0 && x > 0.0f, "disabled CCD permits the tunneling control case");
+    }
+
+    // Distance and hinge joints keep their anchor separation; a world-
+    // anchored spring-damper pulls a stretched body back toward rest length.
+    {
+        engine::Scene scene;
+        auto a = scene.createEntity("DistanceA");
+        a.addComponent<TransformComponent>(glm::vec3{-1.0f, 0.0f, 0.0f});
+        a.addComponent<RigidBodyComponent>(1.0f);
+        a.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        auto b = scene.createEntity("DistanceB");
+        b.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        b.addComponent<RigidBodyComponent>(1.0f);
+        b.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        auto& joint = a.addComponent<engine::JointComponent>();
+        joint.other = b.handle();
+        joint.type = engine::JointType::Distance;
+        joint.restLength = 1.0f;
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        const auto stats = physics.update(scene, 1.0 / 60.0, settings);
+        const float distance = glm::length(b.getComponent<TransformComponent>().position -
+                                           a.getComponent<TransformComponent>().position);
+        check(stats.joints == 1 && distance < 1.9f, "distance joint pulls bodies toward rest length");
+    }
+    {
+        engine::Scene scene;
+        auto pendulum = scene.createEntity("HingePendulum");
+        pendulum.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        auto& pendulumBody = pendulum.addComponent<RigidBodyComponent>(1.0f);
+        pendulumBody.velocity = glm::vec3{0.0f, 1.0f, 0.0f};
+        pendulum.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        auto& joint = pendulum.addComponent<engine::JointComponent>();
+        joint.type = engine::JointType::Hinge;
+        joint.anchorB = glm::vec3{0.0f};
+        joint.restLength = 1.0f;
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        for (int step = 0; step < 60; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float radius = glm::length(pendulum.getComponent<TransformComponent>().position);
+        check(radius > 0.8f && radius < 1.2f, "hinge joint preserves its swing radius");
+    }
+    {
+        engine::Scene scene;
+        auto bodyEntity = scene.createEntity("SpringBody");
+        bodyEntity.addComponent<TransformComponent>(glm::vec3{2.0f, 0.0f, 0.0f});
+        auto& springBody = bodyEntity.addComponent<RigidBodyComponent>(1.0f);
+        bodyEntity.addComponent<ColliderComponent>(ColliderComponent::sphere(0.25f));
+        auto& joint = bodyEntity.addComponent<engine::JointComponent>();
+        joint.type = engine::JointType::SpringDamper;
+        joint.anchorB = glm::vec3{0.0f};
+        joint.restLength = 1.0f;
+        joint.stiffness = 50.0f;
+        joint.damping = 1.0f;
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 0.1, settings);
+        check(springBody.velocity.x < -0.1f, "spring-damper applies a restoring force");
+    }
+
+    // An offset thruster accelerates the body and torques it around the
+    // axis perpendicular to both offset and force.
+    {
+        engine::Scene scene;
+        auto craft = scene.createEntity("ThrusterCraft");
+        craft.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& craftBody = craft.addComponent<RigidBodyComponent>(2.0f);
+        craft.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto& thruster = craft.addComponent<engine::ThrusterComponent>();
+        thruster.force = glm::vec3{10.0f, 0.0f, 0.0f};
+        thruster.localPosition = glm::vec3{0.0f, 1.0f, 0.0f};
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        PhysicsSystem physics;
+        physics.update(scene, 0.1, settings);
+        check(nearlyEqual(craftBody.velocity.x, 0.5, 1e-5), "thruster force accelerates by F/m");
+        check(craftBody.angularVelocity.z < -1.0f, "offset thruster generates torque");
+    }
+
+    // Anisotropic friction can make one tangent direction slippery while
+    // the orthogonal tangent retains the scalar Coulomb coefficient.
+    {
+        engine::Scene scene;
+        auto floor = scene.createEntity("AnisotropicFloor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.05f, 0.0f});
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floorBody.friction = 1.0f;
+        floor.addComponent<ColliderComponent>(ColliderComponent::plane(glm::vec3{0.0f, 1.0f, 0.0f}, 0.0f));
+        auto slider = scene.createEntity("AnisotropicSlider");
+        slider.addComponent<TransformComponent>(glm::vec3{0.0f, 0.5f, 0.0f});
+        auto& sliderBody = slider.addComponent<RigidBodyComponent>(1.0f);
+        sliderBody.velocity = glm::vec3{2.0f, 0.0f, 0.0f};
+        sliderBody.friction = 1.0f;
+        sliderBody.anisotropicFriction = glm::vec2{0.0f, 1.0f};
+        slider.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        physics.update(scene, 1.0 / 60.0, settings);
+        check(sliderBody.velocity.x > 1.9f, "anisotropic friction leaves the slippery tangent direction moving");
+    }
+
+    // Islands split disconnected contact graphs, and parallel execution is
+    // worker-count deterministic for separated bodies.
+    {
+        engine::Scene scene;
+        for (int stackIndex = 0; stackIndex < 2; ++stackIndex) {
+            const float x = stackIndex == 0 ? -5.0f : 5.0f;
+            auto floor = scene.createEntity("IslandFloor");
+            floor.addComponent<TransformComponent>(glm::vec3{x, -0.05f, 0.0f});
+            auto& floorBody = floor.addComponent<RigidBodyComponent>();
+            floorBody.setStatic(true);
+            floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{2.0f, 0.05f, 2.0f}));
+            auto box = scene.createEntity("IslandBox");
+            box.addComponent<TransformComponent>(glm::vec3{x, 0.5f, 0.0f});
+            box.addComponent<RigidBodyComponent>(1.0f);
+            box.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        }
+        PhysicsSettings settings;
+        PhysicsSystem physics;
+        const auto stats = physics.update(scene, 1.0 / 60.0, settings);
+        check(stats.islands == 2 && stats.largestIsland == 2,
+              "solver islands split disconnected contact graphs");
+    }
+    {
+        const auto runWorkers = [](uint32_t workers) {
+            engine::Scene scene;
+            std::vector<engine::Entity> entities;
+            for (int i = 0; i < 128; ++i) {
+                auto entity = scene.createEntity("DeterministicBody");
+                entity.addComponent<TransformComponent>(glm::vec3{static_cast<float>(i) * 3.0f, 10.0f, 0.0f});
+                entity.addComponent<RigidBodyComponent>(1.0f);
+                entity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+                entities.push_back(entity);
+            }
+            PhysicsSettings settings;
+            settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+            settings.parallelMinBodies = 16;
+            engine::JobSystem jobs{engine::JobSystem::Config{workers, 256}};
+            PhysicsSystem physics;
+            physics.update(scene, 0.05, settings, jobs);
+            std::vector<glm::vec3> results;
+            for (auto& entity : entities) {
+                results.push_back(entity.getComponent<TransformComponent>().position);
+                results.push_back(entity.getComponent<RigidBodyComponent>().velocity);
+            }
+            return results;
+        };
+        const std::vector<glm::vec3> oneWorker = runWorkers(1);
+        const std::vector<glm::vec3> threeWorkers = runWorkers(3);
+        bool identical = oneWorker.size() == threeWorkers.size();
+        for (size_t i = 0; identical && i < oneWorker.size(); ++i) {
+            identical = nearlyVec3(oneWorker[i], threeWorkers[i], 1e-6);
+        }
+        check(identical, "parallel physics is deterministic across worker counts");
     }
 }
 

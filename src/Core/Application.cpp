@@ -87,6 +87,90 @@ void Application::buildScene() {
     Entity player = m_scene.createEntity("Player");
     player.addComponent<CameraComponent>(m_config.camera);
 
+    if (m_config.physics.demoMode == PhysicsDemoMode::Space) {
+        // Zero-G sandbox: the uniform field is disabled for this scene and
+        // the planet entity supplies localized radial gravity instead.
+        m_config.physics.gravity = glm::vec3{0.0f};
+        m_config.physics.gravitationalParameter = 0.0f;
+
+        Entity planet = m_scene.createEntity("RadialGravityPlanet");
+        auto& planetTransform = planet.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -5.0f});
+        planetTransform.scale = glm::vec3{1.6f};
+        planet.addComponent<MeshComponent>("cube");
+        auto& planetBody = planet.addComponent<RigidBodyComponent>();
+        planetBody.setStatic(true);
+        planetBody.friction = 0.4f;
+        planet.addComponent<ColliderComponent>(ColliderComponent::sphere(0.5f));
+        auto& planetGravity = planet.addComponent<GravityFieldComponent>();
+        planetGravity.gravitationalParameter = 20.0f;
+        planetGravity.radius = 0.0f; // unbounded inverse-square field
+
+        const auto addSpaceBody = [this](const char* name, const glm::vec3& position, float scale,
+                                         const glm::vec3& velocity, const ColliderComponent& collider) {
+            Entity entity = m_scene.createEntity(name);
+            auto& transform = entity.addComponent<TransformComponent>(position);
+            transform.scale = glm::vec3{scale};
+            entity.addComponent<MeshComponent>("cube");
+            auto& body = entity.addComponent<RigidBodyComponent>(1.0f);
+            body.velocity = velocity;
+            body.restitution = 0.2f;
+            body.friction = 0.3f;
+            entity.addComponent<ColliderComponent>(collider);
+            return entity;
+        };
+
+        // Tangential velocity sqrt(mu/r) = sqrt(20/2.5) ~= 2.83 m/s.
+        addSpaceBody("OrbitalCraft", glm::vec3{-2.5f, 0.0f, -5.0f}, 0.45f, glm::vec3{0.0f, 2.83f, 0.0f},
+                     ColliderComponent::capsule(0.3f, 0.35f));
+
+        Entity drone = addSpaceBody("ThrusterDrone", glm::vec3{2.2f, 1.2f, -5.0f}, 0.35f,
+                                    glm::vec3{-0.5f, 0.0f, 0.0f}, ColliderComponent::sphere(0.5f));
+        auto& thruster = drone.addComponent<ThrusterComponent>();
+        thruster.force = glm::vec3{2.5f, 0.0f, 0.0f};
+        thruster.localPosition = glm::vec3{0.0f, -0.25f, 0.0f}; // offset -> torque
+        thruster.throttle = 1.0f;
+
+        Entity projectile = addSpaceBody("FastProjectile", glm::vec3{-4.0f, -1.2f, -5.0f}, 0.18f,
+                                         glm::vec3{35.0f, 0.0f, 0.0f}, ColliderComponent::sphere(0.5f));
+        projectile.getComponent<RigidBodyComponent>().useGravity = false;
+
+        Entity wall = m_scene.createEntity("ThinCcdWall");
+        auto& wallTransform = wall.addComponent<TransformComponent>(glm::vec3{0.0f, -1.2f, -5.0f});
+        wallTransform.scale = glm::vec3{0.1f, 2.0f, 2.0f};
+        wall.addComponent<MeshComponent>("cube");
+        auto& wallBody = wall.addComponent<RigidBodyComponent>();
+        wallBody.setStatic(true);
+        wall.addComponent<ColliderComponent>(ColliderComponent::obb(glm::vec3{0.5f}));
+
+        Entity cargoA = addSpaceBody("JointCargoA", glm::vec3{1.8f, -1.8f, -4.0f}, 0.3f,
+                                     glm::vec3{0.0f}, ColliderComponent::sphere(0.5f));
+        Entity cargoB = addSpaceBody("JointCargoB", glm::vec3{2.6f, -1.8f, -4.0f}, 0.3f,
+                                     glm::vec3{0.0f}, ColliderComponent::sphere(0.5f));
+        cargoA.getComponent<RigidBodyComponent>().useGravity = false;
+        cargoB.getComponent<RigidBodyComponent>().useGravity = false;
+        auto& cargoJoint = cargoA.addComponent<JointComponent>();
+        cargoJoint.other = cargoB.handle();
+        cargoJoint.type = JointType::Distance;
+        cargoJoint.restLength = 0.8f;
+
+        Entity springCraft = addSpaceBody("SpringAnchoredCraft", glm::vec3{-1.0f, 2.0f, -4.0f}, 0.3f,
+                                          glm::vec3{0.4f, 0.0f, 0.0f}, ColliderComponent::sphere(0.5f));
+        springCraft.getComponent<RigidBodyComponent>().useGravity = false;
+        auto& spring = springCraft.addComponent<JointComponent>();
+        spring.type = JointType::SpringDamper;
+        spring.anchorB = glm::vec3{-1.0f, 3.0f, -4.0f}; // world anchor (other is null)
+        spring.restLength = 1.0f;
+        spring.stiffness = 20.0f;
+        spring.damping = 2.0f;
+
+        m_physicsSystem.captureSpawnStates(m_scene);
+        ENGINE_LOG_INFO("Scene built: " << m_scene.entityCount()
+                                        << " entities (zero-G orbital sandbox: radial-gravity planet, "
+                                        << "capsule craft, thruster drone, jointed cargo, spring craft, "
+                                        << "fast CCD projectile and thin OBB wall)");
+        return;
+    }
+
     // Static floor: rendered as a flattened cube whose top surface is
     // y=-1.25, with an infinite plane collider at exactly that height.
     constexpr float floorTop = -1.25f;
@@ -131,12 +215,25 @@ void Application::buildScene() {
     addPhysicsCube("CubeRightTop", glm::vec3{1.22f, 2.75f, -2.05f}, 0.5f, glm::vec3{0.0f, 0.0f, 0.0f},
                    glm::vec3{0.0f, -30.0f, 0.0f});
 
+    // High-stress terrestrial stack: twelve resting unit-mass cubes in a
+    // 3x4 arrangement behind the falling cubes. Warm starting and island
+    // solving keep this load settled instead of jittering apart.
+    for (int level = 0; level < 4; ++level) {
+        for (int column = 0; column < 3; ++column) {
+            addPhysicsCube("StackCube",
+                           glm::vec3{-0.55f + static_cast<float>(column) * 0.58f +
+                                         static_cast<float>(level) * 0.03f,
+                                     floorTop + 0.26f + static_cast<float>(level) * 0.53f, -3.6f},
+                           0.5f, glm::vec3{0.0f}, glm::vec3{0.0f});
+        }
+    }
+
     // Respawn snapshots for the C key. Capturing handles + values (not
     // component pointers) makes repeated resets allocation-free and safe.
     m_physicsSystem.captureSpawnStates(m_scene);
 
     ENGINE_LOG_INFO("Scene built: " << m_scene.entityCount() << " entities (player camera, static physics floor, "
-                                    << "6 falling rigid-body cubes)");
+                                    << "6 falling rigid-body cubes, 12-cube stacking stress scene)");
 }
 
 void Application::run() {

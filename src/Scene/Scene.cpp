@@ -32,6 +32,9 @@ void Scene::reserveCapacity(size_t entityCount) {
     m_registry.storage<SpinComponent>().reserve(entityCount);
     m_registry.storage<RigidBodyComponent>().reserve(entityCount);
     m_registry.storage<ColliderComponent>().reserve(entityCount);
+    m_registry.storage<GravityFieldComponent>().reserve(entityCount);
+    m_registry.storage<JointComponent>().reserve(entityCount);
+    m_registry.storage<ThrusterComponent>().reserve(entityCount);
     ENGINE_LOG_DEBUG("Scene: reserved component storage for " << entityCount << " entities");
 }
 

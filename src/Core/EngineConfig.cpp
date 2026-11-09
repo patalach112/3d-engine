@@ -395,6 +395,37 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             if (reader.applyInteger(value, intField, 1, 10000000)) {
                 config.physics.parallelMinBodies = static_cast<uint32_t>(intField);
             }
+        } else if (key == "demomode") {
+            const std::string mode = toLower(value);
+            if (mode == "terrestrial" || mode == "earth" || mode == "ground") {
+                config.physics.demoMode = PhysicsDemoMode::Terrestrial;
+            } else if (mode == "space" || mode == "zero-g" || mode == "zerog" || mode == "orbital") {
+                config.physics.demoMode = PhysicsDemoMode::Space;
+            } else {
+                reader.warnInvalid(value, "one of terrestrial/space");
+            }
+        } else if (key == "gravitycenterx") {
+            if (reader.applyDouble(value, doubleField, -1e9, 1e9)) {
+                config.physics.gravityCenter.x = static_cast<float>(doubleField);
+            }
+        } else if (key == "gravitycentery") {
+            if (reader.applyDouble(value, doubleField, -1e9, 1e9)) {
+                config.physics.gravityCenter.y = static_cast<float>(doubleField);
+            }
+        } else if (key == "gravitycenterz") {
+            if (reader.applyDouble(value, doubleField, -1e9, 1e9)) {
+                config.physics.gravityCenter.z = static_cast<float>(doubleField);
+            }
+        } else if (key == "gravitationalparameter") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 1e18)) {
+                config.physics.gravitationalParameter = static_cast<float>(doubleField);
+            }
+        } else if (key == "gravitysoftening") {
+            if (reader.applyDouble(value, doubleField, -1e-9, 1e9)) {
+                config.physics.gravitySoftening = static_cast<float>(doubleField);
+            }
+        } else if (key == "ccdenabled") {
+            reader.apply(value, config.physics.ccdEnabled);
         } else {
             return false;
         }
