@@ -1,7 +1,11 @@
 #include "Assets/AssetManager.h"
 
+#include "Core/Jobs/JobSystem.h"
 #include "Core/Logger.h"
+#include "Geometry/Cube.h"
 #include "Graphics/VramBudget.h"
+
+#include <system_error>
 
 #include <algorithm>
 #include <array>
@@ -62,6 +66,23 @@ AssetManager::AssetManager(VramBudget& vramBudget, VramBudget& stagingBudget, Ca
     m_meshIds.reserve(capacity.meshes);
     m_shaderIds.reserve(capacity.shaders);
     m_materialIds.reserve(capacity.materials);
+
+    // Built-in fallback assets (Phase 20): a magenta-tinted cube and
+    // a magenta/black checker texture, served by the *OrFallback
+    // accessors whenever a requested asset is unknown, still loading
+    // or failed. Never registered (ids stay invalid, no VRAM held).
+    m_fallbackMesh.name = "__fallbackMesh";
+    m_fallbackMesh.vertices = Cube::vertices();
+    for (Vertex& vertex : m_fallbackMesh.vertices) {
+        vertex.color = glm::vec3{1.0f, 0.0f, 1.0f};
+    }
+    m_fallbackMesh.indices = Cube::indices();
+    m_fallbackMesh.bounds = computeMeshBounds(m_fallbackMesh.vertices);
+    m_fallbackTexture.name = "__fallbackTexture";
+    m_fallbackTexture.width = 2;
+    m_fallbackTexture.height = 2;
+    m_fallbackTexture.pixels = {255, 0, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 0, 255, 255};
+    m_fallbackTexture.vramBytes = 2 * 2 * 4;
 }
 
 AssetManager::~AssetManager() {
@@ -541,6 +562,554 @@ const MaterialAsset* AssetManager::material(MaterialId id) const {
 const MaterialAsset* AssetManager::material(std::string_view name) const {
     const auto it = m_materialIds.find(std::string(name));
     return it != m_materialIds.end() ? &m_materials[it->second - 1] : nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Async asset pipeline (Phase 20)
+//
+// Workers perform file I/O + parsing only; the parsed payload waits
+// in the record until processCompletedLoads() (main thread) swaps it
+// into the registry. Completions travel through lock-free rings
+// (with a mutex-guarded overflow for bursts), so workers never block
+// on the registry and the registry is only ever mutated by the
+// thread that also reads it for rendering.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Binary PPM (P6, maxval 255) -> RGBA8. Header tokens may be
+// separated by whitespace and #-comments.
+bool parsePpmFile(const std::filesystem::path& path, uint32_t& outWidth, uint32_t& outHeight,
+                  std::vector<uint8_t>& outPixels, std::string& outError) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        outError = "cannot open file";
+        return false;
+    }
+    const std::vector<char> data{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    size_t pos = 0;
+    const auto nextToken = [&data, &pos]() -> std::string {
+        while (pos < data.size()) {
+            const char c = data[pos];
+            if (c == '#') {
+                while (pos < data.size() && data[pos] != '\n') {
+                    ++pos;
+                }
+            } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                ++pos;
+            } else {
+                break;
+            }
+        }
+        const size_t start = pos;
+        while (pos < data.size()) {
+            const char c = data[pos];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '#') {
+                break;
+            }
+            ++pos;
+        }
+        return std::string{data.data() + start, data.data() + pos};
+    };
+    const auto parseUint = [](const std::string& token, uint32_t& out) {
+        return !token.empty() &&
+               std::from_chars(token.data(), token.data() + token.size(), out).ec == std::errc{};
+    };
+
+    uint32_t maxValue = 0;
+    if (nextToken() != "P6" || !parseUint(nextToken(), outWidth) || !parseUint(nextToken(), outHeight) ||
+        !parseUint(nextToken(), maxValue)) {
+        outError = "malformed PPM header";
+        return false;
+    }
+    if (maxValue != 255 || outWidth == 0 || outHeight == 0) {
+        outError = "unsupported PPM (requires maxval 255 and non-zero size)";
+        return false;
+    }
+    ++pos; // exactly one whitespace byte separates header and raster
+    const size_t needed = static_cast<size_t>(outWidth) * outHeight * 3;
+    if (pos > data.size() || data.size() - pos < needed) {
+        outError = "truncated PPM raster";
+        return false;
+    }
+    outPixels.resize(static_cast<size_t>(outWidth) * outHeight * 4);
+    for (size_t i = 0; i < static_cast<size_t>(outWidth) * outHeight; ++i) {
+        outPixels[i * 4 + 0] = static_cast<uint8_t>(data[pos + i * 3 + 0]);
+        outPixels[i * 4 + 1] = static_cast<uint8_t>(data[pos + i * 3 + 1]);
+        outPixels[i * 4 + 2] = static_cast<uint8_t>(data[pos + i * 3 + 2]);
+        outPixels[i * 4 + 3] = 255;
+    }
+    return true;
+}
+
+// Shared Loading-state gate for both record kinds: atomically moves
+// Unloaded/Failed (and Loaded for reloads) into Loading, clears the
+// previous payload bookkeeping, and fires the Loading event.
+template <typename Record, typename Submit>
+bool beginAsyncLoad(const std::shared_ptr<Record>& record, bool allowFromLoaded, AssetKind kind,
+                    Submit&& submit, const AssetManager::AssetEventCallback& callback) {
+    AssetState current = record->state.load(std::memory_order_acquire);
+    while (true) {
+        const bool allowed = current == AssetState::Unloaded || current == AssetState::Failed ||
+                             (allowFromLoaded && current == AssetState::Loaded);
+        if (!allowed) {
+            return false;
+        }
+        if (record->state.compare_exchange_weak(current, AssetState::Loading, std::memory_order_acq_rel)) {
+            break;
+        }
+    }
+    {
+        std::lock_guard lock(record->mutex);
+        record->cpuReady = false;
+        record->error.clear();
+    }
+    if (callback) {
+        callback(record->name, kind, AssetState::Loading);
+    }
+    submit();
+    return true;
+}
+
+} // namespace
+
+void AssetManager::setAssetEventCallback(AssetEventCallback callback) {
+    m_assetEventCallback = std::move(callback);
+}
+
+void AssetManager::fireAssetEvent(std::string_view name, AssetKind kind, AssetState state) {
+    if (m_assetEventCallback) {
+        m_assetEventCallback(name, kind, state);
+    }
+}
+
+std::shared_ptr<AssetManager::MeshLoadRecord> AssetManager::findMeshRecord(std::string_view name) const {
+    std::lock_guard lock(m_recordsMutex);
+    const auto found = m_meshRecords.find(std::string{name});
+    return found != m_meshRecords.end() ? found->second : nullptr;
+}
+
+std::shared_ptr<AssetManager::TextureLoadRecord> AssetManager::findTextureRecord(std::string_view name) const {
+    std::lock_guard lock(m_recordsMutex);
+    const auto found = m_textureRecords.find(std::string{name});
+    return found != m_textureRecords.end() ? found->second : nullptr;
+}
+
+bool AssetManager::declareMeshSource(const std::string& name, std::filesystem::path source) {
+    std::lock_guard lock(m_recordsMutex);
+    if (m_meshRecords.find(name) != m_meshRecords.end() ||
+        m_textureRecords.find(name) != m_textureRecords.end()) {
+        return false;
+    }
+    auto record = std::make_shared<MeshLoadRecord>();
+    record->name = name;
+    record->source = std::move(source);
+    m_meshRecords.emplace(name, std::move(record));
+    return true;
+}
+
+bool AssetManager::declareTextureSource(const std::string& name, std::filesystem::path source) {
+    std::lock_guard lock(m_recordsMutex);
+    if (m_meshRecords.find(name) != m_meshRecords.end() ||
+        m_textureRecords.find(name) != m_textureRecords.end()) {
+        return false;
+    }
+    auto record = std::make_shared<TextureLoadRecord>();
+    record->name = name;
+    record->source = std::move(source);
+    m_textureRecords.emplace(name, std::move(record));
+    return true;
+}
+
+void AssetManager::submitMeshLoad(const std::shared_ptr<MeshLoadRecord>& record) {
+    const std::shared_ptr<CompletionSink> sink = m_sink;
+    auto job = [record, sink]() {
+        std::vector<Vertex> vertices;
+        std::vector<uint32_t> indices;
+        std::string error;
+        std::ifstream file(record->source);
+        if (!file) {
+            error = "cannot open OBJ file '" + record->source.string() + "'";
+        } else if (!parseObjStream(file, vertices, indices)) {
+            error = "failed to parse OBJ file '" + record->source.string() + "'";
+        }
+        std::error_code ec;
+        const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(record->source, ec);
+        {
+            std::lock_guard lock(record->mutex);
+            record->vertices = std::move(vertices);
+            record->indices = std::move(indices);
+            record->error = std::move(error);
+            record->cpuReady = record->error.empty();
+            if (!ec) {
+                record->writeTime = writeTime;
+            }
+        }
+        sink->pending.fetch_add(1, std::memory_order_acq_rel);
+        if (!sink->meshCompletions.tryPush(record)) {
+            std::lock_guard lock(sink->overflowMutex);
+            sink->meshOverflow.push_back(record);
+        }
+    };
+    if (m_jobs != nullptr) {
+        m_jobs->submit(std::move(job));
+    } else {
+        job(); // no pool: load inline, still published via the sync boundary
+    }
+}
+
+void AssetManager::submitTextureLoad(const std::shared_ptr<TextureLoadRecord>& record) {
+    const std::shared_ptr<CompletionSink> sink = m_sink;
+    auto job = [record, sink]() {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        std::vector<uint8_t> pixels;
+        std::string error;
+        if (!parsePpmFile(record->source, width, height, pixels, error)) {
+            error += " ('" + record->source.string() + "')";
+        }
+        std::error_code ec;
+        const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(record->source, ec);
+        {
+            std::lock_guard lock(record->mutex);
+            record->width = width;
+            record->height = height;
+            record->pixels = std::move(pixels);
+            record->error = std::move(error);
+            record->cpuReady = record->error.empty();
+            if (!ec) {
+                record->writeTime = writeTime;
+            }
+        }
+        sink->pending.fetch_add(1, std::memory_order_acq_rel);
+        if (!sink->textureCompletions.tryPush(record)) {
+            std::lock_guard lock(sink->overflowMutex);
+            sink->textureOverflow.push_back(record);
+        }
+    };
+    if (m_jobs != nullptr) {
+        m_jobs->submit(std::move(job));
+    } else {
+        job();
+    }
+}
+
+bool AssetManager::requestLoad(std::string_view name) {
+    if (const std::shared_ptr<MeshLoadRecord> record = findMeshRecord(name); record != nullptr) {
+        return beginAsyncLoad(record, false, AssetKind::Mesh, [this, record] { submitMeshLoad(record); },
+                              m_assetEventCallback);
+    }
+    if (const std::shared_ptr<TextureLoadRecord> record = findTextureRecord(name); record != nullptr) {
+        return beginAsyncLoad(record, false, AssetKind::Texture,
+                              [this, record] { submitTextureLoad(record); }, m_assetEventCallback);
+    }
+    return false;
+}
+
+bool AssetManager::reloadAsset(std::string_view name) {
+    if (const std::shared_ptr<MeshLoadRecord> record = findMeshRecord(name); record != nullptr) {
+        return beginAsyncLoad(record, true, AssetKind::Mesh, [this, record] { submitMeshLoad(record); },
+                              m_assetEventCallback);
+    }
+    if (const std::shared_ptr<TextureLoadRecord> record = findTextureRecord(name); record != nullptr) {
+        return beginAsyncLoad(record, true, AssetKind::Texture,
+                              [this, record] { submitTextureLoad(record); }, m_assetEventCallback);
+    }
+    return false;
+}
+
+void AssetManager::finishMeshLoad(const std::shared_ptr<MeshLoadRecord>& record) {
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    bool ready = false;
+    {
+        std::lock_guard lock(record->mutex);
+        ready = record->cpuReady;
+        if (ready) {
+            vertices = std::move(record->vertices);
+            indices = std::move(record->indices);
+            record->cpuReady = false;
+        }
+    }
+    if (!ready) {
+        std::string error;
+        {
+            std::lock_guard lock(record->mutex);
+            error = record->error;
+        }
+        record->state.store(AssetState::Failed, std::memory_order_release);
+        ENGINE_LOG_WARNING("AssetManager: mesh '" << record->name << "' failed to load: " << error);
+        fireAssetEvent(record->name, AssetKind::Mesh, AssetState::Failed);
+        return;
+    }
+
+    if (record->meshId != kInvalidAssetId && static_cast<size_t>(record->meshId) <= m_meshes.size()) {
+        // Hot reload: swap data in place under the stable id.
+        MeshAsset& asset = m_meshes[record->meshId - 1];
+        const uint64_t newBytes = static_cast<uint64_t>(vertices.size() * sizeof(Vertex)) +
+                                  static_cast<uint64_t>(indices.size() * sizeof(uint32_t));
+        m_vramBudget.release(asset.vramBytes);
+        m_reservedVramBytes -= asset.vramBytes;
+        if (!m_vramBudget.tryReserve(newBytes)) {
+            if (!m_vramBudget.tryReserve(asset.vramBytes)) {
+                ENGINE_LOG_WARNING("AssetManager: VRAM accounting drift reloading '" << record->name << "'");
+            }
+            m_reservedVramBytes += asset.vramBytes;
+            ENGINE_LOG_WARNING("AssetManager: VRAM budget exceeded reloading mesh '" << record->name
+                                                                                       << "'; keeping previous data");
+            record->state.store(AssetState::Loaded, std::memory_order_release);
+            fireAssetEvent(record->name, AssetKind::Mesh, AssetState::Loaded);
+            return;
+        }
+        m_reservedVramBytes += newBytes;
+        asset.vertices = std::move(vertices);
+        asset.indices = std::move(indices);
+        asset.bounds = computeMeshBounds(asset.vertices);
+        asset.vramBytes = newBytes;
+    } else {
+        const MeshId id = registerMesh(record->name, vertices, indices);
+        if (id == kInvalidAssetId) {
+            {
+                std::lock_guard lock(record->mutex);
+                record->error = "VRAM or staging budget exceeded";
+            }
+            record->state.store(AssetState::Failed, std::memory_order_release);
+            fireAssetEvent(record->name, AssetKind::Mesh, AssetState::Failed);
+            return;
+        }
+        record->meshId = id;
+    }
+    record->state.store(AssetState::Loaded, std::memory_order_release);
+    ENGINE_LOG_INFO("AssetManager: mesh '" << record->name << "' loaded (id " << record->meshId << ")");
+    fireAssetEvent(record->name, AssetKind::Mesh, AssetState::Loaded);
+}
+
+void AssetManager::finishTextureLoad(const std::shared_ptr<TextureLoadRecord>& record) {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> pixels;
+    bool ready = false;
+    {
+        std::lock_guard lock(record->mutex);
+        ready = record->cpuReady;
+        if (ready) {
+            width = record->width;
+            height = record->height;
+            pixels = std::move(record->pixels);
+            record->cpuReady = false;
+        }
+    }
+    if (!ready) {
+        std::string error;
+        {
+            std::lock_guard lock(record->mutex);
+            error = record->error;
+        }
+        record->state.store(AssetState::Failed, std::memory_order_release);
+        ENGINE_LOG_WARNING("AssetManager: texture '" << record->name << "' failed to load: " << error);
+        fireAssetEvent(record->name, AssetKind::Texture, AssetState::Failed);
+        return;
+    }
+
+    if (record->textureId != kInvalidAssetId && static_cast<size_t>(record->textureId) <= m_textures.size()) {
+        TextureAsset& asset = m_textures[record->textureId - 1];
+        const uint64_t newBytes = static_cast<uint64_t>(pixels.size());
+        m_vramBudget.release(asset.vramBytes);
+        m_reservedVramBytes -= asset.vramBytes;
+        if (!m_vramBudget.tryReserve(newBytes)) {
+            if (!m_vramBudget.tryReserve(asset.vramBytes)) {
+                ENGINE_LOG_WARNING("AssetManager: VRAM accounting drift reloading '" << record->name << "'");
+            }
+            m_reservedVramBytes += asset.vramBytes;
+            ENGINE_LOG_WARNING("AssetManager: VRAM budget exceeded reloading texture '" << record->name
+                                                                                          << "'; keeping previous data");
+            record->state.store(AssetState::Loaded, std::memory_order_release);
+            fireAssetEvent(record->name, AssetKind::Texture, AssetState::Loaded);
+            return;
+        }
+        m_reservedVramBytes += newBytes;
+        asset.width = width;
+        asset.height = height;
+        asset.pixels = std::move(pixels);
+        asset.vramBytes = newBytes;
+    } else {
+        const TextureId id = registerTexture(record->name, width, height, pixels);
+        if (id == kInvalidAssetId) {
+            {
+                std::lock_guard lock(record->mutex);
+                record->error = "VRAM or staging budget exceeded";
+            }
+            record->state.store(AssetState::Failed, std::memory_order_release);
+            fireAssetEvent(record->name, AssetKind::Texture, AssetState::Failed);
+            return;
+        }
+        record->textureId = id;
+    }
+    record->state.store(AssetState::Loaded, std::memory_order_release);
+    ENGINE_LOG_INFO("AssetManager: texture '" << record->name << "' loaded (id " << record->textureId << ")");
+    fireAssetEvent(record->name, AssetKind::Texture, AssetState::Loaded);
+}
+
+size_t AssetManager::processCompletedLoads(size_t maxCount) {
+    size_t processed = 0;
+    while (processed < maxCount) {
+        std::shared_ptr<MeshLoadRecord> meshRecord;
+        std::shared_ptr<TextureLoadRecord> textureRecord;
+        if (m_sink->meshCompletions.tryPop(meshRecord)) {
+            finishMeshLoad(meshRecord);
+        } else if (m_sink->textureCompletions.tryPop(textureRecord)) {
+            finishTextureLoad(textureRecord);
+        } else {
+            bool tookOverflow = false;
+            {
+                std::lock_guard lock(m_sink->overflowMutex);
+                if (!m_sink->meshOverflow.empty()) {
+                    meshRecord = std::move(m_sink->meshOverflow.back());
+                    m_sink->meshOverflow.pop_back();
+                    tookOverflow = true;
+                } else if (!m_sink->textureOverflow.empty()) {
+                    textureRecord = std::move(m_sink->textureOverflow.back());
+                    m_sink->textureOverflow.pop_back();
+                    tookOverflow = true;
+                }
+            }
+            if (!tookOverflow) {
+                break;
+            }
+            if (meshRecord != nullptr) {
+                finishMeshLoad(meshRecord);
+            } else {
+                finishTextureLoad(textureRecord);
+            }
+        }
+        m_sink->pending.fetch_sub(1, std::memory_order_acq_rel);
+        ++processed;
+    }
+    return processed;
+}
+
+size_t AssetManager::pendingUploadCount() const {
+    return m_sink->pending.load(std::memory_order_acquire);
+}
+
+size_t AssetManager::pollFileChanges() {
+    std::vector<std::shared_ptr<MeshLoadRecord>> meshRecords;
+    std::vector<std::shared_ptr<TextureLoadRecord>> textureRecords;
+    {
+        std::lock_guard lock(m_recordsMutex);
+        meshRecords.reserve(m_meshRecords.size());
+        for (const auto& [name, record] : m_meshRecords) {
+            meshRecords.push_back(record);
+        }
+        textureRecords.reserve(m_textureRecords.size());
+        for (const auto& [name, record] : m_textureRecords) {
+            textureRecords.push_back(record);
+        }
+    }
+    size_t triggered = 0;
+    const auto checkRecord = [this, &triggered](const auto& record) {
+        if (record->state.load(std::memory_order_acquire) != AssetState::Loaded) {
+            return;
+        }
+        std::error_code ec;
+        const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(record->source, ec);
+        if (ec) {
+            return;
+        }
+        bool changed = false;
+        {
+            std::lock_guard lock(record->mutex);
+            changed = writeTime != record->writeTime;
+        }
+        if (changed && reloadAsset(record->name)) {
+            ++triggered;
+        }
+    };
+    for (const auto& record : meshRecords) {
+        checkRecord(record);
+    }
+    for (const auto& record : textureRecords) {
+        checkRecord(record);
+    }
+    return triggered;
+}
+
+AssetState AssetManager::meshState(std::string_view name) const {
+    if (const std::shared_ptr<MeshLoadRecord> record = findMeshRecord(name); record != nullptr) {
+        return record->state.load(std::memory_order_acquire);
+    }
+    return mesh(name) != nullptr ? AssetState::Loaded : AssetState::Unloaded;
+}
+
+AssetState AssetManager::textureState(std::string_view name) const {
+    if (const std::shared_ptr<TextureLoadRecord> record = findTextureRecord(name); record != nullptr) {
+        return record->state.load(std::memory_order_acquire);
+    }
+    return texture(name) != nullptr ? AssetState::Loaded : AssetState::Unloaded;
+}
+
+std::string AssetManager::assetError(std::string_view name) const {
+    if (const std::shared_ptr<MeshLoadRecord> record = findMeshRecord(name); record != nullptr) {
+        std::lock_guard lock(record->mutex);
+        return record->error;
+    }
+    if (const std::shared_ptr<TextureLoadRecord> record = findTextureRecord(name); record != nullptr) {
+        std::lock_guard lock(record->mutex);
+        return record->error;
+    }
+    return {};
+}
+
+const MeshAsset* AssetManager::meshOrFallback(std::string_view name) const {
+    const MeshAsset* found = mesh(name);
+    return found != nullptr ? found : &m_fallbackMesh;
+}
+
+const TextureAsset* AssetManager::textureOrFallback(std::string_view name) const {
+    const TextureAsset* found = texture(name);
+    return found != nullptr ? found : &m_fallbackTexture;
+}
+
+TextureId AssetManager::registerTexture(std::string name, uint32_t width, uint32_t height,
+                                        std::span<const uint8_t> rgbaPixels) {
+    if (const auto existing = m_textureIds.find(name); existing != m_textureIds.end()) {
+        return existing->second;
+    }
+    if (rgbaPixels.size() != static_cast<size_t>(width) * height * 4) {
+        ENGINE_LOG_WARNING("AssetManager: texture '" << name << "' pixel payload does not match " << width << "x"
+                                                     << height << " RGBA");
+        return kInvalidAssetId;
+    }
+    const uint64_t vramBytes = static_cast<uint64_t>(rgbaPixels.size());
+    if (!m_stagingBudget.tryReserve(vramBytes)) {
+        ENGINE_LOG_WARNING("AssetManager: staging budget exceeded registering texture '" << name << "'");
+        return kInvalidAssetId;
+    }
+    m_stagingBudget.release(vramBytes);
+    if (!m_vramBudget.tryReserve(vramBytes)) {
+        ENGINE_LOG_WARNING("AssetManager: VRAM budget exceeded registering texture '" << name << "'");
+        return kInvalidAssetId;
+    }
+    m_reservedVramBytes += vramBytes;
+
+    TextureAsset asset;
+    asset.id = static_cast<TextureId>(m_textures.size()) + 1;
+    asset.name = name;
+    asset.width = width;
+    asset.height = height;
+    asset.pixels.assign(rgbaPixels.begin(), rgbaPixels.end());
+    asset.vramBytes = vramBytes;
+    m_textureIds.emplace(asset.name, asset.id);
+    m_textures.push_back(std::move(asset));
+    return m_textures.back().id;
+}
+
+const TextureAsset* AssetManager::texture(TextureId id) const {
+    return findById(m_textures, id);
+}
+
+const TextureAsset* AssetManager::texture(std::string_view name) const {
+    const auto it = m_textureIds.find(std::string(name));
+    return it != m_textureIds.end() ? &m_textures[it->second - 1] : nullptr;
 }
 
 } // namespace engine

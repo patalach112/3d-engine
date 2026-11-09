@@ -1387,6 +1387,63 @@ versions and missing files rejected with the scene untouched)
 join the suite: **611 checks, all passing in Debug, Release-shared
 and Release-static, CTest 1/1, zero warnings.**
 
+## Phase 20 — Asynchronous Job-Driven Asset Manager & Resource Pipeline ✅
+
+The startup-only registry grew a full async pipeline. Synchronous
+registration (programmatic meshes, shaders, materials — the Phase 5
+API) is unchanged; file-backed assets now load without ever
+blocking a frame:
+
+- **Registry & handles**: stable dense ids per kind (meshes,
+  shaders, materials, and now textures — name-keyed `TextureAsset`
+  RGBA8 images with VRAM-budgeted registration), the same ids
+  Phase 19 scene files reference by name. Every async asset carries
+  a lifecycle state — `Unloaded`, `Loading`, `Loaded`, `Failed` —
+  queryable per kind (`meshState`/`textureState`/`assetError`).
+- **Job integration**: `declareMeshSource` / `declareTextureSource`
+  bind a name to a file; `requestLoad` flips it to `Loading` and
+  dispatches file I/O + parsing (the existing OBJ importer, a new
+  dependency-free binary-PPM reader) onto the work-stealing
+  `JobSystem`. Workers touch only their load record; completions
+  travel through lock-free MPMC rings (mutex overflow for bursts)
+  and `processCompletedLoads()` — the main thread's frame sync
+  boundary — publishes them into the registry with budget checks,
+  so GPU-facing state mutates only on the thread that renders.
+  `pendingUploadCount` exposes finished-but-unpublished loads.
+  Without a JobSystem, loads run inline but still respect the
+  boundary. Records are shared_ptr-owned and the completion sink
+  outlives the manager, so late worker completions are always safe.
+- **Fallbacks**: built-in error assets (magenta-tinted cube,
+  magenta/black checker texture) back `meshOrFallback` /
+  `textureOrFallback` — unknown names, first loads still in flight
+  and failed loads all degrade to visible, debuggable placeholders
+  instead of nulls; reloads serve stale data until the swap lands.
+- **Hot reload**: `reloadAsset` re-reads a source in place — the
+  registry entry keeps its stable id, VRAM reservations are
+  re-balanced, data swaps at the next sync boundary — and
+  `pollFileChanges()` triggers exactly that for every `Loaded`
+  asset whose file mtime moved. State-change events
+  (`setAssetEventCallback`) fire `Loading` on the requesting thread
+  and `Loaded`/`Failed` on the processing thread.
+
+Demo integration: the application hands its `JobSystem` to the
+asset manager, declares and queues every `*.obj`/`*.ppm` found in
+`./assets` at startup (names from file stems, matching
+`MeshComponent` references), drains up to 8 completions per frame
+in the update callback, polls file mtimes at 1 Hz, and logs
+terminal load events.
+
+Verification: 18 new checks (handle validation, fallback identity
+and pixels, synchronous texture registration, deterministic
+in-flight observation via blocked workers — state stays `Loading`
+after workers finish until the sync boundary runs — OBJ/PPM
+content fidelity, failed-load errors, duplicate/undeclared
+rejections, mtime hot-reload with id stability and watcher
+idempotence, inline mode with bounded processing budgets, and 16
+assets submitted concurrently from 4 threads registering exactly
+once) join the suite: **629 checks, all passing in Debug,
+Release-shared and Release-static, CTest 1/1, zero warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

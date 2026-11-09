@@ -1,6 +1,8 @@
 #include "Core/Application.h"
 
 #include "Physics/PhysicsEvents.h"
+
+#include <filesystem>
 #include "Scene/Systems/TransformSystem.h"
 
 #include "Core/Logger.h"
@@ -78,6 +80,36 @@ Application::Application(EngineConfig config)
                                                                                << sceneSnapshot.size() << " bytes of JSON)");
     } else {
         ENGINE_LOG_WARNING("Scene serialization round-trip FAILED at startup");
+    }
+    // Phase 20: asynchronous asset pipeline. File-backed assets in
+    // ./assets (OBJ meshes, PPM textures) are declared and requested
+    // here; JobSystem workers parse them while the frame loop's sync
+    // boundary (processCompletedLoads in the update callback)
+    // publishes finished loads, and a 1 Hz mtime poll hot-reloads
+    // edited files. Names come from file stems, so a MeshComponent
+    // referencing "crate" picks up assets/crate.obj when it lands.
+    m_assets.setJobSystem(&m_jobSystem);
+    m_assets.setAssetEventCallback([](std::string_view name, AssetKind kind, AssetState state) {
+        if (state == AssetState::Loaded || state == AssetState::Failed) {
+            ENGINE_LOG_INFO("Asset event: '" << name << "' (" << (kind == AssetKind::Mesh ? "mesh" : "texture")
+                                             << ") -> " << (state == AssetState::Loaded ? "loaded" : "FAILED"));
+        }
+    });
+    if (std::filesystem::is_directory("assets")) {
+        for (const auto& entry : std::filesystem::directory_iterator("assets")) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const std::string stem = entry.path().stem().string();
+            const std::string extension = entry.path().extension().string();
+            if (extension == ".obj" && m_assets.declareMeshSource(stem, entry.path())) {
+                m_assets.requestLoad(stem);
+                ENGINE_LOG_INFO("AssetManager: queued async mesh load for '" << stem << "'");
+            } else if (extension == ".ppm" && m_assets.declareTextureSource(stem, entry.path())) {
+                m_assets.requestLoad(stem);
+                ENGINE_LOG_INFO("AssetManager: queued async texture load for '" << stem << "'");
+            }
+        }
     }
     // No late cursor-capture call is needed here: Window already applied
     // GLFW_CURSOR_DISABLED during construction when captureMouseOnStart
@@ -392,6 +424,15 @@ void Application::run() {
     // Player control is frame-rate dependent by nature (mouse look), so
     // the camera system lives in the variable update.
     callbacks.update = [this](double deltaSeconds) {
+        // Asset sync boundary (Phase 20): publish a bounded number of
+        // finished async loads per frame, and poll source files for
+        // hot reloads once a second.
+        m_assets.processCompletedLoads(8);
+        m_secondsSinceAssetPoll += deltaSeconds;
+        if (m_secondsSinceAssetPoll >= 1.0) {
+            m_secondsSinceAssetPoll = 0.0;
+            m_assets.pollFileChanges();
+        }
         handleMouseCapture();
         handlePhysicsReset();
         handleEventImpulse();

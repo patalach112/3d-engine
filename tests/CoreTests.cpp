@@ -5531,6 +5531,190 @@ void testSceneSerialization() {
     }
 }
 
+void testAsyncAssetPipeline() {
+    std::cout << "Async asset pipeline (Phase 20)\n";
+    using engine::AssetKind;
+    using engine::AssetManager;
+    using engine::AssetState;
+    using engine::JobSystem;
+    using engine::VramBudget;
+
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "engine_phase20_assets";
+    fs::create_directories(dir);
+    const auto writeText = [](const fs::path& path, const std::string& content) {
+        std::ofstream file(path, std::ios::binary);
+        file << content;
+    };
+    writeText(dir / "tri.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
+    writeText(dir / "quad.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3\nf 1 3 4\n");
+    {
+        std::ofstream ppm(dir / "tex.ppm", std::ios::binary);
+        ppm << "P6\n2 1\n255\n";
+        const std::array<char, 6> pixels{static_cast<char>(255), 0, 0, 0, static_cast<char>(255), 0};
+        ppm.write(pixels.data(), static_cast<std::streamsize>(pixels.size()));
+    }
+
+    VramBudget vram{64ull << 20};
+    VramBudget staging{64ull << 20};
+    AssetManager assets{vram, staging};
+
+    // --- Handles, fallbacks, synchronous texture registration ---------------------
+    check(assets.mesh(engine::kInvalidAssetId) == nullptr && assets.mesh(9999) == nullptr &&
+              assets.mesh("nope") == nullptr && assets.texture(engine::kInvalidAssetId) == nullptr,
+          "invalid asset handles and unknown names resolve to nullptr");
+    check(assets.fallbackMesh().name == "__fallbackMesh" && !assets.fallbackMesh().vertices.empty() &&
+              assets.fallbackMesh().vertices.front().color == glm::vec3{1.0f, 0.0f, 1.0f} &&
+              assets.fallbackTexture().width == 2 && assets.fallbackTexture().pixels.size() == 16,
+          "built-in fallbacks: magenta cube mesh and 2x2 checker texture");
+    check(assets.meshOrFallback("nope") == &assets.fallbackMesh() &&
+              assets.textureOrFallback("nope") == &assets.fallbackTexture(),
+          "OrFallback accessors serve fallbacks for unknown assets");
+    const std::array<uint8_t, 4> onePixel{10, 20, 30, 40};
+    const engine::TextureId solidId = assets.registerTexture("solid", 1, 1, onePixel);
+    check(solidId != engine::kInvalidAssetId && assets.texture("solid") != nullptr &&
+              assets.texture("solid")->pixels[2] == 30 && assets.textureState("solid") == AssetState::Loaded &&
+              assets.registerTexture("bad", 2, 2, onePixel) == engine::kInvalidAssetId,
+          "synchronous texture registration validates payload size and registers by name");
+
+    // --- Async load lifecycle with a deterministic in-flight window -----------------
+    JobSystem jobs{JobSystem::Config{2, 0}};
+    assets.setJobSystem(&jobs);
+    std::vector<std::pair<std::string, AssetState>> events;
+    assets.setAssetEventCallback([&events](std::string_view name, AssetKind, AssetState state) {
+        events.emplace_back(std::string{name}, state);
+    });
+
+    std::atomic<bool> releaseWorkers{false};
+    std::atomic<int> blockersRunning{0};
+    for (int i = 0; i < 2; ++i) {
+        jobs.submit([&releaseWorkers, &blockersRunning] {
+            blockersRunning.fetch_add(1);
+            while (!releaseWorkers.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        });
+    }
+    while (blockersRunning.load(std::memory_order_acquire) < 2) {
+        std::this_thread::yield();
+    }
+
+    check(assets.declareMeshSource("tri", dir / "tri.obj") && !assets.declareMeshSource("tri", dir / "tri.obj"),
+          "declaring the same asset source twice is rejected");
+    const bool triRequested = assets.requestLoad("tri");
+    const bool triRequestedAgain = assets.requestLoad("tri");
+    check(triRequested && !triRequestedAgain && assets.meshState("tri") == AssetState::Loading &&
+              assets.mesh("tri") == nullptr && assets.meshOrFallback("tri") == &assets.fallbackMesh(),
+          "in-flight load reports Loading, serves the fallback, and rejects duplicate requests");
+
+    releaseWorkers.store(true, std::memory_order_release);
+    jobs.waitForAll();
+    check(assets.meshState("tri") == AssetState::Loading && assets.pendingUploadCount() == 1 &&
+              assets.mesh("tri") == nullptr,
+          "finished CPU work still waits for the main-thread sync boundary");
+    check(assets.processCompletedLoads() == 1 && assets.meshState("tri") == AssetState::Loaded &&
+              assets.pendingUploadCount() == 0,
+          "processCompletedLoads publishes the finished load");
+    const engine::MeshAsset* tri = assets.mesh("tri");
+    check(tri != nullptr && tri->vertices.size() == 3 && tri->indices.size() == 3 &&
+              assets.meshOrFallback("tri") == tri,
+          "the loaded mesh carries the OBJ geometry and replaces the fallback");
+    const auto hasEvent = [&events](const char* name, AssetState state) {
+        return std::any_of(events.begin(), events.end(), [&](const auto& event) {
+            return event.first == name && event.second == state;
+        });
+    };
+    check(hasEvent("tri", AssetState::Loading) && hasEvent("tri", AssetState::Loaded),
+          "asset events fire for Loading (request) and Loaded (sync boundary)");
+
+    // --- Failed loads and async textures ---------------------------------------------
+    const bool missingDeclared = assets.declareMeshSource("missing", dir / "nope.obj");
+    const bool missingRequested = missingDeclared && assets.requestLoad("missing");
+    const bool texDeclared = assets.declareTextureSource("tex", dir / "tex.ppm");
+    const bool texRequested = texDeclared && assets.requestLoad("tex");
+    jobs.waitForAll();
+    assets.processCompletedLoads();
+    check(missingRequested && assets.meshState("missing") == AssetState::Failed &&
+              !assets.assetError("missing").empty() &&
+              assets.meshOrFallback("missing") == &assets.fallbackMesh() && hasEvent("missing", AssetState::Failed),
+          "a missing file ends in Failed with an error and keeps serving the fallback");
+    const engine::TextureAsset* tex = assets.texture("tex");
+    check(texRequested && assets.textureState("tex") == AssetState::Loaded && tex != nullptr && tex->width == 2 &&
+              tex->height == 1 && tex->pixels[0] == 255 && tex->pixels[3] == 255 && tex->pixels[4] == 0 &&
+              tex->pixels[5] == 255 && assets.textureOrFallback("tex") == tex,
+          "PPM texture loads asynchronously with exact RGBA pixels");
+    check(!assets.requestLoad("neverDeclared"), "requesting an undeclared asset is rejected");
+
+    // --- Hot reload through the file watcher -------------------------------------------
+    const engine::MeshId triId = tri->id;
+    writeText(dir / "tri.obj", "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3\nf 1 3 4\n");
+    std::error_code mtimeError;
+    fs::last_write_time(dir / "tri.obj", fs::file_time_type::clock::now() + std::chrono::seconds(5), mtimeError);
+    const size_t triggered = assets.pollFileChanges();
+    jobs.waitForAll();
+    assets.processCompletedLoads();
+    check(triggered == 1 && assets.meshState("tri") == AssetState::Loaded && assets.mesh("tri") != nullptr &&
+              assets.mesh("tri")->id == triId && assets.mesh("tri")->indices.size() == 6,
+          "mtime polling hot-reloads the changed mesh in place under its stable id");
+    check(assets.pollFileChanges() == 0, "an unchanged file does not retrigger the watcher");
+
+    // --- Inline mode (no JobSystem) and bounded processing --------------------------------
+    {
+        VramBudget soloVram{64ull << 20};
+        VramBudget soloStaging{64ull << 20};
+        AssetManager solo{soloVram, soloStaging};
+        solo.declareMeshSource("a", dir / "tri.obj");
+        solo.declareMeshSource("b", dir / "tri.obj");
+        solo.declareMeshSource("c", dir / "tri.obj");
+        const bool ra = solo.requestLoad("a");
+        const bool rb = solo.requestLoad("b");
+        const bool rc = solo.requestLoad("c");
+        check(ra && rb && rc && solo.meshState("a") == AssetState::Loading && solo.pendingUploadCount() == 3,
+              "without a JobSystem loads run inline but still respect the sync boundary");
+        check(solo.processCompletedLoads(2) == 2 && solo.pendingUploadCount() == 1 &&
+                  solo.processCompletedLoads() == 1 && solo.meshState("c") == AssetState::Loaded,
+              "processCompletedLoads honors its per-call budget");
+    }
+
+    // --- Concurrent submission stress -------------------------------------------------------
+    {
+        VramBudget bulkVram{256ull << 20};
+        VramBudget bulkStaging{256ull << 20};
+        AssetManager bulk{bulkVram, bulkStaging};
+        JobSystem bulkJobs{JobSystem::Config{4, 0}};
+        bulk.setJobSystem(&bulkJobs);
+        constexpr int kAssets = 16;
+        for (int i = 0; i < kAssets; ++i) {
+            bulk.declareMeshSource("bulk" + std::to_string(i), dir / "tri.obj");
+        }
+        std::atomic<int> requestCount{0};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([&bulk, &requestCount, t] {
+                for (int i = t * 4; i < t * 4 + 4; ++i) {
+                    if (bulk.requestLoad("bulk" + std::to_string(i))) {
+                        requestCount.fetch_add(1);
+                    }
+                    (void)bulk.meshState("bulk" + std::to_string(i)); // concurrent state polling
+                }
+            });
+        }
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+        bulkJobs.waitForAll();
+        const size_t processed = bulk.processCompletedLoads();
+        bool allLoaded = processed == static_cast<size_t>(kAssets);
+        for (int i = 0; i < kAssets; ++i) {
+            allLoaded = allLoaded && bulk.meshState("bulk" + std::to_string(i)) == AssetState::Loaded;
+        }
+        check(requestCount.load() == kAssets && allLoaded && bulk.meshCount() == static_cast<size_t>(kAssets),
+              "16 assets submitted from 4 threads all load and register exactly once");
+    }
+
+    fs::remove_all(dir);
+}
+
 } // namespace
 
 int main() {
@@ -5552,6 +5736,7 @@ int main() {
     testPhysicsEvents();
     testSceneHierarchy();
     testSceneSerialization();
+    testAsyncAssetPipeline();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();
