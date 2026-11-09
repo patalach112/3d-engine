@@ -3,8 +3,10 @@
 #include "Core/Logger.h"
 #include "Geometry/Cube.h"
 #include "Graphics/GraphicsPipeline.h"
+#include "Graphics/ShadowMap.h"
 #include "Graphics/Swapchain.h"
 #include "Graphics/VulkanContext.h"
+#include "Graphics/VulkanHelpers.h"
 #include "Platform/Window.h"
 
 #include <algorithm>
@@ -21,6 +23,7 @@ Renderer::Renderer(VulkanContext& context, Window& window, Swapchain& swapchain,
       m_framesInFlight(std::clamp(maxFramesInFlight, 1u, static_cast<uint32_t>(kMaxFramesInFlight))) {
     createVertexBuffer();
     createIndexBuffer();
+    createShadowResources();
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
@@ -47,7 +50,119 @@ Renderer::~Renderer() {
     if (m_descriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     }
+    if (m_shadowFramebuffer != VK_NULL_HANDLE) {
+        vkDestroyFramebuffer(device, m_shadowFramebuffer, nullptr);
+    }
+    if (m_shadowRenderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(device, m_shadowRenderPass, nullptr);
+    }
+    if (m_shadowSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device, m_shadowSampler, nullptr);
+    }
+    if (m_shadowView != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, m_shadowView, nullptr);
+    }
+    if (m_shadowImage != VK_NULL_HANDLE) {
+        vkDestroyImage(device, m_shadowImage, nullptr);
+    }
+    if (m_shadowMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, m_shadowMemory, nullptr);
+    }
     // m_vertexBuffer / m_indexBuffer / m_uniformBuffers clean themselves up.
+}
+
+void Renderer::createShadowResources() {
+    const VkDevice device = m_context.device();
+    constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
+
+    helpers::createImage(m_context, kShadowMapSize, kShadowMapSize, kShadowFormat, VK_IMAGE_TILING_OPTIMAL,
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_shadowImage, m_shadowMemory);
+    m_shadowView = helpers::createImageView(m_context, m_shadowImage, kShadowFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    // Plain (non-comparison) sampler: the fragment shader fetches depth
+    // and compares manually, which enables the 3x3 PCF kernel. Border is
+    // opaque white (depth 1.0 = fully lit), so fragments outside the
+    // light frustum can never darken.
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    if (vkCreateSampler(device, &samplerInfo, nullptr, &m_shadowSampler) != VK_SUCCESS) {
+        throw std::runtime_error("Renderer: failed to create shadow map sampler");
+    }
+
+    // Depth-only render pass. The attachment starts undefined and ends in
+    // SHADER_READ_ONLY_OPTIMAL; the two subpass dependencies order the
+    // main pass's texture reads after this pass's depth writes (and this
+    // pass's writes after the previous frame's reads).
+    VkAttachmentDescription depthAttachment{};
+    depthAttachment.format = kShadowFormat;
+    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkAttachmentReference depthReference{};
+    depthReference.attachment = 0;
+    depthReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 0;
+    subpass.pDepthStencilAttachment = &depthReference;
+
+    std::array<VkSubpassDependency, 2> dependencies{};
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[0].dependencyFlags = 0;
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dependencies[1].dependencyFlags = 0;
+
+    VkRenderPassCreateInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &depthAttachment;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    renderPassInfo.dependencyCount = static_cast<uint32_t>(dependencies.size());
+    renderPassInfo.pDependencies = dependencies.data();
+    if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &m_shadowRenderPass) != VK_SUCCESS) {
+        throw std::runtime_error("Renderer: failed to create shadow render pass");
+    }
+
+    VkFramebufferCreateInfo framebufferInfo{};
+    framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebufferInfo.renderPass = m_shadowRenderPass;
+    framebufferInfo.attachmentCount = 1;
+    framebufferInfo.pAttachments = &m_shadowView;
+    framebufferInfo.width = kShadowMapSize;
+    framebufferInfo.height = kShadowMapSize;
+    framebufferInfo.layers = 1;
+    if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_shadowFramebuffer) != VK_SUCCESS) {
+        throw std::runtime_error("Renderer: failed to create shadow framebuffer");
+    }
+
+    m_pipeline.createShadowPipeline(m_shadowRenderPass);
 }
 
 void Renderer::createCommandBuffers() {
@@ -126,14 +241,16 @@ void Renderer::createUniformBuffers() {
 }
 
 void Renderer::createDescriptorPool() {
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSize.descriptorCount = m_framesInFlight;
+    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[0].descriptorCount = m_framesInFlight;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[1].descriptorCount = m_framesInFlight;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
     poolInfo.maxSets = m_framesInFlight;
 
     if (vkCreateDescriptorPool(m_context.device(), &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS) {
@@ -161,23 +278,96 @@ void Renderer::createDescriptorSets() {
         bufferInfo.offset = 0;
         bufferInfo.range = sizeof(UniformBufferObject);
 
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = m_descriptorSets[i];
-        write.dstBinding = 0;
-        write.dstArrayElement = 0;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        write.descriptorCount = 1;
-        write.pBufferInfo = &bufferInfo;
+        VkDescriptorImageInfo shadowInfo{};
+        shadowInfo.sampler = m_shadowSampler;
+        shadowInfo.imageView = m_shadowView;
+        shadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        vkUpdateDescriptorSets(m_context.device(), 1, &write, 0, nullptr);
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = m_descriptorSets[i];
+        writes[0].dstBinding = 0;
+        writes[0].dstArrayElement = 0;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorCount = 1;
+        writes[0].pBufferInfo = &bufferInfo;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = m_descriptorSets[i];
+        writes[1].dstBinding = 1;
+        writes[1].dstArrayElement = 0;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].descriptorCount = 1;
+        writes[1].pImageInfo = &shadowInfo;
+
+        vkUpdateDescriptorSets(m_context.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0,
+                               nullptr);
     }
 }
 
 void Renderer::updateUniformBuffer(const glm::mat4& view, const glm::mat4& projection) {
-    const UniformBufferObject ubo{view, projection};
+    UniformBufferObject ubo{};
+    ubo.view = view;
+    ubo.proj = projection;
+    ubo.lightViewProj = directionalLightViewProjection(directionalLightDirection(), shadowSceneCenter(),
+                                                       kShadowSceneExtent, kShadowLightDistance,
+                                                       kShadowNearPlane, kShadowFarPlane);
+    const glm::vec3 lightDirection = directionalLightDirection();
+    ubo.lightDirection = glm::vec4{lightDirection, 0.0f};
     void* mapped = m_uniformBuffers[m_currentFrame].mappedData();
     std::memcpy(mapped, &ubo, sizeof(ubo));
+}
+
+void Renderer::recordShadowPass(VkCommandBuffer commandBuffer, std::span<const DrawItem> drawItems) {
+    // Depth-only pass from the key light's point of view. Every draw item
+    // (floor included) writes its light-space depth; the main pass then
+    // tests fragments against this map. Rendered first, into a resource
+    // whose render-pass transitions hand it to the fragment shader.
+    VkClearValue clearValue{};
+    clearValue.depthStencil = {1.0f, 0};
+
+    VkRenderPassBeginInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    renderPassInfo.renderPass = m_shadowRenderPass;
+    renderPassInfo.framebuffer = m_shadowFramebuffer;
+    renderPassInfo.renderArea.offset = {0, 0};
+    renderPassInfo.renderArea.extent = {kShadowMapSize, kShadowMapSize};
+    renderPassInfo.clearValueCount = 1;
+    renderPassInfo.pClearValues = &clearValue;
+    vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.shadowPipeline());
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(kShadowMapSize);
+    viewport.height = static_cast<float>(kShadowMapSize);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {kShadowMapSize, kShadowMapSize};
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    const VkBuffer vertexBuffers[] = {m_vertexBuffer.handle()};
+    constexpr VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+    vkCmdBindIndexBuffer(commandBuffer, m_indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.layout(), 0, 1,
+                            &m_descriptorSets[m_currentFrame], 0, nullptr);
+
+    for (const DrawItem& item : drawItems) {
+        // Same 112-byte push payload as the main pass; shadow.vert reads
+        // the model matrix from its head.
+        const DrawPushConstants pushConstants{item.model, item.baseColor, item.specular, item.surface};
+        vkCmdPushConstants(commandBuffer, m_pipeline.layout(), VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(DrawPushConstants), &pushConstants);
+        vkCmdDrawIndexed(commandBuffer, m_indexCount, 1, 0, 0, 0);
+    }
+
+    vkCmdEndRenderPass(commandBuffer);
 }
 
 void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
@@ -187,6 +377,9 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
         throw std::runtime_error("Renderer: failed to begin recording command buffer");
     }
+
+    // Shadow pass first: it fills the depth texture the main pass samples.
+    recordShadowPass(commandBuffer, drawItems);
 
     const VkExtent2D extent = m_swapchain.extent();
 

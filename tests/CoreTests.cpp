@@ -29,6 +29,7 @@
 #include "Graphics/VramBudget.h"
 #include "Graphics/HudFont.h"
 #include "Graphics/RenderQueue.h"
+#include "Graphics/ShadowMap.h"
 #include "Graphics/Renderer.h"
 #include "Graphics/Swapchain.h"
 #include "Core/Memory/PoolAllocator.h"
@@ -1161,6 +1162,124 @@ void testDynamicModulesAndMaterials() {
     check(sandboxAsset != nullptr && nearlyEqual(sandboxAsset->desc.baseColor.x, 0.38f, 1e-6) &&
               nearlyEqual(sandboxAsset->desc.baseColor.z, 0.54f, 1e-6),
           "EngineAssets preserves the standardized sandbox material color");
+}
+
+
+void testShadowsDepthAndRotationSync() {
+    std::cout << "Shadows, depth contract & rotation sync\n";
+
+    // --- Directional shadow light frustum --------------------------------
+    const glm::vec3 lightDir = engine::directionalLightDirection();
+    const glm::vec3 center = engine::shadowSceneCenter();
+    const glm::mat4 lightMatrix = engine::directionalLightViewProjection(
+        lightDir, center, engine::kShadowSceneExtent, engine::kShadowLightDistance, engine::kShadowNearPlane,
+        engine::kShadowFarPlane);
+    const auto projectToLight = [&lightMatrix](const glm::vec3& point) {
+        const glm::vec4 clip = lightMatrix * glm::vec4{point, 1.0f};
+        return glm::vec3{clip} / clip.w;
+    };
+    const glm::vec3 centerNdc = projectToLight(center);
+    check(nearlyEqual(centerNdc.x, 0.0f, 1e-4) && nearlyEqual(centerNdc.y, 0.0f, 1e-4) &&
+              centerNdc.z > 0.0f && centerNdc.z < 1.0f,
+          "shadow light frustum centers the scene in light space");
+    const float depthTowardLight = projectToLight(center + lightDir * 2.0f).z;
+    const float depthAwayFromLight = projectToLight(center - lightDir * 2.0f).z;
+    check(depthTowardLight < depthAwayFromLight,
+          "points closer to the light get smaller shadow depths (occluders win)");
+    const glm::vec3 outsideNdc = projectToLight(center + glm::vec3{30.0f, 30.0f, 30.0f});
+    check(std::abs(outsideNdc.x) > 1.0f || std::abs(outsideNdc.y) > 1.0f,
+          "shadow frustum bounds are finite (outside points project out)");
+
+    // --- Depth / winding contract -----------------------------------------
+    // The pipeline declares VK_FRONT_FACE_CLOCKWISE with back-face
+    // culling because the camera projection flips clip Y. Reproduce that
+    // math on the CPU: every cube triangle that geometrically faces the
+    // camera must have negative signed area in Vulkan NDC (clockwise),
+    // and every away-facing triangle the opposite, so the rasterizer
+    // keeps exactly the visible faces and the depth buffer (Less +
+    // write) resolves the rest. If either side flipped, the sandbox
+    // would render inside-out / see-through while rotating.
+    {
+        const std::vector<engine::Vertex> vertices = engine::Cube::vertices();
+        const std::vector<uint32_t> indices = engine::Cube::indices();
+        const glm::vec3 eye{3.0f, 2.0f, 4.0f};
+        glm::mat4 projection = glm::perspective(glm::radians(45.0f), 16.0f / 9.0f, 0.1f, 100.0f);
+        projection[1][1] *= -1.0f; // GLM -> Vulkan Y flip (Camera::projectionMatrix)
+        const glm::mat4 view = glm::lookAt(eye, glm::vec3{0.0f}, glm::vec3{0.0f, 1.0f, 0.0f});
+        bool frontOk = true;
+        bool backOk = true;
+        for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+            const glm::vec3 p0 = vertices[indices[i]].position;
+            const glm::vec3 p1 = vertices[indices[i + 1]].position;
+            const glm::vec3 p2 = vertices[indices[i + 2]].position;
+            const glm::vec3 faceNormal = glm::cross(p1 - p0, p2 - p0);
+            const auto ndc = [&projection, &view](const glm::vec3& point) {
+                const glm::vec4 clip = projection * view * glm::vec4{point, 1.0f};
+                return glm::vec2{clip.x, clip.y} / clip.w;
+            };
+            const glm::vec2 a = ndc(p0);
+            const glm::vec2 b = ndc(p1);
+            const glm::vec2 c = ndc(p2);
+            const float signedArea = 0.5f * ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y));
+            if (glm::dot(faceNormal, eye - p0) > 0.0f) {
+                frontOk = frontOk && signedArea < 0.0f; // clockwise in Vulkan NDC
+            } else {
+                backOk = backOk && signedArea > 0.0f;
+            }
+        }
+        check(frontOk, "camera-facing triangles are clockwise under the Y-flip (kept by back-face culling)");
+        check(backOk, "away-facing triangles are counter-clockwise under the Y-flip (culled, never see-through)");
+    }
+
+    // --- Quaternion -> render matrix 1:1 sync ------------------------------
+    {
+        engine::TransformComponent transform{glm::vec3{1.0f, 2.0f, 3.0f}};
+        const glm::quat orientation = glm::normalize(
+            glm::angleAxis(glm::radians(35.0f), glm::normalize(glm::vec3{1.0f, 2.0f, 3.0f})));
+        transform.setOrientation(orientation);
+        const glm::mat3 rendered = glm::mat3{transform.modelMatrix()};
+        const glm::mat3 simulated = glm::mat3_cast(orientation);
+        bool identical = true;
+        for (int column = 0; column < 3; ++column) {
+            identical = identical && nearlyVec3(rendered[column], simulated[column], 1e-5f);
+        }
+        check(identical, "transform model matrix matches the physics quaternion exactly");
+        transform.setOrientation(-orientation); // quaternion double cover
+        const glm::mat3 renderedNegated = glm::mat3{transform.modelMatrix()};
+        bool sameAfterNegation = true;
+        for (int column = 0; column < 3; ++column) {
+            sameAfterNegation = sameAfterNegation && nearlyVec3(renderedNegated[column], simulated[column], 1e-5f);
+        }
+        check(sameAfterNegation, "negated quaternion (same rotation) renders the identical matrix");
+        check(sizeof(engine::TransformComponent) == 64, "quaternion sync fits the 64-byte transform cache line");
+    }
+
+    // Tumbling body: after every fixed step, the rendered matrix must
+    // equal the matrix of the body's simulated orientation — including
+    // through orientations where Euler extraction is near gimbal lock.
+    {
+        engine::Scene scene;
+        auto entity = scene.createEntity("Tumbler");
+        entity.addComponent<engine::TransformComponent>(glm::vec3{0.0f, 10.0f, 0.0f});
+        auto& body = entity.addComponent<engine::RigidBodyComponent>(1.0f);
+        body.angularVelocity = glm::vec3{140.0f, 260.0f, 90.0f}; // fast tumble through gimbal regions
+        entity.addComponent<engine::ColliderComponent>(engine::ColliderComponent::box(glm::vec3{0.5f}));
+        engine::PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        engine::PhysicsSystem physics;
+        bool inSync = true;
+        for (int step = 0; step < 240; ++step) {
+            physics.update(scene, 1.0 / 120.0, settings);
+            const auto& transform = entity.getComponent<engine::TransformComponent>();
+            const auto& rigidBody = entity.getComponent<engine::RigidBodyComponent>();
+            const glm::mat3 rendered = glm::mat3{transform.modelMatrix()};
+            const glm::mat3 simulated = glm::mat3_cast(glm::normalize(rigidBody.orientation));
+            for (int column = 0; column < 3; ++column) {
+                inSync = inSync && nearlyVec3(rendered[column], simulated[column], 1e-4f);
+            }
+        }
+        check(inSync, "tumbling rigid body render matrix stays 1:1 with physics orientation for 240 steps");
+    }
 }
 
 void testPlayerCollision() {
@@ -2338,6 +2457,7 @@ int main() {
     testCamera();
     testPhysics();
     testDynamicModulesAndMaterials();
+    testShadowsDepthAndRotationSync();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

@@ -315,7 +315,7 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 326 checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 335 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
@@ -337,8 +337,10 @@ loop runs on), and Phase 8 checks (shared-module link/export surface,
 uniform material color and normals, solid depth/cull pipeline defaults,
 and capsule-player landing, cube pushing, wall blocking, and sliding), and
 Phase 9 checks (sandbox palette separation, per-material specular/rim
-parameters, 112-byte push-constant layout, packed lighting in draw items) —
-everything verifiable without a GPU.
+parameters, 112-byte push-constant layout, packed lighting in draw items),
+and Phase 10 checks (shadow light-frustum math, the clockwise-winding /
+depth contract, and 1:1 quaternion-to-render-matrix sync over a tumbling
+body) — everything verifiable without a GPU.
 
 ## Phase 5 — Asset Management, Shader Pipelines & Materials ✅
 
@@ -628,6 +630,66 @@ push-constant minimum, so richer per-material lighting needs no
 descriptor updates and no extra draw calls; material palette entries with
 identical pipeline state still deduplicate to a single `VkPipeline`.
 
+## Phase 10 — Shadow Mapping, Depth Integrity & Rotation Sync ✅
+
+### Directional shadow mapping
+
+A real shadow pass now grounds every object. Before the main pass, the
+renderer draws all draw items a second time from the key light's point
+of view into a 2048×2048 `D32_SFLOAT` depth texture (depth-only render
+pass; artifacts created in `Renderer::createShadowResources`):
+
+- The light uses a fixed orthographic frustum
+  (`Graphics/ShadowMap.*`, `directionalLightViewProjection`) aimed at the
+  sandbox center, wide enough to cover the floor and the zero-G cluster;
+  its matrix and direction travel in the per-frame UBO.
+- The shadow pipeline (`shadow.vert`, front-face culling + constant/slope
+  depth bias) stores back-face depth, the standard acne-resistant setup.
+- `cube.frag` reprojects each fragment into light space and applies a
+  3×3 PCF comparison with a slope-scaled bias and a small normal offset;
+  the shadow factor attenuates the diffuse and specular terms only, so
+  shadowed surfaces keep their material's ambient identity. Fragments
+  outside the light frustum are always lit.
+
+### Depth, culling and the see-through investigation
+
+The depth contract was audited end to end and is now pinned by CPU tests
+that reproduce the rasterizer's math:
+
+- The swapchain render pass clears depth to 1.0 and the graphics
+  pipeline enforces depth test + depth write with
+  `VK_COMPARE_OP_LESS`; materials are opaque (blending off), so nearer
+  geometry always wins and nothing blends through.
+- Cube triangles are wound counter-clockwise in model space; the camera
+  projection's Y-flip makes camera-facing triangles **clockwise** in
+  Vulkan NDC, which is exactly what `VK_FRONT_FACE_CLOCKWISE` +
+  back-face culling keeps. A unit test projects all 12 cube triangles
+  through the real projection/view math and asserts this sign split, so
+  the winding convention cannot silently regress into inside-out
+  rendering while rotating.
+- The previous see-through/floating appearance traced to missing
+  contact grounding (now fixed by shadow mapping) and the orientation
+  mismatch below, not to depth state.
+
+### 1:1 rigid-body rotation sync
+
+Physics integrates orientation as a quaternion, but rendering used to
+rebuild the model matrix from Euler angles extracted from that
+quaternion every step — a round-trip that jitters near gimbal lock and
+let the rendered mesh disagree with its collider. Now:
+
+- `TransformComponent` carries the authoritative `glm::quat orientation`
+  (stored in the cache line's tail padding; still exactly 64 bytes).
+- `PhysicsSystem` publishes the integrated quaternion directly via
+  `setOrientation()`, and `modelMatrix()` builds the render matrix with
+  `glm::mat4_cast` — bit-for-bit the simulated rotation (the q / −q
+  double cover renders identically). Euler angles remain as a derived
+  view for spawn capture and tooling, and `RotationSystem` keeps the
+  quaternion in lockstep for Euler-authored spin.
+- The spawn/reset path restores the quaternion too. Tests verify the
+  render matrix matches `mat3_cast(body.orientation)` after every one
+  of 240 tumbling steps at high angular velocity.
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
@@ -714,7 +776,8 @@ releases the mouse (press again to quit).
 │   └── engine.ini            # All engine tuning (window, render, logger, loop)
 ├── shaders/
 │   ├── cube.vert             # MVP, inverse-transpose normals, world/camera + material lighting varyings
-│   └── cube.frag             # Ambient + Lambert diffuse + Blinn-Phong specular + rim
+│   ├── cube.frag             # Ambient + Lambert diffuse + Blinn-Phong specular + rim + PCF shadows
+│   └── shadow.vert           # Depth-only directional shadow pass
 ├── tests/
 │   └── CoreTests.cpp         # Config/logger/physics/player/material tests (CTest)
 └── src/
@@ -802,7 +865,9 @@ what it depends on.
   engine modules with explicit export/import macros, a physical capsule
   player with exact capsule collision (landing, pushing, sliding), and a
   uniform solid-material pipeline (normals, diffuse shading, push
-  constants), plus Phase 9's distinct palette and directional lighting
+  constants), plus Phase 9's distinct palette and directional lighting,
+  and Phase 10's shadow mapping, depth/winding contract tests, and 1:1
+  quaternion rotation sync
   constants, depth-write/back-cull defaults)
 - Later phases build the real engine core on top of this foundation —
   editors and visual tooling only arrive once the core is complete.

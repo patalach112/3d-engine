@@ -276,6 +276,7 @@ size_t PhysicsSystem::resetToSpawnStates(Scene& scene) {
         TransformComponent& transform = registry.get<TransformComponent>(state.entity);
         transform.position = state.position;
         transform.rotationDegrees = state.rotationDegrees;
+        transform.setOrientation(state.orientation); // rendered matrix matches the restored body
         transform.scale = state.scale;
         body.velocity = state.velocity;
         body.angularVelocity = state.angularVelocity;
@@ -495,8 +496,11 @@ void PhysicsSystem::integrate(double fixedDeltaSeconds, const PhysicsSettings& s
             }
             body.angularVelocity = glm::degrees(angularVelocity);
             ref.transform->position += body.velocity * dt;
-            ref.transform->rotationDegrees =
-                glm::mod(glm::degrees(glm::eulerAngles(body.orientation)), 360.0f);
+            // 1:1 visual sync: push the integrated quaternion straight
+            // into the transform. The render matrix is built from this
+            // exact quaternion (no Euler round-trip), so what is drawn
+            // is exactly what the collider solver simulated.
+            ref.transform->setOrientation(body.orientation);
             body.clearForcesAndTorques();
         }
     };

@@ -20,8 +20,9 @@ namespace engine {
 // RigidBodyComponent
 //
 // Dynamic state for one rigid body. TransformComponent remains the source
-// of truth for rendered position/scale; PhysicsSystem synchronizes its
-// Euler rotation from this component's authoritative quaternion each step.
+// of truth for rendered position/scale; PhysicsSystem publishes this
+// component's authoritative quaternion into the transform each step, so
+// the rendered model matrix is built from the exact simulated rotation.
 //
 // Rotational state is physical rather than a simple Euler spin:
 // angularMomentum is the conserved world-space quantity, the full local

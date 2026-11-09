@@ -49,6 +49,13 @@ public:
                                    const std::string& vertexShaderFile, const std::string& fragmentShaderFile,
                                    const Swapchain& swapchain);
 
+    // Creates the depth-only shadow-map pipeline (shadow.vert, no
+    // fragment stage, front-face culling + depth bias) for the given
+    // shadow render pass, sharing this manager's pipeline layout. Owned
+    // here and destroyed with the other pipelines.
+    VkPipeline createShadowPipeline(VkRenderPass shadowRenderPass);
+    [[nodiscard]] VkPipeline shadowPipeline() const { return m_shadowPipeline; }
+
     [[nodiscard]] VkPipeline handle() const { return m_pipeline; }
     [[nodiscard]] VkPipelineLayout layout() const { return m_layout; }
     [[nodiscard]] VkDescriptorSetLayout descriptorSetLayout() const { return m_descriptorSetLayout; }
@@ -67,6 +74,7 @@ private:
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
     VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
     PipelineStateCache m_stateCache;
     std::unordered_map<uint32_t, VkPipeline> m_materialPipelines;
     std::unordered_map<uint64_t, VkPipeline> m_pipelinesByState; // (state, shaders) -> pipeline

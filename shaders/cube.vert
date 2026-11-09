@@ -3,6 +3,8 @@
 layout(set = 0, binding = 0) uniform UniformBufferObject {
     mat4 view;
     mat4 proj;
+    mat4 lightViewProj;
+    vec4 lightDirection;
 } ubo;
 
 layout(push_constant) uniform PushConstants {

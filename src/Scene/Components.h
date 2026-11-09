@@ -7,6 +7,7 @@
 #include "Physics/PhysicsComponents.h"
 
 #include <glm/mat4x4.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/vec3.hpp>
 
 #include <string>
@@ -32,11 +33,42 @@ struct alignas(64) TransformComponent {
     glm::vec3 position{0.0f};
     glm::vec3 rotationDegrees{0.0f};
     glm::vec3 scale{1.0f};
+    // Authoritative orientation for physics-driven bodies. Rigid-body
+    // orientation is a quaternion; converting it to Euler angles and back
+    // every step (the old path) is lossy near gimbal lock and made the
+    // rendered matrix drift/jitter against the physics geometry.
+    // PhysicsSystem therefore writes its quaternion straight here and
+    // modelMatrix() consumes it 1:1. The quaternion + flag live in the
+    // cache line's tail padding, so the 64-byte layout is unchanged.
+    glm::quat orientation{1.0f, 0.0f, 0.0f, 0.0f};
+    bool useQuaternionOrientation = false;
 
     TransformComponent() = default;
     explicit TransformComponent(const glm::vec3& position_) : position(position_) {}
 
-    // Model matrix: T * R(yaw) * R(pitch) * R(roll) * S.
+    // Stores a physics orientation for rendering: kept normalized, and
+    // rotationDegrees is refreshed from it so Euler readers (spawn
+    // capture, tooling) still see an equivalent angle triple.
+    void setOrientation(const glm::quat& quaternion) {
+        orientation = glm::normalize(quaternion);
+        useQuaternionOrientation = true;
+        rotationDegrees = glm::mod(glm::degrees(glm::eulerAngles(orientation)), 360.0f);
+    }
+
+    // Rebuilds the quaternion from rotationDegrees (Euler order Y, X, Z —
+    // the same order modelMatrix used historically). For systems that
+    // author rotation as Euler angles (RotationSystem spin).
+    void syncOrientationFromEuler() {
+        const glm::vec3 radians = glm::radians(rotationDegrees);
+        orientation = glm::normalize(glm::angleAxis(radians.y, glm::vec3{0.0f, 1.0f, 0.0f}) *
+                                     glm::angleAxis(radians.x, glm::vec3{1.0f, 0.0f, 0.0f}) *
+                                     glm::angleAxis(radians.z, glm::vec3{0.0f, 0.0f, 1.0f}));
+        useQuaternionOrientation = true;
+    }
+
+    // Model matrix: T * R * S, where R is the authoritative quaternion
+    // when useQuaternionOrientation is set, else R(yaw) * R(pitch) *
+    // R(roll) from rotationDegrees.
     [[nodiscard]] ENGINE_SCENE_API glm::mat4 modelMatrix() const;
 };
 

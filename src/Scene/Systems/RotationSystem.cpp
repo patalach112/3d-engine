@@ -46,6 +46,9 @@ void applyRange(const AlignedRanges& ranges, float fixedDelta, size_t begin, siz
         TransformComponent& transform = *denseElementAt(*ranges.transforms, i);
         const SpinComponent& spin = *denseElementAt(*ranges.spins, i);
         transform.rotationDegrees = glm::mod(transform.rotationDegrees + spin.degreesPerSecond * fixedDelta, 360.0f);
+        // Keep the quaternion in lockstep so modelMatrix stays on the
+        // same 1:1 path physics bodies use.
+        transform.syncOrientationFromEuler();
     }
 }
 

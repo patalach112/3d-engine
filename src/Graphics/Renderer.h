@@ -20,12 +20,16 @@ class Window;
 class Swapchain;
 class GraphicsPipeline;
 
-// Per-frame data consumed by cube.vert: camera matrices only. Per-entity
-// model matrices travel through push constants instead, so one frame can
-// draw any number of entities with a single uniform buffer update.
+// Per-frame data consumed by the cube shaders: camera matrices plus the
+// directional light's view-projection (shadow reprojection) and
+// direction. Per-entity model matrices travel through push constants
+// instead, so one frame can draw any number of entities with a single
+// uniform buffer update.
 struct UniformBufferObject {
     glm::mat4 view{1.0f};
     glm::mat4 proj{1.0f};
+    glm::mat4 lightViewProj{1.0f};
+    glm::vec4 lightDirection{0.0f, 1.0f, 0.0f, 0.0f}; // xyz toward the key light
 };
 
 // ---------------------------------------------------------------------------
@@ -85,6 +89,8 @@ private:
     void createDescriptorPool();
     void createDescriptorSets();
 
+    void createShadowResources();
+    void recordShadowPass(VkCommandBuffer commandBuffer, std::span<const DrawItem> drawItems);
     void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
                              std::span<const DrawItem> drawItems);
     void updateUniformBuffer(const glm::mat4& view, const glm::mat4& projection);
@@ -112,6 +118,15 @@ private:
     std::vector<Buffer> m_uniformBuffers;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> m_descriptorSets;
+
+    // Directional shadow map (depth-only). Fixed size, independent of the
+    // swapchain, so resize never recreates it.
+    VkImage m_shadowImage = VK_NULL_HANDLE;
+    VkDeviceMemory m_shadowMemory = VK_NULL_HANDLE;
+    VkImageView m_shadowView = VK_NULL_HANDLE;
+    VkSampler m_shadowSampler = VK_NULL_HANDLE;
+    VkRenderPass m_shadowRenderPass = VK_NULL_HANDLE;
+    VkFramebuffer m_shadowFramebuffer = VK_NULL_HANDLE;
 };
 
 } // namespace engine
