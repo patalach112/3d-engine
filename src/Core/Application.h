@@ -5,6 +5,7 @@
 #include "Core/Jobs/JobSystem.h"
 #include "Graphics/GraphicsPipeline.h"
 #include "Graphics/Renderer.h"
+#include "Graphics/VramBudget.h"
 #include "Graphics/Swapchain.h"
 #include "Graphics/VulkanContext.h"
 #include "Platform/Input.h"
@@ -58,6 +59,7 @@ private:
     Renderer m_renderer;
     GameLoop m_gameLoop;
     JobSystem m_jobSystem;
+    VramBudget m_vramBudget;
     Scene m_scene;
     RenderSystem m_renderSystem;
 

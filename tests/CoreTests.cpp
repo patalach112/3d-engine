@@ -18,7 +18,9 @@
 #include "Scene/Systems/RotationSystem.h"
 
 #include "Core/Concurrency/LockFreeRingBuffer.h"
+#include "Core/HardwareProfile.h"
 #include "Core/Jobs/JobSystem.h"
+#include "Graphics/VramBudget.h"
 #include "Graphics/RenderQueue.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Graphics/Frustum.h"
@@ -81,7 +83,8 @@ void testConfigLoading() {
              << "[Camera]\nmovementSpeed = 7.5\nmouseSensitivity = 0.25\npositionZ = 5\n"
              << "[Input]\ncaptureMouseOnStart = false\n"
              << "[Render]\nfrustumCulling = false\n"
-             << "[Performance]\njobWorkerCount = 2\nentityReserve = 4096\n";
+             << "[Performance]\njobWorkerCount = 2\nentityReserve = 4096\nparallelBatchSize = 512\n"
+             << "[Render]\nvramBudgetMiB = 2048\nstagingBufferBudgetMiB = 128\n";
     }
 
     const engine::EngineConfig config = engine::EngineConfig::loadFromFile(path);
@@ -102,6 +105,9 @@ void testConfigLoading() {
     check(!config.input.captureMouseOnStart, "input capture flag parsed");
     check(!config.render.frustumCulling, "frustum culling flag parsed");
     check(config.performance.jobWorkerCount == 2, "job worker count parsed");
+    check(config.performance.parallelBatchSize == 512, "parallel batch size parsed");
+    check(config.render.vramBudgetMiB == 2048, "VRAM budget parsed");
+    check(config.render.stagingBufferBudgetMiB == 128, "staging budget parsed");
     check(config.performance.entityReserve == 4096, "entity reserve parsed");
     check(config.loadWarnings.size() >= 2, "unknown/invalid keys produce warnings");
 
@@ -443,6 +449,84 @@ void testJobSystem() {
     jobs.waitForAll();
     check(afterThrow.load(), "workers survive a throwing job");
     check(jobs.failedJobCount() >= 1, "throwing job is counted as failed");
+}
+
+void testHardwareProfile() {
+    std::cout << "Hardware profile (i5-3470 / GTX 970)\n";
+    namespace hw = engine::hardware;
+
+    check(hw::targetPhysicalCores == 4 && hw::recommendedWorkerCount == 3,
+          "profile: 3 workers + main fill the 4 physical cores");
+    check(hw::cacheLineBytes == 64 && hw::l2CacheBytes == 256 * 1024,
+          "profile: 64-byte cache lines, 256 KiB per-core L2");
+    check(hw::gpuVramFastBytes == hw::gpuVramTotalBytes - hw::gpuVramTotalBytes / 8,
+          "profile: GTX 970 fast VRAM segment is 3.5 of 4 GiB");
+    check(hw::recommendedVramBudgetBytes < hw::gpuVramFastBytes,
+          "profile: VRAM budget stays inside the fast segment");
+
+    // Worker resolution: explicit wins; automatic never oversubscribes.
+    check(hw::resolveWorkerCount(4, 4) == 4, "explicit worker count always wins");
+    check(hw::resolveWorkerCount(0, 4) == 3, "auto workers on 4 threads = 3 (main keeps a core)");
+    check(hw::resolveWorkerCount(0, 8) == 3, "auto workers capped at physical cores under Hyper-Threading");
+    check(hw::resolveWorkerCount(0, 2) == 1, "auto workers on 2 threads = 1");
+    check(hw::resolveWorkerCount(0, 0) == 3, "unknown host concurrency falls back to the profile");
+
+    // A default-constructed JobSystem must respect the same cap.
+    {
+        engine::JobSystem jobs;
+        const uint32_t expected =
+            hw::resolveWorkerCount(0, std::thread::hardware_concurrency());
+        check(jobs.workerCount() == expected && jobs.workerCount() <= hw::recommendedWorkerCount,
+              "default JobSystem worker count matches the profile cap");
+    }
+
+    // Batch granularity: ~4 batches/worker, capped at the L2-sized batch.
+    check(hw::resolveParallelBatchSize(100, 3, 0) == 9, "small ranges split ~4 ways per worker");
+    check(hw::resolveParallelBatchSize(1000000, 3, 0) == hw::parallelBatchItems,
+          "huge ranges cap at the L2-friendly batch size");
+    check(hw::resolveParallelBatchSize(1000000, 3, 77) == 77, "configured batch size always wins");
+    check(hw::resolveParallelBatchSize(0, 3, 0) == 1, "empty range resolves to a safe batch");
+
+    // Defaults in the config system match the profile recommendations.
+    const engine::EngineConfig defaults;
+    check(defaults.performance.parallelBatchSize == hw::parallelBatchItems,
+          "config default batch size matches the profile");
+    check(defaults.render.vramBudgetMiB * 1024ull * 1024ull == hw::recommendedVramBudgetBytes,
+          "config default VRAM budget matches the profile");
+    check(defaults.render.stagingBufferBudgetMiB * 1024ull * 1024ull ==
+              hw::recommendedStagingBudgetBytes,
+          "config default staging budget matches the profile");
+}
+
+void testVramBudget() {
+    std::cout << "VramBudget\n";
+    engine::VramBudget budget(1000);
+    check(budget.tryReserve(600) && budget.usedBytes() == 600, "reserve within budget succeeds");
+    check(!budget.tryReserve(500) && budget.usedBytes() == 600, "over-budget reserve fails without side effects");
+    check(budget.remainingBytes() == 400, "remaining budget tracks reservations");
+    budget.release(200);
+    check(budget.tryReserve(500) && budget.usedBytes() == 900, "released budget can be reserved again");
+    budget.release(100000);
+    check(budget.usedBytes() == 0 && budget.remainingBytes() == 1000, "release saturates at zero");
+
+    // Concurrent reservers can never push past the cap.
+    engine::VramBudget contended(10000);
+    std::atomic<int> successes{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&contended, &successes] {
+            for (int i = 0; i < 100; ++i) {
+                if (contended.tryReserve(100)) {
+                    successes.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    check(successes.load() == 100 && contended.usedBytes() == 10000,
+          "concurrent reservations stop exactly at the budget cap");
 }
 
 void testLockFreeRingBuffer() {
@@ -979,6 +1063,8 @@ int main() {
     testCamera();
     testSceneAndSystems();
     testPoolAllocator();
+    testHardwareProfile();
+    testVramBudget();
     testLockFreeRingBuffer();
     testJobSystem();
     testAsyncLoggerConcurrency();

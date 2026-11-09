@@ -267,6 +267,33 @@ in ECS collection order:
   sort + stable merge through `parallelFor`. Toggle with
   `[Render] sortDrawItems`.
 
+### Target hardware profile (i5-3470 / GTX 970)
+
+`src/Core/HardwareProfile.h` is the single source of truth for the
+target machine (i5-3470: 4 physical cores, no Hyper-Threading, 32 KiB
+L1d + 256 KiB L2 per core, 6 MiB L3, DDR3-1600; GTX 970: 4 GiB VRAM with
+a ~3.5 GiB fast segment), and defaults across the engine derive from it:
+
+- **Threads:** automatic JobSystem sizing is `workers + main = physical
+  cores` — 3 workers on the target, capped even on Hyper-Threaded hosts
+  so the pool never oversubscribes the part. `parallelFor` batches cap
+  at ~1024 hot items, roughly one L2-resident working set per batch.
+- **Memory:** pool geometry (64 KiB pages = 16 OS pages, power-of-two
+  blocks up to one 4 KiB OS page, 64-byte page alignment) and the
+  cache-line component layout are asserted against the profile
+  constants; ECS iteration streams sequentially through dense pages to
+  respect DDR3 bandwidth instead of chasing pointers.
+- **GPU:** `Graphics/VramBudget.h` provides CAS-based, over-commit-proof
+  accounting for device-local memory, planned at 3072 MiB (inside the
+  fast segment, headroom left for driver/compositor) with a 256 MiB
+  staging budget — the groundwork for budgeted buffer/descriptor
+  allocation in later phases.
+
+A ready-made preset ships in `config/profile-i5-3470-gtx970.ini`
+(1080p, 3 workers, profile batching and budgets); load it with
+`--config config/profile-i5-3470-gtx970.ini`. It parses with zero
+warnings against the config system.
+
 ### Frustum culling (`src/Graphics/Frustum.*`, `src/Geometry/Bounds.*`)
 
 View frustum planes are extracted from the view-projection matrix
@@ -279,7 +306,7 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 143 checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 169 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
@@ -290,7 +317,9 @@ dense-page pointer strides, owning-group pairing with non-spinning decoys, and
 ring hammering, concurrent job producers, concurrent async logging), and
 render-queue checks (sort-key ordering, stable ties, 5,000-item parallel
 sort integrity/determinism, material grouping with front-to-back order in
-integrated frames) — everything verifiable without a GPU.
+integrated frames), and hardware-profile checks (worker-count resolution,
+batch granularity, config/profile agreement, VRAM budget accounting under
+concurrency) — everything verifiable without a GPU.
 
 ## Configuration
 
@@ -373,6 +402,7 @@ mouse (press again to quit).
     │   ├── Application.h/.cpp  # Composition root, wires loop callbacks
     │   ├── Camera.h/.cpp       # First-person yaw/pitch camera (GLM)
     │   ├── Concurrency/LockFreeRingBuffer.h # Bounded MPMC lock-free ring buffer
+    │   ├── HardwareProfile.h   # i5-3470/GTX 970 target constants + tuning policy
     │   ├── Jobs/JobSystem.*    # Work-stealing thread pool, parallelFor
     │   ├── Memory/PoolAllocator.* # Paginated pool allocator for the ECS
     │   ├── EngineConfig.h/.cpp # INI loading, validation, fallback chain
@@ -402,6 +432,7 @@ mouse (press again to quit).
         ├── GraphicsPipeline.h/.cpp # Shader modules, pipeline state, UBO layout
         ├── Frustum.h/.cpp        # View frustum extraction + AABB/sphere tests
         ├── RenderQueue.h/.cpp    # CPU render command stream + parallel sort
+        ├── VramBudget.h          # CAS-based VRAM accounting policy (GTX 970)
         └── Renderer.h/.cpp       # Frames-in-flight, command recording, present
 ```
 
@@ -424,8 +455,10 @@ what it depends on.
   storage, work-stealing job system with parallel systems, frustum culling,
   strict data-oriented component layout (cache-line transforms, dense
   paged storage, owning-group parallel iteration), lock-free ring
-  buffers on the job-system and async-logger hot paths, and a sorted
-  CPU-side render queue (material grouping + front-to-back Early-Z)
+  buffers on the job-system and async-logger hot paths, a sorted
+  CPU-side render queue (material grouping + front-to-back Early-Z), and
+  i5-3470/GTX 970 hardware-profile tuning (core-exact thread pool, L2
+  batching, VRAM budgeting, preset config)
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.

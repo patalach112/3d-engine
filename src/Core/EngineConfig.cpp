@@ -230,6 +230,14 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             reader.apply(value, config.render.frustumCulling);
         } else if (key == "sortdrawitems") {
             reader.apply(value, config.render.sortDrawItems);
+        } else if (key == "vrambudgetmib") {
+            if (reader.applyInteger(value, intField, 0, 1048576)) {
+                config.render.vramBudgetMiB = static_cast<uint32_t>(intField);
+            }
+        } else if (key == "stagingbufferbudgetmib") {
+            if (reader.applyInteger(value, intField, 0, 1048576)) {
+                config.render.stagingBufferBudgetMiB = static_cast<uint32_t>(intField);
+            }
         } else {
             return false;
         }
@@ -249,6 +257,10 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
         } else if (key == "parallelmindrawitems") {
             if (reader.applyInteger(value, intField, 1, 1000000)) {
                 config.performance.parallelMinDrawItems = static_cast<uint32_t>(intField);
+            }
+        } else if (key == "parallelbatchsize") {
+            if (reader.applyInteger(value, intField, 0, 1000000)) {
+                config.performance.parallelBatchSize = static_cast<uint32_t>(intField);
             }
         } else {
             return false;

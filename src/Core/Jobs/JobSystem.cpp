@@ -1,5 +1,6 @@
 #include "Core/Jobs/JobSystem.h"
 
+#include "Core/HardwareProfile.h"
 #include "Core/Logger.h"
 
 #include <algorithm>
@@ -13,20 +14,16 @@ namespace {
 constexpr size_t kWorkerQueueCapacity = 1024;
 
 uint32_t resolveWorkerCount(uint32_t requested) {
-    if (requested > 0) {
-        return requested;
-    }
-    const uint32_t hardware = std::thread::hardware_concurrency();
-    // Keep one core for the main thread; never drop below a single worker
-    // so parallelFor still offloads on very small machines.
-    return hardware > 1 ? hardware - 1 : 1;
+    // Profile-driven: on the 4-core target this yields 3 workers, so
+    // workers + main thread occupy the physical cores exactly.
+    return hardware::resolveWorkerCount(requested, std::thread::hardware_concurrency());
 }
 
 } // namespace
 
 JobSystem::JobSystem() : JobSystem(Config{}) {}
 
-JobSystem::JobSystem(const Config& config) {
+JobSystem::JobSystem(const Config& config) : m_defaultBatchSize(config.defaultBatchSize) {
     const uint32_t workerCount = resolveWorkerCount(config.workerThreads);
     m_queues.reserve(workerCount);
     for (uint32_t i = 0; i < workerCount; ++i) {
@@ -91,8 +88,7 @@ void JobSystem::parallelFor(size_t itemCount, size_t batchSize,
         return;
     }
     if (batchSize == 0) {
-        const size_t targetBatches = std::max<size_t>(m_workers.size() * 4, 1);
-        batchSize = std::max<size_t>((itemCount + targetBatches - 1) / targetBatches, 1);
+        batchSize = hardware::resolveParallelBatchSize(itemCount, m_workers.size(), m_defaultBatchSize);
     }
 
     struct SharedState {

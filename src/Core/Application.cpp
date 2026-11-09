@@ -19,9 +19,16 @@ Application::Application(EngineConfig config)
       m_pipeline(m_context, m_swapchain),
       m_renderer(m_context, m_window, m_swapchain, m_pipeline),
       m_gameLoop(m_config.loop),
-      m_jobSystem(JobSystem::Config{m_config.performance.jobWorkerCount}),
+      m_jobSystem(JobSystem::Config{m_config.performance.jobWorkerCount,
+                                    m_config.performance.parallelBatchSize}),
+      m_vramBudget(static_cast<uint64_t>(m_config.render.vramBudgetMiB) * 1024 * 1024),
       m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
                      m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems) {
+    ENGINE_LOG_INFO("Hardware profile: JobSystem workers "
+                    << m_jobSystem.workerCount() << " (+ main thread), parallel batch "
+                    << m_config.performance.parallelBatchSize << " items, VRAM budget "
+                    << m_config.render.vramBudgetMiB << " MiB (staging "
+                    << m_config.render.stagingBufferBudgetMiB << " MiB)");
     // Reserve pooled component storage before populating the scene.
     m_scene.reserveCapacity(m_config.performance.entityReserve);
     buildScene();

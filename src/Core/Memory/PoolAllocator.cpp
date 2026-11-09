@@ -1,5 +1,7 @@
 #include "Core/Memory/PoolAllocator.h"
 
+#include "Core/HardwareProfile.h"
+
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -13,11 +15,15 @@
 namespace engine::memory {
 namespace {
 
-constexpr size_t kPageBytes = 64 * 1024;
-constexpr size_t kMaxPooledBytes = 4096;
-// Pages are allocated 64-byte aligned and block sizes are powers of two,
-// so any alignment up to a full cache line is honored by pooled blocks.
-constexpr size_t kMaxPooledAlignment = 64;
+// Pool geometry comes from the target hardware profile: 64 KiB pages
+// (16 OS pages, allocated once) carved into power-of-two blocks up to
+// one 4 KiB OS page. Pages are allocated 64-byte aligned and block sizes
+// are powers of two, so any alignment up to a full cache line is honored
+// by pooled blocks.
+constexpr size_t kPageBytes = hardware::poolPageBytes;
+constexpr size_t kMaxPooledAlignment = hardware::cacheLineBytes;
+static_assert(kPageBytes % 4096 == 0, "pool pages must span whole OS pages");
+static_assert(hardware::poolMaxBlockBytes == 4096, "largest pooled block is one OS page");
 
 // Block size classes: powers of two from 16 B to 4 KiB.
 constexpr std::array<size_t, 9> kBlockSizes = {16, 32, 64, 128, 256, 512, 1024, 2048, 4096};

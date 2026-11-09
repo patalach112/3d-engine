@@ -28,6 +28,12 @@ struct RenderConfig {
     bool frustumCulling = true;
     // Sort draw items by material, then front-to-back, before submission.
     bool sortDrawItems = true;
+    // Device-local VRAM planning budget for the GTX 970 profile: the
+    // engine accounts allocations against this cap (below the card's
+    // ~3.5 GiB fast segment) instead of over-committing VRAM.
+    uint32_t vramBudgetMiB = 3072;
+    // Budget for host-visible staging allocations used in uploads.
+    uint32_t stagingBufferBudgetMiB = 256;
 };
 
 // Performance & memory tuning (see config/engine.ini, [Performance]).
@@ -39,6 +45,9 @@ struct PerformanceConfig {
     // Minimum visible meshes before render preparation parallelizes
     // (below this, sequential evaluation is cheaper than dispatching).
     uint32_t parallelMinDrawItems = 128;
+    // Default parallelFor batch size (items). Tuned to the target's
+    // per-core L2: ~1024 hot ECS items per batch. 0 = profile heuristic.
+    uint32_t parallelBatchSize = 1024;
 };
 
 // ---------------------------------------------------------------------------

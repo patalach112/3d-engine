@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Camera.h"
+#include "Core/HardwareProfile.h"
 #include "Geometry/Bounds.h"
 
 #include <glm/mat4x4.hpp>
@@ -78,7 +79,8 @@ struct alignas(16) SpinComponent {
 };
 
 // Compile-time layout guarantees for the hot components (see above).
-static_assert(sizeof(TransformComponent) == 64 && alignof(TransformComponent) == 64,
+static_assert(sizeof(TransformComponent) == hardware::cacheLineBytes &&
+                  alignof(TransformComponent) == hardware::cacheLineBytes,
               "TransformComponent must occupy exactly one cache line");
 static_assert(sizeof(SpinComponent) == 16 && alignof(SpinComponent) == 16,
               "SpinComponent must pack four-per-cache-line");

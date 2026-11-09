@@ -44,10 +44,14 @@ namespace engine {
 class JobSystem {
 public:
     struct Config {
-        // 0 = automatic: hardware threads minus one (the main thread),
-        // at least 1. Values above hardware concurrency are allowed but
-        // rarely useful.
+        // 0 = automatic: sized from the target hardware profile
+        // (Core/HardwareProfile.h) so workers + the calling thread fill
+        // the physical cores without oversubscribing them (i5-3470:
+        // 3 workers + main). Explicit values always win.
         uint32_t workerThreads = 0;
+        // Default parallelFor batch size when callers pass 0.
+        // 0 = profile heuristic (see hardware::resolveParallelBatchSize).
+        size_t defaultBatchSize = 0;
     };
 
     JobSystem();
@@ -92,6 +96,7 @@ private:
 
     std::vector<std::unique_ptr<WorkerQueue>> m_queues;
     std::vector<std::thread> m_workers;
+    size_t m_defaultBatchSize = 0;
 
     std::atomic<uint32_t> m_nextQueue{0};
     std::atomic<uint64_t> m_pendingJobs{0}; // queued + running
