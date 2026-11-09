@@ -315,7 +315,7 @@ Entities outside the frustum never reach the GPU. Toggle with
 
 ### Unit tests
 
-`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 316 checks) covers
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`, 326 checks) covers
 configuration parsing/fallbacks, log filtering and rotation, fixed-timestep
 math, the frame clock, loop dispatch, ECS lifecycle/systems, pool allocator
 behavior (block reuse, alignment, fallback), job system correctness
@@ -335,7 +335,9 @@ checks (glyph layout vertex counts and NDC bounds, HUD text composition,
 and the poll → fixed → update → render callback contract the window
 loop runs on), and Phase 8 checks (shared-module link/export surface,
 uniform material color and normals, solid depth/cull pipeline defaults,
-and capsule-player landing, cube pushing, wall blocking, and sliding) —
+and capsule-player landing, cube pushing, wall blocking, and sliding), and
+Phase 9 checks (sandbox palette separation, per-material specular/rim
+parameters, 112-byte push-constant layout, packed lighting in draw items) —
 everything verifiable without a GPU.
 
 ## Phase 5 — Asset Management, Shader Pipelines & Materials ✅
@@ -553,15 +555,16 @@ camera that happens to render the scene:
 
 ### Uniform solid materials (`Vertex`, `Cube`, shaders, push constants)
 
-- All sandbox cubes use one standardized material color (slate blue,
-  `(0.38, 0.44, 0.54)`) from `MaterialDesc::baseColor`; geometry carries a
-  single white tint. The old per-face debug colors are gone — visible
-  face variation comes only from lighting.
+- Each sandbox material is a solid color from `MaterialDesc::baseColor`;
+  geometry carries a single white tint. The old per-face debug colors are
+  gone — visible face variation comes only from lighting. Phase 9 gives
+  the floor, falling cubes, stacking cubes, environment, and player
+  accent distinct materials (see the section below).
 - `Vertex` is position + normal + color (36 bytes). The vertex shader
   transforms normals with the inverse-transpose model matrix, and the
   fragment shader applies ambient + diffuse solid-material shading.
-- Each draw pushes an 80-byte `DrawPushConstants` payload (model matrix +
-  material color), inside Vulkan's guaranteed 128-byte push-constant
+- Each draw pushes a `DrawPushConstants` payload (model matrix + material
+  color/lighting), inside Vulkan's guaranteed 128-byte push-constant
   minimum.
 - The default pipeline state is a solid material: depth test and depth
   write enabled, `Less` depth comparison, back-face culling with
@@ -569,6 +572,61 @@ camera that happens to render the scene:
   nearer geometry occludes farther geometry and neither light nor color
   bleeds through solid surfaces.
 
+## Phase 9 — Distinct Materials & Directional Lighting ✅
+
+The sandbox no longer renders as one flat gray-blue mass. Every scene
+category owns a solid material with its own base color and lighting
+response (`src/Assets/AssetManager.*`, `makeSandbox*Material` factories):
+
+| Material | Used for | Base color | Character |
+|---|---|---|---|
+| `floor` | terrestrial floor slab | dark asphalt `(0.10, 0.115, 0.135)` | matte, weak specular, almost no rim |
+| `cube` | falling dynamic cubes | warm copper `(0.84, 0.43, 0.18)` | strong warm specular, high shininess |
+| `stackCube` | stacking stress cubes | teal `(0.08, 0.52, 0.58)` | cool specular, stronger rim |
+| `environment` | planet, CCD wall, double-sided surfaces | blue-violet `(0.27, 0.33, 0.58)` | moderate cool specular/rim |
+| `player` | orbital craft, fast projectile | mint green `(0.16, 0.76, 0.46)` | strongest rim in the palette |
+
+`MaterialDesc::lighting` (`MaterialLighting`) carries specular color and
+strength, shininess, rim strength/power, and ambient strength.
+`Application::buildScene` assigns materials per object category; the
+first-person player itself stays a camera + physical capsule (it has no
+rendered mesh), and `player` is the accent for player-adjacent craft in
+the zero-G scene.
+
+### Shading model (`shaders/cube.vert`, `shaders/cube.frag`)
+
+The fragment shader now evaluates a directional lighting model per pixel:
+
+- **Ambient** — per-material strength, so shadowed faces keep material
+  identity instead of collapsing to one flat tone.
+- **Lambert diffuse** — against a fixed warm key light using correct
+  world-space normals (inverse-transpose model matrix, verified exact in
+  tests), giving each face a clean brightness gradient so edges and
+  stacking corners read immediately.
+- **Blinn-Phong specular** — per-material color, strength, and shininess;
+  the camera position is recovered in the vertex shader from the view
+  matrix, so specular highlights cost no extra uniform.
+- **Rim lighting** — a view-dependent Fresnel-style term (strength/power
+  per material) that separates silhouettes from same-depth backgrounds
+  without transparent halos.
+
+Back faces flip their normal (`gl_FrontFacing`), so double-sided
+materials light both sides correctly. The pipeline state is unchanged
+and still solid: depth test + depth write with `Less` comparison,
+back-face culling, no blending — lighting and color cannot bleed through
+opaque geometry.
+
+### Push-constant payload
+
+`DrawPushConstants` grew deliberately from 80 to **112 bytes**: model
+matrix (64), base color (16), specular color + shininess (16), and a
+surface vec4 — specular strength, rim strength, rim power, ambient
+strength (16). Layout offsets (0/64/80/96) are pinned by `static_assert`s
+and cross-checked against the SPIR-V block with `glslangValidator`. At
+112 bytes the payload stays inside Vulkan's guaranteed 128-byte
+push-constant minimum, so richer per-material lighting needs no
+descriptor updates and no extra draw calls; material palette entries with
+identical pipeline state still deduplicate to a single `VkPipeline`.
 
 ## Configuration
 
@@ -655,8 +713,8 @@ releases the mouse (press again to quit).
 ├── config/
 │   └── engine.ini            # All engine tuning (window, render, logger, loop)
 ├── shaders/
-│   ├── cube.vert             # MVP + inverse-transpose normals + material color
-│   └── cube.frag             # Ambient + diffuse solid-material shading
+│   ├── cube.vert             # MVP, inverse-transpose normals, world/camera + material lighting varyings
+│   └── cube.frag             # Ambient + Lambert diffuse + Blinn-Phong specular + rim
 ├── tests/
 │   └── CoreTests.cpp         # Config/logger/physics/player/material tests (CTest)
 └── src/
@@ -743,7 +801,8 @@ what it depends on.
 - **Phase 8 — DLL modules, player & materials ✅:** layered shared-library
   engine modules with explicit export/import macros, a physical capsule
   player with exact capsule collision (landing, pushing, sliding), and a
-  uniform solid-material pipeline (normals, diffuse shading, 80-byte push
+  uniform solid-material pipeline (normals, diffuse shading, push
+  constants), plus Phase 9's distinct palette and directional lighting
   constants, depth-write/back-cull defaults)
 - Later phases build the real engine core on top of this foundation —
   editors and visual tooling only arrive once the core is complete.

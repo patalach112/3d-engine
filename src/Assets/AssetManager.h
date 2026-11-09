@@ -5,6 +5,7 @@
 #include "Geometry/Vertex.h"
 #include "Graphics/PipelineState.h"
 
+#include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
 #include <cstdint>
@@ -43,15 +44,42 @@ struct ShaderAsset {
     uint64_t byteSize = 0;
 };
 
-// Everything a material needs: shader pair, a tint (the first entry of
-// the future material descriptor array), and its pipeline state.
+// Per-material lighting parameters for the directional shader. They are
+// packed into two vec4s in the per-draw push constants (see
+// Graphics/RenderQueue.h), so upgrading a material's look costs no extra
+// descriptor traffic: specular color + shininess, then specular strength,
+// rim strength, rim power, and ambient strength.
+struct MaterialLighting {
+    glm::vec3 specularColor{0.35f};
+    float specularStrength = 0.35f;
+    float shininess = 32.0f;
+    float rimStrength = 0.10f;
+    float rimPower = 3.0f;
+    float ambientStrength = 0.28f;
+};
+
+// Everything a material needs: shader pair, a base color and lighting
+// parameters (the first entries of the future material descriptor array),
+// and its pipeline state.
 struct MaterialDesc {
     std::string name;
     std::string vertexShader = "cube.vert.spv";
     std::string fragmentShader = "cube.frag.spv";
     glm::vec4 baseColor{1.0f};
+    MaterialLighting lighting{};
     PipelineStateDesc pipeline{};
 };
+
+// Built-in sandbox palette. Each category of scene object gets its own
+// base color and lighting response so silhouettes never merge: a dark
+// asphalt floor, warm metallic falling cubes, cool teal stacking cubes, a
+// blue-violet environment, and a bright player accent. Defined in
+// EngineAssets so the application and the tests share one source of truth.
+[[nodiscard]] ENGINE_ASSETS_API MaterialDesc makeSandboxFloorMaterial();
+[[nodiscard]] ENGINE_ASSETS_API MaterialDesc makeSandboxCubeMaterial();
+[[nodiscard]] ENGINE_ASSETS_API MaterialDesc makeSandboxStackMaterial();
+[[nodiscard]] ENGINE_ASSETS_API MaterialDesc makeSandboxEnvironmentMaterial();
+[[nodiscard]] ENGINE_ASSETS_API MaterialDesc makeSandboxPlayerMaterial();
 
 struct MaterialAsset {
     MaterialId id = kInvalidAssetId;

@@ -58,30 +58,36 @@ void Application::registerAssets() {
     // on and are what MeshComponents reference by name.
     m_assets.registerMesh("cube", Cube::vertices(), Cube::indices());
 
-    // One standardized sandbox material: a clean slate-blue solid. Every
-    // cube renders with this single color; face-to-face variation comes
-    // only from normal-based diffuse lighting, never debug face colors.
-    MaterialDesc defaultMaterial;
-    defaultMaterial.name = "default";
-    defaultMaterial.baseColor = glm::vec4{0.38f, 0.44f, 0.54f, 1.0f};
-    const MaterialId defaultId = m_assets.registerMaterial(defaultMaterial);
+    // Distinct sandbox palette (Assets/makeSandbox*Material): the floor,
+    // falling cubes, stacking cubes, environment, and player accent each
+    // get their own base color and specular/rim response, so objects can
+    // never visually merge the way the old single slate-blue material let
+    // them. Geometry still carries one white tint; all per-object color
+    // and lighting character lives in these materials.
+    const auto registerSandboxMaterial = [this](const MaterialDesc& desc) {
+        const MaterialId id = m_assets.registerMaterial(desc);
+        // Deterministic PSO creation per material (deduplicated by
+        // pipeline state + shader pair, accelerated by the VkPipelineCache).
+        if (const MaterialAsset* material = m_assets.material(id)) {
+            m_pipeline.getOrCreatePipeline(material->id, material->desc.pipeline, material->desc.vertexShader,
+                                           material->desc.fragmentShader, m_swapchain);
+        }
+        return id;
+    };
 
-    MaterialDesc doubleSidedMaterial;
+    MaterialDesc defaultMaterial = makeSandboxCubeMaterial();
+    defaultMaterial.name = "default"; // fallback for unassigned meshes
+    registerSandboxMaterial(defaultMaterial);
+    registerSandboxMaterial(makeSandboxFloorMaterial());
+    registerSandboxMaterial(makeSandboxCubeMaterial());
+    registerSandboxMaterial(makeSandboxStackMaterial());
+    registerSandboxMaterial(makeSandboxEnvironmentMaterial());
+    registerSandboxMaterial(makeSandboxPlayerMaterial());
+
+    MaterialDesc doubleSidedMaterial = makeSandboxEnvironmentMaterial();
     doubleSidedMaterial.name = "doubleSided";
-    doubleSidedMaterial.baseColor = defaultMaterial.baseColor;
     doubleSidedMaterial.pipeline.cullMode = CullMode::None;
-    const MaterialId doubleSidedId = m_assets.registerMaterial(doubleSidedMaterial);
-
-    // Deterministic PSO creation for both materials (deduplicated by
-    // pipeline state + shader pair, accelerated by the VkPipelineCache).
-    if (const MaterialAsset* material = m_assets.material(defaultId)) {
-        m_pipeline.getOrCreatePipeline(material->id, material->desc.pipeline, material->desc.vertexShader,
-                                       material->desc.fragmentShader, m_swapchain);
-    }
-    if (const MaterialAsset* material = m_assets.material(doubleSidedId)) {
-        m_pipeline.getOrCreatePipeline(material->id, material->desc.pipeline, material->desc.vertexShader,
-                                       material->desc.fragmentShader, m_swapchain);
-    }
+    registerSandboxMaterial(doubleSidedMaterial);
     ENGINE_LOG_INFO("Assets registered: " << m_assets.meshCount() << " mesh(es), " << m_assets.materialCount()
                                           << " material(s), VRAM reserved " << m_assets.reservedVramBytes()
                                           << " bytes, " << m_pipeline.cachedPipelineCount()
@@ -116,7 +122,8 @@ void Application::buildScene() {
         Entity planet = m_scene.createEntity("RadialGravityPlanet");
         auto& planetTransform = planet.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -5.0f});
         planetTransform.scale = glm::vec3{1.6f};
-        planet.addComponent<MeshComponent>("cube");
+        auto& planetMesh = planet.addComponent<MeshComponent>("cube");
+        planetMesh.materialName = "environment";
         auto& planetBody = planet.addComponent<RigidBodyComponent>();
         planetBody.setStatic(true);
         planetBody.friction = 0.4f;
@@ -126,11 +133,13 @@ void Application::buildScene() {
         planetGravity.radius = 0.0f; // unbounded inverse-square field
 
         const auto addSpaceBody = [this](const char* name, const glm::vec3& position, float scale,
-                                         const glm::vec3& velocity, const ColliderComponent& collider) {
+                                         const glm::vec3& velocity, const ColliderComponent& collider,
+                                         const char* materialName = "cube") {
             Entity entity = m_scene.createEntity(name);
             auto& transform = entity.addComponent<TransformComponent>(position);
             transform.scale = glm::vec3{scale};
-            entity.addComponent<MeshComponent>("cube");
+            auto& mesh = entity.addComponent<MeshComponent>("cube");
+            mesh.materialName = materialName;
             auto& body = entity.addComponent<RigidBodyComponent>(1.0f);
             body.velocity = velocity;
             body.restitution = 0.2f;
@@ -141,7 +150,7 @@ void Application::buildScene() {
 
         // Tangential velocity sqrt(mu/r) = sqrt(20/2.5) ~= 2.83 m/s.
         addSpaceBody("OrbitalCraft", glm::vec3{-2.5f, 0.0f, -5.0f}, 0.45f, glm::vec3{0.0f, 2.83f, 0.0f},
-                     ColliderComponent::capsule(0.3f, 0.35f));
+                     ColliderComponent::capsule(0.3f, 0.35f), "player");
 
         Entity drone = addSpaceBody("ThrusterDrone", glm::vec3{2.2f, 1.2f, -5.0f}, 0.35f,
                                     glm::vec3{-0.5f, 0.0f, 0.0f}, ColliderComponent::sphere(0.5f));
@@ -151,13 +160,15 @@ void Application::buildScene() {
         thruster.throttle = 1.0f;
 
         Entity projectile = addSpaceBody("FastProjectile", glm::vec3{-4.0f, -1.2f, -5.0f}, 0.18f,
-                                         glm::vec3{35.0f, 0.0f, 0.0f}, ColliderComponent::sphere(0.5f));
+                                         glm::vec3{35.0f, 0.0f, 0.0f}, ColliderComponent::sphere(0.5f),
+                                         "player");
         projectile.getComponent<RigidBodyComponent>().useGravity = false;
 
         Entity wall = m_scene.createEntity("ThinCcdWall");
         auto& wallTransform = wall.addComponent<TransformComponent>(glm::vec3{0.0f, -1.2f, -5.0f});
         wallTransform.scale = glm::vec3{0.1f, 2.0f, 2.0f};
-        wall.addComponent<MeshComponent>("cube");
+        auto& wallMesh = wall.addComponent<MeshComponent>("cube");
+        wallMesh.materialName = "environment";
         auto& wallBody = wall.addComponent<RigidBodyComponent>();
         wallBody.setStatic(true);
         wall.addComponent<ColliderComponent>(ColliderComponent::obb(glm::vec3{0.5f}));
@@ -174,7 +185,8 @@ void Application::buildScene() {
         cargoJoint.restLength = 0.8f;
 
         Entity springCraft = addSpaceBody("SpringAnchoredCraft", glm::vec3{-1.0f, 2.0f, -4.0f}, 0.3f,
-                                          glm::vec3{0.4f, 0.0f, 0.0f}, ColliderComponent::sphere(0.5f));
+                                          glm::vec3{0.4f, 0.0f, 0.0f}, ColliderComponent::sphere(0.5f),
+                                          "stackCube");
         springCraft.getComponent<RigidBodyComponent>().useGravity = false;
         auto& spring = springCraft.addComponent<JointComponent>();
         spring.type = JointType::SpringDamper;
@@ -199,7 +211,8 @@ void Application::buildScene() {
     Entity floor = m_scene.createEntity("Floor");
     auto& floorTransform = floor.addComponent<TransformComponent>(glm::vec3{0.0f, floorTop - 0.05f, 0.0f});
     floorTransform.scale = glm::vec3{9.0f, 0.1f, 9.0f};
-    floor.addComponent<MeshComponent>("cube");
+    auto& floorMesh = floor.addComponent<MeshComponent>("cube");
+    floorMesh.materialName = "floor";
     auto& floorBody = floor.addComponent<RigidBodyComponent>();
     floorBody.setStatic(true);
     floorBody.restitution = 0.35f;
@@ -210,11 +223,13 @@ void Application::buildScene() {
     // by TransformComponent; the box collider's local half-extents are
     // 0.5, so PhysicsSystem derives each world AABB from that same scale.
     const auto addPhysicsCube = [this](const char* name, const glm::vec3& position, float scale,
-                                       const glm::vec3& velocity, const glm::vec3& angularVelocity) {
+                                       const glm::vec3& velocity, const glm::vec3& angularVelocity,
+                                       const char* materialName = "cube") {
         Entity entity = m_scene.createEntity(name);
         auto& transform = entity.addComponent<TransformComponent>(position);
         transform.scale = glm::vec3{scale};
-        entity.addComponent<MeshComponent>("cube");
+        auto& mesh = entity.addComponent<MeshComponent>("cube");
+        mesh.materialName = materialName;
         auto& body = entity.addComponent<RigidBodyComponent>(scale * scale * scale);
         body.velocity = velocity;
         body.angularVelocity = angularVelocity;
@@ -246,7 +261,7 @@ void Application::buildScene() {
                            glm::vec3{-0.55f + static_cast<float>(column) * 0.58f +
                                          static_cast<float>(level) * 0.03f,
                                      floorTop + 0.26f + static_cast<float>(level) * 0.53f, -3.6f},
-                           0.5f, glm::vec3{0.0f}, glm::vec3{0.0f});
+                           0.5f, glm::vec3{0.0f}, glm::vec3{0.0f}, "stackCube");
         }
     }
 

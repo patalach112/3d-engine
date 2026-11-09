@@ -53,11 +53,19 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
     uint32_t materialId = materialIdFor(mesh.materialName);
     uint32_t descriptorIndex = 0;
     glm::vec4 baseColor{1.0f};
+    // Default lighting matches MaterialLighting's defaults, so scenes
+    // built without an asset pass still shade with the full model.
+    glm::vec4 specular{0.35f, 0.35f, 0.35f, 32.0f};
+    glm::vec4 surface{0.35f, 0.10f, 3.0f, 0.28f};
     if (assets != nullptr) {
         if (const MaterialAsset* material = assets->material(mesh.materialName)) {
             materialId = material->id;
             descriptorIndex = material->descriptorIndex;
             baseColor = material->desc.baseColor;
+            const MaterialLighting& lighting = material->desc.lighting;
+            specular = glm::vec4{lighting.specularColor, lighting.shininess};
+            surface = glm::vec4{lighting.specularStrength, lighting.rimStrength, lighting.rimPower,
+                                lighting.ambientStrength};
         }
     }
     DrawItem item;
@@ -65,6 +73,8 @@ void evaluateMesh(const View& view, entt::entity entity, const Frustum& frustum,
     item.materialId = materialId;
     item.descriptorIndex = descriptorIndex;
     item.baseColor = baseColor;
+    item.specular = specular;
+    item.surface = surface;
     item.viewDepth = viewDepth;
     item.sortKey = RenderQueue::makeSortKey(materialId, viewDepth);
     outItem = item;

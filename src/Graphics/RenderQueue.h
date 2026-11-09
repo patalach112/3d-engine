@@ -34,15 +34,28 @@ struct DrawItem {
     // Pushed to the shader with the model matrix so every sandbox mesh is
     // shaded as one solid material, not per-face debug colors.
     glm::vec4 baseColor{1.0f};
+    // Packed material lighting (from MaterialDesc::lighting): specular
+    // color in rgb, shininess in a.
+    glm::vec4 specular{0.35f, 0.35f, 0.35f, 32.0f};
+    // Surface response: x = specular strength, y = rim strength,
+    // z = rim power, w = ambient strength.
+    glm::vec4 surface{0.35f, 0.10f, 3.0f, 0.28f};
 };
 
-// Push-constant payload for one draw (model matrix + material color).
-// 80 bytes, comfortably inside Vulkan's guaranteed 128-byte minimum.
+// Push-constant payload for one draw: model matrix, material base color,
+// and the two packed lighting vec4s above. 112 bytes, inside Vulkan's
+// guaranteed 128-byte push-constant minimum, so richer per-material
+// lighting costs no descriptor updates and no extra draw calls.
 struct DrawPushConstants {
     glm::mat4 model{1.0f};
     glm::vec4 baseColor{1.0f};
+    glm::vec4 specular{0.35f, 0.35f, 0.35f, 32.0f};
+    glm::vec4 surface{0.35f, 0.10f, 3.0f, 0.28f};
 };
-static_assert(sizeof(DrawPushConstants) == 80, "DrawPushConstants must stay a compact 80-byte payload");
+static_assert(sizeof(DrawPushConstants) == 112, "DrawPushConstants must stay a compact 112-byte payload");
+static_assert(offsetof(DrawPushConstants, model) == 0 && offsetof(DrawPushConstants, baseColor) == 64 &&
+                  offsetof(DrawPushConstants, specular) == 80 && offsetof(DrawPushConstants, surface) == 96,
+              "DrawPushConstants layout must match the shader push-constant block");
 
 // ---------------------------------------------------------------------------
 // RenderQueue

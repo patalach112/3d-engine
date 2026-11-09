@@ -5,10 +5,10 @@ namespace engine {
 std::vector<Vertex> Cube::vertices() {
     constexpr float h = 0.5f; // half extent
 
-    // One uniform material tint for every face. The sandbox uses a single
-    // professional material (its color lives in MaterialDesc::baseColor);
-    // per-face variation comes only from normal-based diffuse lighting in
-    // the shader, never from debug face colors.
+    // One neutral white tint for every face: per-object color lives in
+    // the material (MaterialDesc::baseColor, chosen per scene category),
+    // and per-face variation comes only from normal-based lighting in the
+    // shader, never from debug face colors.
     constexpr glm::vec3 kMaterialTint{1.0f, 1.0f, 1.0f};
 
     constexpr glm::vec3 kFront{0.0f, 0.0f, 1.0f};

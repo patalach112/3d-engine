@@ -244,7 +244,7 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
             boundMaterial = item.materialId;
             haveBoundMaterial = true;
         }
-        const DrawPushConstants pushConstants{item.model, item.baseColor};
+        const DrawPushConstants pushConstants{item.model, item.baseColor, item.specular, item.surface};
         vkCmdPushConstants(commandBuffer, m_pipeline.layout(), VK_SHADER_STAGE_VERTEX_BIT, 0,
                            sizeof(DrawPushConstants), &pushConstants);
         vkCmdDrawIndexed(commandBuffer, m_indexCount, 1, 0, 0, 0);

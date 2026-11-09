@@ -130,6 +130,82 @@ ShaderId AssetManager::loadShader(const std::string& name, const std::filesystem
     return registerShader(name, words);
 }
 
+namespace {
+
+MaterialDesc sandboxMaterial(const char* name, const glm::vec4& baseColor, const MaterialLighting& lighting) {
+    MaterialDesc desc;
+    desc.name = name;
+    desc.baseColor = baseColor;
+    desc.lighting = lighting;
+    return desc;
+}
+
+} // namespace
+
+MaterialDesc makeSandboxFloorMaterial() {
+    // Dark asphalt/slate: matte, dim specular, almost no rim, so the floor
+    // recedes and everything resting on it reads against it.
+    MaterialLighting lighting;
+    lighting.specularColor = glm::vec3{0.32f, 0.38f, 0.46f};
+    lighting.specularStrength = 0.08f;
+    lighting.shininess = 10.0f;
+    lighting.rimStrength = 0.035f;
+    lighting.rimPower = 4.0f;
+    lighting.ambientStrength = 0.34f;
+    return sandboxMaterial("floor", glm::vec4{0.10f, 0.115f, 0.135f, 1.0f}, lighting);
+}
+
+MaterialDesc makeSandboxCubeMaterial() {
+    // Warm metallic copper for the falling/dynamic cubes: strong warm
+    // specular highlight, moderate rim.
+    MaterialLighting lighting;
+    lighting.specularColor = glm::vec3{1.0f, 0.70f, 0.40f};
+    lighting.specularStrength = 0.62f;
+    lighting.shininess = 56.0f;
+    lighting.rimStrength = 0.16f;
+    lighting.rimPower = 3.0f;
+    lighting.ambientStrength = 0.24f;
+    return sandboxMaterial("cube", glm::vec4{0.84f, 0.43f, 0.18f, 1.0f}, lighting);
+}
+
+MaterialDesc makeSandboxStackMaterial() {
+    // Cool teal for the stacking stress cubes: separates the resting stack
+    // from the warm falling cubes by hue as well as by shading.
+    MaterialLighting lighting;
+    lighting.specularColor = glm::vec3{0.55f, 0.95f, 1.0f};
+    lighting.specularStrength = 0.42f;
+    lighting.shininess = 38.0f;
+    lighting.rimStrength = 0.22f;
+    lighting.rimPower = 3.5f;
+    lighting.ambientStrength = 0.27f;
+    return sandboxMaterial("stackCube", glm::vec4{0.08f, 0.52f, 0.58f, 1.0f}, lighting);
+}
+
+MaterialDesc makeSandboxEnvironmentMaterial() {
+    // Blue-violet environment (planet, CCD wall): mid-tone, cool specular.
+    MaterialLighting lighting;
+    lighting.specularColor = glm::vec3{0.62f, 0.74f, 1.0f};
+    lighting.specularStrength = 0.38f;
+    lighting.shininess = 28.0f;
+    lighting.rimStrength = 0.18f;
+    lighting.rimPower = 3.0f;
+    lighting.ambientStrength = 0.28f;
+    return sandboxMaterial("environment", glm::vec4{0.27f, 0.33f, 0.58f, 1.0f}, lighting);
+}
+
+MaterialDesc makeSandboxPlayerMaterial() {
+    // Bright mint player accent: the strongest rim response in the palette,
+    // so player-adjacent craft stay readable against every other category.
+    MaterialLighting lighting;
+    lighting.specularColor = glm::vec3{0.72f, 1.0f, 0.88f};
+    lighting.specularStrength = 0.50f;
+    lighting.shininess = 44.0f;
+    lighting.rimStrength = 0.30f;
+    lighting.rimPower = 2.6f;
+    lighting.ambientStrength = 0.26f;
+    return sandboxMaterial("player", glm::vec4{0.16f, 0.76f, 0.46f, 1.0f}, lighting);
+}
+
 MaterialId AssetManager::registerMaterial(MaterialDesc desc) {
     if (const auto existing = m_materialIds.find(desc.name); existing != m_materialIds.end()) {
         return existing->second;

@@ -272,8 +272,8 @@ VkPipeline GraphicsPipeline::createPipeline(const Swapchain& swapchain, const Pi
     colorBlending.pAttachments = &colorBlendAttachment;
 
     // --- Pipeline layout ------------------------------------------------------
-    // Per-entity model matrices and material colors arrive as push
-    // constants (80 bytes, inside the guaranteed 128-byte minimum). The
+    // Per-entity model matrices and material color/lighting arrive as push
+    // constants (112 bytes, inside the guaranteed 128-byte minimum). The
     // default pipeline state is a solid material: depth test + depth write
     // enabled with Less comparison and back-face culling, so nearer solid
     // geometry always occludes what is behind it.

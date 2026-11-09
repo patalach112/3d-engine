@@ -38,6 +38,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -261,6 +262,11 @@ void testFixedTimestep() {
 bool nearlyVec3(const glm::vec3& value, const glm::vec3& expected, float epsilon = 1e-5f) {
     return std::abs(value.x - expected.x) <= epsilon && std::abs(value.y - expected.y) <= epsilon &&
            std::abs(value.z - expected.z) <= epsilon;
+}
+
+bool nearlyVec4(const glm::vec4& value, const glm::vec4& expected, float epsilon = 1e-5f) {
+    return std::abs(value.x - expected.x) <= epsilon && std::abs(value.y - expected.y) <= epsilon &&
+           std::abs(value.z - expected.z) <= epsilon && std::abs(value.w - expected.w) <= epsilon;
 }
 
 void testCamera() {
@@ -1055,9 +1061,19 @@ void testDynamicModulesAndMaterials() {
     engine::RenderQueue moduleQueue;
     engine::DrawItem moduleItem;
     moduleItem.baseColor = glm::vec4{0.38f, 0.44f, 0.54f, 1.0f};
+    moduleItem.specular = glm::vec4{1.0f, 0.7f, 0.4f, 56.0f};
+    moduleItem.surface = glm::vec4{0.62f, 0.16f, 3.0f, 0.24f};
     moduleQueue.push(moduleItem);
     check(moduleQueue.size() == 1 && nearlyEqual(moduleQueue.items()[0].baseColor.x, 0.38f, 1e-6),
           "draw items carry the standardized material color across modules");
+    check(nearlyVec4(moduleQueue.items()[0].specular, glm::vec4{1.0f, 0.7f, 0.4f, 56.0f}) &&
+              nearlyVec4(moduleQueue.items()[0].surface, glm::vec4{0.62f, 0.16f, 3.0f, 0.24f}),
+          "draw items carry specular and rim surface parameters across modules");
+    check(sizeof(engine::DrawPushConstants) == 112 && offsetof(engine::DrawPushConstants, model) == 0 &&
+              offsetof(engine::DrawPushConstants, baseColor) == 64 &&
+              offsetof(engine::DrawPushConstants, specular) == 80 &&
+              offsetof(engine::DrawPushConstants, surface) == 96,
+          "push constants pack the 112-byte lighting payload inside the Vulkan minimum");
 
     // Solid-material pipeline contract: depth test + depth write on, Less
     // comparison, back-face culling. This is what prevents light/color
@@ -1090,6 +1106,48 @@ void testDynamicModulesAndMaterials() {
     }
     check(windingOutward, "cube triangles wind outward so back-face culling keeps visible faces");
     check(sizeof(engine::Vertex) == 36, "vertex format is position+normal+color (36 bytes)");
+
+    // Sandbox palette: every scene category gets its own solid material,
+    // with distinct base colors and lighting responses.
+    const engine::MaterialDesc floorMat = engine::makeSandboxFloorMaterial();
+    const engine::MaterialDesc cubeMat = engine::makeSandboxCubeMaterial();
+    const engine::MaterialDesc stackMat = engine::makeSandboxStackMaterial();
+    const engine::MaterialDesc environmentMat = engine::makeSandboxEnvironmentMaterial();
+    const engine::MaterialDesc playerMat = engine::makeSandboxPlayerMaterial();
+    check(floorMat.name == "floor" && cubeMat.name == "cube" && stackMat.name == "stackCube" &&
+              environmentMat.name == "environment" && playerMat.name == "player",
+          "sandbox palette registers floor/cube/stack/environment/player materials");
+    check(floorMat.baseColor != cubeMat.baseColor && cubeMat.baseColor != stackMat.baseColor &&
+              stackMat.baseColor != environmentMat.baseColor &&
+              environmentMat.baseColor != playerMat.baseColor && floorMat.baseColor != stackMat.baseColor &&
+              floorMat.baseColor != playerMat.baseColor,
+          "floor, falling cubes, stacking cubes, environment and player accent never share a color");
+    check(floorMat.lighting.specularStrength < cubeMat.lighting.specularStrength &&
+              floorMat.lighting.shininess < cubeMat.lighting.shininess,
+          "dark floor material is matte while dynamic cubes carry a strong specular response");
+    check(playerMat.lighting.rimStrength > environmentMat.lighting.rimStrength &&
+              environmentMat.lighting.rimStrength > floorMat.lighting.rimStrength,
+          "player/environment materials carry stronger rim light than the floor");
+    check(cubeMat.baseColor.r > cubeMat.baseColor.b && floorMat.baseColor.b > floorMat.baseColor.r,
+          "dynamic cubes read warm against the cool dark floor");
+
+    engine::VramBudget paletteVram(1024 * 1024);
+    engine::VramBudget paletteStaging(1024 * 1024);
+    engine::AssetManager paletteAssets(paletteVram, paletteStaging);
+    const engine::MaterialId floorMatId = paletteAssets.registerMaterial(floorMat);
+    const engine::MaterialId cubeMatId = paletteAssets.registerMaterial(cubeMat);
+    const engine::MaterialId stackMatId = paletteAssets.registerMaterial(stackMat);
+    const engine::MaterialId environmentMatId = paletteAssets.registerMaterial(environmentMat);
+    const engine::MaterialId playerMatId = paletteAssets.registerMaterial(playerMat);
+    check(paletteAssets.materialCount() == 5 && floorMatId != cubeMatId && cubeMatId != stackMatId &&
+              stackMatId != environmentMatId && environmentMatId != playerMatId,
+          "palette materials register as five distinct material assets");
+    check(nearlyVec4(paletteAssets.material(playerMatId)->desc.baseColor, playerMat.baseColor) &&
+              nearlyEqual(paletteAssets.material(playerMatId)->desc.lighting.rimStrength,
+                          playerMat.lighting.rimStrength, 1e-6) &&
+              nearlyEqual(paletteAssets.material("floor")->desc.lighting.specularStrength,
+                          floorMat.lighting.specularStrength, 1e-6),
+          "registered palette materials preserve per-material lighting");
 
     // Material colors round-trip through EngineAssets unchanged.
     engine::VramBudget vram(1024 * 1024);
@@ -1647,8 +1705,22 @@ void testAssetManagement() {
     engine::AssetManager assets(bigVram, bigStaging);
     engine::MaterialDesc matA;
     matA.name = "matA";
+    matA.baseColor = glm::vec4{0.2f, 0.4f, 0.6f, 1.0f};
+    matA.lighting.specularColor = glm::vec3{0.2f, 0.4f, 0.6f};
+    matA.lighting.shininess = 0.4f;
+    matA.lighting.specularStrength = 0.6f;
+    matA.lighting.rimStrength = 0.8f;
+    matA.lighting.rimPower = 1.0f;
+    matA.lighting.ambientStrength = 0.25f;
     engine::MaterialDesc matB;
     matB.name = "matB";
+    matB.baseColor = glm::vec4{0.8f, 0.6f, 0.4f, 1.0f};
+    matB.lighting.specularColor = glm::vec3{0.8f, 0.6f, 0.4f};
+    matB.lighting.shininess = 64.0f;
+    matB.lighting.specularStrength = 0.5f;
+    matB.lighting.rimStrength = 0.25f;
+    matB.lighting.rimPower = 2.5f;
+    matB.lighting.ambientStrength = 0.3f;
     const engine::MaterialId idA = assets.registerMaterial(matA);
     const engine::MaterialId idB = assets.registerMaterial(matB);
 
@@ -1679,6 +1751,20 @@ void testAssetManagement() {
     check(indicesOk, "render items carry dense descriptor indices");
     check(frame.renderQueue.items().front().materialId == std::min(idA, idB),
           "render queue groups by registered material id");
+    bool lightingOk = frame.renderQueue.size() == 3;
+    for (const engine::DrawItem& item : frame.renderQueue.items()) {
+        const engine::MaterialAsset* material = assets.material(item.materialId);
+        lightingOk = lightingOk && material != nullptr &&
+                     nearlyVec4(item.baseColor, material->desc.baseColor) &&
+                     nearlyVec3(item.specular, material->desc.lighting.specularColor) &&
+                     nearlyEqual(item.specular.a, material->desc.lighting.shininess, 1e-6) &&
+                     nearlyVec4(item.surface,
+                                glm::vec4{material->desc.lighting.specularStrength,
+                                          material->desc.lighting.rimStrength,
+                                          material->desc.lighting.rimPower,
+                                          material->desc.lighting.ambientStrength});
+    }
+    check(lightingOk, "render items carry packed material colors and lighting parameters");
 }
 
 void testLockFreeRingBuffer() {
