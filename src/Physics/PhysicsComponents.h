@@ -183,6 +183,10 @@ struct alignas(16) ColliderComponent {
     float planeOffset = 0.0f;
     std::array<glm::vec3, 8> hullPoints{};
     uint8_t hullPointCount = 0;
+    // Trigger volumes (Phase 17) produce overlap events instead of
+    // contact response. (This byte rides the tail padding alongside
+    // the layer/mask fields, keeping the dense 160-byte layout.)
+    bool isTrigger = false;
     // Collision filtering: the single layer this collider belongs to
     // and the set of layers it collides with (see CollisionLayer).
     uint32_t layer = CollisionLayer::Default;

@@ -1,5 +1,7 @@
 #include "Core/Application.h"
 
+#include "Physics/PhysicsEvents.h"
+
 #include "Core/Logger.h"
 #include "Graphics/HudFont.h"
 #include "Geometry/Cube.h"
@@ -38,6 +40,28 @@ Application::Application(EngineConfig config)
                     << m_config.render.vramBudgetMiB << " MiB (staging "
                     << m_config.render.stagingBufferBudgetMiB << " MiB)");
     registerAssets();
+    // Phase 17 wiring: one event bus shared by scene lifetime and
+    // physics events, plus the named input action the variable update
+    // turns into an impulse on the picked body.
+    m_scene.setEventBus(&m_eventBus);
+    m_physicsSystem.setEventBus(&m_eventBus);
+    m_input.bindAction("Impulse", Key::F);
+    m_triggerLogSubscription = m_eventBus.subscribeScoped<TriggerEvent>([](const TriggerEvent& event) {
+        ENGINE_LOG_INFO("Event: entity #" << entt::to_integral(event.otherEntity)
+                                          << (event.entered ? " entered trigger #" : " exited trigger #")
+                                          << entt::to_integral(event.triggerEntity));
+    });
+    m_collisionLogSubscription = m_eventBus.subscribeScoped<CollisionEvent>([](const CollisionEvent& event) {
+        if (event.impulse > 25.0f) {
+            ENGINE_LOG_INFO("Event: collision #"
+                            << entt::to_integral(event.entityA) << " <-> #" << entt::to_integral(event.entityB)
+                            << " impact impulse " << event.impulse << " N*s");
+        }
+    });
+    m_destroyedLogSubscription =
+        m_eventBus.subscribeScoped<EntityDestroyedEvent>([](const EntityDestroyedEvent& event) {
+            ENGINE_LOG_DEBUG("Event: entity #" << entt::to_integral(event.entity) << " destroyed");
+        });
     // Reserve pooled component storage before populating the scene.
     m_scene.reserveCapacity(m_config.performance.entityReserve);
     buildScene();
@@ -275,6 +299,20 @@ void Application::buildScene() {
         }
     }
 
+    // Trigger pad (Phase 17): a static trigger volume beside the
+    // stacks. Walking or falling through it publishes TriggerEvents
+    // on the bus (logged by the ctor hooks); it has no contact
+    // response, so bodies pass straight through.
+    Entity triggerPad = m_scene.createEntity("TriggerPad");
+    auto& padTransform = triggerPad.addComponent<TransformComponent>(glm::vec3{2.6f, floorTop + 0.15f, -1.0f});
+    padTransform.scale = glm::vec3{1.2f, 0.3f, 1.2f};
+    auto& padMesh = triggerPad.addComponent<MeshComponent>("cube");
+    padMesh.materialName = "environment";
+    auto& padBody = triggerPad.addComponent<RigidBodyComponent>();
+    padBody.setStatic(true);
+    auto& padCollider = triggerPad.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+    padCollider.isTrigger = true;
+
     // Respawn snapshots for the C key. Capturing handles + values (not
     // component pointers) makes repeated resets allocation-free and safe.
     m_physicsSystem.captureSpawnStates(m_scene);
@@ -295,7 +333,7 @@ void Application::run() {
                     << m_renderer.framesInFlight() << " frame(s) in flight)");
     ENGINE_LOG_INFO("Controls: WASD move, Q/E down/up, Shift boost, C resets physics cubes, mouse look "
                     "(click window to capture mouse, Esc releases / quits), left-click selects the object "
-                    "under the cursor (crosshair when captured)");
+                    "under the cursor (crosshair when captured), F launches the selected body");
 
     LoopCallbacks callbacks;
     callbacks.shouldContinue = [this] { return !m_window.shouldClose(); };
@@ -324,6 +362,7 @@ void Application::run() {
     callbacks.update = [this](double deltaSeconds) {
         handleMouseCapture();
         handlePhysicsReset();
+        handleEventImpulse();
         CameraSystem::update(m_scene, m_input, deltaSeconds);
 
         if (m_config.loop.statsLogIntervalSeconds > 0.0) {
@@ -430,6 +469,32 @@ void Application::handleMousePicking() {
                                              << hit.position.x << ", " << hit.position.y << ", " << hit.position.z
                                              << "), normal (" << hit.normal.x << ", " << hit.normal.y << ", "
                                              << hit.normal.z << ")");
+}
+
+void Application::handleEventImpulse() {
+    // Input action -> gameplay effect, end to end through the Phase 17
+    // stack: the "Impulse" action (bound to F in the ctor) pops the
+    // Phase 13 picked body up and away from the camera.
+    if (!m_input.wasActionPressed("Impulse") || m_selectedEntity == entt::null) {
+        return;
+    }
+    auto& registry = m_scene.registry();
+    if (!registry.valid(m_selectedEntity)) {
+        return;
+    }
+    RigidBodyComponent* body = registry.try_get<RigidBodyComponent>(m_selectedEntity);
+    if (body == nullptr || !body->dynamic()) {
+        ENGINE_LOG_INFO("Impulse action: selected entity is not a dynamic body");
+        return;
+    }
+    glm::vec3 direction{0.0f, 1.0f, 0.0f};
+    if (CameraComponent* camera = m_scene.findActiveCamera(); camera != nullptr) {
+        direction += camera->camera.front() * 0.75f;
+    }
+    body->velocity += glm::normalize(direction) * 6.0f;
+    body->sleeping = false;
+    body->sleepTimer = 0.0f;
+    ENGINE_LOG_INFO("Impulse action: launched entity #" << entt::to_integral(m_selectedEntity));
 }
 
 void Application::handlePhysicsReset() {

@@ -269,6 +269,7 @@ PhysicsSystem::Stats PhysicsSystem::update(Scene& scene, double fixedDeltaSecond
     }
     m_subStepIndex = 0;
     m_subStepCount = 1;
+    publishPhysicsEvents(scene);
     return m_lastStats;
 }
 
@@ -395,6 +396,9 @@ size_t PhysicsSystem::resetToSpawnStates(Scene& scene) {
     // rebuild it from the respawned transforms.
     m_candidatePairs.clear();
     m_jointStates.clear();
+    m_activeContactPairs.clear();
+    m_activeTriggerPairs.clear();
+    m_stepTriggerPairs.clear();
     m_broadTree.clear();
     m_broadProxies.clear();
     m_broadBodyIndex.clear();
@@ -906,9 +910,29 @@ void PhysicsSystem::broadPhase() {
 
 void PhysicsSystem::narrowPhase(JobSystem* jobs, uint32_t parallelMinBodies) {
     m_contactSlots.assign(m_candidatePairs.size(), std::vector<Contact>{});
+    // Trigger pairs (either collider is a trigger volume) produce
+    // overlap events instead of contact response. They are marked
+    // serially here so the parallel manifold pass below can skip
+    // them — which also keeps CCD from stopping bodies at a
+    // trigger's surface.
+    m_triggerPairFlags.assign(m_candidatePairs.size(), 0);
+    m_stepTriggerPairs.clear();
+    for (size_t i = 0; i < m_candidatePairs.size(); ++i) {
+        const auto [bodyA, bodyB] = m_candidatePairs[i];
+        if (m_bodies[bodyA].collider->isTrigger || m_bodies[bodyB].collider->isTrigger) {
+            m_triggerPairFlags[i] = 1;
+            const uint32_t entityA = entt::to_integral(m_bodies[bodyA].entity);
+            const uint32_t entityB = entt::to_integral(m_bodies[bodyB].entity);
+            m_stepTriggerPairs.push_back((static_cast<uint64_t>(std::min(entityA, entityB)) << 32u) |
+                                         static_cast<uint64_t>(std::max(entityA, entityB)));
+        }
+    }
     const auto evaluateRange = [this](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
             const auto [bodyA, bodyB] = m_candidatePairs[i];
+            if (m_triggerPairFlags[i] != 0) {
+                continue;
+            }
             collideManifold(bodyA, bodyB, m_contactSlots[i]);
             if (m_contactSlots[i].empty() && m_ccdEnabled) {
                 const glm::vec3 relativeDisplacement =
@@ -2939,6 +2963,78 @@ void PhysicsSystem::resolveJointPosition(const JointRef& ref) {
     }
     rotateJointBody(ref.bodyB, glm::angleAxis(angle * strength * (weightB / weightSum), axis));
     rotateJointBody(ref.bodyA, glm::angleAxis(-angle * strength * (weightA / weightSum), axis));
+}
+
+void PhysicsSystem::publishPhysicsEvents(Scene& scene) {
+    // Trigger crossings: diff the final sub-step's trigger pair set
+    // against the previous update's set.
+    {
+        const std::unordered_set<uint64_t> current(m_stepTriggerPairs.begin(), m_stepTriggerPairs.end());
+        if (m_eventBus != nullptr) {
+            auto& registry = scene.registry();
+            const auto publishTransition = [this, &registry](uint64_t key, bool entered) {
+                const entt::entity first = static_cast<entt::entity>(static_cast<uint32_t>(key >> 32u));
+                const entt::entity second = static_cast<entt::entity>(static_cast<uint32_t>(key & 0xFFFFFFFFu));
+                // The trigger is whichever side carries a trigger
+                // collider (if both do, the pair is reported from the
+                // first entity's perspective).
+                const ColliderComponent* firstCollider = registry.try_get<ColliderComponent>(first);
+                const bool firstIsTrigger = firstCollider != nullptr && firstCollider->isTrigger;
+                TriggerEvent event;
+                event.triggerEntity = firstIsTrigger ? first : second;
+                event.otherEntity = firstIsTrigger ? second : first;
+                event.entered = entered;
+                m_eventBus->publish(event);
+            };
+            for (const uint64_t key : current) {
+                if (m_activeTriggerPairs.count(key) == 0) {
+                    publishTransition(key, true);
+                }
+            }
+            for (const uint64_t key : m_activeTriggerPairs) {
+                if (current.count(key) == 0) {
+                    publishTransition(key, false);
+                }
+            }
+        }
+        m_activeTriggerPairs = current;
+    }
+
+    // Collision began: pairs that have contacts now but had none at
+    // the previous update. The event carries the pair's strongest
+    // contact (largest accumulated normal impulse).
+    {
+        std::unordered_map<uint64_t, const Contact*> strongest;
+        for (const Contact& contact : m_contacts) {
+            const uint32_t entityA = entt::to_integral(m_bodies[contact.bodyA].entity);
+            const uint32_t entityB = entt::to_integral(m_bodies[contact.bodyB].entity);
+            const uint64_t key = (static_cast<uint64_t>(std::min(entityA, entityB)) << 32u) |
+                                 static_cast<uint64_t>(std::max(entityA, entityB));
+            const auto found = strongest.find(key);
+            if (found == strongest.end()) {
+                strongest.emplace(key, &contact);
+            } else if (contact.normalImpulse > found->second->normalImpulse) {
+                found->second = &contact;
+            }
+        }
+        if (m_eventBus != nullptr) {
+            for (const auto& [key, contact] : strongest) {
+                if (m_activeContactPairs.count(key) == 0) {
+                    CollisionEvent event;
+                    event.entityA = m_bodies[contact->bodyA].entity;
+                    event.entityB = m_bodies[contact->bodyB].entity;
+                    event.point = contact->point;
+                    event.normal = contact->normal;
+                    event.impulse = contact->normalImpulse;
+                    m_eventBus->publish(event);
+                }
+            }
+        }
+        m_activeContactPairs.clear();
+        for (const auto& [key, contact] : strongest) {
+            m_activeContactPairs.insert(key);
+        }
+    }
 }
 
 } // namespace engine

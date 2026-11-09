@@ -1220,6 +1220,66 @@ impulse solver shows, verified rather than assumed) join the
 suite: **535 checks, all passing in Debug, Release-shared and
 Release-static, CTest 1/1, zero warnings.**
 
+## Phase 17 — Event Bus & Input System ✅
+
+Producers and consumers no longer call each other directly:
+`EventBus` (`src/Core/EventBus.h`) is a small header-only,
+type-safe publish/subscribe hub. Any struct can be an event;
+`subscribe<T>()` dispatches synchronously in subscription order,
+`unsubscribe(id)` (or the RAII `EventBus::Subscription` from
+`subscribeScoped<T>()`) detaches, and dispatch iterates a snapshot
+so listeners may safely subscribe/unsubscribe while handling an
+event. The engine emits three core events on it:
+
+- **`CollisionEvent`** (entities, world contact point, normal,
+  strongest contact impulse) — published by `PhysicsSystem` at the
+  end of `update()` for contact pairs that appeared since the
+  previous update: resting pairs fire once, bounce re-contacts and
+  re-drops fire again, and nothing is ever published from inside
+  the solver, so listeners may inspect or modify the scene.
+- **`TriggerEvent`** (`triggerEntity`, `otherEntity`, `entered`) —
+  colliders flagged `ColliderComponent::isTrigger` generate
+  enter/exit crossings instead of contact response: bodies fall
+  straight through, only pairs passing the Phase 15 layer/mask
+  filter are reported, and the event names which side is the
+  trigger. Event generation respects the end-of-update pair-set
+  diff, so sub-step jitter never double-fires.
+- **`EntityDestroyedEvent`** — published by `Scene::destroyEntity`
+  *before* the entity is destroyed, while its components are still
+  readable: the cleanup-hook point for per-entity state kept
+  outside the registry.
+
+`Input` grew from raw state polling into the full input system.
+It still tracks held keys/buttons plus per-frame pressed/released
+edges, cursor position/delta and scroll — now through shared
+`inject*()` entry points that the GLFW callbacks and tools/tests
+both feed — and adds named mappings on top: `bindAction` /
+`bindActionButton` collect any number of physical controls under
+one gameplay name (`isActionDown`, `wasActionPressed`,
+`wasActionReleased`), and `bindAxis` turns a key pair into a
+-1/0/+1 axis (`axisValue`). Gameplay code asks for "Impulse" or
+"Horizontal", never for raw key codes. A default-constructed
+headless `Input` (no window) exists for tests and replays.
+
+Demo integration proves the loop end to end: `Application` owns
+one bus wired into both `Scene` and `PhysicsSystem`, logs trigger
+crossings and hard (> 25 N·s) collisions from subscribed hooks,
+adds a static trigger pad beside the cube stacks that bodies and
+the player fall/walk through, and binds the **F** key to an
+"Impulse" action that launches the Phase 13 picked body up and
+away from the camera.
+
+Verification: 31 new checks (bus ordering, payloads, type
+isolation, id/RAII/clear unsubscription, no-replay, safe
+unsubscribe-during-dispatch; injected press/held/repeat/release
+transitions, cursor baseline/delta/scroll accumulation and
+per-frame clearing, multi-control actions, axis signs and
+cancellation; collision-began exactly-once and re-fire after
+re-drop, trigger enter/exit with fall-through and layer/mask
+silence, destroyed-entity cleanup with live components) join the
+suite: **566 checks, all passing in Debug, Release-shared and
+Release-static, CTest 1/1, zero warnings.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

@@ -2,10 +2,12 @@
 #include "Core/Export.h"
 
 #include "Assets/AssetManager.h"
+#include "Core/EventBus.h"
 #include "Core/Memory/PoolAllocator.h"
 #include "Scene/Components.h"
 #include "Scene/DynamicAABBTree.h"
 #include "Scene/Raycast.h"
+#include "Scene/SceneEvents.h"
 
 #include <entt/entt.hpp>
 
@@ -162,6 +164,11 @@ public:
     // creating entities; harmless to call again later.
     void reserveCapacity(size_t entityCount);
 
+    // Event output (Phase 17): when a bus is attached, destroyEntity
+    // publishes EntityDestroyedEvent just before the entity is
+    // destroyed (components still readable inside listeners).
+    void setEventBus(EventBus* bus) { m_eventBus = bus; }
+
     // Memory pool backing all component storage of this scene.
     [[nodiscard]] memory::PoolStats memoryStats() const { return m_registry.get_allocator().stats(); }
 
@@ -197,6 +204,7 @@ private:
 
     Registry m_registry;
     size_t m_entityCount = 0; // Scene-created, still-alive entities
+    EventBus* m_eventBus = nullptr;
     mutable DynamicAABBTree m_raycastTree;
     mutable std::unordered_map<uint32_t /*entt integral*/, RaycastProxyEntry> m_raycastProxies;
 };

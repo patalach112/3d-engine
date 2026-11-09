@@ -5,6 +5,9 @@
 
 #include "Core/Camera.h"
 #include "Core/EngineConfig.h"
+#include "Core/EventBus.h"
+#include "Physics/PhysicsEvents.h"
+#include "Platform/Input.h"
 #include "Platform/Window.h"
 #include "Core/GameLoop.h"
 #include "Core/Logger.h"
@@ -4708,6 +4711,280 @@ void testGameLoop() {
     check(skippedLoop.time().framesPerSecond() == 0.0, "skipped presentations do not feed FPS");
 }
 
+void testEventBus() {
+    std::cout << "Event bus (Phase 17)\n";
+    using engine::EventBus;
+    struct AlphaEvent {
+        int value = 0;
+    };
+    struct BetaEvent {
+        float value = 0.0f;
+    };
+
+    {
+        EventBus bus;
+        std::vector<int> order;
+        bus.subscribe<AlphaEvent>([&order](const AlphaEvent& event) { order.push_back(10 + event.value); });
+        bus.subscribe<AlphaEvent>([&order](const AlphaEvent& event) { order.push_back(20 + event.value); });
+        bus.publish(AlphaEvent{1});
+        check(order == std::vector<int>({11, 21}), "listeners fire in subscription order with the payload");
+        check(bus.listenerCount<AlphaEvent>() == 2 && bus.listenerCount<BetaEvent>() == 0,
+              "listener counts are tracked per event type");
+    }
+    {
+        EventBus bus;
+        int alphaHits = 0;
+        int betaHits = 0;
+        bus.subscribe<AlphaEvent>([&alphaHits](const AlphaEvent&) { ++alphaHits; });
+        bus.subscribe<BetaEvent>([&betaHits](const BetaEvent&) { ++betaHits; });
+        bus.publish(AlphaEvent{});
+        check(alphaHits == 1 && betaHits == 0, "event types are isolated from each other");
+        bus.publish(BetaEvent{});
+        check(alphaHits == 1 && betaHits == 1, "each type dispatches independently");
+    }
+    {
+        EventBus bus;
+        int hits = 0;
+        const EventBus::SubscriptionId first =
+            bus.subscribe<AlphaEvent>([&hits](const AlphaEvent&) { ++hits; });
+        bus.subscribe<AlphaEvent>([&hits](const AlphaEvent&) { ++hits; });
+        bus.publish(AlphaEvent{});
+        bus.unsubscribe(first);
+        bus.publish(AlphaEvent{});
+        check(hits == 3 && bus.listenerCount<AlphaEvent>() == 1,
+              "unsubscribe(id) removes exactly that listener");
+        bus.unsubscribe(first);
+        check(bus.listenerCount<AlphaEvent>() == 1, "unsubscribing a dead id is a no-op");
+    }
+    {
+        EventBus bus;
+        int hits = 0;
+        {
+            const EventBus::Subscription scoped =
+                bus.subscribeScoped<AlphaEvent>([&hits](const AlphaEvent&) { ++hits; });
+            bus.publish(AlphaEvent{});
+        }
+        bus.publish(AlphaEvent{});
+        check(hits == 1 && bus.listenerCount<AlphaEvent>() == 0,
+              "RAII subscription unsubscribes when its handle leaves scope");
+    }
+    {
+        EventBus bus;
+        bus.publish(AlphaEvent{5});
+        int hits = 0;
+        bus.subscribe<AlphaEvent>([&hits](const AlphaEvent&) { ++hits; });
+        check(hits == 0, "late subscribers do not receive past events (no replay)");
+        bus.clear();
+        check(bus.listenerCount<AlphaEvent>() == 0, "clear() drops every subscription");
+    }
+    {
+        EventBus bus;
+        int first = 0;
+        int second = 0;
+        EventBus::SubscriptionId secondId = EventBus::kInvalidSubscription;
+        bus.subscribe<AlphaEvent>([&bus, &first, &secondId](const AlphaEvent&) {
+            ++first;
+            bus.unsubscribe(secondId);
+        });
+        secondId = bus.subscribe<AlphaEvent>([&second](const AlphaEvent&) { ++second; });
+        bus.publish(AlphaEvent{});
+        bus.publish(AlphaEvent{});
+        check(first == 2 && second == 1,
+              "unsubscribing during dispatch is safe and applies from the next publish");
+    }
+}
+
+void testInputSystem() {
+    std::cout << "Input system: state transitions and mappings (Phase 17)\n";
+    using engine::Input;
+    using engine::Key;
+    using engine::MouseButton;
+
+    Input input; // headless instance driven through inject*()
+    input.bindAxis("Horizontal", Key::A, Key::D);
+    input.bindAction("Jump", Key::Space);
+    input.bindActionButton("Jump", MouseButton::Right);
+
+    // Press / held / repeat / release transitions for keys.
+    input.beginFrame();
+    input.injectKeyState(Key::Space, true);
+    check(input.isKeyDown(Key::Space) && input.wasKeyPressed(Key::Space) && !input.wasKeyReleased(Key::Space),
+          "injected press: held + pressed edge in the same frame");
+    check(input.isActionDown("Jump") && input.wasActionPressed("Jump"),
+          "action mirrors its key binding's press");
+    input.beginFrame();
+    check(input.isKeyDown(Key::Space) && !input.wasKeyPressed(Key::Space),
+          "held key produces no new press edge on the next frame");
+    input.injectKeyState(Key::Space, true);
+    check(!input.wasKeyPressed(Key::Space), "repeated down (auto-repeat) does not re-fire the press edge");
+    input.injectKeyState(Key::Space, false);
+    check(!input.isKeyDown(Key::Space) && input.wasKeyReleased(Key::Space) && input.wasActionReleased("Jump"),
+          "release: up + released edge, action released with it");
+    input.beginFrame();
+    check(!input.wasKeyReleased(Key::Space), "beginFrame clears per-frame transition edges");
+
+    // Mouse buttons, cursor delta, scroll.
+    input.beginFrame();
+    input.injectMouseButtonState(MouseButton::Left, true);
+    input.injectCursorPosition(glm::vec2{100.0f, 50.0f});
+    check(input.mouseDelta() == glm::vec2{0.0f, 0.0f}, "first cursor sample only sets the baseline");
+    input.injectCursorPosition(glm::vec2{110.0f, 40.0f});
+    input.injectScrollDelta(glm::vec2{0.0f, 1.0f});
+    input.injectMouseButtonState(MouseButton::Right, true);
+    check(input.isMouseButtonDown(MouseButton::Left) && input.wasMouseButtonPressed(MouseButton::Left),
+          "mouse button press edge tracked");
+    check(input.mouseDelta() == glm::vec2{10.0f, -10.0f} && input.scrollDelta() == glm::vec2{0.0f, 1.0f},
+          "cursor delta and scroll accumulate within the frame");
+    check(input.isActionDown("Jump"), "action also answers to its mouse-button binding");
+    input.beginFrame();
+    check(input.mouseDelta() == glm::vec2{0.0f, 0.0f} && input.scrollDelta() == glm::vec2{0.0f, 0.0f} &&
+              input.isMouseButtonDown(MouseButton::Left),
+          "beginFrame clears deltas but keeps held state");
+
+    // Axes: neutral, both directions, cancellation, rebinding.
+    input.beginFrame();
+    check(input.axisValue("Horizontal") == 0.0f, "axis reads 0 with neither key down");
+    input.injectKeyState(Key::D, true);
+    check(input.axisValue("Horizontal") == 1.0f, "axis reads +1 with the positive key down");
+    input.injectKeyState(Key::A, true);
+    check(input.axisValue("Horizontal") == 0.0f, "opposing axis keys cancel out");
+    input.injectKeyState(Key::D, false);
+    check(input.axisValue("Horizontal") == -1.0f, "axis reads -1 with only the negative key down");
+    input.clearAxisBinding("Horizontal");
+    check(input.axisValue("Horizontal") == 0.0f && input.axisValue("NeverBound") == 0.0f &&
+              !input.isActionDown("NeverBound"),
+          "cleared and never-bound mappings read as neutral");
+}
+
+void testPhysicsEvents() {
+    std::cout << "Physics & scene events (Phase 17)\n";
+    using engine::ColliderComponent;
+    using engine::CollisionEvent;
+    using engine::EntityDestroyedEvent;
+    using engine::EventBus;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::RigidBodyComponent;
+    using engine::TransformComponent;
+    using engine::TriggerEvent;
+
+    const auto step = [](PhysicsSystem& physics, engine::Scene& scene, const PhysicsSettings& settings,
+                         int steps) {
+        for (int i = 0; i < steps; ++i) {
+            physics.update(scene, 1.0 / 60.0, settings, nullptr);
+        }
+    };
+
+    // CollisionEvent: exactly once for a new contact pair, again after
+    // a genuine separation + re-collision.
+    {
+        engine::Scene scene;
+        PhysicsSystem physics;
+        EventBus bus;
+        physics.setEventBus(&bus);
+        scene.setEventBus(&bus);
+        PhysicsSettings settings;
+        settings.subSteps = 4;
+        settings.sleepEnabled = false;
+
+        auto floor = scene.createEntity("Floor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, 0.0f});
+        floor.addComponent<RigidBodyComponent>(0.0f);
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{10.0f, 0.5f, 10.0f}));
+        auto boxEntity = scene.createEntity("Box");
+        auto& boxTransform = boxEntity.addComponent<TransformComponent>(glm::vec3{0.0f, 1.5f, 0.0f});
+        auto& boxBody = boxEntity.addComponent<RigidBodyComponent>(1.0f);
+        boxBody.restitution = 0.0f;
+        boxEntity.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        int collisions = 0;
+        float bestImpulse = 0.0f;
+        bool routingOk = true;
+        bus.subscribe<CollisionEvent>([&](const CollisionEvent& event) {
+            ++collisions;
+            bestImpulse = std::max(bestImpulse, event.impulse);
+            routingOk &= (event.entityA == floor.handle() || event.entityB == floor.handle()) &&
+                         (event.entityA == boxEntity.handle() || event.entityB == boxEntity.handle());
+        });
+        step(physics, scene, settings, 120);
+        check(collisions == 1 && bestImpulse > 0.0f && routingOk,
+              "collision-began fires exactly once for a pair that stays in contact, with impulse and entities");
+
+        boxTransform.position.y = 3.0f;
+        boxBody.velocity = glm::vec3{0.0f};
+        step(physics, scene, settings, 120);
+        check(collisions == 2, "collision-began fires again after separation and re-collision");
+    }
+
+    // TriggerEvent: enter/exit around a pass-through volume, and the
+    // Phase 15 layer/mask filter decides which pairs ever see it.
+    {
+        engine::Scene scene;
+        PhysicsSystem physics;
+        EventBus bus;
+        physics.setEventBus(&bus);
+        PhysicsSettings settings;
+        settings.subSteps = 4;
+        settings.sleepEnabled = false;
+
+        auto pad = scene.createEntity("Pad");
+        pad.addComponent<TransformComponent>(glm::vec3{0.0f, 0.5f, 0.0f});
+        pad.addComponent<RigidBodyComponent>(0.0f);
+        auto& padCollider = pad.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{2.0f, 0.5f, 2.0f}));
+        padCollider.isTrigger = true;
+        auto falling = scene.createEntity("Falling");
+        auto& fallingTransform = falling.addComponent<TransformComponent>(glm::vec3{0.0f, 3.0f, 0.0f});
+        falling.addComponent<RigidBodyComponent>(1.0f);
+        falling.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+        int enters = 0;
+        int exits = 0;
+        int collisions = 0;
+        bool routingOk = true;
+        bus.subscribe<TriggerEvent>([&](const TriggerEvent& event) {
+            routingOk &= event.triggerEntity == pad.handle() && event.otherEntity == falling.handle();
+            if (event.entered) {
+                ++enters;
+            } else {
+                ++exits;
+            }
+        });
+        bus.subscribe<CollisionEvent>([&collisions](const CollisionEvent&) { ++collisions; });
+        step(physics, scene, settings, 120);
+        check(enters == 1 && exits == 1 && routingOk && collisions == 0 && fallingTransform.position.y < -2.0f,
+              "trigger emits one enter + one exit, names the trigger, and bodies fall through it");
+
+        // Mask the pair out (pad only sees layer 0x2): the falling box
+        // is on the default layer, so no further trigger events.
+        padCollider.layer = 0x2u;
+        padCollider.mask = 0x2u;
+        fallingTransform.position = glm::vec3{0.0f, 3.0f, 0.0f};
+        scene.registry().get<RigidBodyComponent>(falling.handle()).velocity = glm::vec3{0.0f};
+        step(physics, scene, settings, 60);
+        check(enters == 1 && exits == 1, "trigger pairs filtered out by layer/mask emit no events");
+    }
+
+    // EntityDestroyedEvent: published while components still exist.
+    {
+        engine::Scene scene;
+        EventBus bus;
+        scene.setEventBus(&bus);
+        auto victim = scene.createEntity("Victim");
+        victim.addComponent<TransformComponent>(glm::vec3{1.0f, 2.0f, 3.0f});
+        bool fired = false;
+        bool readableInside = false;
+        bus.subscribe<EntityDestroyedEvent>([&](const EntityDestroyedEvent& event) {
+            fired = true;
+            readableInside = scene.registry().valid(event.entity) &&
+                             scene.registry().try_get<TransformComponent>(event.entity) != nullptr &&
+                             event.entity == victim.handle();
+        });
+        scene.destroyEntity(victim);
+        check(fired && readableInside && !scene.registry().valid(victim.handle()),
+              "destroyed event fires before destruction with components still readable");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -4724,6 +5001,9 @@ int main() {
     testSpatialPartitioning();
     testCollisionLayers();
     testJointConstraints();
+    testEventBus();
+    testInputSystem();
+    testPhysicsEvents();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

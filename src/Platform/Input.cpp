@@ -6,6 +6,8 @@
 // deliberately not part of Input.h so Core code stays GLFW-free.
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
+
 namespace engine {
 namespace {
 
@@ -49,20 +51,25 @@ MouseButton translateMouseButton(int glfwButton) {
 
 } // namespace
 
-Input::Input(Window& window) : m_window(window) {
-    m_window.setInputHandler(this);
+Input::Input(Window& window) : m_window(&window) {
+    m_window->setInputHandler(this);
     // Window applies the requested GLFW cursor mode during construction;
     // adopt that state without re-sending the mode or losing the fact that
     // the cursor is already captured at startup.
-    m_mouseCaptured = m_window.isCursorCaptured();
+    m_mouseCaptured = m_window->isCursorCaptured();
     m_hasMousePosition = false;
 }
 
+Input::Input() = default;
+
 Input::~Input() {
+    if (m_window == nullptr) {
+        return; // headless: nothing was ever registered
+    }
     if (m_mouseCaptured) {
         setMouseCaptured(false);
     }
-    m_window.setInputHandler(nullptr);
+    m_window->setInputHandler(nullptr);
 }
 
 void Input::beginFrame() {
@@ -105,11 +112,14 @@ bool Input::wasMouseButtonReleased(MouseButton button) const {
 }
 
 void Input::setMouseCaptured(bool captured) {
-    if (m_mouseCaptured == captured && m_window.isCursorCaptured() == captured) {
+    if (m_mouseCaptured == captured &&
+        (m_window == nullptr || m_window->isCursorCaptured() == captured)) {
         return;
     }
     m_mouseCaptured = captured;
-    m_window.setCursorCaptured(captured);
+    if (m_window != nullptr) {
+        m_window->setCursorCaptured(captured);
+    }
     // A mode change can make previously accumulated cursor samples stale.
     // In particular, absolute positions reported just before GLFW switches
     // to its virtual captured cursor must not be replayed as one large
@@ -118,43 +128,39 @@ void Input::setMouseCaptured(bool captured) {
     m_hasMousePosition = false;
 }
 
-void Input::onKeyEvent(int glfwKey, int glfwAction) {
-    const Key key = translateKey(glfwKey);
-    if (key == Key::Unknown) {
+void Input::injectKeyState(Key key, bool down) {
+    if (key == Key::Unknown || key == Key::Count) {
         return;
     }
     const size_t index = static_cast<size_t>(key);
-    if (glfwAction == GLFW_PRESS) {
+    if (down) {
         if (!m_keysDown[index]) {
             m_keysPressed[index] = true;
         }
         m_keysDown[index] = true;
-    } else if (glfwAction == GLFW_RELEASE) {
+    } else if (m_keysDown[index]) {
         m_keysDown[index] = false;
         m_keysReleased[index] = true;
     }
-    // GLFW_REPEAT is intentionally ignored: held state already covers it.
 }
 
-void Input::onMouseButtonEvent(int glfwButton, int glfwAction) {
-    const MouseButton button = translateMouseButton(glfwButton);
+void Input::injectMouseButtonState(MouseButton button, bool down) {
     if (button == MouseButton::Count) {
         return;
     }
     const size_t index = static_cast<size_t>(button);
-    if (glfwAction == GLFW_PRESS) {
+    if (down) {
         if (!m_buttonsDown[index]) {
             m_buttonsPressed[index] = true;
         }
         m_buttonsDown[index] = true;
-    } else if (glfwAction == GLFW_RELEASE) {
+    } else if (m_buttonsDown[index]) {
         m_buttonsDown[index] = false;
         m_buttonsReleased[index] = true;
     }
 }
 
-void Input::onCursorPositionEvent(double xPosition, double yPosition) {
-    const glm::vec2 position{static_cast<float>(xPosition), static_cast<float>(yPosition)};
+void Input::injectCursorPosition(glm::vec2 position) {
     if (m_hasMousePosition) {
         m_mouseDelta += position - m_mousePosition;
     }
@@ -162,8 +168,123 @@ void Input::onCursorPositionEvent(double xPosition, double yPosition) {
     m_hasMousePosition = true;
 }
 
+void Input::injectScrollDelta(glm::vec2 delta) {
+    m_scrollDelta += delta;
+}
+
+void Input::onKeyEvent(int glfwKey, int glfwAction) {
+    // GLFW_REPEAT is intentionally not forwarded: held state covers it.
+    if (glfwAction == GLFW_PRESS) {
+        injectKeyState(translateKey(glfwKey), true);
+    } else if (glfwAction == GLFW_RELEASE) {
+        injectKeyState(translateKey(glfwKey), false);
+    }
+}
+
+void Input::onMouseButtonEvent(int glfwButton, int glfwAction) {
+    if (glfwAction == GLFW_PRESS) {
+        injectMouseButtonState(translateMouseButton(glfwButton), true);
+    } else if (glfwAction == GLFW_RELEASE) {
+        injectMouseButtonState(translateMouseButton(glfwButton), false);
+    }
+}
+
+void Input::onCursorPositionEvent(double xPosition, double yPosition) {
+    injectCursorPosition(glm::vec2{static_cast<float>(xPosition), static_cast<float>(yPosition)});
+}
+
 void Input::onScrollEvent(double xOffset, double yOffset) {
-    m_scrollDelta += glm::vec2{static_cast<float>(xOffset), static_cast<float>(yOffset)};
+    injectScrollDelta(glm::vec2{static_cast<float>(xOffset), static_cast<float>(yOffset)});
+}
+
+void Input::bindAction(std::string_view name, Key key) {
+    ActionBinding& binding = m_actions[std::string{name}];
+    if (std::find(binding.keys.begin(), binding.keys.end(), key) == binding.keys.end()) {
+        binding.keys.push_back(key);
+    }
+}
+
+void Input::bindActionButton(std::string_view name, MouseButton button) {
+    ActionBinding& binding = m_actions[std::string{name}];
+    if (std::find(binding.buttons.begin(), binding.buttons.end(), button) == binding.buttons.end()) {
+        binding.buttons.push_back(button);
+    }
+}
+
+void Input::clearActionBindings(std::string_view name) {
+    m_actions.erase(std::string{name});
+}
+
+bool Input::isActionDown(std::string_view name) const {
+    const auto found = m_actions.find(std::string{name});
+    if (found == m_actions.end()) {
+        return false;
+    }
+    for (const Key key : found->second.keys) {
+        if (isKeyDown(key)) {
+            return true;
+        }
+    }
+    for (const MouseButton button : found->second.buttons) {
+        if (isMouseButtonDown(button)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Input::wasActionPressed(std::string_view name) const {
+    const auto found = m_actions.find(std::string{name});
+    if (found == m_actions.end()) {
+        return false;
+    }
+    for (const Key key : found->second.keys) {
+        if (wasKeyPressed(key)) {
+            return true;
+        }
+    }
+    for (const MouseButton button : found->second.buttons) {
+        if (wasMouseButtonPressed(button)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Input::wasActionReleased(std::string_view name) const {
+    const auto found = m_actions.find(std::string{name});
+    if (found == m_actions.end()) {
+        return false;
+    }
+    for (const Key key : found->second.keys) {
+        if (wasKeyReleased(key)) {
+            return true;
+        }
+    }
+    for (const MouseButton button : found->second.buttons) {
+        if (wasMouseButtonReleased(button)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Input::bindAxis(std::string_view name, Key negative, Key positive) {
+    m_axes[std::string{name}] = AxisBinding{negative, positive};
+}
+
+void Input::clearAxisBinding(std::string_view name) {
+    m_axes.erase(std::string{name});
+}
+
+float Input::axisValue(std::string_view name) const {
+    const auto found = m_axes.find(std::string{name});
+    if (found == m_axes.end()) {
+        return 0.0f;
+    }
+    const float value = (isKeyDown(found->second.positive) ? 1.0f : 0.0f) -
+                        (isKeyDown(found->second.negative) ? 1.0f : 0.0f);
+    return value;
 }
 
 void Input::onFocusChanged(bool focused) {

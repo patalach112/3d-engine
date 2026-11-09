@@ -1,7 +1,9 @@
 #pragma once
 #include "Core/Export.h"
 
+#include "Core/EventBus.h"
 #include "Physics/PhysicsComponents.h"
+#include "Physics/PhysicsEvents.h"
 #include "Scene/Components.h"
 #include "Scene/DynamicAABBTree.h"
 
@@ -12,6 +14,7 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,6 +61,14 @@ public:
 
     [[nodiscard]] const Stats& lastStats() const { return m_lastStats; }
     [[nodiscard]] size_t spawnStateCount() const { return m_spawnStates.size(); }
+
+    // Event output (Phase 17): when a bus is attached, the end of
+    // each update() publishes CollisionEvent for contact pairs that
+    // appeared since the previous update and TriggerEvent for
+    // trigger-volume crossings. Null (the default) disables
+    // publication; the pair bookkeeping runs either way, so
+    // attaching a bus mid-run does not replay history.
+    void setEventBus(EventBus* bus) { m_eventBus = bus; }
 
 private:
     struct SpawnState {
@@ -295,6 +306,16 @@ private:
     std::vector<ThrusterRef> m_thrusters;
     std::vector<JointRef> m_joints;
     std::unordered_map<uint32_t, JointSolverState> m_jointStates; // key: joint entity integral
+    // Event publication state: entity-pair sets (packed entity
+    // integrals) as of the previous update, diffed against the
+    // current sets at the end of update() to derive began/entered
+    // and ended/exited transitions.
+    EventBus* m_eventBus = nullptr;
+    std::unordered_set<uint64_t> m_activeContactPairs;
+    std::unordered_set<uint64_t> m_activeTriggerPairs;
+    std::vector<uint64_t> m_stepTriggerPairs; // trigger pairs of the latest sub-step
+    std::vector<char> m_triggerPairFlags;     // per-candidate-pair trigger marks (narrow phase)
+    void publishPhysicsEvents(Scene& scene);
     std::vector<SolverIsland> m_islands;
     std::vector<SpawnState> m_spawnStates;
     // Force/torque accumulated by gameplay code before an update: these

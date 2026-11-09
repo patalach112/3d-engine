@@ -50,6 +50,9 @@ void Scene::destroyEntity(Entity entity) {
         return;
     }
     ENGINE_LOG_DEBUG("Scene: destroying entity '" << entity.name() << "' (id " << entity.id() << ")");
+    if (m_eventBus != nullptr) {
+        m_eventBus->publish(EntityDestroyedEvent{entity.handle()});
+    }
     m_registry.destroy(entity.handle());
     --m_entityCount;
 }

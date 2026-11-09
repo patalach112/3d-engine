@@ -3,6 +3,7 @@
 
 #include "Assets/AssetManager.h"
 #include "Core/EngineConfig.h"
+#include "Core/EventBus.h"
 #include "Core/GameLoop.h"
 #include "Core/Jobs/JobSystem.h"
 #include "Graphics/GraphicsPipeline.h"
@@ -54,6 +55,7 @@ private:
     void handleMouseCapture();
     void handleMousePicking();
     void handlePhysicsReset();
+    void handleEventImpulse();
     void logLoopStats(const char* context) const;
 
     EngineConfig m_config;
@@ -69,6 +71,13 @@ private:
     VramBudget m_stagingBudget;
     AssetManager m_assets;
     Scene m_scene;
+    // Phase 17 event hub: Scene and PhysicsSystem publish lifecycle,
+    // collision and trigger events here; the demo's logging hooks and
+    // any future gameplay/audio/UI consumers subscribe to it.
+    EventBus m_eventBus;
+    EventBus::Subscription m_triggerLogSubscription;
+    EventBus::Subscription m_collisionLogSubscription;
+    EventBus::Subscription m_destroyedLogSubscription;
     PhysicsSystem m_physicsSystem;
     RenderSystem m_renderSystem;
 
