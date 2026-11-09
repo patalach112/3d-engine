@@ -1,5 +1,6 @@
 #include "Graphics/Swapchain.h"
 
+#include "Core/Logger.h"
 #include "Graphics/VulkanContext.h"
 #include "Graphics/VulkanHelpers.h"
 #include "Platform/Window.h"
@@ -12,7 +13,8 @@
 
 namespace engine {
 
-Swapchain::Swapchain(VulkanContext& context, const Window& window) : m_context(context), m_window(window) {
+Swapchain::Swapchain(VulkanContext& context, const Window& window, bool vsync)
+    : m_context(context), m_window(window), m_vsync(vsync) {
     createSwapchain(VK_NULL_HANDLE);
     createImageViews();
     m_depthFormat = findDepthFormat();
@@ -124,6 +126,9 @@ void Swapchain::createSwapchain(VkSwapchainKHR oldSwapchain) {
 
     m_imageFormat = surfaceFormat.format;
     m_extent = extent;
+
+    ENGINE_LOG_DEBUG("swapchain: " << extent.width << 'x' << extent.height << ", " << m_images.size()
+                                    << " images, format " << static_cast<int>(surfaceFormat.format));
 }
 
 void Swapchain::createImageViews() {
@@ -237,13 +242,22 @@ VkSurfaceFormatKHR Swapchain::chooseSurfaceFormat(const std::vector<VkSurfaceFor
 }
 
 VkPresentModeKHR Swapchain::choosePresentMode(const std::vector<VkPresentModeKHR>& presentModes) const {
-    // MAILBOX gives low latency without tearing; FIFO (vsync) is the only
-    // mode the specification guarantees, so it is the fallback.
-    for (const VkPresentModeKHR mode : presentModes) {
-        if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
-            return mode;
+    if (m_vsync) {
+        // FIFO is the only present mode the specification guarantees to
+        // exist: tear-free and paced to the display refresh rate.
+        ENGINE_LOG_DEBUG("swapchain: vsync enabled, using FIFO present mode");
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+    // Lowest latency first: IMMEDIATE presents as fast as possible (may
+    // tear), MAILBOX is the tear-free low-latency compromise.
+    for (const VkPresentModeKHR preferred :
+         {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR}) {
+        if (std::find(presentModes.begin(), presentModes.end(), preferred) != presentModes.end()) {
+            ENGINE_LOG_DEBUG("swapchain: vsync disabled, using present mode " << static_cast<int>(preferred));
+            return preferred;
         }
     }
+    ENGINE_LOG_DEBUG("swapchain: vsync disabled but only FIFO is available; using FIFO");
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 

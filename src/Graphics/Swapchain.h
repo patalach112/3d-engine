@@ -22,7 +22,9 @@ class Window;
 // ---------------------------------------------------------------------------
 class Swapchain {
 public:
-    Swapchain(VulkanContext& context, const Window& window);
+    // vsync selects the presentation policy (configured in [Render]):
+    // true -> FIFO, false -> lowest-latency modes. See choosePresentMode().
+    Swapchain(VulkanContext& context, const Window& window, bool vsync);
     ~Swapchain();
 
     Swapchain(const Swapchain&) = delete;
@@ -59,6 +61,7 @@ private:
 
     VulkanContext& m_context;
     const Window& m_window;
+    bool m_vsync;
 
     VkSwapchainKHR m_swapchain = VK_NULL_HANDLE;
     std::vector<VkImage> m_images; // owned by the swapchain, never destroyed manually

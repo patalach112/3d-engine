@@ -1,11 +1,11 @@
 #include "Graphics/VulkanContext.h"
 
+#include "Core/Logger.h"
 #include "Platform/Window.h"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <iostream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -20,8 +20,10 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBits
                                              VkDebugUtilsMessageTypeFlagsEXT /*types*/,
                                              const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
                                              void* /*userData*/) {
-    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        std::cerr << "[Vulkan validation] " << callbackData->pMessage << '\n';
+    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        ENGINE_LOG_ERROR("[Vulkan validation] " << callbackData->pMessage);
+    } else if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        ENGINE_LOG_WARNING("[Vulkan validation] " << callbackData->pMessage);
     }
     return VK_FALSE;
 }
@@ -103,9 +105,9 @@ void VulkanContext::waitIdle() const {
 void VulkanContext::createInstance() {
     m_validationEnabled = kValidationLayersRequested && checkValidationLayerSupport();
     if (kValidationLayersRequested && !m_validationEnabled) {
-        std::cerr << "[Vulkan] Validation layers requested but VK_LAYER_KHRONOS_validation "
-                     "was not found. Continuing without validation (install the Vulkan SDK "
-                     "to enable it).\n";
+        ENGINE_LOG_WARNING("Validation layers requested but VK_LAYER_KHRONOS_validation was not "
+                           "found. Continuing without validation (install the Vulkan SDK to "
+                           "enable it).");
     }
 
     VkApplicationInfo appInfo{};
@@ -146,7 +148,7 @@ void VulkanContext::setupDebugMessenger() {
     auto createFn = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
         vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT"));
     if (createFn == nullptr || createFn(m_instance, &createInfo, nullptr, &m_debugMessenger) != VK_SUCCESS) {
-        std::cerr << "[Vulkan] Failed to set up debug messenger; continuing without it.\n";
+        ENGINE_LOG_WARNING("Failed to set up Vulkan debug messenger; continuing without it.");
         m_debugMessenger = VK_NULL_HANDLE;
     }
 }
@@ -191,7 +193,7 @@ void VulkanContext::pickPhysicalDevice() {
 
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
-    std::cout << "[Vulkan] Selected GPU: " << properties.deviceName << '\n';
+    ENGINE_LOG_INFO("Selected GPU: " << properties.deviceName);
 }
 
 void VulkanContext::createLogicalDevice() {

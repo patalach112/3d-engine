@@ -4,14 +4,15 @@
 
 namespace engine {
 
-Window::Window(int width, int height, const char* title) : m_width(width), m_height(height) {
+Window::Window(int width, int height, const char* title, bool resizable)
+    : m_width(width), m_height(height) {
     if (glfwInit() != GLFW_TRUE) {
         throw std::runtime_error("Window: failed to initialize GLFW");
     }
 
     // No OpenGL/legacy context: Vulkan creates its own device and surface.
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    glfwWindowHint(GLFW_RESIZABLE, resizable ? GLFW_TRUE : GLFW_FALSE);
 
     m_window = glfwCreateWindow(width, height, title, nullptr, nullptr);
     if (m_window == nullptr) {

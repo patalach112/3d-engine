@@ -1,5 +1,6 @@
 #include "Graphics/Renderer.h"
 
+#include "Core/Logger.h"
 #include "Geometry/Cube.h"
 #include "Graphics/GraphicsPipeline.h"
 #include "Graphics/Swapchain.h"
@@ -260,7 +261,7 @@ void Renderer::drawFrame(const UniformBufferObject& ubo) {
 
     const VkSemaphore waitSemaphores[] = {m_imageAvailableSemaphores[m_currentFrame]};
     const VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-    const VkSemaphore signalSemaphores[] = {m_renderFinishedSemaphores[m_currentFrame]};
+    const VkSemaphore signalSemaphores[] = {m_renderFinishedSemaphores[imageIndex]};
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -312,6 +313,12 @@ void Renderer::recreateSwapchain() {
 
     m_context.waitIdle();
     m_swapchain.recreate();
+    // The new swapchain may have a different image count, and the old
+    // presentations are finished (device idle), so rebuild these safely.
+    createRenderFinishedSemaphores();
+
+    const VkExtent2D extent = m_swapchain.extent();
+    ENGINE_LOG_INFO("swapchain recreated for " << extent.width << 'x' << extent.height << " framebuffer");
 }
 
 } // namespace engine

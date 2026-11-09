@@ -26,8 +26,7 @@ A minimal, clean application that verifies the whole rendering pipeline:
   (`VK_LAYER_KHRONOS_validation`, gracefully skipped if the SDK layer is absent)
 - Physical device selection (prefers a discrete GPU), logical device with
   graphics + present queues
-- Swapchain (sRGB format preferred, mailbox present mode with FIFO fallback),
-  depth buffer, render pass, and framebuffers
+- Swapchain (sRGB format preferred), depth buffer, render pass, and framebuffers
 - Fixed graphics pipeline with dynamic viewport/scissor, depth testing, and
   back-face culling
 - A unit cube with one distinct color per face (24 vertices / 36 indices),
@@ -40,11 +39,77 @@ A minimal, clean application that verifies the whole rendering pipeline:
 - Window-resize handling with swapchain recreation (including minimized /
   zero-size windows), `Esc` to exit, and ordered RAII cleanup of every object
 
-### Run it
+## Phase 2 — Core Infrastructure: Logger & Robust Game Loop ✅
 
-You should see a tumbling cube with six colored faces (red, green, blue,
-yellow, magenta, cyan) on a dark background. Press **Esc** or close the window
-to exit.
+Everything is data-driven: no paths, rates or limits are hardcoded in engine
+code. All tuning lives in **`config/engine.ini`** (see
+[Configuration](#configuration)).
+
+### Logger (`src/Core/Logger.*`)
+
+- Six levels — Trace, Debug, Info, Warning, Error, Fatal — with a configurable
+  minimum level; disabled levels are checked before the message expression is
+  even evaluated
+- Dual sinks: color-coded console output (ANSI colors, terminal-aware) and a
+  log file written **asynchronously** from a background thread fed by a bounded
+  queue, so disk I/O never stalls the frame loop (overflow drops are counted
+  and reported)
+- File sink creates directories automatically, optionally inserts a timestamp
+  into the file name, and rotates by size (`engine.log` → `engine.1.log` → …)
+  keeping a configurable number of archives; a missing/unwritable log file
+  degrades to console-only instead of aborting startup
+- Stream-style macros with automatic source location:
+
+  ```cpp
+  ENGINE_LOG_INFO("Loaded " << assetCount << " assets");
+  ENGINE_LOG_ERROR("Failed to open " << path);
+  ```
+
+  Every line is timestamped and ends with `(File.cpp:line)`. Error/Fatal
+  messages flush all sinks immediately. Vulkan validation messages are routed
+  through the logger as warnings/errors.
+
+### Time & game loop (`src/Core/Time.*`, `src/Core/GameLoop.*`)
+
+- `Time`: monotonic `std::chrono::steady_clock` frame clock — delta time,
+  total elapsed time, frame count, smoothed FPS
+- `FixedTimestep`: pure, unit-testable accumulator that turns variable frame
+  deltas into integral fixed steps, clamps hitches to `maxFrameSeconds`, caps
+  catch-up work per frame and drops deeper backlogs (counted in the stats)
+  instead of spiraling
+- `GameLoop`: orchestrates frames through plain callbacks — no dependency on
+  the window or renderer:
+
+  ```
+  shouldContinue → pollEvents → fixedUpdate × N → update(dt) → render(alpha)
+  ```
+
+  The cube's rotation is integrated in **fixed updates** (deterministic) and
+  rendered with extrapolation by the interpolation `alpha`, so motion is
+  smooth at any display rate. An optional software FPS cap and periodic
+  loop statistics (frames, FPS, fixed steps, dropped time) are configurable.
+
+### Unit tests
+
+`tests/CoreTests.cpp` (CTest: `engine-core-tests`) covers configuration
+parsing/fallbacks, log filtering and rotation, fixed-timestep math, the
+frame clock and loop dispatch — everything verifiable without a GPU.
+
+## Configuration
+
+`config/engine.ini` is copied next to the executable at build time and can be
+edited without rebuilding. Lookup order:
+
+1. `--config <path>` command-line argument (or `--config=<path>`)
+2. `ENGINE_CONFIG_PATH` environment variable
+3. `config/engine.ini` relative to the working directory
+4. The copy in the source tree (development fallback)
+5. Built-in defaults
+
+Invalid or unknown keys never abort startup: they fall back to defaults and
+are reported as warnings. Sections: `[Window]`, `[Render]` (`vsync` selects
+FIFO vs. low-latency present modes), `[Logger]` (level, sinks, rotation,
+async writes) and `[Loop]` (fixed-delta, step cap, frame clamp, FPS cap).
 
 ## Building
 
@@ -71,6 +136,7 @@ sudo apt install libx11-dev libxrandr-dev libxinerama-dev \
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ./build/3d-engine        # Windows: build\Debug\3d-engine.exe
+ctest --test-dir build --output-on-failure
 ```
 
 Or with the provided presets (output lands in `build/debug` or `build/release`):
@@ -84,21 +150,30 @@ cmake --build --preset debug
 GLSL shaders in `shaders/` are compiled to SPIR-V automatically during the
 build; the executable finds them regardless of the working directory.
 A Debug build enables Vulkan validation layers when they are installed —
-watch stderr for `[Vulkan validation]` diagnostics while developing.
+watch the console or `logs/` for `[Vulkan validation]` diagnostics while
+developing. Press **Esc** or close the window to exit.
 
 ## Project structure
 
 ```
 .
-├── CMakeLists.txt            # Build, dependencies, shader compilation
+├── CMakeLists.txt            # Build, dependencies, shader compilation, tests
 ├── CMakePresets.json         # debug / release presets
+├── config/
+│   └── engine.ini            # All engine tuning (window, render, logger, loop)
 ├── shaders/
 │   ├── cube.vert             # MVP transform (UBO) + color passthrough
 │   └── cube.frag             # Flat per-face color output
+├── tests/
+│   └── CoreTests.cpp         # Config/logger/timing/loop unit tests (CTest)
 └── src/
-    ├── main.cpp              # Entry point (exception guard only)
+    ├── main.cpp              # Bootstrap: arguments -> config -> logger -> app
     ├── Core/
-    │   ├── Application.h/.cpp  # Composition root, game loop, camera + rotation
+    │   ├── Application.h/.cpp  # Composition root, wires loop callbacks
+    │   ├── EngineConfig.h/.cpp # INI loading, validation, fallback chain
+    │   ├── Logger.h/.cpp       # Levels, console/file/async sinks, macros
+    │   ├── Time.h/.cpp         # steady_clock frame timing, delta, FPS
+    │   └── GameLoop.h/.cpp     # Fixed/variable loop, FPS cap, statistics
     ├── Platform/
     │   └── Window.h/.cpp       # GLFW window, surface, resize/input polling
     ├── Geometry/
@@ -120,7 +195,9 @@ what it depends on.
 
 ## Roadmap
 
-- **Phase 1 — First render (current):** window, Vulkan bootstrap, rotating colored cube
+- **Phase 1 — First render ✅:** window, Vulkan bootstrap, rotating colored cube
+- **Phase 2 — Core infrastructure ✅:** configurable dual-sink async logger,
+  robust fixed/variable game loop, data-driven configuration
 - Later phases build the real engine core on top of this foundation (asset
   management, scene/entity systems, materials, lighting) — editors and visual
   tooling only arrive once the core is complete.

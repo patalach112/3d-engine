@@ -21,7 +21,7 @@ namespace engine {
 // ---------------------------------------------------------------------------
 class Window {
 public:
-    Window(int width, int height, const char* title);
+    Window(int width, int height, const char* title, bool resizable = true);
     ~Window();
 
     Window(const Window&) = delete;
