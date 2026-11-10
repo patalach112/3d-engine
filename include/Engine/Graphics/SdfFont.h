@@ -60,8 +60,14 @@ struct SdfFontAtlas {
 
     [[nodiscard]] bool empty() const { return pixels.empty() || width == 0 || height == 0; }
     // Glyph for a character; anything outside printable ASCII maps
-    // to '?', mirroring the bitmap font's fallback.
-    [[nodiscard]] const SdfGlyph& glyphFor(char character) const;
+    // to '?', mirroring the bitmap font's fallback. The explicit
+    // export is load-bearing: this out-of-line member is consumed
+    // across the DLL boundary (UIRenderer internally, the test
+    // suite directly), and — unlike everything else the tests
+    // import — it previously carried no *_API annotation, so
+    // MinGW produced no export for it and engine-core-tests
+    // failed to link (undefined reference to glyphFor(char)).
+    [[nodiscard]] ENGINE_GRAPHICS_API const SdfGlyph& glyphFor(char character) const;
 };
 
 // Bakes the built-in font data into an SDF atlas page (CPU only).

@@ -2539,3 +2539,24 @@ contract teardown orders against the real flight module.
 **1096 passed, 0 failed** in Debug, Release (shared and
 static), hidden-visibility and ASan builds, warning-free,
 CTest 1/1.
+
+## Maintenance — MinGW link fix: `SdfFontAtlas::glyphFor` export ✅
+
+`engine-core-tests` failed to link on Windows/MinGW with
+`undefined reference to engine::SdfFontAtlas::glyphFor(char)
+const`: the definition existed and compiled into
+EngineGraphics, but the declaration carried no
+`ENGINE_GRAPHICS_API` annotation — the lone un-annotated
+out-of-line member among everything the test binary imports
+(the header's own free functions and every comparable type —
+`AABB`, `Cube`, `Camera`, `Scene`… — are all annotated).
+ELF default visibility masked it on Linux; the annotation
+is now on the declaration (function-level, matching the
+`ProjectExport` precedent for STL-membered data structs and
+avoiding any new MSVC C4251 surface). Verified in the
+sandbox by compiling the TU with `-fvisibility=hidden`:
+pre-fix the symbol is withheld from the dynamic table and
+a consumer reproduces the exact undefined-reference error;
+post-fix it exports and the consumer links and runs.
+1096 passed / 0 failed across all five build configs,
+CTest 1/1.
