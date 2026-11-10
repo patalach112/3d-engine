@@ -44,6 +44,8 @@
 #include "Graphics/Pbr.h"
 #include "Graphics/ToneMapping.h"
 #include "Scene/Systems/LightingSystem.h"
+#include "Core/ModuleManager.h"
+#include "Platform/DynamicLibrary.h"
 
 #include <atomic>
 
@@ -6177,6 +6179,158 @@ void testPhase22PbrIblPost() {
     }
 }
 
+void testPhase23GameModules() {
+    std::cout << "Phase 23: game modules & hot reload\n";
+
+    const auto dir = std::filesystem::temp_directory_path() / "engine_p23_modules";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::filesystem::path builtPlugin = ENGINE_TEST_PLUGIN_PATH;
+    const std::filesystem::path pluginSource = dir / ("game_logic" + builtPlugin.extension().string());
+    std::filesystem::copy_file(builtPlugin, pluginSource);
+    const auto statePath = dir / "module_state.txt";
+    const std::string statePathString = statePath.string();
+
+    const auto readLines = [&statePath] {
+        std::vector<std::string> lines;
+        std::ifstream in(statePath);
+        std::string line;
+        while (std::getline(in, line)) {
+            lines.push_back(line);
+        }
+        return lines;
+    };
+    const auto countPrefix = [](const std::vector<std::string>& lines, const std::string& prefix) {
+        size_t count = 0;
+        for (const std::string& line : lines) {
+            if (line.rfind(prefix, 0) == 0) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    engine::Scene scene;
+    engine::EngineContext context;
+    context.scene = &scene;
+    context.userData = const_cast<char*>(statePathString.c_str());
+
+    // --- (1) Raw dynamic library --------------------------------------
+    {
+        engine::DynamicLibrary library;
+        std::string error;
+        check(library.load(pluginSource, error) && library.isLoaded(), "dynlib: test plugin loads");
+        check(library.symbol("CreateGameModule") != nullptr && library.symbol("DestroyGameModule") != nullptr,
+              "dynlib: factory symbols resolve by name");
+        check(library.symbol("NoSuchSymbol") == nullptr, "dynlib: unknown symbols resolve to null");
+        library.unload();
+        check(!library.isLoaded(), "dynlib: unload releases the handle");
+        check(!library.load(dir / "absent.so", error) && !error.empty(),
+              "dynlib: a missing file fails with an OS error message");
+    }
+
+    // --- (2) Manager lifecycle through the scratch copy ----------------
+    engine::ModuleManager manager;
+    manager.update(context, 0.016f); // safe no-op with nothing loaded
+    check(!manager.load(dir / "absent.so", context) && !manager.lastError().empty() && !manager.isLoaded(),
+          "manager: missing module file is rejected gracefully");
+    check(manager.load(pluginSource, context), "manager: plugin loads");
+    check(manager.isLoaded() && manager.generation() == 1 && manager.moduleName() == "MockGameModule",
+          "manager: reports the module name and first generation");
+    check(std::filesystem::exists(manager.scratchPath()) && manager.scratchPath() != pluginSource,
+          "manager: the loaded library is a scratch copy, not the compiler output");
+    const std::filesystem::path firstScratch = manager.scratchPath();
+
+    context.frameIndex = 1;
+    manager.update(context, 0.016f);
+    context.frameIndex = 2;
+    manager.update(context, 0.016f);
+    manager.fixedUpdate(context, 1.0f / 60.0f);
+    {
+        const std::vector<std::string> lines = readLines();
+        check(countPrefix(lines, "load") == 1 && countPrefix(lines, "update") == 2 &&
+                  countPrefix(lines, "fixed") == 1,
+              "module: lifecycle calls cross the library boundary");
+        double totalDt = 0.0;
+        uint64_t lastFrame = 0;
+        bool framesAscending = true;
+        for (const std::string& line : lines) {
+            if (line.rfind("update ", 0) == 0) {
+                const size_t split = line.find(' ', 7);
+                const uint64_t frame = std::stoull(line.substr(7, split - 7));
+                totalDt += std::stod(line.substr(split + 1));
+                framesAscending = framesAscending && frame > lastFrame;
+                lastFrame = frame;
+            }
+        }
+        check(framesAscending && nearlyEqual(totalDt, 0.032, 1e-5),
+              "module: updates see monotonic frame indices and real deltas");
+    }
+
+    // --- (3) Hot reload: scene survives, scratch rotates ----------------
+    engine::Entity persistent = scene.createEntity("Persistent");
+    persistent.addComponent<engine::TransformComponent>(glm::vec3{1.0f, 2.0f, 3.0f});
+    const entt::entity persistentHandle = persistent.handle();
+
+    // Rebuilding over the source must succeed while the engine runs:
+    // the loader holds the scratch copy, never the compiler output.
+    std::filesystem::copy_file(builtPlugin, pluginSource, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::last_write_time(
+        pluginSource, std::filesystem::file_time_type::clock::now() + std::chrono::seconds(5));
+    check(manager.pollForChanges(context), "manager: mtime poll hot-reloads the rebuilt module");
+    check(manager.generation() == 2 && manager.scratchPath() != firstScratch &&
+              !std::filesystem::exists(firstScratch),
+          "manager: reload rotates to a fresh scratch and deletes the old one");
+    check(scene.registry().valid(persistentHandle) &&
+              scene.registry().get<engine::TransformComponent>(persistentHandle).position ==
+                  glm::vec3{1.0f, 2.0f, 3.0f},
+          "manager: engine-owned entities survive a module reload untouched");
+    {
+        const std::vector<std::string> lines = readLines();
+        check(countPrefix(lines, "load") == 2 && countPrefix(lines, "unload") == 1,
+              "module: reload unloads the old generation exactly once");
+    }
+    check(!manager.pollForChanges(context), "manager: no reload without a newer build");
+
+    // --- (4) Broken rebuild: previous generation keeps running ----------
+    std::filesystem::copy_file(ENGINE_TEST_BAD_PLUGIN_PATH, pluginSource,
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::last_write_time(
+        pluginSource, std::filesystem::file_time_type::clock::now() + std::chrono::seconds(30));
+    check(!manager.pollForChanges(context), "manager: a module without factories is rejected");
+    check(manager.isLoaded() && manager.generation() == 2 && !manager.lastError().empty(),
+          "manager: the previous generation keeps running after a bad rebuild");
+    context.frameIndex = 3;
+    manager.update(context, 0.016f);
+    check(countPrefix(readLines(), "update") == 3, "module: surviving generation still updates");
+
+    // --- (5) Throwing initialization ------------------------------------
+    {
+        engine::ModuleManager throwing;
+        check(!throwing.load(ENGINE_TEST_THROW_PLUGIN_PATH, context) && !throwing.isLoaded() &&
+                  !throwing.lastError().empty(),
+              "manager: a throwing onLoad is caught and rejected");
+        std::filesystem::copy_file(builtPlugin, pluginSource, std::filesystem::copy_options::overwrite_existing);
+        check(throwing.load(pluginSource, context) && throwing.isLoaded(),
+              "manager: the host stays usable after a failed load");
+    }
+    check(countPrefix(readLines(), "load") == 3, "module: recovered manager loads the good module");
+
+    // --- (6) Unload: marker written, scratch removed ---------------------
+    const std::filesystem::path secondScratch = manager.scratchPath();
+    manager.unload();
+    check(!manager.isLoaded() && !std::filesystem::exists(secondScratch),
+          "manager: unload removes the scratch copy");
+    {
+        const std::vector<std::string> lines = readLines();
+        // Loads: generation 1, generation 2, the recovered manager.
+        // Unloads: generation 1's retirement, the recovered manager's
+        // scope exit, and this explicit unload — one per load.
+        check(countPrefix(lines, "unload") == 3 && countPrefix(lines, "load") == 3,
+              "module: every load is paired with exactly one unload");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -6199,6 +6353,7 @@ int main() {
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();
+    testPhase23GameModules();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

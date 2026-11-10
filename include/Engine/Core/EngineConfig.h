@@ -86,6 +86,14 @@ struct PerformanceConfig {
 // (and reported through the logger once it exists), offending values keep
 // their defaults.
 // ---------------------------------------------------------------------------
+// Native game module (Phase 23, [Game]): path to the compiled game
+// library (.dll/.so); empty means no module. Hot reload polls the
+// file and swaps in new builds while the engine keeps running.
+struct GameConfig {
+    std::string modulePath;
+    bool moduleHotReload = true;
+};
+
 struct ENGINE_CORE_API EngineConfig {
     LoggerConfig logger;
     LoopConfig loop;
@@ -95,6 +103,7 @@ struct ENGINE_CORE_API EngineConfig {
     InputConfig input;
     PerformanceConfig performance;
     PhysicsSettings physics;
+    GameConfig game;
 
     // File the values were actually loaded from; empty when defaults were used.
     std::string sourcePath;

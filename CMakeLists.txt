@@ -142,10 +142,12 @@ target_link_libraries(EngineFoundation PUBLIC Threads::Threads glm::glm)
 engine_module(EnginePlatform ENGINE_BUILDING_PLATFORM
     src/Platform/Window.cpp
     src/Platform/Input.cpp
+    src/Platform/DynamicLibrary.cpp
 )
-target_link_libraries(EnginePlatform PUBLIC EngineFoundation glfw Vulkan::Vulkan glm::glm)
+target_link_libraries(EnginePlatform PUBLIC EngineFoundation glfw Vulkan::Vulkan glm::glm ${CMAKE_DL_LIBS})
 
 engine_module(EngineCore ENGINE_BUILDING_CORE
+    src/Core/ModuleManager.cpp
     src/Core/Camera.cpp
     src/Core/GameLoop.cpp
     src/Core/EngineConfig.cpp
@@ -321,6 +323,20 @@ if(BUILD_TESTING)
     target_link_libraries(engine-core-tests
         PRIVATE EngineApp EngineScene EngineAssets EngineGraphics EngineGeometry EngineCore
                 EnginePlatform EngineFoundation Threads::Threads Vulkan::Vulkan glfw glm::glm EnTT::EnTT)
+
+    # Phase 23: mock game modules for the hot-reload tests. They are
+    # standalone shared libraries (ABI header only, no engine link),
+    # loaded by path through ModuleManager exactly like real game code.
+    foreach(plugin TestGameModule TestBadGameModule TestThrowGameModule)
+        add_library(${plugin} MODULE tests/${plugin}.cpp)
+        target_include_directories(${plugin} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/Engine)
+        target_compile_definitions(${plugin} PRIVATE ENGINE_BUILDING_PLUGIN)
+    endforeach()
+    add_dependencies(engine-core-tests TestGameModule TestBadGameModule TestThrowGameModule)
+    target_compile_definitions(engine-core-tests PRIVATE
+        ENGINE_TEST_PLUGIN_PATH="$<TARGET_FILE:TestGameModule>"
+        ENGINE_TEST_BAD_PLUGIN_PATH="$<TARGET_FILE:TestBadGameModule>"
+        ENGINE_TEST_THROW_PLUGIN_PATH="$<TARGET_FILE:TestThrowGameModule>")
     engine_copy_runtime_dlls(engine-core-tests)
     if(MSVC)
         target_compile_options(engine-core-tests PRIVATE /W4 /permissive-)

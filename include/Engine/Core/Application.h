@@ -7,6 +7,7 @@
 #include "Core/GameLoop.h"
 #include "Core/Jobs/JobSystem.h"
 #include "Graphics/GraphicsPipeline.h"
+#include "Core/ModuleManager.h"
 #include "Graphics/Renderer.h"
 #include "Graphics/VramBudget.h"
 #include "Graphics/Swapchain.h"
@@ -57,6 +58,8 @@ private:
     void handlePhysicsReset();
     void handleEventImpulse();
     void logLoopStats(const char* context) const;
+    // Assembles the context handed to the game module (Phase 23).
+    EngineContext buildModuleContext(float deltaSeconds, float fixedDeltaSeconds);
 
     EngineConfig m_config;
     Window m_window;
@@ -81,8 +84,15 @@ private:
     PhysicsSystem m_physicsSystem;
     RenderSystem m_renderSystem;
 
+    // Native game module (Phase 23): engine-owned; the scene it
+    // drives survives its reloads. Empty [Game] modulePath = unused.
+    ModuleManager m_moduleManager;
+    double m_moduleElapsedSeconds = 0.0;
+    uint64_t m_moduleFrameIndex = 0;
+
     double m_secondsSinceStatsLog = 0.0;
     double m_secondsSinceAssetPoll = 0.0;
+    double m_secondsSinceModulePoll = 0.0;
     double m_secondsSinceHudUpdate = 0.0;
 
     // Mouse picking selection: the last entity clicked, and the

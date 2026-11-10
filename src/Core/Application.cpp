@@ -45,6 +45,13 @@ Application::Application(EngineConfig config)
                                             m_config.render.skyboxEnabled,
                                             static_cast<float>(m_config.render.environmentIntensity)});
 
+    // Native game module (Phase 23): optional — the engine runs
+    // unchanged without one. The manager logs its own outcome.
+    if (!m_config.game.modulePath.empty()) {
+        EngineContext context = buildModuleContext(0.0f, 0.0f);
+        m_moduleManager.load(m_config.game.modulePath, context);
+    }
+
     ENGINE_LOG_INFO("Hardware profile: JobSystem workers "
                     << m_jobSystem.workerCount() << " (+ main thread), parallel batch "
                     << m_config.performance.parallelBatchSize << " items, VRAM budget "
@@ -128,6 +135,19 @@ Application::~Application() {
     // Make sure no frame is still using the resources that member
     // destruction is about to release (Renderer, buffers, swapchain...).
     m_context.waitIdle();
+}
+
+EngineContext Application::buildModuleContext(float deltaSeconds, float fixedDeltaSeconds) {
+    EngineContext context;
+    context.scene = &m_scene;
+    context.input = &m_input;
+    context.assets = &m_assets;
+    context.jobs = &m_jobSystem;
+    context.deltaSeconds = deltaSeconds;
+    context.fixedDeltaSeconds = fixedDeltaSeconds;
+    context.elapsedSeconds = m_moduleElapsedSeconds;
+    context.frameIndex = m_moduleFrameIndex;
+    return context;
 }
 
 void Application::registerAssets() {
@@ -438,6 +458,12 @@ void Application::run() {
         // Propagate the scene graph first so physics sees current
         // parent placements (Phase 18).
         TransformSystem::update(m_scene);
+        // Game module fixed logic (Phase 23) runs before physics so
+        // it can drive bodies the solver then resolves.
+        {
+            EngineContext context = buildModuleContext(0.0f, static_cast<float>(fixedDeltaSeconds));
+            m_moduleManager.fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
+        }
         // Rigid-body physics is deterministic simulation, so it lives in
         // the fixed step (never the variable/render-rate update). Its
         // parallel phases return at JobSystem barriers before rendering.
@@ -462,6 +488,21 @@ void Application::run() {
         if (m_secondsSinceAssetPoll >= 1.0) {
             m_secondsSinceAssetPoll = 0.0;
             m_assets.pollFileChanges();
+        }
+        // Game module (Phase 23): variable update, then the
+        // half-second hot-reload poll (mtime on the source file).
+        m_moduleElapsedSeconds += deltaSeconds;
+        ++m_moduleFrameIndex;
+        {
+            EngineContext context = buildModuleContext(static_cast<float>(deltaSeconds), 0.0f);
+            m_moduleManager.update(context, static_cast<float>(deltaSeconds));
+            if (m_config.game.moduleHotReload) {
+                m_secondsSinceModulePoll += deltaSeconds;
+                if (m_secondsSinceModulePoll >= 0.5) {
+                    m_secondsSinceModulePoll = 0.0;
+                    m_moduleManager.pollForChanges(context);
+                }
+            }
         }
         handleMouseCapture();
         handlePhysicsReset();

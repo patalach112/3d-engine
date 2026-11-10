@@ -1563,6 +1563,63 @@ real glslangValidator (built from the KhronosGroup/glslang 15.4
 sources; the sandbox SDK validator is a stub), including the
 dynamically-indexed material texture array.
 
+## Phase 23 — Native C++ Game Modules & Hot-Reload Scripting ✅
+
+Gameplay code no longer has to live inside the engine binary. A
+game is now a native shared library the engine loads, drives, and
+hot-swaps while running — with the world state safely on the engine
+side of the boundary:
+
+- **Stable module ABI** (`Core/GameModule.h`): plugins implement
+  `IGameModule` (`onLoad` / `onUnload` / `onUpdate` /
+  `onFixedUpdate`, plus a `moduleName`) and expose two `extern "C"`
+  factories, `CreateGameModule` / `DestroyGameModule`, stamped by
+  the `ENGINE_IMPLEMENT_GAME_MODULE` macro — so objects are always
+  created and destroyed inside the plugin, never across heaps.
+  `ENGINE_PLUGIN_API` (`Core/PluginApi.h`) resolves to
+  `dllexport`/`dllimport` under `ENGINE_BUILDING_PLUGIN` on Windows
+  and default visibility on ELF. The ABI header itself includes no
+  EnTT/GLM and no engine library linkage: a plugin needs only the
+  headers.
+- **EngineContext**: every module call receives the controlled
+  surface — `Scene` (the ECS registry lives in engine memory),
+  `Input`, `AssetManager`, `JobSystem`, frame/timing data and a
+  `userData` slot. Because the registry outlives the module, a
+  reload swaps logic, never world state.
+- **Scratch-copy loading** (`Platform/DynamicLibrary`,
+  `Core/ModuleManager`): the manager copies the `.dll`/`.so` to a
+  uniquely named scratch file next to it and loads *that*, so the
+  compiler can rebuild the original while the engine runs (no file
+  locking on Windows). Scratch names come from a process-wide
+  monotonic counter — two managers can never collide on the path
+  one of them has mapped. The move-only `DynamicLibrary` wraps
+  `LoadLibraryW` / `dlopen(RTLD_NOW | RTLD_LOCAL)` with clean
+  symbol resolution.
+- **Failure-proof reload pipeline**: a candidate generation is
+  copied, loaded, symbol-checked, constructed and `onLoad`ed
+  *before* the running generation is retired; a missing file, a
+  library without factories, a factory returning null, or a
+  throwing `onLoad` just logs and keeps the old module (or no
+  module) running. A module whose `onUpdate`/`onFixedUpdate`
+  throws is retired cleanly mid-run. `pollForChanges()` (mtime)
+  drives hot reload from the app's update loop, and every load is
+  paired with exactly one unload.
+- **Wiring**: `[Game] modulePath` / `moduleHotReload` in
+  `config/engine.ini`; the `Application` loads the module at
+  startup, feeds `onFixedUpdate` from the fixed-step loop (before
+  physics, so modules can drive bodies), `onUpdate` from the frame
+  loop, and polls for rebuilds every 0.5 s.
+
+Verified headlessly with three mock plugin binaries built as real
+`MODULE` libraries (a state-file mock observed across the boundary,
+a factory-less library, and a throwing `onLoad`): raw loader symbol
+resolution, scratch isolation and rotation, exact lifecycle pairing,
+scene/entity survival across reloads, bad-rebuild fallback,
+throwing-init recovery, and delta/frame-index delivery — **727
+passing checks** (24 new), zero warnings in Debug, Release-shared
+and Release-static, CTest 1/1, and all 11 shaders still compile
+under a real glslangValidator 15.4.
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
@@ -1656,7 +1713,8 @@ releases the mouse (press again to quit).
 │   ├── bloomDown/bloomUp.frag # Multi-scale bloom (bright-pass, tent blur)
 │   └── composite.frag        # Exposure + ACES tone mapping + sRGB output
 ├── tests/
-│   └── CoreTests.cpp         # Config/logger/physics/player/material tests (CTest)
+│   ├── CoreTests.cpp         # Config/logger/physics/player/material tests (CTest)
+│   └── TestGameModule.cpp    # (+Bad/Throw variants) mock plugins for Phase 23
 ├── include/Engine/           # Public headers (Phase 21): subsystem tree,
 │   ├── Core/                 #   installed-style; src/ holds .cpp only
 │   ├── Platform/
@@ -1673,9 +1731,11 @@ releases the mouse (press again to quit).
     │   ├── EngineConfig.cpp  # INI loading, validation, fallback chain
     │   ├── Logger.cpp        # Levels, console/file/async sinks, macros
     │   ├── Time.cpp          # steady_clock frame timing, delta, FPS
-    │   └── GameLoop.cpp      # Fixed/variable loop, FPS cap, statistics
+    │   ├── GameLoop.cpp      # Fixed/variable loop, FPS cap, statistics
+    │   └── ModuleManager.cpp # Native game-module hot reload (Phase 23)
     ├── Platform/
     │   ├── Window.cpp        # GLFW window, surface, resize/input callbacks
+    │   ├── DynamicLibrary.cpp # LoadLibrary/dlopen RAII wrapper (Phase 23)
     │   └── Input.cpp         # Key/mouse state, transitions, mouse delta
     ├── Assets/
     │   └── AssetManager.cpp  # Mesh/shader/material registry, VRAM-budgeted

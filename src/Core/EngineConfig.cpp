@@ -277,6 +277,18 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
         return true;
     }
 
+    // --- [Game] ---------------------------------------------------------------
+    if (section == "game") {
+        if (key == "modulepath") {
+            config.game.modulePath = value;
+        } else if (key == "modulehotreload") {
+            reader.apply(value, config.game.moduleHotReload);
+        } else {
+            return false;
+        }
+        return true;
+    }
+
     // --- [Performance] -----------------------------------------------------------
     if (section == "performance") {
         if (key == "jobworkercount") {
