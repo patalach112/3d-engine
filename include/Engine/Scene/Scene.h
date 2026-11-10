@@ -308,15 +308,8 @@ void Entity::removeComponent() {
     m_scene->registry().remove<T>(m_handle);
 }
 
-inline bool Entity::isValid() const {
-    return m_scene != nullptr && m_handle != entt::null && m_scene->registry().valid(m_handle);
-}
-
-inline std::string Entity::name() const {
-    if (isValid() && hasComponent<TagComponent>()) {
-        return m_scene->registry().get<TagComponent>(m_handle).tag;
-    }
-    return {};
-}
+// Entity::isValid() / Entity::name() are defined in Scene.cpp, not
+// inline here: Entity is an exported class, and out-of-line inline
+// definitions of its members clash with dllimport on Windows.
 
 } // namespace engine

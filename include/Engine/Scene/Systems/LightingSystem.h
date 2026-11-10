@@ -73,7 +73,7 @@ struct SceneLightData {
     return glm::clamp((cosTheta - cosOuter) / (cosInner - cosOuter), 0.0f, 1.0f);
 }
 
-class LightingSystem {
+class ENGINE_SCENE_API LightingSystem {
 public:
     // Gathers the frame's lighting. When the scene has an active
     // camera, cascades are fitted to it and dynamic lights are

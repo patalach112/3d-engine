@@ -247,6 +247,17 @@ std::vector<Entity> Scene::childrenOf(Entity parent) const {
     return result;
 }
 
+bool Entity::isValid() const {
+    return m_scene != nullptr && m_handle != entt::null && m_scene->registry().valid(m_handle);
+}
+
+std::string Entity::name() const {
+    if (isValid() && hasComponent<TagComponent>()) {
+        return m_scene->registry().get<TagComponent>(m_handle).tag;
+    }
+    return {};
+}
+
 bool Entity::setParent(Entity parent, bool keepWorldTransform) {
     return isValid() && m_scene->setParent(*this, parent, keepWorldTransform);
 }
