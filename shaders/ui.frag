@@ -35,9 +35,21 @@ void main() {
 
     if (fragKind > 1.5) {
         // SDF text: 0.5 is the glyph edge in the baked field.
+        // Convert the field to a *screen-space* signed distance in
+        // pixels (field units divided by the field's own gradient)
+        // and anti-alias over exactly one pixel either side of the
+        // edge. The old form -- smoothstep over a +/-fwidth band --
+        // reaches full opacity only one whole pixel *inside* the
+        // edge, so at editor text sizes (drawn at roughly a quarter
+        // of the 48 px bake) thin strokes like 'i', 'l' and '.'
+        // never get there and render washed-out grey. Here, any
+        // coverage at least half a pixel inside the edge is fully
+        // opaque and the ramp is symmetric, so letters stay solid
+        // at any scale while edges remain smooth.
         float field = texture(uiTexture, atlasUv).r;
-        float band = max(fwidth(field), 1e-4);
-        float alpha = smoothstep(0.5 - band, 0.5 + band, field);
+        float gradient = max(fwidth(field), 1e-4);
+        float distancePx = (field - 0.5) / gradient;
+        float alpha = clamp(distancePx + 0.5, 0.0, 1.0);
         if (alpha <= 0.0) {
             discard;
         }

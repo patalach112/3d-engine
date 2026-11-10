@@ -1,15 +1,19 @@
 #include "Scene/TransformGizmo.h"
 
+#include "Physics/PhysicsComponents.h"
 #include "Scene/Components.h"
 #include "Scene/Raycast.h"
 #include "Scene/Scene.h"
+#include "Scene/Systems/TransformSystem.h"
 
+#include <glm/common.hpp>
 #include <glm/geometric.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace engine {
 namespace {
@@ -230,6 +234,96 @@ float TransformGizmo::rayAxisParameter(const Ray& ray, glm::vec3 lineOrigin, glm
 
 float TransformGizmo::handleLength(float cameraDistance) {
     return std::clamp(cameraDistance * kHandleLengthFraction, kMinHandleLength, kMaxHandleLength);
+}
+
+bool TransformGizmo::selectionBoxCorners(const Scene& scene, entt::entity entity,
+                                         std::array<glm::vec3, 8>& outCorners) {
+    if (entity == entt::null) {
+        return false;
+    }
+    const Scene::Registry& registry = scene.registry();
+    if (!registry.valid(entity)) {
+        return false;
+    }
+    const TransformComponent* transform = registry.try_get<TransformComponent>(entity);
+    if (transform == nullptr) {
+        return false;
+    }
+    const glm::mat4 model = TransformSystem::effectiveWorldMatrix(
+        *transform, registry.try_get<WorldTransformComponent>(entity));
+
+    // The pick volume picking itself uses (Scene::syncRaycastTree):
+    // a visible mesh's bounds and/or a box/OBB collider, unioned.
+    bool hasBox = false;
+    AABB localBox{};
+    if (const MeshComponent* mesh = registry.try_get<MeshComponent>(entity);
+        mesh != nullptr && mesh->visible) {
+        localBox = mesh->localBounds;
+        hasBox = true;
+    }
+    if (const ColliderComponent* collider = registry.try_get<ColliderComponent>(entity);
+        collider != nullptr &&
+        (collider->type == ColliderComponent::Type::Box || collider->type == ColliderComponent::Type::Obb)) {
+        const AABB colliderBox{collider->centerOffset - glm::abs(collider->halfExtents),
+                               collider->centerOffset + glm::abs(collider->halfExtents)};
+        localBox = hasBox ? localBox.combined(colliderBox) : colliderBox;
+        hasBox = true;
+    }
+    if (!hasBox) {
+        // Nothing pick-shaped on this entity (lights, cameras, plain
+        // transforms): still outline it, with a modest box at its
+        // position, so no selection is ever invisible.
+        localBox = AABB{glm::vec3{-0.25f}, glm::vec3{0.25f}};
+    }
+    for (size_t i = 0; i < outCorners.size(); ++i) {
+        const glm::vec3 corner{(i & 1u) != 0u ? localBox.max.x : localBox.min.x,
+                               (i & 2u) != 0u ? localBox.max.y : localBox.min.y,
+                               (i & 4u) != 0u ? localBox.max.z : localBox.min.z};
+        outCorners[i] = glm::vec3{model * glm::vec4{corner, 1.0f}};
+    }
+    return true;
+}
+
+void TransformGizmo::drawSelectionOutline(UIBatch& batch, const Scene& scene, entt::entity entity,
+                                          const Camera& camera, const UIRect& viewport) {
+    if (viewport.width <= 0.0f || viewport.height <= 0.0f) {
+        return;
+    }
+    std::array<glm::vec3, 8> corners{};
+    if (!selectionBoxCorners(scene, entity, corners)) {
+        return;
+    }
+    const glm::vec2 viewportSize{viewport.width, viewport.height};
+    const glm::vec2 viewportOrigin{viewport.x, viewport.y};
+    const glm::mat4 viewProjection =
+        camera.projectionMatrix(viewportSize.x / viewportSize.y) * camera.viewMatrix();
+
+    std::array<glm::vec2, 8> pixels{};
+    std::array<bool, 8> valid{};
+    for (size_t i = 0; i < corners.size(); ++i) {
+        valid[i] = projectToScreen(corners[i], viewProjection, viewportSize, pixels[i]);
+        if (valid[i]) {
+            pixels[i] += viewportOrigin;
+        }
+    }
+    // Editor amber; brighter than the gizmo's neutral centre dot so
+    // the two never read as one widget.
+    const glm::vec4 outlineColor{1.0f, 0.72f, 0.15f, 0.95f};
+    constexpr std::array<std::pair<size_t, size_t>, 12> kEdges{{
+        {0, 1}, {2, 3}, {4, 5}, {6, 7}, // x-running
+        {0, 2}, {1, 3}, {4, 6}, {5, 7}, // y-running
+        {0, 4}, {1, 5}, {2, 6}, {3, 7}, // z-running
+    }};
+    for (const auto& [a, b] : kEdges) {
+        if (valid[a] && valid[b]) {
+            drawDottedSegment(batch, pixels[a], pixels[b], outlineColor, 1.7f);
+        }
+    }
+    for (size_t i = 0; i < corners.size(); ++i) {
+        if (valid[i]) {
+            drawDot(batch, pixels[i], 2.6f, outlineColor);
+        }
+    }
 }
 
 void TransformGizmo::setMode(GizmoMode mode) {

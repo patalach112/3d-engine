@@ -109,6 +109,10 @@ public:
 
     // Panels draw their background, push a matching scissor onto
     // the batch, and host a vertical row cursor for layout widgets.
+    // A default-constructed style yields the rounded, bordered
+    // house look; passing a negative cornerRadius/borderWidth is an
+    // explicit opt-out (square, borderless) for panels that tile
+    // flush against their neighbours, like the editor docks.
     void beginPanel(std::string_view id, const UIRect& rect, const UIRectStyle& style = {});
     void endPanel();
 

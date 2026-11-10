@@ -2603,3 +2603,49 @@ game-style mouse capture. All three are fixed:
 
 1112 passed / 0 failed across all five build configs, CTest 1/1,
 zero warnings.
+
+## Maintenance — Composite alignment, text solidity, selection outline ✅
+
+Four editor defects from a user screenshot, one of them a genuine
+rendering bug that invalidated the previous maintenance pass's
+"no offset math needed" assumption:
+
+- **Rendered world displaced from picking/gizmo**: the composite
+  pass narrowed the Vulkan *viewport* to the scene rect while
+  `post.vert` derives UVs from NDC — so the composite stretched
+  the whole HDR image across the viewport panel while the scene
+  pass had written the world only into the panel's own texels.
+  The world rendered squashed and offset inside the panel while
+  picking rays, gizmo projection and the camera all assumed a
+  1:1 panel mapping. The composite now keeps a full-extent
+  viewport and confines itself with the scissor only: panel
+  pixel (x, y) shows scene texel (x, y), the mapping every other
+  system already used. A CPU round-trip test (project a cube's
+  centre through the docked rect, pick at that pixel, expect the
+  cube) pins the contract.
+- **Text fading/clipping**: the SDF shader now thresholds in
+  *screen-space* distance (`(field-0.5)/fwidth(field)`, AA over
+  one pixel) instead of a ±fwidth band that left thin strokes
+  permanently grey at editor text sizes; the font atlas carries
+  a mip chain (blit-generated, feature-gated) so the gradient
+  estimate stays clean at 4x minification; `UIRenderer` staging
+  buffers are per-frame-slot, ending the CPU/GPU race that
+  corrupted glyphs at random; and the Inspector's component
+  panels now nest inside the dock panel, so its scissor — not
+  each panel's own rect wherever it landed — is the clipping
+  authority.
+- **Flush viewport**: docks tile edge-to-edge (no gutters, no
+  drawn frame around the viewport); the viewport reclaims the
+  margin pixels and meets its neighbours surface-to-surface.
+  Dock panels opt out of the rounded/bordered house style via a
+  negative-style sentinel in `beginPanel`.
+- **Selection outline + deselection**: the selected entity gets
+  an amber wire box around its exact pick volume (mesh bounds ∪
+  box/OBB collider, fallback box for bounds-less entities),
+  projected through the same `projectToScreen` path as the
+  gizmo. Empty-space viewport clicks already deselected, but
+  the displaced rendering made them land on geometry; with the
+  composite fixed, deselect works as written and is test-pinned.
+
+1122 passed / 0 failed across all five build configs, CTest 1/1,
+zero warnings.

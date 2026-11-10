@@ -1066,15 +1066,24 @@ void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageInde
     // rect. The render-pass clear above has already painted the
     // whole image with the editor background colour, so the docks
     // get a defined backdrop even before the UI overlay draws them.
-    // The fullscreen triangle's UVs still map 1:1 over the whole
-    // image, so the sub-rect samples exactly the texels the scene
-    // pass wrote there -- no rescaling, no offset math in shaders.
+    //
+    // The confinement MUST be scissor-only. post.vert derives
+    // fragUv from the NDC position, so narrowing the Vulkan
+    // *viewport* to the scene rect would stretch the rasterized
+    // triangle -- and with it the UVs -- across the panel, sampling
+    // the whole HDR image there while the scene pass wrote the
+    // world only into the panel's own texels. The world would then
+    // render squashed and offset inside the panel, displaced from
+    // where the camera projection, picking rays and gizmo
+    // projection (all pure 1:1 mappings onto the rect) place it.
+    // With a full-extent viewport the UVs are true framebuffer
+    // coordinates: panel pixel (x, y) samples scene texel (x, y),
+    // exactly where the scene pass put it, and the scissor alone
+    // keeps composite writes out of the docks.
     const SceneViewportRect sceneRect = effectiveSceneViewport(extent);
     VkViewport viewport{};
-    viewport.x = static_cast<float>(sceneRect.x);
-    viewport.y = static_cast<float>(sceneRect.y);
-    viewport.width = static_cast<float>(sceneRect.width);
-    viewport.height = static_cast<float>(sceneRect.height);
+    viewport.width = static_cast<float>(extent.width);
+    viewport.height = static_cast<float>(extent.height);
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     VkRect2D scissor{};
@@ -1098,9 +1107,10 @@ void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageInde
                        &push);
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);
 
-    // The UI overlay addresses the whole framebuffer in pixels, so
-    // restore the full viewport/scissor the composite just narrowed
-    // (UIRenderer additionally sets its own per-segment scissors).
+    // The UI overlay addresses the whole framebuffer in pixels:
+    // widen the composite's scissor back to the full image (the
+    // viewport never narrowed; UIRenderer additionally sets its
+    // own per-segment scissors).
     VkViewport fullViewport{};
     fullViewport.width = static_cast<float>(extent.width);
     fullViewport.height = static_cast<float>(extent.height);
@@ -1112,8 +1122,9 @@ void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageInde
 
     // Phase 26 UI overlay (analytic rounded-rect panels/widgets),
     // drawn on the presented image after the composite, under the
-    // FPS HUD text.
-    m_ui.record(commandBuffer, extent);
+    // FPS HUD text. The frame slot keeps the overlay's staging
+    // buffers disjoint from any still-in-flight submission.
+    m_ui.record(commandBuffer, extent, m_currentFrame);
 
     // FPS HUD overlay, drawn on the presented image after the composite.
     m_hud.record(commandBuffer, extent);

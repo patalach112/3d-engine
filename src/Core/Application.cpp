@@ -750,12 +750,11 @@ void Application::run() {
                         layout.statusBar.height, glm::vec4{0.07f, 0.08f, 0.11f, 1.0f});
             ui.drawRect(layout.statusBar.x, layout.statusBar.y, layout.statusBar.width, 1.0f,
                         glm::vec4{1.0f, 1.0f, 1.0f, 0.14f});
-            // Viewport panel frame + label chip (the scene itself is
-            // already clipped to this rectangle by the renderer).
-            ui.drawRoundedRect(layout.viewport.x - 1.0f, layout.viewport.y - 1.0f,
-                               layout.viewport.width + 2.0f, layout.viewport.height + 2.0f,
-                               UIRectStyle{4.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.18f}},
-                               glm::vec4{0.0f, 0.0f, 0.0f, 0.0f});
+            // No frame around the viewport: the docks tile flush
+            // (EditorLayout), so the scene surface runs edge-to-edge
+            // against its neighbours and only this small label chip
+            // rides on top of it (the scene itself is already
+            // clipped to the rectangle by the renderer).
             {
                 const std::string viewportLabel = playing ? "Viewport - Play" : "Viewport - Scene";
                 const float chipWidth = ui.measureText(viewportLabel, 1.2f) + 20.0f;
@@ -862,8 +861,14 @@ void Application::run() {
             const entt::entity selected = m_outliner.selected();
             if (!playing) {
                 // One opaque dock behind the per-component panels.
-                m_uiContext.beginPanel("InspectorDock", inspectorRect);
-                m_uiContext.endPanel();
+                // The component panels nest INSIDE the dock panel,
+                // so the dock's scissor is the clipping authority:
+                // overflowing component content now clips cleanly
+                // at the dock's edge instead of spilling text over
+                // the status bar (each panel used to scissor only
+                // to its own rect, wherever that landed).
+                m_uiContext.beginPanel("InspectorDock", inspectorRect,
+                                       UIRectStyle{-1.0f, -1.0f, glm::vec4{}});
                 if (selected != entt::null && registry.valid(selected)) {
                     float y = inspectorRect.y + 6.0f;
                     y = inspectComponentAt<TransformComponent>(m_uiContext, registry, selected, inspectorX, y,
@@ -883,7 +888,7 @@ void Application::run() {
                         y = inspectMaterialAt(m_uiContext, m_assets, registry.get<MeshComponent>(selected),
                                               inspectorX, y, inspectorWidth);
                     }
-                    (void)y; // panels are scissored by their own rects; the dock bounds the picking below
+                    (void)y; // panels stack downward and clip at the dock's lower edge
                 } else {
                     bool drewFallback = false;
                     const auto tags = registry.view<TagComponent>();
@@ -908,9 +913,24 @@ void Application::run() {
                                     inspectorRect.y + 58.0f, 1.2f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
                     }
                 }
+                m_uiContext.endPanel();
                 m_outliner.build(m_uiContext, layout.hierarchy, m_scene);
             }
             const UIRect assetRect = layout.assetBrowser;
+
+            // Selection outline: the selected entity's world bounds
+            // projected as an amber wire box in the viewport, so the
+            // current pick is unmistakable in 3D (drawn first, the
+            // gizmo rides on top). Edit mode only -- in Play the
+            // runtime owns the screen. The deselect half of the
+            // contract lives in the picking below: a click on empty
+            // viewport space clears the selection (and this box).
+            if (!playing) {
+                if (const CameraComponent* activeCamera = m_scene.findActiveCamera(); activeCamera != nullptr) {
+                    TransformGizmo::drawSelectionOutline(ui, m_scene, m_outliner.selected(),
+                                                         activeCamera->camera, layout.viewport);
+                }
+            }
 
             // Transform gizmo over the selection, then viewport
             // picking -- both strictly inside the viewport panel.

@@ -71,6 +71,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -9374,9 +9375,19 @@ void testEditorViewportAndFont() {
     check(edit.toolbar.x == 0.0f && edit.toolbar.y == 0.0f && edit.toolbar.width == 1280.0f &&
               edit.statusBar.y + edit.statusBar.height == 720.0f,
           "layout: toolbar spans the top, status bar the bottom of the window");
-    check(edit.hierarchy.x < edit.viewport.x && edit.viewport.x + edit.viewport.width < edit.inspector.x &&
-              edit.viewport.y + edit.viewport.height < edit.assetBrowser.y,
+    check(edit.hierarchy.x < edit.viewport.x && edit.viewport.x + edit.viewport.width <= edit.inspector.x &&
+              edit.viewport.y + edit.viewport.height <= edit.assetBrowser.y,
           "layout: Hierarchy | Viewport | Inspector with the Asset Browser below the viewport");
+    // Flush docking: docks tile the window edge-to-edge with no
+    // gutters -- each dock's edge is exactly its neighbour's edge,
+    // so the viewport loses no pixels to margins or frames.
+    check(edit.hierarchy.x == 0.0f && edit.hierarchy.x + edit.hierarchy.width == edit.viewport.x &&
+              edit.viewport.x + edit.viewport.width == edit.inspector.x &&
+              edit.inspector.x + edit.inspector.width == 1280.0f &&
+              edit.viewport.y == edit.toolbar.y + edit.toolbar.height &&
+              edit.viewport.y + edit.viewport.height == edit.assetBrowser.y &&
+              edit.assetBrowser.y + edit.assetBrowser.height == edit.statusBar.y,
+          "layout: docks tile flush edge-to-edge (viewport reclaims the old gutter pixels)");
     check(edit.viewportIsDockBounded() && edit.viewport.width > 400.0f && edit.viewport.height > 200.0f,
           "layout: the 3D viewport is a bounded panel overlapped by no dock");
     check(edit.containsViewport(edit.viewport.x + 4.0f, edit.viewport.y + 4.0f) &&
@@ -9437,6 +9448,83 @@ void testEditorViewportAndFont() {
           "viewport: the renderer rect carries the same geometry the layout computed");
 }
 
+void testEditorSelectionOutline() {
+    std::cout << "Editor selection outline & rendered-pixel picking round-trip\\n";
+
+    // The whole viewport contract in one round-trip: the renderer's
+    // composite now maps panel pixel (x, y) to scene texel (x, y)
+    // unchanged, so the pixel the *gizmo projection* predicts for a
+    // world point must be the pixel *picking* hits it at -- through
+    // the docked rect, with its non-zero origin. (A composite that
+    // re-stretches the image across the panel breaks exactly this,
+    // and no amount of CPU-side consistency can rescue it.)
+    const engine::EditorLayout edit = engine::computeEditorLayout(1280.0f, 720.0f, false);
+    const engine::UIRect& viewport = edit.viewport;
+
+    engine::Scene scene;
+    auto cube = scene.createEntity("Cube");
+    cube.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+    cube.addComponent<engine::ColliderComponent>(engine::ColliderComponent::box(glm::vec3{0.5f}));
+    cube.addComponent<engine::MeshComponent>("cube");
+    const entt::entity cubeHandle = cube.handle();
+    auto light = scene.createEntity("Light"); // transform only: the fallback-box outline
+    light.addComponent<engine::TransformComponent>(glm::vec3{2.0f, 1.0f, 0.0f});
+
+    engine::CameraConfig camConfig;
+    camConfig.startPosition = glm::vec3{0.0f, 0.0f, 5.0f};
+    const engine::Camera camera{camConfig};
+    const float aspect = viewport.width / viewport.height;
+    const glm::mat4 viewProjection = camera.projectionMatrix(aspect) * camera.viewMatrix();
+
+    glm::vec2 centrePx{0.0f};
+    check(engine::TransformGizmo::projectToScreen(glm::vec3{0.0f}, viewProjection,
+                                                  glm::vec2{viewport.width, viewport.height}, centrePx),
+          "outline: the cube centre projects inside the docked viewport");
+    centrePx += glm::vec2{viewport.x, viewport.y};
+    check(viewport.contains(centrePx.x, centrePx.y) &&
+              nearlyEqual(centrePx.x, viewport.x + 0.5f * viewport.width, 1.0f) &&
+              nearlyEqual(centrePx.y, viewport.y + 0.5f * viewport.height, 1.0f),
+          "outline: the projected centre lands at the panel's centre (offset + size, not window origin)");
+    engine::RaycastHit hit;
+    check(engine::pickEntityAt(scene, camera, centrePx, viewport, hit) && hit.entity == cubeHandle,
+          "picking: the pixel the projection predicts for the cube is the pixel that selects it");
+    engine::RaycastHit miss;
+    check(!engine::pickEntityAt(scene, camera, glm::vec2{viewport.x + 2.0f, viewport.y + 2.0f}, viewport, miss),
+          "picking: an empty viewport corner hits nothing (the empty-space-click deselect path)");
+
+    // Selection box corners: the pick volume (mesh bounds U
+    // collider) in world space -- 8 corners hugging the unit cube.
+    std::array<glm::vec3, 8> corners{};
+    check(engine::TransformGizmo::selectionBoxCorners(scene, cubeHandle, corners),
+          "outline: a mesh+collider entity yields selection corners");
+    glm::vec3 boxMin{std::numeric_limits<float>::max()};
+    glm::vec3 boxMax{-std::numeric_limits<float>::max()};
+    bool cornersProjectInside = true;
+    bool straddlesCentre = false;
+    for (const glm::vec3& corner : corners) {
+        boxMin = glm::min(boxMin, corner);
+        boxMax = glm::max(boxMax, corner);
+        glm::vec2 px{0.0f};
+        if (!engine::TransformGizmo::projectToScreen(corner, viewProjection,
+                                                     glm::vec2{viewport.width, viewport.height}, px)) {
+            cornersProjectInside = false;
+        } else if (std::abs(px.x - 0.5f * viewport.width) > 4.0f || std::abs(px.y - 0.5f * viewport.height) > 4.0f) {
+            straddlesCentre = true;
+        }
+    }
+    check(nearlyVec3(boxMin, glm::vec3{-0.5f}) && nearlyVec3(boxMax, glm::vec3{0.5f}),
+          "outline: corners hug the entity's unit-cube bounds in world space");
+    check(cornersProjectInside && straddlesCentre,
+          "outline: every corner projects into the viewport, spread around the centre");
+    std::array<glm::vec3, 8> lightCorners{};
+    check(engine::TransformGizmo::selectionBoxCorners(scene, light.handle(), lightCorners) &&
+              nearlyVec3(lightCorners[7], glm::vec3{2.25f, 1.25f, 0.25f}),
+          "outline: a bounds-less entity still gets a small box at its position");
+    std::array<glm::vec3, 8> noCorners{};
+    check(!engine::TransformGizmo::selectionBoxCorners(scene, entt::null, noCorners),
+          "outline: no selection -> no outline (deselected state draws nothing)");
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -9462,6 +9550,7 @@ int main() {
     testPhase33Export();
     testSceneTeardown();
     testEditorViewportAndFont();
+    testEditorSelectionOutline();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();

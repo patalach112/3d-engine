@@ -29,10 +29,10 @@ ENGINE_GRAPHICS_API void endSingleTimeCommands(VulkanContext& context, VkCommand
 
 ENGINE_GRAPHICS_API void createImage(VulkanContext& context, uint32_t width, uint32_t height, VkFormat format,
                  VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties,
-                 VkImage& image, VkDeviceMemory& memory);
+                 VkImage& image, VkDeviceMemory& memory, uint32_t mipLevels = 1);
 
 ENGINE_GRAPHICS_API VkImageView createImageView(VulkanContext& context, VkImage image, VkFormat format,
-                            VkImageAspectFlags aspectFlags);
+                            VkImageAspectFlags aspectFlags, uint32_t mipLevels = 1);
 
 // Reads an entire binary file (used for SPIR-V shader modules).
 ENGINE_GRAPHICS_API std::vector<char> readFile(const std::string& path);

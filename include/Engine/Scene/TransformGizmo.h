@@ -7,6 +7,7 @@
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 
+#include <array>
 #include <cstdint>
 
 #include "Core/Camera.h"
@@ -107,6 +108,27 @@ public:
     // Screen-size-independent handle length for a target at the
     // given distance from the camera, clamped to sane bounds.
     [[nodiscard]] static float handleLength(float cameraDistance);
+
+    // World-space corners of the selection box: the union of the
+    // entity's visible-mesh bounds and box/OBB collider -- the same
+    // volume picking tests (Scene::syncRaycastTree), so the outline
+    // hugs exactly what a click can select. Corners are indexed by
+    // (x,y,z) bits of the local box. An entity with neither bounds
+    // nor collider still gets a small box at its world position so
+    // every selection reads in 3D. False only when the entity is
+    // null, invalid, or has no TransformComponent.
+    [[nodiscard]] static bool selectionBoxCorners(const Scene& scene, entt::entity entity,
+                                                  std::array<glm::vec3, 8>& outCorners);
+    // Draws the selection outline (amber wire box, corners dotted)
+    // for `entity` into the UI batch, projected through `camera`
+    // into the viewport panel via projectToScreen -- the same
+    // projection the gizmo handles and picking use, so the box can
+    // never drift from the mesh it wraps. No-op for an empty or
+    // unbounded selection. Pure overlay: nothing here mutates the
+    // scene, and an empty-space viewport click (Application) clears
+    // the selection this draws for.
+    static void drawSelectionOutline(UIBatch& batch, const Scene& scene, entt::entity entity,
+                                     const Camera& camera, const UIRect& viewport);
 
 private:
     GizmoMode m_mode = GizmoMode::Translate;

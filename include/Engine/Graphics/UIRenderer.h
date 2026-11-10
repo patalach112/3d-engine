@@ -216,8 +216,11 @@ public:
     void unregisterTexture(UITextureId texture);
 
     // Flushes the batch and clears it. No-op without geometry or
-    // with a zero extent, but still clears the batch.
-    void record(VkCommandBuffer commandBuffer, VkExtent2D extent);
+    // with a zero extent, but still clears the batch. `frameIndex`
+    // selects the per-slot staging buffers (the renderer's frame
+    // slot): the CPU rewrite of one slot must never race the GPU
+    // still reading another's, or glyphs corrupt at random.
+    void record(VkCommandBuffer commandBuffer, VkExtent2D extent, uint32_t frameIndex);
 
     // The single vertex-input contract shared by the pipeline and
     // the tests: binding 0 (per-vertex), stride sizeof(UIVertex),
@@ -246,8 +249,14 @@ private:
     VkDeviceMemory m_atlasMemory = VK_NULL_HANDLE;
     VkImageView m_atlasView = VK_NULL_HANDLE;
     VkSampler m_atlasSampler = VK_NULL_HANDLE;
-    Buffer m_vertexBuffer;
-    Buffer m_indexBuffer;
+    // One staging pair per frame slot (Renderer::kMaxFramesInFlight
+    // is 2). The batch is re-uploaded from scratch every flush, so a
+    // shared pair would let the CPU overwrite vertices a still-in-
+    // flight submission is reading -- the classic cause of UI
+    // glyphs flickering, shearing, or vanishing at random.
+    static constexpr size_t kFrameBufferSlots = 2;
+    std::array<Buffer, kFrameBufferSlots> m_vertexBuffers;
+    std::array<Buffer, kFrameBufferSlots> m_indexBuffers;
     SdfFontAtlas m_fontAtlas;
     UIBatch m_batch;
     std::unordered_map<UITextureId, VkDescriptorSet> m_textures;

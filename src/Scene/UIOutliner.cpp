@@ -77,7 +77,9 @@ UIOutliner::Result UIOutliner::build(UIContext& ui, const UIRect& rect, Scene& s
         m_selected = entt::null; // deleted directly or via a cascade
     }
 
-    ui.beginPanel("Scene Hierarchy", rect);
+    // Dock panels tile flush (square, borderless): neighbours butt
+    // edge-to-edge, so rounded corners would notch the seams.
+    ui.beginPanel("Scene Hierarchy", rect, UIRectStyle{-1.0f, -1.0f, glm::vec4{}});
     ui.label("Scene Hierarchy");
 
     // Flatten the hierarchy: roots sorted by name (deterministic),

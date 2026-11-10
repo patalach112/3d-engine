@@ -345,7 +345,7 @@ VkDescriptorSet UIRenderer::resolveDescriptorSet(UITextureId texture) const {
     return it != m_textures.end() ? it->second : m_fontDescriptorSet;
 }
 
-void UIRenderer::record(VkCommandBuffer commandBuffer, VkExtent2D extent) {
+void UIRenderer::record(VkCommandBuffer commandBuffer, VkExtent2D extent, uint32_t frameIndex) {
     const std::vector<UIVertex>& vertices = m_batch.vertices();
     const std::vector<uint32_t>& indices = m_batch.indices();
     const std::vector<UISegment>& segments = m_batch.segments();
@@ -353,18 +353,23 @@ void UIRenderer::record(VkCommandBuffer commandBuffer, VkExtent2D extent) {
         m_batch.clear();
         return;
     }
-    if (m_vertexBuffer.mappedData() != nullptr) {
-        std::memcpy(m_vertexBuffer.mappedData(), vertices.data(), vertices.size() * sizeof(UIVertex));
+    // Per-frame-slot staging: this flush rewrites only the slot the
+    // renderer has already fenced off, never a buffer an in-flight
+    // submission may still be reading.
+    Buffer& vertexBuffer = m_vertexBuffers[frameIndex % kFrameBufferSlots];
+    Buffer& indexBuffer = m_indexBuffers[frameIndex % kFrameBufferSlots];
+    if (vertexBuffer.mappedData() != nullptr) {
+        std::memcpy(vertexBuffer.mappedData(), vertices.data(), vertices.size() * sizeof(UIVertex));
     }
-    if (m_indexBuffer.mappedData() != nullptr) {
-        std::memcpy(m_indexBuffer.mappedData(), indices.data(), indices.size() * sizeof(uint32_t));
+    if (indexBuffer.mappedData() != nullptr) {
+        std::memcpy(indexBuffer.mappedData(), indices.data(), indices.size() * sizeof(uint32_t));
     }
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
-    const VkBuffer vertexBuffers[] = {m_vertexBuffer.handle()};
+    const VkBuffer vertexBuffers[] = {vertexBuffer.handle()};
     constexpr VkDeviceSize vertexOffsets[] = {0};
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, vertexOffsets);
-    vkCmdBindIndexBuffer(commandBuffer, m_indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindIndexBuffer(commandBuffer, indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
     const std::array<float, 2> viewportSize{static_cast<float>(extent.width),
                                             static_cast<float>(extent.height)};
     vkCmdPushConstants(commandBuffer, m_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
@@ -399,14 +404,18 @@ void UIRenderer::record(VkCommandBuffer commandBuffer, VkExtent2D extent) {
 }
 
 void UIRenderer::createBuffers() {
-    m_vertexBuffer = Buffer(m_context, static_cast<VkDeviceSize>(UIBatch::kMaxVertices) * sizeof(UIVertex),
-                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    m_vertexBuffer.map(); // persistently mapped; rewritten every flush
-    m_indexBuffer = Buffer(m_context, static_cast<VkDeviceSize>(UIBatch::kMaxIndices) * sizeof(uint32_t),
-                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    m_indexBuffer.map();
+    for (size_t slot = 0; slot < kFrameBufferSlots; ++slot) {
+        m_vertexBuffers[slot] =
+            Buffer(m_context, static_cast<VkDeviceSize>(UIBatch::kMaxVertices) * sizeof(UIVertex),
+                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        m_vertexBuffers[slot].map(); // persistently mapped; rewritten on its slot's flushes
+        m_indexBuffers[slot] =
+            Buffer(m_context, static_cast<VkDeviceSize>(UIBatch::kMaxIndices) * sizeof(uint32_t),
+                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        m_indexBuffers[slot].map();
+    }
 }
 
 void UIRenderer::createFontAtlasTexture() {
@@ -418,10 +427,35 @@ void UIRenderer::createFontAtlasTexture() {
     std::memcpy(staging.mappedData(), m_fontAtlas.pixels.data(), m_fontAtlas.pixels.size());
     staging.unmap();
 
+    // Editor text is drawn at roughly a quarter of the 48 px bake
+    // size, i.e. ~4x minified. Sampling a single mip level there
+    // makes the fragment shader's fwidth() gradient estimate noisy
+    // (glyphs shimmer and thin strokes wash out), so the atlas gets
+    // a full mip chain wherever the device can blit one; the
+    // single-level path stays as the portable fallback.
+    uint32_t mipLevels = 1;
+    {
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(m_context.physicalDevice(), VK_FORMAT_R8_UNORM, &properties);
+        const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        if ((properties.optimalTilingFeatures & needed) == needed && m_fontAtlas.width > 0 &&
+            m_fontAtlas.height > 0) {
+            uint32_t largest = std::max(m_fontAtlas.width, m_fontAtlas.height);
+            mipLevels = 1;
+            while (largest > 1) {
+                largest >>= 1;
+                ++mipLevels;
+            }
+        }
+    }
+    const bool generateMips = mipLevels > 1;
+
     helpers::createImage(m_context, m_fontAtlas.width, m_fontAtlas.height, VK_FORMAT_R8_UNORM,
                          VK_IMAGE_TILING_OPTIMAL,
-                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_atlasImage, m_atlasMemory);
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_atlasImage, m_atlasMemory, mipLevels);
 
     VkCommandBuffer commandBuffer = helpers::beginSingleTimeCommands(m_context);
     VkImageMemoryBarrier barrier{};
@@ -442,15 +476,69 @@ void UIRenderer::createFontAtlasTexture() {
     vkCmdCopyBufferToImage(commandBuffer, staging.handle(), m_atlasImage,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    if (generateMips) {
+        // Vulkan has no generate-mipmaps command: walk the chain
+        // with explicit blits, moving each source level to
+        // TRANSFER_SRC and each fresh level from UNDEFINED to
+        // TRANSFER_DST, and retire every finished level to
+        // SHADER_READ_ONLY as soon as it has been read.
+        int32_t levelWidth = static_cast<int32_t>(m_fontAtlas.width);
+        int32_t levelHeight = static_cast<int32_t>(m_fontAtlas.height);
+        for (uint32_t level = 1; level < mipLevels; ++level) {
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.subresourceRange.baseMipLevel = level - 1;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.subresourceRange.baseMipLevel = level;
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
+            blit.srcOffsets[1] = {levelWidth, levelHeight, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+            blit.dstOffsets[1] = {std::max(1, levelWidth / 2), std::max(1, levelHeight / 2), 1};
+            vkCmdBlitImage(commandBuffer, m_atlasImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_atlasImage,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.subresourceRange.baseMipLevel = level - 1;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            levelWidth = std::max(1, levelWidth / 2);
+            levelHeight = std::max(1, levelHeight / 2);
+        }
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    } else {
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
     helpers::endSingleTimeCommands(m_context, commandBuffer);
 
-    m_atlasView = helpers::createImageView(m_context, m_atlasImage, VK_FORMAT_R8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    m_atlasView = helpers::createImageView(m_context, m_atlasImage, VK_FORMAT_R8_UNORM,
+                                           VK_IMAGE_ASPECT_COLOR_BIT, mipLevels);
 
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -462,7 +550,8 @@ void UIRenderer::createFontAtlasTexture() {
     samplerInfo.maxAnisotropy = 1.0f;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    samplerInfo.maxLod = 0.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = static_cast<float>(mipLevels - 1);
     if (vkCreateSampler(device, &samplerInfo, nullptr, &m_atlasSampler) != VK_SUCCESS) {
         throw std::runtime_error("UIRenderer: failed to create font atlas sampler");
     }

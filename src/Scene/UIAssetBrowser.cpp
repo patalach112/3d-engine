@@ -205,7 +205,8 @@ UIAssetBrowser::Result UIAssetBrowser::build(UIContext& ui, const UIRect& rect) 
         m_selectedPath.clear();
     }
 
-    ui.beginPanel("Asset Browser", rect);
+    // Dock panels tile flush (square, borderless) like the Hierarchy.
+    ui.beginPanel("Asset Browser", rect, UIRectStyle{-1.0f, -1.0f, glm::vec4{}});
     const std::string header =
         m_current.empty() ? std::string{"Assets"} : "Assets / " + m_current.generic_string();
     ui.label(header.c_str());

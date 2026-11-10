@@ -26,9 +26,13 @@ class GraphicsPipeline;
 // Pixel rectangle (framebuffer coordinates, top-left origin) the 3D
 // scene is confined to. The editor sets this to its docked viewport
 // panel; an empty rect (the default) means "the whole framebuffer",
-// which is what the standalone game player uses. The scene pass and
-// the composite both clip to it (viewport + scissor), so world pixels
-// can never appear under editor chrome.
+// which is what the standalone game player uses. The scene pass
+// clips to it with viewport + scissor; the composite clips with the
+// scissor only (its viewport stays full-extent so the post shader's
+// NDC-derived UVs remain true framebuffer coordinates -- see
+// recordComposite). Either way, world pixels can never appear
+// under editor chrome, and panel pixel (x, y) always shows scene
+// texel (x, y): the same 1:1 mapping picking and the gizmo use.
 struct SceneViewportRect {
     int32_t x = 0;
     int32_t y = 0;

@@ -113,12 +113,20 @@ void UIContext::beginPanel(std::string_view id, const UIRect& rect, const UIRect
         return;
     }
     UIRectStyle effective = style;
-    if (effective.cornerRadius <= 0.0f) {
+    // A default-constructed style (0) asks for the house panel look;
+    // a negative value is an explicit opt-out (square, borderless)
+    // used by the flush-docked editor panels, whose neighbours tile
+    // edge-to-edge and must not show rounded notches at the seams.
+    if (effective.cornerRadius == 0.0f) {
         effective.cornerRadius = 6.0f;
+    } else if (effective.cornerRadius < 0.0f) {
+        effective.cornerRadius = 0.0f;
     }
-    if (effective.borderWidth <= 0.0f) {
+    if (effective.borderWidth == 0.0f) {
         effective.borderWidth = 1.0f;
         effective.borderColor = m_theme.panelBorder;
+    } else if (effective.borderWidth < 0.0f) {
+        effective.borderWidth = 0.0f;
     }
     m_batch->drawRoundedRect(rect.x, rect.y, rect.width, rect.height, effective, m_theme.panelFill);
     m_batch->pushScissor(rect.x, rect.y, rect.width, rect.height);
