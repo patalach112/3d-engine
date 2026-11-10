@@ -2303,3 +2303,63 @@ parsing on load, plus editor Save/Load commands.
   leave the scene untouched. **1000 passed, 0 failed** in
   Debug, Release (shared and static), hidden-visibility and
   ASan builds, warning-free, CTest 1/1.
+
+## Phase 31 — Play / Stop Mode (Runtime Simulation) ✅
+
+The editor gains the classic edit/play split: the scene opens
+frozen in **Edit** mode, **Play** runs the live simulation
+against a throwaway state, and **Stop** restores the authored
+scene exactly as it was.
+
+- **Snapshot** (`Scene/PlaySession`): `enterPlay()` captures
+  the entire scene as **in-memory GBQ bytes**
+  (`Scene::saveToGbqBytes()`, the Phase 30 serialization core
+  with no file in between — a test verifies the snapshot is
+  byte-identical to the `.gbq` file form). All component
+  states, hierarchies, rigid bodies, joint links and native
+  script bindings are secured before any runtime code runs.
+  `saveToGbqBytes`/`loadFromGbqBytes` (plus
+  `serializeSceneToBytes`/`deserializeSceneFromBytes` free
+  functions) are the new in-memory API; the file functions
+  are now thin wrappers over them.
+- **Runtime gating**: in Edit mode the fixed step propagates
+  transforms only — game modules, `NativeScriptSystem`
+  (`INativeScript`), `PlayerSystem`, rigid-body physics and
+  spin stay frozen. Play mode runs the full pipeline (module
+  and script updates also ungate in the variable update);
+  module hot-reload polling stays live in Edit so code
+  changes land while authoring. The camera fly controls work
+  in both modes.
+- **Editor lockdown in Play**: the transform gizmo is never
+  updated (nothing draws or drags) and raycast picking is
+  blocked through the same gate; the Inspector and Outliner
+  (whose widgets and context menus edit the scene) are not
+  built; the Asset Browser is not built, so no drops can
+  spawn; tool keys, toolbar authoring buttons and Ctrl+S/O
+  are ignored (the buttons still draw). Stop is always
+  reachable.
+- **Controls**: a **Play / Stop** toolbar segment beside
+  Save/Load (accent underline + red Stop tint while playing,
+  PLAY MODE hint line) and **Ctrl+P** to toggle. Entering
+  Play clears the editor selection and re-captures physics
+  spawn states; the C-key respawn is a runtime-only action.
+- **Restoration**: `exitPlay()` feeds the snapshot back
+  through the validating GBQ loader — the runtime may move,
+  spawn and destroy entities freely; Stop rebuilds the
+  authored scene bit-for-bit (new EnTT handles, so the
+  selection is cleared rather than left dangling). Guards:
+  entering twice is refused, Stop while editing is a no-op,
+  and a failed restore (impossible for a self-produced
+  snapshot, but defended) keeps the session in Play rather
+  than presenting a mutated scene as edit state. Snapshot
+  memory is released on Stop.
+- **Verification**: `testPhase31PlayMode()` adds 22 checks —
+  state-machine guards, snapshot↔file byte identity, a live
+  150-step physics run inside Play (body falls and lands),
+  runtime destruction/spawn/edit mutations, bit-exact
+  restoration of transforms, hierarchy, joint links, lights'
+  hosts, script bindings and camera, a second-cycle
+  re-snapshot, and the empty-scene round trip. **1022
+  passed, 0 failed** in Debug, Release (shared and static),
+  hidden-visibility and ASan builds, warning-free, CTest
+  1/1.

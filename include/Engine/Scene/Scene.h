@@ -259,6 +259,12 @@ public:
     // loadFromString.
     bool saveToGbqFile(const std::string& filepath) const;
     bool loadFromGbqFile(const std::string& filepath);
+    // In-memory twins (Phase 31): exactly the bytes saveToGbqFile
+    // writes / loadFromGbqFile reads, with no file involved.
+    // Editor play-mode snapshots ride these. loadFromGbqBytes
+    // validates fully before touching the scene.
+    [[nodiscard]] std::vector<std::byte> saveToGbqBytes() const;
+    bool loadFromGbqBytes(const std::vector<std::byte>& bytes);
 
     // Memory pool backing all component storage of this scene.
     [[nodiscard]] memory::PoolStats memoryStats() const { return m_registry.get_allocator().stats(); }

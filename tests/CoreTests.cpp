@@ -20,6 +20,7 @@
 #include "Scene/DynamicAABBTree.h"
 #include "Scene/Scene.h"
 #include "Scene/SceneBinarySerialization.h"
+#include "Scene/PlaySession.h"
 #include "Scene/UIOutliner.h"
 #include "Scene/UIAssetBrowser.h"
 #include "Scene/Raycast.h"
@@ -5840,6 +5841,183 @@ void testPhase30Gbq() {
     std::filesystem::remove(gbqPath2);
 }
 
+void testPhase31PlayMode() {
+    std::cout << "Phase 31: play/stop mode (runtime simulation)\n";
+    using engine::CameraComponent;
+    using engine::ColliderComponent;
+    using engine::JointComponent;
+    using engine::NativeScriptComponent;
+    using engine::ParentComponent;
+    using engine::PhysicsSettings;
+    using engine::PhysicsSystem;
+    using engine::PointLightComponent;
+    using engine::RigidBodyComponent;
+    using engine::SpinComponent;
+    using engine::ThrusterComponent;
+    using engine::TransformComponent;
+
+    const auto findByTag = [](engine::Scene& scene, const std::string& tag) -> engine::Entity {
+        auto& registry = scene.registry();
+        for (const entt::entity entity : registry.view<engine::TagComponent>()) {
+            if (registry.get<engine::TagComponent>(entity).tag == tag) {
+                return engine::Entity{entity, &scene};
+            }
+        }
+        return engine::Entity{};
+    };
+    const auto bitsOf = [](float value) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, 4);
+        return bits;
+    };
+
+    // --- Authored scene -----------------------------------------------------------
+    engine::Scene scene;
+    auto ground = scene.createEntity("Ground");
+    ground.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+    auto& groundBody = ground.addComponent<RigidBodyComponent>(0.0f);
+    groundBody.setStatic(true);
+    ground.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{10.0f, 0.5f, 10.0f}));
+
+    auto rig = scene.createEntity("Rig");
+    rig.addComponent<TransformComponent>(glm::vec3{1.0f, 2.0f, 3.0f});
+    auto crate = scene.createEntity("Crate");
+    crate.addComponent<TransformComponent>(glm::vec3{0.0f, 1.0f, 0.0f});
+    crate.addComponent<RigidBodyComponent>(1.0f);
+    crate.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+    crate.addComponent<SpinComponent>(glm::vec3{0.0f, 90.0f, 0.0f});
+    scene.setParent(crate, rig);
+    auto lamp = scene.createEntity("Lamp");
+    lamp.addComponent<TransformComponent>(glm::vec3{0.0f, 2.0f, 0.0f});
+    auto& lampLight = lamp.addComponent<PointLightComponent>();
+    lampLight.intensity = 10.0f;
+    lampLight.range = 5.0f;
+    scene.setParent(lamp, crate);
+
+    auto faller = scene.createEntity("Faller");
+    faller.addComponent<TransformComponent>(glm::vec3{3.0f, 10.0f, 0.0f});
+    faller.addComponent<RigidBodyComponent>(1.0f);
+    faller.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+
+    auto drone = scene.createEntity("Drone");
+    drone.addComponent<TransformComponent>(glm::vec3{-3.0f, 3.0f, 0.0f});
+    drone.addComponent<NativeScriptComponent>(std::string{"DroneAI"});
+    auto& droneThruster = drone.addComponent<ThrusterComponent>();
+    droneThruster.throttle = 0.75f;
+
+    auto anchorA = scene.createEntity("AnchorA");
+    anchorA.addComponent<TransformComponent>(glm::vec3{0.0f, 4.0f, 0.0f});
+    auto anchorB = scene.createEntity("AnchorB");
+    anchorB.addComponent<TransformComponent>(glm::vec3{2.0f, 4.0f, 0.0f});
+    anchorA.addComponent<JointComponent>(
+        JointComponent::distance(anchorB.handle(), glm::vec3{0.0f}, glm::vec3{0.0f}, 2.0f));
+
+    auto cam = scene.createEntity("Cam");
+    cam.addComponent<TransformComponent>(glm::vec3{0.0f});
+    auto& camComponent = cam.addComponent<CameraComponent>(engine::CameraConfig{});
+    camComponent.camera.setPosition(glm::vec3{1.0f, 2.0f, 3.0f});
+
+    const size_t authoredCount = scene.entityCount();
+    check(authoredCount == 9, "the authored scene has nine entities");
+
+    // --- Snapshot rides the serialization core --------------------------------------
+    const std::vector<std::byte> snapshotBytes = scene.saveToGbqBytes();
+    const std::filesystem::path diskPath = std::filesystem::temp_directory_path() / "engine_scene_phase31.gbq";
+    check(!snapshotBytes.empty() && scene.saveToGbqFile(diskPath.string()),
+          "the in-memory snapshot is the GBQ serialization core, no file required");
+    {
+        std::ifstream in(diskPath, std::ios::binary);
+        const std::string diskBytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        check(diskBytes.size() == snapshotBytes.size() &&
+                  std::memcmp(diskBytes.data(), snapshotBytes.data(), diskBytes.size()) == 0,
+              "snapshot bytes are identical to the .gbq file bytes for the same scene");
+        std::filesystem::remove(diskPath);
+    }
+    check(engine::serializeSceneToBytes(scene) == snapshotBytes, "the free-function serializer agrees byte-for-byte");
+
+    // --- State machine guards ---------------------------------------------------------
+    engine::PlaySession session;
+    check(session.mode() == engine::EditorMode::Edit && !session.isPlaying() && !session.hasSnapshot(),
+          "a fresh session starts in Edit mode with no snapshot");
+    check(!session.exitPlay(scene) && scene.entityCount() == authoredCount,
+          "Stop while editing is a harmless no-op");
+
+    // --- Enter Play, run the runtime, mutate everything ------------------------------
+    check(session.enterPlay(scene) && session.isPlaying() && session.mode() == engine::EditorMode::Play &&
+              session.hasSnapshot() && session.snapshotBytes() == snapshotBytes.size(),
+          "enterPlay captures the pre-play snapshot and switches to Play");
+    check(!session.enterPlay(scene), "entering Play twice is refused");
+
+    PhysicsSystem physics;
+    PhysicsSettings settings;
+    settings.subSteps = 4;
+    settings.sleepEnabled = false;
+    for (int i = 0; i < 150; ++i) {
+        physics.update(scene, 1.0f / 60.0f, settings, nullptr);
+    }
+    const float fallenY = findByTag(scene, "Faller").getComponent<TransformComponent>().position.y;
+    check(fallenY < 5.0f && fallenY > -1.0f, "runtime physics ran: the falling body dropped and landed");
+
+    findByTag(scene, "Crate").getComponent<TransformComponent>().position = glm::vec3{9.0f, 9.0f, 9.0f};
+    findByTag(scene, "Crate").getComponent<SpinComponent>().degreesPerSecond = glm::vec3{1.0f, 2.0f, 3.0f};
+    findByTag(scene, "Drone").getComponent<ThrusterComponent>().throttle = 0.1f;
+    scene.destroyEntity(findByTag(scene, "Lamp"));
+    scene.createEntity("RuntimeJunk");
+    check(scene.entityCount() == authoredCount && !findByTag(scene, "Lamp").isValid() &&
+              findByTag(scene, "RuntimeJunk").isValid(),
+          "the runtime mutated the scene: one entity destroyed, one spawned (count unchanged)");
+
+    // --- Stop: exact restoration -------------------------------------------------------
+    check(session.exitPlay(scene) && !session.isPlaying() && session.mode() == engine::EditorMode::Edit &&
+              !session.hasSnapshot(),
+          "Stop restores the snapshot, frees it, and returns to Edit mode");
+    check(scene.entityCount() == authoredCount && !findByTag(scene, "RuntimeJunk").isValid(),
+          "runtime-spawned entities are gone after Stop");
+
+    engine::Entity rFaller = findByTag(scene, "Faller");
+    const TransformComponent& rFallerTransform = rFaller.getComponent<TransformComponent>();
+    check(bitsOf(rFallerTransform.position.x) == bitsOf(3.0f) && bitsOf(rFallerTransform.position.y) == bitsOf(10.0f) &&
+              rFaller.getComponent<RigidBodyComponent>().velocity == glm::vec3{0.0f},
+          "the fallen body is back at its authored position, bit-for-bit, at rest");
+    engine::Entity rCrate = findByTag(scene, "Crate");
+    engine::Entity rRig = findByTag(scene, "Rig");
+    engine::Entity rLamp = findByTag(scene, "Lamp");
+    check(rCrate.getComponent<TransformComponent>().position == glm::vec3{0.0f, 1.0f, 0.0f} &&
+              rCrate.getComponent<SpinComponent>().degreesPerSecond == glm::vec3{0.0f, 90.0f, 0.0f},
+          "runtime transform and spin edits are rolled back");
+    check(rLamp.isValid() && rLamp.getComponent<PointLightComponent>().intensity == 10.0f &&
+              rLamp.getComponent<ParentComponent>().parent == rCrate.handle() &&
+              rCrate.getComponent<ParentComponent>().parent == rRig.handle(),
+          "the runtime-destroyed entity returns with its components and hierarchy links");
+    engine::Entity rDrone = findByTag(scene, "Drone");
+    check(rDrone.getComponent<NativeScriptComponent>().scriptName == "DroneAI" &&
+              rDrone.getComponent<ThrusterComponent>().throttle == 0.75f,
+          "script binding and thruster state are restored");
+    check(findByTag(scene, "AnchorA").getComponent<JointComponent>().other ==
+              findByTag(scene, "AnchorB").handle(),
+          "joint links remap onto the restored handles");
+    check(findByTag(scene, "Cam").getComponent<CameraComponent>().camera.position() == glm::vec3{1.0f, 2.0f, 3.0f},
+          "the camera returns to its authored position");
+
+    // --- A second cycle snapshots the restored scene, not stale state -------------------
+    check(session.enterPlay(scene), "a second Play entry is allowed");
+    findByTag(scene, "Crate").getComponent<TransformComponent>().position = glm::vec3{99.0f, 99.0f, 99.0f};
+    scene.destroyEntity(findByTag(scene, "Faller"));
+    check(session.exitPlay(scene) && scene.entityCount() == authoredCount &&
+              findByTag(scene, "Crate").getComponent<TransformComponent>().position == glm::vec3{0.0f, 1.0f, 0.0f} &&
+              findByTag(scene, "Faller").getComponent<TransformComponent>().position.y == 10.0f,
+          "the second cycle restores the same authored state again");
+    check(!session.exitPlay(scene) && scene.entityCount() == authoredCount,
+          "Stop after Stop stays a no-op");
+
+    // --- Empty scene ----------------------------------------------------------------------
+    engine::Scene emptyScene;
+    engine::PlaySession emptySession;
+    check(emptySession.enterPlay(emptyScene) && emptySession.exitPlay(emptyScene) &&
+              emptyScene.entityCount() == 0 && emptySession.mode() == engine::EditorMode::Edit,
+          "Play/Stop over an empty scene round-trips cleanly");
+}
+
 void testAsyncAssetPipeline() {
     std::cout << "Async asset pipeline (Phase 20)\n";
     using engine::AssetKind;
@@ -8476,6 +8654,7 @@ int main() {
     testSceneHierarchy();
     testSceneSerialization();
     testPhase30Gbq();
+    testPhase31PlayMode();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();

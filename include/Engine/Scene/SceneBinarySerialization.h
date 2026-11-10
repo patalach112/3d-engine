@@ -77,4 +77,11 @@ struct GbqFileInfo {
 // the registry, hierarchy and joint links.
 ENGINE_SCENE_API bool deserializeScene(Scene& scene, const std::filesystem::path& path);
 
+// In-memory twins of the two functions above (Phase 31):
+// serializeSceneToBytes returns the exact container bytes (an
+// editor play-mode snapshot is one of these); the byte-form
+// load keeps the same validate-then-rebuild contract.
+[[nodiscard]] ENGINE_SCENE_API std::vector<std::byte> serializeSceneToBytes(const Scene& scene);
+ENGINE_SCENE_API bool deserializeSceneFromBytes(Scene& scene, const std::vector<std::byte>& bytes);
+
 } // namespace engine

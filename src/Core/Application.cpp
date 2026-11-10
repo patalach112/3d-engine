@@ -465,7 +465,9 @@ void Application::run() {
                     << m_renderer.framesInFlight() << " frame(s) in flight)");
     ENGINE_LOG_INFO("Controls: WASD move, Q/E down/up, Shift boost, C resets physics cubes, mouse look "
                     "(click window to capture mouse, Esc releases / quits), left-click selects the object "
-                    "under the cursor (crosshair when captured), F launches the selected body");
+                    "under the cursor (crosshair when captured), F launches the selected body. The scene "
+                    "starts frozen in Edit mode: Play (toolbar or Ctrl+P) runs the simulation, Stop "
+                    "restores the pre-play snapshot");
 
     LoopCallbacks callbacks;
     callbacks.shouldContinue = [this] { return !m_window.shouldClose(); };
@@ -482,25 +484,30 @@ void Application::run() {
         // Propagate the scene graph first so physics sees current
         // parent placements (Phase 18).
         TransformSystem::update(m_scene);
-        // Game module fixed logic (Phase 23) runs before physics so
-        // it can drive bodies the solver then resolves.
-        {
+        // Phase 31: the simulation (game modules, native scripts,
+        // player, rigid-body physics, spin) runs only in Play
+        // mode. In Edit mode the world stays frozen exactly as
+        // authored; transforms still propagate so rendering,
+        // picking and the gizmo see the edited placements.
+        if (m_playSession.isPlaying()) {
+            // Game module fixed logic (Phase 23) runs before physics so
+            // it can drive bodies the solver then resolves.
             EngineContext context = buildModuleContext(0.0f, static_cast<float>(fixedDeltaSeconds));
             m_moduleManager.fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
             // Native scripts (Phase 25) tick in the fixed step too,
             // before physics, so script-driven forces are resolved
             // by the same step that produced them.
             NativeScriptSystem::fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
+            // Rigid-body physics is deterministic simulation, so it lives in
+            // the fixed step (never the variable/render-rate update). Its
+            // parallel phases return at JobSystem barriers before rendering.
+            // Player input becomes rigid-body velocity first, then physics
+            // resolves gravity, floor contact, cube pushback, and sliding.
+            PlayerSystem::update(m_scene, m_input, fixedDeltaSeconds);
+            m_physicsSystem.update(m_scene, fixedDeltaSeconds, m_config.physics, m_jobSystem);
+            PlayerSystem::syncCamera(m_scene);
+            RotationSystem::update(m_scene, fixedDeltaSeconds, m_jobSystem);
         }
-        // Rigid-body physics is deterministic simulation, so it lives in
-        // the fixed step (never the variable/render-rate update). Its
-        // parallel phases return at JobSystem barriers before rendering.
-        // Player input becomes rigid-body velocity first, then physics
-        // resolves gravity, floor contact, cube pushback, and sliding.
-        PlayerSystem::update(m_scene, m_input, fixedDeltaSeconds);
-        m_physicsSystem.update(m_scene, fixedDeltaSeconds, m_config.physics, m_jobSystem);
-        PlayerSystem::syncCamera(m_scene);
-        RotationSystem::update(m_scene, fixedDeltaSeconds, m_jobSystem);
         // Re-propagate after every writer of local transforms so
         // picking and rendering consume this step's world matrices.
         TransformSystem::update(m_scene);
@@ -534,7 +541,11 @@ void Application::run() {
             }
         }
         handleMouseCapture();
-        handlePhysicsReset();
+        // The C-key respawn is a runtime action: live in Play
+        // mode only (Edit mode's frozen scene has nothing to reset).
+        if (m_playSession.isPlaying()) {
+            handlePhysicsReset();
+        }
         handleEventImpulse();
         CameraSystem::update(m_scene, m_input, deltaSeconds);
 
@@ -593,22 +604,37 @@ void Application::run() {
             // neither picking nor gizmo drags may start from them.
             const bool popupOpenAtFrameStart = m_uiContext.popupOpen();
 
+            // Phase 31: in Play mode the editor's authoring surface
+            // (tool keys, scene-file shortcuts, inspector, outliner,
+            // gizmo, picking, asset drops) is inert — only Stop and
+            // the runtime itself are live.
+            const bool playing = m_playSession.isPlaying();
+
             // Phase 28 gizmo tool switching (also on the toolbar below).
-            if (m_input.wasKeyPressed(Key::Num1)) {
+            if (!playing && m_input.wasKeyPressed(Key::Num1)) {
                 m_gizmo.setMode(GizmoMode::Translate);
-            } else if (m_input.wasKeyPressed(Key::Num2)) {
+            } else if (!playing && m_input.wasKeyPressed(Key::Num2)) {
                 m_gizmo.setMode(GizmoMode::Rotate);
-            } else if (m_input.wasKeyPressed(Key::Num3)) {
+            } else if (!playing && m_input.wasKeyPressed(Key::Num3)) {
                 m_gizmo.setMode(GizmoMode::Scale);
             }
 
             // Phase 30 scene file shortcuts: Ctrl+S saves the whole
-            // registry to the .gbq quicksave, Ctrl+O restores it.
+            // registry to the .gbq quicksave, Ctrl+O restores it
+            // (Edit mode only — never serialize the live runtime
+            // scene over the authored quicksave). Phase 31: Ctrl+P
+            // toggles Play/Stop.
             const bool ctrlHeld =
                 m_input.isKeyDown(Key::LeftControl) || m_input.isKeyDown(Key::RightControl);
-            if (ctrlHeld && m_input.wasKeyPressed(Key::S)) {
+            if (ctrlHeld && m_input.wasKeyPressed(Key::P)) {
+                if (playing) {
+                    exitPlayMode();
+                } else {
+                    enterPlayMode();
+                }
+            } else if (!playing && ctrlHeld && m_input.wasKeyPressed(Key::S)) {
                 saveSceneToGbq();
-            } else if (ctrlHeld && m_input.wasKeyPressed(Key::O)) {
+            } else if (!playing && ctrlHeld && m_input.wasKeyPressed(Key::O)) {
                 loadSceneFromGbq();
             }
 
@@ -619,8 +645,9 @@ void Application::run() {
             // SDF text (Step 2): a control hint along the bottom edge,
             // crisp at any window size from the baked distance atlas.
             const float hintY = static_cast<float>(std::max(m_window.height() - 34, 0));
-            ui.drawText("WASD + MOUSE FLY - SPACE/CTRL RISE/SINK - Q/E ROLL", 12.0f, hintY, 1.5f,
-                        glm::vec4{0.75f, 0.85f, 1.0f, 0.85f});
+            ui.drawText(playing ? "PLAY MODE - SIMULATION RUNNING - STOP (OR CTRL+P) RESTORES THE EDIT SCENE"
+                                : "WASD + MOUSE FLY - SPACE/CTRL RISE/SINK - Q/E ROLL - CTRL+P PLAYS THE SCENE",
+                        12.0f, hintY, 1.5f, glm::vec4{0.75f, 0.85f, 1.0f, 0.85f});
 
             // Phase 28 tool toolbar: gizmo mode switch (keys 1/2/3),
             // its accent underline marking the active tool.
@@ -631,13 +658,15 @@ void Application::run() {
             const float kToolX[3] = {394.0f, 472.0f, 550.0f};
             const int activeTool = m_gizmo.mode() == GizmoMode::Translate ? 0 : m_gizmo.mode() == GizmoMode::Rotate ? 1 : 2;
             ui.drawRect(kToolX[activeTool], 45.0f, 74.0f, 3.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.95f});
-            if (m_uiContext.button(UIRect{kToolX[0], 17.0f, 74.0f, 28.0f}, "Move")) {
+            // (Phase 31: in Play mode the authoring buttons still
+            // draw, but their actions are ignored.)
+            if (m_uiContext.button(UIRect{kToolX[0], 17.0f, 74.0f, 28.0f}, "Move") && !playing) {
                 m_gizmo.setMode(GizmoMode::Translate);
             }
-            if (m_uiContext.button(UIRect{kToolX[1], 17.0f, 74.0f, 28.0f}, "Rotate")) {
+            if (m_uiContext.button(UIRect{kToolX[1], 17.0f, 74.0f, 28.0f}, "Rotate") && !playing) {
                 m_gizmo.setMode(GizmoMode::Rotate);
             }
-            if (m_uiContext.button(UIRect{kToolX[2], 17.0f, 74.0f, 28.0f}, "Scale")) {
+            if (m_uiContext.button(UIRect{kToolX[2], 17.0f, 74.0f, 28.0f}, "Scale") && !playing) {
                 m_gizmo.setMode(GizmoMode::Scale);
             }
 
@@ -648,11 +677,34 @@ void Application::run() {
             ui.drawRoundedRect(sceneFileRect.x, sceneFileRect.y, sceneFileRect.width, sceneFileRect.height,
                                UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
                                glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
-            if (m_uiContext.button(UIRect{648.0f, 17.0f, 74.0f, 28.0f}, "Save")) {
+            if (m_uiContext.button(UIRect{648.0f, 17.0f, 74.0f, 28.0f}, "Save") && !playing) {
                 saveSceneToGbq();
             }
-            if (m_uiContext.button(UIRect{726.0f, 17.0f, 74.0f, 28.0f}, "Load")) {
+            if (m_uiContext.button(UIRect{726.0f, 17.0f, 74.0f, 28.0f}, "Load") && !playing) {
                 loadSceneFromGbq();
+            }
+
+            // Phase 31: Play/Stop segment. Play snapshots the scene
+            // and starts the runtime simulation; Stop tears the
+            // runtime down and restores the pre-play snapshot.
+            // The accent underline marks the button matching the
+            // live mode (Stop stays reachable in Play mode, when
+            // every other authoring control is inert).
+            const UIRect playRect{816.0f, 8.0f, 168.0f, 46.0f};
+            ui.drawRoundedRect(playRect.x, playRect.y, playRect.width, playRect.height,
+                               UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
+                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
+            ui.drawRect(playing ? 902.0f : 824.0f, 45.0f, 74.0f, 3.0f,
+                        playing ? glm::vec4{1.0f, 0.35f, 0.25f, 0.95f} : glm::vec4{0.35f, 1.0f, 0.55f, 0.95f});
+            if (m_uiContext.button(UIRect{824.0f, 17.0f, 74.0f, 28.0f}, "Play")) {
+                if (!playing) {
+                    enterPlayMode();
+                }
+            }
+            if (m_uiContext.button(UIRect{902.0f, 17.0f, 74.0f, 28.0f}, "Stop")) {
+                if (playing) {
+                    exitPlayMode();
+                }
             }
 
             // Phase 27 editor layout: the Component Inspector dock
@@ -673,7 +725,9 @@ void Application::run() {
                 static_cast<float>(m_window.width()) - kInspectorWidth - 8.0f;
             const entt::entity selected = m_outliner.selected();
             float inspectorBottom = 8.0f; // viewport picking occluder edge
-            if (selected != entt::null && registry.valid(selected)) {
+            // Phase 31: no inspector in Play mode — its widgets
+            // edit component memory, which the runtime owns.
+            if (!playing && selected != entt::null && registry.valid(selected)) {
                 float y = 8.0f;
                 y = inspectComponentAt<TransformComponent>(m_uiContext, registry, selected, inspectorX, y,
                                                            kInspectorWidth, inspectorOptions);
@@ -686,7 +740,7 @@ void Application::run() {
                 y = inspectComponentAt<SpotLightComponent>(m_uiContext, registry, selected, inspectorX, y,
                                                            kInspectorWidth, inspectorOptions);
                 inspectorBottom = y;
-            } else {
+            } else if (!playing) {
                 const auto tags = registry.view<TagComponent>();
                 for (const auto entity : tags) {
                     if (tags.get<TagComponent>(entity).tag != "Spacecraft" ||
@@ -718,10 +772,13 @@ void Application::run() {
             // (HUD, toolbar, inspector, outliner), with no context
             // menu open at frame start and no widget mid-drag.
             if (const CameraComponent* activeCamera = m_scene.findActiveCamera(); activeCamera != nullptr) {
-                const bool gizmoBlocked = popupOpenAtFrameStart || m_input.isMouseCaptured();
-                const GizmoUpdateResult gizmoResult = m_gizmo.update(m_uiContext, m_scene, m_outliner.selected(),
-                                                                     activeCamera->camera, viewportSize,
-                                                                     gizmoBlocked);
+                // Phase 31: `playing` blocks both the gizmo (never
+                // updated — nothing draws or drags) and picking.
+                const bool gizmoBlocked = playing || popupOpenAtFrameStart || m_input.isMouseCaptured();
+                const GizmoUpdateResult gizmoResult =
+                    playing ? GizmoUpdateResult{}
+                            : m_gizmo.update(m_uiContext, m_scene, m_outliner.selected(), activeCamera->camera,
+                                             viewportSize, gizmoBlocked);
                 const glm::vec2 mouse = m_uiContext.mousePosition();
                 const auto insideRect = [](const UIRect& rect, glm::vec2 point) {
                     return point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y &&
@@ -751,7 +808,11 @@ void Application::run() {
             // viewport), the viewport spawns dropped meshes at the
             // ground point under the cursor. Double-clicking a mesh
             // file spawns it through the screen centre.
-            const UIAssetBrowser::Result browserResult = m_assetBrowser.build(m_uiContext, assetRect);
+            // Phase 31: the asset browser spawns into the scene,
+            // so it is not built in Play mode (no drag sources, no
+            // activation; the drop targets below then stay inert).
+            const UIAssetBrowser::Result browserResult =
+                playing ? UIAssetBrowser::Result{} : m_assetBrowser.build(m_uiContext, assetRect);
             const UIDragPayload dragPayload = m_uiContext.dragPayload();
             const glm::vec2 dragMouse = m_uiContext.mousePosition();
             const auto overRect = [](const UIRect& rect, glm::vec2 point) {
@@ -853,6 +914,26 @@ void Application::handleEventImpulse() {
     body->sleeping = false;
     body->sleepTimer = 0.0f;
     ENGINE_LOG_INFO("Impulse action: launched entity #" << entt::to_integral(selected));
+}
+
+void Application::enterPlayMode() {
+    // The selection names an entity the runtime is about to own;
+    // drop it so no editor widget keeps a handle across the
+    // snapshot boundary (Stop rebuilds every handle anyway).
+    m_outliner.setSelected(entt::null);
+    if (m_playSession.enterPlay(m_scene)) {
+        // The C-key physics reset targets the pre-play state:
+        // capture spawn states against the live handles now.
+        m_physicsSystem.captureSpawnStates(m_scene);
+    }
+}
+
+void Application::exitPlayMode() {
+    if (m_playSession.exitPlay(m_scene)) {
+        // The restore rebuilt every entity: keep the selection
+        // cleared rather than pointing at a recycled handle.
+        m_outliner.setSelected(entt::null);
+    }
 }
 
 void Application::saveSceneToGbq() {

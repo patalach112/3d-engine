@@ -608,7 +608,7 @@ void addSection(std::vector<SectionData>& sections, const char* type, ByteWriter
 
 } // namespace
 
-bool Scene::saveToGbqFile(const std::string& filepath) const {
+std::vector<std::byte> Scene::saveToGbqBytes() const {
     // Gather every entity that carries anything (same reach as the
     // JSON writer), in a stable order for byte-identical re-saves.
     std::vector<entt::entity> entities;
@@ -917,17 +917,22 @@ bool Scene::saveToGbqFile(const std::string& filepath) const {
         file.bytes(sections[i].body.data.data(), sections[i].body.data.size());
     }
 
+    return file.data;
+}
+
+bool Scene::saveToGbqFile(const std::string& filepath) const {
+    const std::vector<std::byte> bytes = saveToGbqBytes();
     std::ofstream out(filepath, std::ios::binary | std::ios::trunc);
     if (!out) {
         ENGINE_LOG_WARNING("Scene GBQ: cannot open '" << filepath << "' for writing");
         return false;
     }
-    out.write(reinterpret_cast<const char*>(file.data.data()), static_cast<std::streamsize>(file.data.size()));
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!out) {
         ENGINE_LOG_WARNING("Scene GBQ: failed while writing '" << filepath << "'");
         return false;
     }
-    ENGINE_LOG_DEBUG("Scene GBQ: saved " << entities.size() << " entities to '" << filepath << "'");
+    ENGINE_LOG_DEBUG("Scene GBQ: saved " << bytes.size() << " bytes to '" << filepath << "'");
     return true;
 }
 
@@ -937,10 +942,17 @@ bool Scene::loadFromGbqFile(const std::string& filepath) {
         ENGINE_LOG_WARNING("Scene GBQ: cannot open '" << filepath << "' for reading");
         return false;
     }
-    StagedScene staged;
-    if (!parseGbq(*bytes, staged)) {
+    if (!loadFromGbqBytes(*bytes)) {
         ENGINE_LOG_WARNING("Scene GBQ: '" << filepath << "' is not a valid GBQ1 scene (scene left untouched)");
         return false;
+    }
+    return true;
+}
+
+bool Scene::loadFromGbqBytes(const std::vector<std::byte>& bytes) {
+    StagedScene staged;
+    if (!parseGbq(bytes, staged)) {
+        return false; // callers log the source; the scene is untouched
     }
 
     // Validated: clear wholesale (silently, like loadFromString)
@@ -1014,7 +1026,7 @@ bool Scene::loadFromGbqFile(const std::string& filepath) {
             setParent(Entity{handles[i], this}, Entity{handles[static_cast<size_t>(parent)], this});
         }
     }
-    ENGINE_LOG_INFO("Scene GBQ: loaded " << handles.size() << " entities from '" << filepath << "'");
+    ENGINE_LOG_INFO("Scene GBQ: loaded " << handles.size() << " entities");
     return true;
 }
 
@@ -1054,6 +1066,14 @@ bool serializeScene(const Scene& scene, const std::filesystem::path& path) {
 
 bool deserializeScene(Scene& scene, const std::filesystem::path& path) {
     return scene.loadFromGbqFile(path.string());
+}
+
+std::vector<std::byte> serializeSceneToBytes(const Scene& scene) {
+    return scene.saveToGbqBytes();
+}
+
+bool deserializeSceneFromBytes(Scene& scene, const std::vector<std::byte>& bytes) {
+    return scene.loadFromGbqBytes(bytes);
 }
 
 } // namespace engine

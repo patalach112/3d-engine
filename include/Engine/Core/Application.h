@@ -19,6 +19,7 @@
 #include "Graphics/VulkanContext.h"
 #include "Platform/Input.h"
 #include "Platform/Window.h"
+#include "Scene/PlaySession.h"
 #include "Scene/Scene.h"
 #include "Scene/TransformGizmo.h"
 #include "Scene/UIAssetBrowser.h"
@@ -74,6 +75,14 @@ private:
     // so no stale entity handle survives the rebuild.
     void saveSceneToGbq();
     void loadSceneFromGbq();
+
+    // Phase 31 play mode: enterPlayMode snapshots the scene (GBQ
+    // bytes) and starts the runtime simulation; exitPlayMode
+    // restores the snapshot wholesale. Both drop the editor
+    // selection so the inspector/gizmo never chase a stale or
+    // recycled entity handle across the transition.
+    void enterPlayMode();
+    void exitPlayMode();
     // Registers (once) a material derived from the mesh's current
     // one and points the mesh at it. Returns the material name.
     std::string deriveMaterial(MeshComponent& mesh, const std::string& derivedName,
@@ -95,6 +104,7 @@ private:
     UIOutliner m_outliner; // Phase 27 entity hierarchy panel
     TransformGizmo m_gizmo; // Phase 28 viewport transform gizmo
     UIAssetBrowser m_assetBrowser; // Phase 29 asset browser panel
+    PlaySession m_playSession; // Phase 31 Edit/Play state + scene snapshot
     GameLoop m_gameLoop;
     JobSystem m_jobSystem;
     VramBudget m_vramBudget;
