@@ -2115,3 +2115,65 @@ Inspector around the 3D viewport.
   0 failed** in Debug, Release (shared and static),
   hidden-visibility (Windows-symbol simulation) and ASan
   builds, warning-free, CTest 1/1.
+
+## Phase 28 — 3D Raycasting & Transform Gizmos ✅
+
+The editor becomes spatial: clicking in the viewport selects
+entities through the active camera, and the selection grows
+procedural 3D gizmos — translation arrows, rotation rings, scale
+handles — that edit the entity's `TransformComponent` live under
+the mouse.
+
+- **Screen-to-world raycasting**: the picking chain is
+  `pickEntityAt` (`Scene/Raycast`) — viewport pixel →
+  `screenToNdc` → `cameraRay` (unprojection through the active
+  camera's view/projection, distances measured from the eye) →
+  `Scene::raycast`, which walks the BVH broadphase and tests
+  box/OBB colliders exactly in local space with mesh-bounds
+  fallback. The nearest hit wins; a transform-only entity is
+  transparent to the ray. This also retires the orphaned Phase 13
+  picking stub: selection is now the single editor selection
+  (outliner + inspector + gizmo all read it), and the Phase 17
+  "Impulse" action (F) applies to whatever the editor has
+  selected.
+- **TransformGizmo** (`Scene/TransformGizmo`, EngineScene):
+  immediate-mode interaction over `UIContext`. Handles are
+  picked in screen space (cursor distance to the projected
+  handle geometry, 12 px threshold, deterministic axis
+  priority), drags are exact 3D constructions — the closest
+  point between the mouse ray and the axis line for
+  translate/scale, ray vs ring-plane angles for rotate. Axis
+  constraint is absolute: a translate freezes the other two
+  position components bit-for-bit, a rotate touches one Euler
+  angle (and re-syncs the orientation quaternion so
+  `modelMatrix` honors it), a scale clamps into
+  [0.01, 100] so a drag can never invert an entity. Drags lock
+  their target at press time; switching tools (toolbar or keys
+  1/2/3), opening a menu, capturing the mouse, or deleting the
+  target mid-drag all cancel cleanly.
+- **Reflection-instant edits**: drag results are written
+  straight into `TransformComponent` — the exact fields the
+  reflection-driven Inspector re-reads every frame — so the
+  dock, the gizmo and the rendered entity move as one.
+- **Procedural rendering**: true 3D handle geometry (axis
+  segments, 64-sample rings, length proportional to camera
+  distance) projected through the same view-projection and
+  emitted as dotted SDF lines/tip glyphs into the UI overlay
+  batch, so the gizmo always renders on top of the scene.
+- **Editor glue** (`Application`): the gizmo updates after the
+  outliner (context menu still paints last-but-one over docks);
+  viewport picking fires only for presses the UI left
+  unconsumed — outside the HUD, toolbar, inspector and
+  outliner rects, with no menu open at frame start and no
+  widget mid-drag — and clicking empty space deselects.
+- **Verification**: `testPhase28Gizmos()` adds 40 checks —
+  NDC mapping corners, ray/AABB slab cases (front hit, miss,
+  behind, inside origin), projection analytics + a
+  project→pick round-trip, axis-parameter math (incl. the
+  parallel fallback), nearest-hit picking through occluders,
+  and full drag state machines per tool (hover, grab,
+  consume, axis-frozen deltas, reflection read-back, scale
+  clamping, blocked input, mid-drag tool switch and target
+  deletion, inert targets). **937 passed, 0 failed** in
+  Debug, Release (shared and static), hidden-visibility and
+  ASan builds, warning-free, CTest 1/1.

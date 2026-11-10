@@ -23,6 +23,15 @@ Ray cameraRay(const Camera& camera, glm::vec2 ndc, float aspectRatio) {
     return ray;
 }
 
+bool pickEntityAt(const Scene& scene, const Camera& camera, glm::vec2 mousePixels, glm::vec2 viewportSize,
+                  RaycastHit& outHit) {
+    if (viewportSize.x <= 0.0f || viewportSize.y <= 0.0f) {
+        return false;
+    }
+    const float aspectRatio = viewportSize.x / viewportSize.y;
+    return scene.raycast(cameraRay(camera, screenToNdc(mousePixels, viewportSize), aspectRatio), outHit);
+}
+
 namespace {
 
 // One entity's nearest intersection along the ray, in world space.

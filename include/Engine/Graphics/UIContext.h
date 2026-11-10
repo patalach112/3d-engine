@@ -146,6 +146,9 @@ public:
     [[nodiscard]] bool pressedRect(const UIRect& rect);
     [[nodiscard]] bool rightPressedRect(const UIRect& rect);
     [[nodiscard]] glm::vec2 mousePosition() const { return {m_input.mouseX, m_input.mouseY}; }
+    // Raw left-button state for drag-style tools (Phase 28 gizmos)
+    // that track their own capture instead of the widget active id.
+    [[nodiscard]] bool mouseDown() const { return m_input.mouseDown; }
     [[nodiscard]] float scrollDelta() const { return m_input.scrollY; }
 
     [[nodiscard]] UIWidgetId hoveredId() const { return m_hovered; }

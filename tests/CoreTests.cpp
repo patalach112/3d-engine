@@ -20,6 +20,8 @@
 #include "Scene/DynamicAABBTree.h"
 #include "Scene/Scene.h"
 #include "Scene/UIOutliner.h"
+#include "Scene/Raycast.h"
+#include "Scene/TransformGizmo.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/TransformSystem.h"
@@ -7578,6 +7580,307 @@ void testPhase27Editor() {
     }
 }
 
+void testPhase28Gizmos() {
+    std::cout << "Phase 28: raycast picking & transform gizmos\n";
+    struct GizmoRig {
+        engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+        engine::UIBatch batch;
+        engine::UIContext ctx;
+        GizmoRig() { batch.setFontAtlas(&atlas); }
+        void frame(float mouseX, float mouseY, bool down) {
+            batch.begin(800, 600);
+            engine::UIInput input;
+            input.mouseX = mouseX;
+            input.mouseY = mouseY;
+            input.mouseDown = down;
+            ctx.beginFrame(input, batch);
+        }
+        void end() { ctx.endFrame(); }
+    };
+    const glm::vec2 viewport{800.0f, 600.0f};
+
+    // Axis-aligned test camera: eye (0,0,5) looking down -Z.
+    engine::CameraConfig camConfig;
+    camConfig.startPosition = glm::vec3{0.0f, 0.0f, 5.0f};
+    const engine::Camera camera{camConfig};
+
+    // --- (a) Screen -> NDC -> world ray mapping --------------------------------
+    check(engine::screenToNdc(glm::vec2{400.0f, 300.0f}, viewport) == glm::vec2{0.0f, 0.0f} &&
+              engine::screenToNdc(glm::vec2{0.0f, 0.0f}, viewport) == glm::vec2{-1.0f, -1.0f},
+          "gizmo: viewport centre/corner map to NDC origin/top-left");
+    const engine::Ray centreRay = engine::cameraRay(camera, glm::vec2{0.0f, 0.0f}, 800.0f / 600.0f);
+    check(nearlyVec3(centreRay.origin, glm::vec3{0.0f, 0.0f, 5.0f}) &&
+              nearlyVec3(centreRay.direction, glm::vec3{0.0f, 0.0f, -1.0f}),
+          "gizmo: centre ray leaves the eye along -Z");
+    const engine::Ray cornerRay = engine::cameraRay(camera, engine::screenToNdc(glm::vec2{799.0f, 0.0f}, viewport),
+                                                    800.0f / 600.0f);
+    check(cornerRay.direction.x > 0.4f && cornerRay.direction.y > 0.3f && cornerRay.direction.z < -0.7f,
+          "gizmo: top-right pixel ray leans right/up/forward (Vulkan y-down NDC)");
+
+    // --- (b) Ray vs AABB slab test ------------------------------------------------
+    {
+        float distance = -1.0f;
+        glm::vec3 normal{0.0f};
+        const engine::AABB box{glm::vec3{-0.5f}, glm::vec3{0.5f}};
+        check(engine::rayIntersectsAABB(centreRay, box, distance, normal) && nearlyEqual(distance, 4.5f, 1e-4) &&
+                  nearlyVec3(normal, glm::vec3{0.0f, 0.0f, 1.0f}),
+              "gizmo: ray enters the box front face at 4.5 with a +Z normal");
+        const engine::Ray missRay{glm::vec3{0.0f, 3.0f, 5.0f}, glm::vec3{0.0f, 0.0f, -1.0f}};
+        check(!engine::rayIntersectsAABB(missRay, box, distance, normal), "gizmo: an offset ray misses cleanly");
+        const engine::Ray awayRay{glm::vec3{0.0f, 0.0f, 5.0f}, glm::vec3{0.0f, 0.0f, 1.0f}};
+        check(!engine::rayIntersectsAABB(awayRay, box, distance, normal), "gizmo: a box behind the ray is no hit");
+        const engine::Ray insideRay{glm::vec3{0.0f}, glm::vec3{0.0f, 0.0f, -1.0f}};
+        check(engine::rayIntersectsAABB(insideRay, box, distance, normal) && distance == 0.0f &&
+                  nearlyVec3(normal, glm::vec3{0.0f, 0.0f, 1.0f}),
+              "gizmo: an inside origin hits at 0 facing the ray");
+    }
+
+    // --- (c) World -> screen projection (screenToNdc inverse) -----------------------
+    {
+        const glm::mat4 viewProjection = camera.projectionMatrix(800.0f / 600.0f) * camera.viewMatrix();
+        glm::vec2 pixels{0.0f};
+        check(engine::TransformGizmo::projectToScreen(glm::vec3{0.0f}, viewProjection, viewport, pixels) &&
+                  nearlyEqual(pixels.x, 400.0f, 0.5f) && nearlyEqual(pixels.y, 300.0f, 0.5f),
+              "gizmo: the world origin projects to the viewport centre");
+        check(engine::TransformGizmo::projectToScreen(glm::vec3{1.4f, 0.0f, 0.0f}, viewProjection, viewport, pixels) &&
+                  nearlyEqual(pixels.x, 602.8f, 3.0f) && nearlyEqual(pixels.y, 300.0f, 0.5f),
+              "gizmo: +X projects right at the analytic pixel");
+        check(engine::TransformGizmo::projectToScreen(glm::vec3{0.0f, 1.4f, 0.0f}, viewProjection, viewport, pixels) &&
+                  nearlyEqual(pixels.x, 400.0f, 0.5f) && nearlyEqual(pixels.y, 97.2f, 3.0f),
+              "gizmo: +Y projects up-screen (engine y-down pixels)");
+        check(!engine::TransformGizmo::projectToScreen(glm::vec3{0.0f, 0.0f, 10.0f}, viewProjection, viewport, pixels),
+              "gizmo: points behind the camera do not project");
+        // Round-trip: the picking ray through the projected pixel must
+        // pass through the original world point.
+        const glm::vec3 world{0.3f, -0.2f, -1.0f};
+        (void)engine::TransformGizmo::projectToScreen(world, viewProjection, viewport, pixels);
+        const engine::Ray roundTrip = engine::cameraRay(camera, engine::screenToNdc(pixels, viewport), 800.0f / 600.0f);
+        const float offRay = glm::length(glm::cross(world - roundTrip.origin, roundTrip.direction));
+        check(offRay < 1e-3f, "gizmo: project -> pick ray round-trips through the same point");
+    }
+
+    // --- (d) Axis-line parameter (closest point between ray and line) ---------------
+    {
+        using engine::TransformGizmo;
+        const engine::Ray down{glm::vec3{2.0f, 1.0f, 5.0f}, glm::vec3{0.0f, 0.0f, -1.0f}};
+        check(nearlyEqual(TransformGizmo::rayAxisParameter(down, glm::vec3{0.0f}, glm::vec3{1.0f, 0.0f, 0.0f}), 2.0f,
+                          1e-4f),
+              "gizmo: closest point on the X axis sits below the offset ray");
+        const engine::Ray parallel{glm::vec3{0.0f, 3.0f, 5.0f}, glm::vec3{1.0f, 0.0f, 0.0f}};
+        check(nearlyEqual(TransformGizmo::rayAxisParameter(parallel, glm::vec3{0.0f}, glm::vec3{1.0f, 0.0f, 0.0f}),
+                          0.0f, 1e-4f),
+              "gizmo: a parallel ray falls back to the projected origin parameter");
+        check(TransformGizmo::handleLength(5.0f) == 1.4f && TransformGizmo::handleLength(0.0f) == 0.4f &&
+                  TransformGizmo::handleLength(1000.0f) == 20.0f,
+              "gizmo: handle length is distance-proportional and clamped");
+    }
+
+    // --- (e) Viewport picking ---------------------------------------------------------
+    {
+        engine::Scene scene;
+        auto far = scene.createEntity("Far");
+        far.addComponent<engine::TransformComponent>(glm::vec3{1.2f, 0.0f, -4.0f});
+        far.addComponent<engine::ColliderComponent>(engine::ColliderComponent::box(glm::vec3{0.5f}));
+        auto nearCube = scene.createEntity("Near");
+        nearCube.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+        nearCube.addComponent<engine::ColliderComponent>(engine::ColliderComponent::box(glm::vec3{0.5f}));
+        auto ghost = scene.createEntity("Ghost"); // transform only: nothing to hit
+        ghost.addComponent<engine::TransformComponent>(glm::vec3{0.0f, 0.0f, -2.0f});
+
+        engine::RaycastHit hit;
+        check(engine::pickEntityAt(scene, camera, glm::vec2{400.0f, 300.0f}, viewport, hit) &&
+                  hit.entity == nearCube.handle() && nearlyEqual(hit.distance, 4.5f, 1e-3f) &&
+                  nearlyVec3(hit.normal, glm::vec3{0.0f, 0.0f, 1.0f}),
+              "picking: the centre pixel selects the nearest collider entity");
+        check(!engine::pickEntityAt(scene, camera, glm::vec2{60.0f, 60.0f}, viewport, hit),
+              "picking: an empty pixel selects nothing");
+        check(!engine::pickEntityAt(scene, camera, glm::vec2{400.0f, 300.0f}, glm::vec2{0.0f, 600.0f}, hit),
+              "picking: a degenerate viewport is rejected");
+        // Aiming right of Near reaches the laterally offset Far:
+        // pixel x 509 crosses the z=0 plane at x = 0.75 (outside
+        // Near's [-0.5, 0.5]) and Far's face at x = 1.275.
+        check(engine::pickEntityAt(scene, camera, glm::vec2{509.0f, 300.0f}, viewport, hit) &&
+                  hit.entity == far.handle(),
+              "picking: a ray past the front cube reaches the one behind");
+    }
+
+    // --- (f) Translate drag state machine ---------------------------------------------
+    {
+        GizmoRig rig;
+        engine::Scene scene;
+        engine::TransformGizmo gizmo;
+        auto cube = scene.createEntity("Cube");
+        cube.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+        cube.addComponent<engine::ColliderComponent>(engine::ColliderComponent::box(glm::vec3{0.5f}));
+        const entt::entity cubeHandle = cube.handle();
+        auto& registry = scene.registry();
+        auto update = [&](float x, float y, bool down, bool blocked = false) {
+            rig.frame(x, y, down);
+            const engine::GizmoUpdateResult result =
+                gizmo.update(rig.ctx, scene, cubeHandle, camera, viewport, blocked);
+            rig.end();
+            return result;
+        };
+
+        // Idle hover over empty space: nothing lights up.
+        engine::GizmoUpdateResult result = update(100.0f, 100.0f, false);
+        check(result.hoveredAxis == engine::GizmoAxis::None && !result.dragging && !result.pressConsumed,
+              "gizmo: empty viewport space hovers no axis");
+        // Hover the X handle midpoint (projected (0.7,0,0) ~= (501,300)).
+        result = update(501.0f, 300.0f, false);
+        check(result.hoveredAxis == engine::GizmoAxis::X && gizmo.hoveredAxis() == engine::GizmoAxis::X,
+              "gizmo: the X arrow lights up under the cursor");
+        // Press grabs the axis, the press counts as consumed (no re-pick).
+        result = update(501.0f, 300.0f, true);
+        check(result.pressConsumed && result.dragging && gizmo.activeAxis() == engine::GizmoAxis::X &&
+                  gizmo.dragTarget() == cubeHandle,
+              "gizmo: pressing a handle starts an axis-locked drag");
+        // Drag +100 px: world x follows the analytic delta, y/z frozen.
+        result = update(601.0f, 300.0f, true);
+        const glm::vec3 afterDrag = registry.get<engine::TransformComponent>(cubeHandle).position;
+        check(result.changed && nearlyEqual(afterDrag.x, 0.69f, 0.04f) && afterDrag.y == 0.0f && afterDrag.z == 0.0f,
+              "gizmo: translate drag moves exactly along X (axis constraint)");
+        // The reflection layer sees the very same write immediately.
+        const engine::TypeInfo& transformType = engine::reflect<engine::TransformComponent>();
+        const engine::PropertyInfo* positionProperty = nullptr;
+        for (const engine::PropertyInfo& property : transformType.properties) {
+            if (property.name == "position") {
+                positionProperty = &property;
+            }
+        }
+        const glm::vec3 reflected =
+            positionProperty != nullptr
+                ? engine::readProperty<glm::vec3>(&registry.get<engine::TransformComponent>(cubeHandle),
+                                                  *positionProperty)
+                : glm::vec3{-999.0f};
+        check(positionProperty != nullptr && nearlyVec3(reflected, afterDrag),
+              "gizmo: reflection reads the dragged position back unchanged");
+        // Dragging past the screen edge keeps following; release ends it.
+        result = update(790.0f, 300.0f, true);
+        check(result.dragging && registry.get<engine::TransformComponent>(cubeHandle).position.x > 1.8f,
+              "gizmo: the drag keeps tracking near the viewport edge");
+        result = update(790.0f, 300.0f, false);
+        check(!result.dragging && !gizmo.dragging(), "gizmo: releasing ends the drag");
+        // A fresh press in open space starts nothing.
+        result = update(150.0f, 520.0f, true);
+        check(!result.pressConsumed && !gizmo.dragging(), "gizmo: pressing open space never grabs an axis");
+        // Blocked input (popup/capture) cannot start a drag.
+        update(501.0f, 300.0f, false);
+        result = update(501.0f, 300.0f, true, true);
+        check(!result.pressConsumed && !gizmo.dragging(), "gizmo: blocked input starts no drag");
+        // Switching tools mid-drag cancels without snapping back.
+        update(501.0f, 300.0f, false); // release, so the next press has an edge
+        update(501.0f, 300.0f, true);
+        const float xBeforeSwitch = registry.get<engine::TransformComponent>(cubeHandle).position.x;
+        gizmo.setMode(engine::GizmoMode::Rotate);
+        result = update(601.0f, 300.0f, true);
+        check(!result.dragging && gizmo.mode() == engine::GizmoMode::Rotate &&
+                  registry.get<engine::TransformComponent>(cubeHandle).position.x == xBeforeSwitch,
+              "gizmo: switching tools cancels the drag cleanly");
+    }
+
+    // --- (g) Rotate drag about Y (diagonal camera keeps the ring plane usable) --------
+    {
+        GizmoRig rig;
+        engine::Scene scene;
+        engine::TransformGizmo gizmo;
+        gizmo.setMode(engine::GizmoMode::Rotate);
+        engine::CameraConfig tiltedConfig;
+        tiltedConfig.startPosition = glm::vec3{0.0f, 2.5f, 5.0f};
+        tiltedConfig.startPitchDegrees = -26.565f; // look straight at the origin
+        const engine::Camera tilted{tiltedConfig};
+        auto dial = scene.createEntity("Dial");
+        dial.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+        const entt::entity dialHandle = dial.handle();
+        auto& registry = scene.registry();
+        auto update = [&](float x, float y, bool down) {
+            rig.frame(x, y, down);
+            const engine::GizmoUpdateResult result = gizmo.update(rig.ctx, scene, dialHandle, tilted, viewport);
+            rig.end();
+            return result;
+        };
+        const glm::mat4 viewProjection = tilted.projectionMatrix(800.0f / 600.0f) * tilted.viewMatrix();
+        const float len = engine::TransformGizmo::handleLength(glm::distance(tilted.position(), glm::vec3{0.0f}));
+        // Ring points at +/-45 degrees in the XZ plane (chosen off
+        // the axis crossings, where two rings would share a point).
+        const float s = len * 0.70710678f;
+        glm::vec2 pointA{0.0f};
+        glm::vec2 pointB{0.0f};
+        (void)engine::TransformGizmo::projectToScreen(glm::vec3{s, 0.0f, s}, viewProjection, viewport, pointA);
+        (void)engine::TransformGizmo::projectToScreen(glm::vec3{-s, 0.0f, s}, viewProjection, viewport, pointB);
+        engine::GizmoUpdateResult result = update(pointA.x, pointA.y, false);
+        check(result.hoveredAxis == engine::GizmoAxis::Y, "gizmo: the Y ring lights up under the cursor");
+        result = update(pointA.x, pointA.y, true);
+        check(result.pressConsumed && gizmo.activeAxis() == engine::GizmoAxis::Y,
+              "gizmo: pressing the ring starts a rotation drag");
+        result = update(pointB.x, pointB.y, true);
+        const engine::TransformComponent& dialTransform = registry.get<engine::TransformComponent>(dialHandle);
+        check(result.changed && nearlyEqual(dialTransform.rotationDegrees.y, -90.0f, 2.0f) &&
+                  dialTransform.rotationDegrees.x == 0.0f && dialTransform.rotationDegrees.z == 0.0f,
+              "gizmo: rotating between ring points turns exactly -90 about Y");
+        check(dialTransform.useQuaternionOrientation &&
+                  nearlyEqual(glm::degrees(glm::eulerAngles(dialTransform.orientation)).y, -90.0f, 2.0f),
+              "gizmo: the orientation quaternion is synced with the Euler edit");
+        update(pointB.x, pointB.y, false);
+    }
+
+    // --- (h) Scale drag with clamping ---------------------------------------------------
+    {
+        GizmoRig rig;
+        engine::Scene scene;
+        engine::TransformGizmo gizmo;
+        gizmo.setMode(engine::GizmoMode::Scale);
+        auto block = scene.createEntity("Block");
+        block.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+        const entt::entity blockHandle = block.handle();
+        auto& registry = scene.registry();
+        auto update = [&](float x, float y, bool down) {
+            rig.frame(x, y, down);
+            const engine::GizmoUpdateResult result = gizmo.update(rig.ctx, scene, blockHandle, camera, viewport);
+            rig.end();
+            return result;
+        };
+        engine::GizmoUpdateResult result = update(501.0f, 300.0f, true);
+        check(result.pressConsumed && gizmo.activeAxis() == engine::GizmoAxis::X,
+              "gizmo: the scale handle grabs like an arrow");
+        result = update(601.0f, 300.0f, true);
+        glm::vec3 scale = registry.get<engine::TransformComponent>(blockHandle).scale;
+        check(nearlyEqual(scale.x, 1.69f, 0.05f) && scale.y == 1.0f && scale.z == 1.0f,
+              "gizmo: scale drag grows exactly one axis");
+        result = update(20.0f, 300.0f, true);
+        scale = registry.get<engine::TransformComponent>(blockHandle).scale;
+        check(scale.x == engine::TransformGizmo::kMinScale && scale.y == 1.0f,
+              "gizmo: dragging through zero clamps at the minimum scale (never inverts)");
+        update(20.0f, 300.0f, false);
+        // Deleting the target mid-drag cancels safely.
+        update(501.0f, 300.0f, true);
+        check(gizmo.dragging(), "gizmo: second drag running before the delete");
+        scene.destroyEntity(block);
+        result = update(601.0f, 300.0f, true);
+        check(!result.dragging && !gizmo.dragging(), "gizmo: deleting the target mid-drag cancels safely");
+    }
+
+    // --- (i) Inert targets ----------------------------------------------------------------
+    {
+        GizmoRig rig;
+        engine::Scene scene;
+        engine::TransformGizmo gizmo;
+        auto bare = scene.createEntity("Bare"); // tag only, no transform
+        auto update = [&](entt::entity target, float x, float y, bool down) {
+            rig.frame(x, y, down);
+            const engine::GizmoUpdateResult result = gizmo.update(rig.ctx, scene, target, camera, viewport);
+            rig.end();
+            return result;
+        };
+        engine::GizmoUpdateResult result = update(entt::null, 400.0f, 300.0f, true);
+        check(!result.dragging && result.hoveredAxis == engine::GizmoAxis::None,
+              "gizmo: no selection means no gizmo");
+        result = update(bare.handle(), 400.0f, 300.0f, true);
+        check(!result.dragging && result.hoveredAxis == engine::GizmoAxis::None,
+              "gizmo: an entity without a Transform gets no gizmo");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -7606,6 +7909,7 @@ int main() {
     testPhase26UIRenderer();
     testPhase26Widgets();
     testPhase27Editor();
+    testPhase28Gizmos();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

@@ -11,6 +11,8 @@
 
 namespace engine {
 
+class Scene;
+
 // ---------------------------------------------------------------------------
 // RaycastHit
 //
@@ -34,5 +36,14 @@ struct RaycastHit {
 // exactly through the specified pixel, so hit distances are measured
 // from the eye.
 [[nodiscard]] ENGINE_SCENE_API Ray cameraRay(const Camera& camera, glm::vec2 ndc, float aspectRatio);
+
+// Editor mouse picking (Phase 28): converts a viewport pixel
+// position (window coordinates, origin top-left) into a camera ray
+// and returns the closest raycastable entity (box/OBB colliders in
+// local space, mesh bounds otherwise — see Scene::raycast). False
+// when nothing is hit or the viewport is degenerate; outHit is
+// untouched in that case.
+[[nodiscard]] ENGINE_SCENE_API bool pickEntityAt(const Scene& scene, const Camera& camera, glm::vec2 mousePixels,
+                                                 glm::vec2 viewportSize, RaycastHit& outHit);
 
 } // namespace engine

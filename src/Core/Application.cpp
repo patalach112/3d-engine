@@ -10,6 +10,7 @@
 #include "Graphics/HudFont.h"
 #include "Graphics/UIInspector.h"
 #include "Scene/ComponentReflection.h"
+#include "Scene/Raycast.h"
 #include "Geometry/Cube.h"
 #include "Scene/Components.h"
 #include "Scene/Systems/CameraSystem.h"
@@ -216,13 +217,6 @@ void Application::registerAssets() {
     doubleSidedMaterial.pipeline.cullMode = CullMode::None;
     registerSandboxMaterial(doubleSidedMaterial);
 
-    // Mouse-picking highlight: a hot orange the sandbox palette never
-    // uses, so the selected entity is unmistakable. Applied by swapping
-    // a MeshComponent's materialName (see handleMousePicking).
-    MaterialDesc highlightMaterial = makeSandboxCubeMaterial();
-    highlightMaterial.name = "pickedHighlight";
-    highlightMaterial.baseColor = glm::vec4{1.0f, 0.45f, 0.05f, 1.0f};
-    registerSandboxMaterial(highlightMaterial);
     ENGINE_LOG_INFO("Assets registered: " << m_assets.meshCount() << " mesh(es), " << m_assets.materialCount()
                                           << " material(s), VRAM reserved " << m_assets.reservedVramBytes()
                                           << " bytes, " << m_pipeline.cachedPipelineCount()
@@ -594,6 +588,18 @@ void Application::run() {
                 uiInput.scrollY = m_input.scrollDelta().y;
             }
             m_uiContext.beginFrame(uiInput, ui);
+            // A menu open at frame start owns this frame's clicks:
+            // neither picking nor gizmo drags may start from them.
+            const bool popupOpenAtFrameStart = m_uiContext.popupOpen();
+
+            // Phase 28 gizmo tool switching (also on the toolbar below).
+            if (m_input.wasKeyPressed(Key::Num1)) {
+                m_gizmo.setMode(GizmoMode::Translate);
+            } else if (m_input.wasKeyPressed(Key::Num2)) {
+                m_gizmo.setMode(GizmoMode::Rotate);
+            } else if (m_input.wasKeyPressed(Key::Num3)) {
+                m_gizmo.setMode(GizmoMode::Scale);
+            }
 
             ui.drawRoundedRect(6.0f, 6.0f, 372.0f, 118.0f,
                                UIRectStyle{10.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.16f}},
@@ -604,6 +610,25 @@ void Application::run() {
             const float hintY = static_cast<float>(std::max(m_window.height() - 34, 0));
             ui.drawText("WASD + MOUSE FLY - SPACE/CTRL RISE/SINK - Q/E ROLL", 12.0f, hintY, 1.5f,
                         glm::vec4{0.75f, 0.85f, 1.0f, 0.85f});
+
+            // Phase 28 tool toolbar: gizmo mode switch (keys 1/2/3),
+            // its accent underline marking the active tool.
+            const UIRect toolbarRect{386.0f, 8.0f, 246.0f, 46.0f};
+            ui.drawRoundedRect(toolbarRect.x, toolbarRect.y, toolbarRect.width, toolbarRect.height,
+                               UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
+                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
+            const float kToolX[3] = {394.0f, 472.0f, 550.0f};
+            const int activeTool = m_gizmo.mode() == GizmoMode::Translate ? 0 : m_gizmo.mode() == GizmoMode::Rotate ? 1 : 2;
+            ui.drawRect(kToolX[activeTool], 45.0f, 74.0f, 3.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.95f});
+            if (m_uiContext.button(UIRect{kToolX[0], 17.0f, 74.0f, 28.0f}, "Move")) {
+                m_gizmo.setMode(GizmoMode::Translate);
+            }
+            if (m_uiContext.button(UIRect{kToolX[1], 17.0f, 74.0f, 28.0f}, "Rotate")) {
+                m_gizmo.setMode(GizmoMode::Rotate);
+            }
+            if (m_uiContext.button(UIRect{kToolX[2], 17.0f, 74.0f, 28.0f}, "Scale")) {
+                m_gizmo.setMode(GizmoMode::Scale);
+            }
 
             // Phase 27 editor layout: the Component Inspector dock
             // (top-right) reflects the Outliner's selection over
@@ -622,6 +647,7 @@ void Application::run() {
             const float inspectorX =
                 static_cast<float>(m_window.width()) - kInspectorWidth - 8.0f;
             const entt::entity selected = m_outliner.selected();
+            float inspectorBottom = 8.0f; // viewport picking occluder edge
             if (selected != entt::null && registry.valid(selected)) {
                 float y = 8.0f;
                 y = inspectComponentAt<TransformComponent>(m_uiContext, registry, selected, inspectorX, y,
@@ -634,6 +660,7 @@ void Application::run() {
                                                             kInspectorWidth, inspectorOptions);
                 y = inspectComponentAt<SpotLightComponent>(m_uiContext, registry, selected, inspectorX, y,
                                                            kInspectorWidth, inspectorOptions);
+                inspectorBottom = y;
             } else {
                 const auto tags = registry.view<TagComponent>();
                 for (const auto entity : tags) {
@@ -644,12 +671,49 @@ void Application::run() {
                     auto& body = registry.get<RigidBodyComponent>(entity);
                     inspectComponent(m_uiContext, UIRect{inspectorX, 8.0f, kInspectorWidth, 252.0f},
                                      reflect<RigidBodyComponent>(), &body, inspectorOptions);
+                    inspectorBottom = 260.0f;
                     break;
                 }
             }
             const float outlinerHeight =
                 std::max(static_cast<float>(m_window.height()) - 148.0f, 120.0f);
-            m_outliner.build(m_uiContext, UIRect{6.0f, 140.0f, 300.0f, outlinerHeight}, m_scene);
+            const UIRect outlinerRect{6.0f, 140.0f, 300.0f, outlinerHeight};
+            m_outliner.build(m_uiContext, outlinerRect, m_scene);
+
+            // Phase 28: transform gizmo over the selection, then
+            // viewport picking. The gizmo runs first so a press that
+            // grabs a handle never re-picks; picking then fires only
+            // for presses the UI left unconsumed, outside every dock
+            // (HUD, toolbar, inspector, outliner), with no context
+            // menu open at frame start and no widget mid-drag.
+            const glm::vec2 viewportSize{static_cast<float>(m_window.width()),
+                                         static_cast<float>(m_window.height())};
+            if (const CameraComponent* activeCamera = m_scene.findActiveCamera(); activeCamera != nullptr) {
+                const bool gizmoBlocked = popupOpenAtFrameStart || m_input.isMouseCaptured();
+                const GizmoUpdateResult gizmoResult = m_gizmo.update(m_uiContext, m_scene, m_outliner.selected(),
+                                                                     activeCamera->camera, viewportSize,
+                                                                     gizmoBlocked);
+                const glm::vec2 mouse = m_uiContext.mousePosition();
+                const auto insideRect = [](const UIRect& rect, glm::vec2 point) {
+                    return point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y &&
+                           point.y < rect.y + rect.height;
+                };
+                const UIRect inspectorOccluder{inspectorX, 0.0f, std::max(0.0f, viewportSize.x - inspectorX),
+                                               inspectorBottom};
+                if (!gizmoResult.pressConsumed && !gizmoBlocked && m_uiContext.activeId() == kUINoWidget &&
+                    m_uiContext.pressedRect(UIRect{0.0f, 0.0f, viewportSize.x, viewportSize.y}) &&
+                    !insideRect(UIRect{6.0f, 6.0f, 372.0f, 124.0f}, mouse) && !insideRect(toolbarRect, mouse) &&
+                    !insideRect(outlinerRect, mouse) && !insideRect(inspectorOccluder, mouse)) {
+                    RaycastHit hit;
+                    if (pickEntityAt(m_scene, activeCamera->camera, mouse, viewportSize, hit)) {
+                        m_outliner.setSelected(hit.entity);
+                        ENGINE_LOG_DEBUG("Editor pick: entity #" << entt::to_integral(hit.entity) << " at "
+                                                                 << hit.distance << " m");
+                    } else {
+                        m_outliner.setSelected(entt::null); // empty-space click deselects
+                    }
+                }
+            }
             m_uiContext.endFrame();
         }
         return m_renderSystem.render(m_scene);
@@ -680,73 +744,22 @@ void Application::handleMouseCapture() {
     }
 }
 
-void Application::handleMousePicking() {
-    // Edge trigger: a held button must not re-pick every frame.
-    if (!m_input.wasMouseButtonPressed(MouseButton::Left)) {
-        return;
-    }
-    CameraComponent* activeCamera = m_scene.findActiveCamera();
-    if (activeCamera == nullptr) {
-        return;
-    }
-    const float aspectRatio =
-        m_window.height() > 0 ? static_cast<float>(m_window.width()) / static_cast<float>(m_window.height()) : 1.0f;
-    // With the cursor captured there is no visible pointer position:
-    // pick through the screen centre (the crosshair). Otherwise pick
-    // through the actual cursor position.
-    const glm::vec2 ndc =
-        m_input.isMouseCaptured()
-            ? glm::vec2{0.0f, 0.0f}
-            : screenToNdc(m_input.mousePosition(),
-                          glm::vec2{static_cast<float>(m_window.width()), static_cast<float>(m_window.height())});
-    const Ray ray = cameraRay(activeCamera->camera, ndc, aspectRatio);
-
-    auto& registry = m_scene.registry();
-    // Restore the previously selected entity's material before choosing
-    // a new one, so at most one object ever wears the highlight.
-    if (m_selectedEntity != entt::null && registry.valid(m_selectedEntity)) {
-        if (MeshComponent* mesh = registry.try_get<MeshComponent>(m_selectedEntity);
-            mesh != nullptr && mesh->materialName == "pickedHighlight") {
-            mesh->materialName = m_selectedMaterialName;
-        }
-    }
-    m_selectedEntity = entt::null;
-    m_selectedMaterialName.clear();
-
-    RaycastHit hit;
-    const Scene::MeshResolver resolveMesh = [this](std::string_view assetId) { return m_assets.mesh(assetId); };
-    if (!m_scene.raycastPrecise(ray, hit, resolveMesh)) {
-        ENGINE_LOG_DEBUG("Mouse pick: nothing under the cursor");
-        return;
-    }
-    m_selectedEntity = hit.entity;
-    std::string pickedName = "entity";
-    if (const TagComponent* tag = registry.try_get<TagComponent>(hit.entity); tag != nullptr) {
-        pickedName = tag->tag;
-    }
-    if (MeshComponent* mesh = registry.try_get<MeshComponent>(hit.entity); mesh != nullptr) {
-        m_selectedMaterialName = mesh->materialName;
-        mesh->materialName = "pickedHighlight";
-    }
-    ENGINE_LOG_INFO("Mouse pick: selected '" << pickedName << "' (#" << entt::to_integral(hit.entity)
-                                             << ") at distance " << hit.distance << " m, position ("
-                                             << hit.position.x << ", " << hit.position.y << ", " << hit.position.z
-                                             << "), normal (" << hit.normal.x << ", " << hit.normal.y << ", "
-                                             << hit.normal.z << ")");
-}
 
 void Application::handleEventImpulse() {
     // Input action -> gameplay effect, end to end through the Phase 17
     // stack: the "Impulse" action (bound to F in the ctor) pops the
-    // Phase 13 picked body up and away from the camera.
-    if (!m_input.wasActionPressed("Impulse") || m_selectedEntity == entt::null) {
+    // editor-selected body up and away from the camera. Selection is
+    // the unified editor selection (Phase 27/28: outliner clicks and
+    // viewport picking both feed it).
+    const entt::entity selected = m_outliner.selected();
+    if (!m_input.wasActionPressed("Impulse") || selected == entt::null) {
         return;
     }
     auto& registry = m_scene.registry();
-    if (!registry.valid(m_selectedEntity)) {
+    if (!registry.valid(selected)) {
         return;
     }
-    RigidBodyComponent* body = registry.try_get<RigidBodyComponent>(m_selectedEntity);
+    RigidBodyComponent* body = registry.try_get<RigidBodyComponent>(selected);
     if (body == nullptr || !body->dynamic()) {
         ENGINE_LOG_INFO("Impulse action: selected entity is not a dynamic body");
         return;
@@ -758,7 +771,7 @@ void Application::handleEventImpulse() {
     body->velocity += glm::normalize(direction) * 6.0f;
     body->sleeping = false;
     body->sleepTimer = 0.0f;
-    ENGINE_LOG_INFO("Impulse action: launched entity #" << entt::to_integral(m_selectedEntity));
+    ENGINE_LOG_INFO("Impulse action: launched entity #" << entt::to_integral(selected));
 }
 
 void Application::handlePhysicsReset() {

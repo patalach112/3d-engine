@@ -16,6 +16,7 @@
 #include "Platform/Input.h"
 #include "Platform/Window.h"
 #include "Scene/Scene.h"
+#include "Scene/TransformGizmo.h"
 #include "Scene/UIOutliner.h"
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/RenderSystem.h"
@@ -56,7 +57,6 @@ private:
     void registerAssets();
     void buildScene();
     void handleMouseCapture();
-    void handleMousePicking();
     void handlePhysicsReset();
     void handleEventImpulse();
     void logLoopStats(const char* context) const;
@@ -72,6 +72,7 @@ private:
     Renderer m_renderer;
     UIContext m_uiContext; // Phase 26 Step 3 widget state (CPU-only)
     UIOutliner m_outliner; // Phase 27 entity hierarchy panel
+    TransformGizmo m_gizmo; // Phase 28 viewport transform gizmo
     GameLoop m_gameLoop;
     JobSystem m_jobSystem;
     VramBudget m_vramBudget;
@@ -99,12 +100,6 @@ private:
     double m_secondsSinceModulePoll = 0.0;
     double m_secondsSinceHudUpdate = 0.0;
 
-    // Mouse picking selection: the last entity clicked, and the
-    // material name it carried before the highlight was applied (so
-    // selecting something else — or clicking empty space — restores
-    // it). entt::null when nothing is selected.
-    entt::entity m_selectedEntity = entt::null;
-    std::string m_selectedMaterialName;
 };
 
 } // namespace engine
