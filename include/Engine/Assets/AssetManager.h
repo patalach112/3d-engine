@@ -210,6 +210,13 @@ public:
     // Loads SPIR-V from a file and registers it. Invalid id on I/O failure.
     ShaderId loadShader(const std::string& name, const std::filesystem::path& path);
     MaterialId registerMaterial(MaterialDesc desc);
+    // Phase 32: live material editing (the editor's Material
+    // panel). Replaces the registered description in place — id
+    // and dense descriptor slot preserved, material registry
+    // version bumped — so the next frame's draw items shade with
+    // the new PBR values. False when nothing is registered under
+    // `name`. The name inside `desc` is ignored (no renames).
+    bool updateMaterial(std::string_view name, const MaterialDesc& desc);
 
     [[nodiscard]] const MeshAsset* mesh(MeshId id) const;
     [[nodiscard]] const MeshAsset* mesh(std::string_view name) const;
@@ -227,6 +234,9 @@ public:
     // Bumps on every texture register/replace, so GPU mirrors can
     // skip re-uploads when nothing changed.
     [[nodiscard]] uint64_t textureRegistryVersion() const { return m_textureRegistryVersion; }
+    // Material-side twin: bumps on every material register or
+    // updateMaterial() (Phase 32).
+    [[nodiscard]] uint64_t materialRegistryVersion() const { return m_materialRegistryVersion; }
     [[nodiscard]] uint64_t reservedVramBytes() const { return m_reservedVramBytes; }
 
     // --- Textures (synchronous registration, Phase 20) -------------------
@@ -342,6 +352,7 @@ private:
     std::vector<MaterialAsset> m_materials;
     std::vector<TextureAsset> m_textures;
     uint64_t m_textureRegistryVersion = 0;
+    uint64_t m_materialRegistryVersion = 0;
     std::unordered_map<std::string, MeshId> m_meshIds;
     std::unordered_map<std::string, ShaderId> m_shaderIds;
     std::unordered_map<std::string, MaterialId> m_materialIds;

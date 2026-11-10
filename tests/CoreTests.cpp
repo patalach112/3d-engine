@@ -6018,6 +6018,275 @@ void testPhase31PlayMode() {
           "Play/Stop over an empty scene round-trips cleanly");
 }
 
+void testPhase32Pbr() {
+    std::cout << "Phase 32: advanced PBR materials, directional & spot shadows\n";
+    using engine::CameraComponent;
+    using engine::DirectionalLightComponent;
+    using engine::PointLightComponent;
+    using engine::SpotLightComponent;
+    using engine::TransformComponent;
+
+    const auto addCamera = [](engine::Scene& scene) {
+        auto cam = scene.createEntity("Cam");
+        cam.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& camComponent = cam.addComponent<CameraComponent>(engine::CameraConfig{});
+        camComponent.camera.setPosition(glm::vec3{0.0f});
+        camComponent.camera.setOrientation(-90.0f, 0.0f);
+    };
+
+    // --- Directional key light: legacy fallback vs entity sun ---------------------
+    {
+        engine::Scene scene;
+        addCamera(scene);
+        const engine::SceneLightData data = engine::LightingSystem::gather(scene);
+        check(!data.directionalFromEntity && data.directionalRadiance == 1.0f &&
+                  data.directionalColor == glm::vec3{1.0f, 0.96f, 0.88f} && data.directionalCastShadow &&
+                  data.cascadeCount == engine::kMaxShadowCascades && data.cascadesFilled,
+              "no Sun entity: the legacy fixed sun answers (tint, radiance, shadows, 4 cascades)");
+        check(nearlyVec3(data.directionalDirection, glm::normalize(glm::vec3{0.35f, 0.8f, 0.45f})),
+              "legacy sun direction matches the historical fixed direction");
+    }
+    {
+        engine::Scene scene;
+        addCamera(scene);
+        auto sun = scene.createEntity("Sun");
+        auto& sunLight = sun.addComponent<DirectionalLightComponent>();
+        sunLight.color = glm::vec3{0.5f, 0.6f, 0.7f};
+        sunLight.intensity = 2.5f;
+        sunLight.direction = glm::vec3{0.0f, 3.0f, 4.0f}; // normalized on gather
+        sunLight.castShadow = false;
+        sunLight.cascadeCount = 2;
+        auto dimSun = scene.createEntity("DimSun");
+        auto& dim = dimSun.addComponent<DirectionalLightComponent>();
+        dim.color = glm::vec3{1.0f, 0.0f, 0.0f};
+        dim.intensity = 0.5f;
+        auto offSun = scene.createEntity("OffSun");
+        auto& off = offSun.addComponent<DirectionalLightComponent>();
+        off.intensity = 99.0f;
+        off.enabled = false;
+
+        const engine::SceneLightData data = engine::LightingSystem::gather(scene);
+        check(data.directionalFromEntity && data.directionalColor == glm::vec3{0.5f, 0.6f, 0.7f} &&
+                  data.directionalRadiance == 2.5f && !data.directionalCastShadow,
+              "the brightest enabled Sun drives color, radiance and shadow toggle");
+        check(nearlyVec3(data.directionalDirection, glm::vec3{0.0f, 0.6f, 0.8f}),
+              "the sun direction is normalized on gather");
+        check(data.cascadeCount == 2 && data.cascadeSplits.x < data.cascadeSplits.y &&
+                  data.cascadeSplits.z == data.cascadeSplits.y && data.cascadeSplits.w == data.cascadeSplits.y &&
+                  data.cascadeMatrices[3] == data.cascadeMatrices[1],
+              "a 2-cascade sun pins the unused splits and matrices to the last slice");
+    }
+
+    // --- Spot shadow selection and light-space math ---------------------------------
+    {
+        engine::Scene scene;
+        addCamera(scene);
+        auto point = scene.createEntity("Point");
+        point.addComponent<TransformComponent>(glm::vec3{1.0f, 0.0f, 0.0f});
+        point.addComponent<PointLightComponent>();
+        auto nearSpot = scene.createEntity("NearSpot");
+        auto& nearTransform = nearSpot.addComponent<TransformComponent>(glm::vec3{0.0f, 5.0f, 0.0f});
+        nearTransform.rotationDegrees = glm::vec3{-90.0f, 0.0f, 0.0f}; // aim down
+        auto& nearLight = nearSpot.addComponent<SpotLightComponent>();
+        nearLight.castShadow = true;
+        nearLight.range = 18.0f;
+        nearLight.outerConeRadians = 0.6f;
+        auto farSpot = scene.createEntity("FarSpot");
+        auto& farTransform = farSpot.addComponent<TransformComponent>(glm::vec3{0.0f, 20.0f, 0.0f});
+        farTransform.rotationDegrees = glm::vec3{-90.0f, 0.0f, 0.0f};
+        auto& farLight = farSpot.addComponent<SpotLightComponent>();
+        farLight.castShadow = true;
+        farLight.range = 18.0f;
+
+        const engine::SceneLightData data = engine::LightingSystem::gather(scene);
+        check(data.spotShadowEnabled && data.spotShadowLightIndex == 1,
+              "the nearest packed shadow-casting spot owns the shadow map (index into the light arrays)");
+        const glm::vec4 hitClip = data.spotShadowViewProj * glm::vec4{0.0f, 3.0f, 0.0f, 1.0f};
+        const glm::vec3 hitNdc = glm::vec3{hitClip} / hitClip.w;
+        check(hitClip.w > 0.0f && std::abs(hitNdc.x) <= 1.0f && std::abs(hitNdc.y) <= 1.0f && hitNdc.z > 0.0f &&
+                  hitNdc.z < 1.0f,
+              "a point under the shadow spot projects inside the spot shadow frustum");
+        const glm::vec4 behindClip = data.spotShadowViewProj * glm::vec4{0.0f, 7.0f, 0.0f, 1.0f};
+        check(behindClip.w < 0.0f, "a point behind the spot is behind its shadow camera");
+
+        engine::Scene noShadowScene;
+        addCamera(noShadowScene);
+        auto plainSpot = noShadowScene.createEntity("PlainSpot");
+        plainSpot.addComponent<TransformComponent>(glm::vec3{0.0f, 5.0f, 0.0f});
+        plainSpot.addComponent<SpotLightComponent>(); // castShadow defaults false
+        const engine::SceneLightData plain = engine::LightingSystem::gather(noShadowScene);
+        check(!plain.spotShadowEnabled && plain.spotShadowLightIndex == -1,
+              "no shadow-casting spot, no spot shadow");
+
+        const glm::mat4 vp = engine::spotShadowViewProjection(glm::vec3{0.0f, 5.0f, 0.0f}, glm::vec3{0.0f, -1.0f, 0.0f},
+                                                              0.6f, 0.17f, 18.0f);
+        const glm::vec4 centre = vp * glm::vec4{0.0f, 3.0f, 0.0f, 1.0f};
+        const glm::vec3 centreNdc = glm::vec3{centre} / centre.w;
+        check(std::abs(centreNdc.x) < 1e-4f && std::abs(centreNdc.y) < 1e-4f && centreNdc.z > 0.0f &&
+                  centreNdc.z < 1.0f,
+              "the spot axis lands on the shadow map centre at a mappable depth");
+    }
+
+    // --- Live material editing ------------------------------------------------------
+    {
+        engine::VramBudget vram(1024 * 1024);
+        engine::VramBudget staging(1024 * 1024);
+        engine::AssetManager assets(vram, staging);
+        const std::vector<uint8_t> pixels(2 * 2 * 4, 200);
+        const auto tex = [&assets, &pixels](const char* name) {
+            return assets.registerTexture(name, 2, 2, std::span<const uint8_t>{pixels});
+        };
+        const engine::TextureId albedoId = tex("albedoTex");
+        const engine::TextureId mrId = tex("mrTex");
+        const engine::TextureId normalId = tex("nrmTex");
+        const engine::TextureId aoId = tex("aoTex");
+        check(albedoId != engine::kInvalidAssetId && mrId != engine::kInvalidAssetId &&
+                  normalId != engine::kInvalidAssetId && aoId != engine::kInvalidAssetId,
+              "material textures register for the binding test");
+
+        engine::MaterialDesc desc;
+        desc.name = "pbr1";
+        desc.pbr.metallic = 0.2f;
+        desc.pbr.roughness = 0.8f;
+        const engine::MaterialId materialId = assets.registerMaterial(desc);
+        const uint32_t descriptorIndex = assets.material(materialId)->descriptorIndex;
+        check(assets.materialRegistryVersion() == 1, "material registration bumps the registry version");
+        check(!assets.updateMaterial("notRegistered", desc), "updating an unknown material is refused");
+
+        engine::MaterialDesc edited = desc;
+        edited.baseColor = glm::vec4{0.25f, 0.5f, 0.75f, 1.0f};
+        edited.pbr.metallic = 1.0f;
+        edited.pbr.roughness = 0.25f;
+        edited.pbr.occlusionStrength = 0.5f;
+        edited.pbr.albedoTexture = "albedoTex";
+        edited.pbr.metallicRoughnessTexture = "mrTex";
+        edited.pbr.normalTexture = "nrmTex";
+        edited.pbr.occlusionTexture = "aoTex";
+        check(assets.updateMaterial("pbr1", edited) && assets.materialRegistryVersion() == 2,
+              "updateMaterial commits and bumps the version");
+        const engine::MaterialAsset* updated = assets.material("pbr1");
+        check(updated != nullptr && updated->id == materialId && updated->descriptorIndex == descriptorIndex &&
+                  updated->desc.pbr.metallic == 1.0f && updated->desc.pbr.roughness == 0.25f,
+              "the update replaces values in place (id and descriptor slot stable)");
+
+        engine::Scene scene;
+        scene.createEntity("Cam").addComponent<CameraComponent>(engine::CameraConfig{});
+        auto cube = scene.createEntity("Cube");
+        cube.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -3.0f});
+        auto& mesh = cube.addComponent<engine::MeshComponent>("cube");
+        mesh.materialName = "pbr1";
+        engine::FramePrepareOptions options;
+        options.assets = &assets;
+        options.frustumCulling = false;
+        const engine::PreparedFrame frame = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+        check(frame.renderQueue.size() == 1, "the material scene produces one draw item");
+        if (frame.renderQueue.size() == 1) {
+            const engine::DrawItem& item = frame.renderQueue.items().front();
+            check(item.pbrParams == glm::vec4{1.0f, 0.25f, 0.5f, 0.0f} &&
+                      item.baseColor == glm::vec4{0.25f, 0.5f, 0.75f, 1.0f},
+                  "draw items pack the edited PBR factors and base color");
+            check(item.textureIndices[0] == static_cast<int32_t>(albedoId) - 1 &&
+                      item.textureIndices[1] == static_cast<int32_t>(mrId) - 1 &&
+                      item.textureIndices[2] == static_cast<int32_t>(normalId) - 1 &&
+                      item.textureIndices[3] == static_cast<int32_t>(aoId) - 1,
+                  "all four material maps bind to their texture array slots");
+        }
+
+        engine::MaterialDesc reEdited = edited;
+        reEdited.pbr.roughness = 0.9f;
+        reEdited.pbr.normalTexture.clear();
+        assets.updateMaterial("pbr1", reEdited);
+        const engine::PreparedFrame reframed = engine::RenderSystem::prepareFrame(scene, 16.0f / 9.0f, options);
+        check(reframed.renderQueue.size() == 1 && reframed.renderQueue.items().front().pbrParams.y == 0.9f &&
+                  reframed.renderQueue.items().front().textureIndices[2] == -1,
+              "a second edit flows into the very next frame (live viewport updates)");
+    }
+
+    // --- GBQ: directional light + spot shadow flag round-trip ------------------------
+    {
+        engine::Scene scene;
+        auto sun = scene.createEntity("Sun");
+        auto& sunLight = sun.addComponent<DirectionalLightComponent>();
+        sunLight.color = glm::vec3{0.9f, 0.8f, 0.7f};
+        sunLight.intensity = 3.25f;
+        sunLight.direction = glm::vec3{0.1f, 0.9f, 0.2f};
+        sunLight.castShadow = false;
+        sunLight.cascadeCount = 3;
+        auto spot = scene.createEntity("Spot");
+        spot.addComponent<TransformComponent>(glm::vec3{1.0f, 2.0f, 3.0f});
+        auto& spotLight = spot.addComponent<SpotLightComponent>();
+        spotLight.intensity = 77.0f;
+        spotLight.castShadow = true;
+
+        engine::Scene loaded;
+        check(engine::deserializeSceneFromBytes(loaded, engine::serializeSceneToBytes(scene)),
+              "the phase-32 scene round-trips through .gbq bytes");
+        const auto findByTag = [&loaded](const std::string& tag) -> engine::Entity {
+            auto& registry = loaded.registry();
+            for (const entt::entity entity : registry.view<engine::TagComponent>()) {
+                if (registry.get<engine::TagComponent>(entity).tag == tag) {
+                    return engine::Entity{entity, &loaded};
+                }
+            }
+            return engine::Entity{};
+        };
+        const DirectionalLightComponent& rSun = findByTag("Sun").getComponent<DirectionalLightComponent>();
+        check(rSun.color == glm::vec3{0.9f, 0.8f, 0.7f} && rSun.intensity == 3.25f &&
+                  rSun.direction == glm::vec3{0.1f, 0.9f, 0.2f} && !rSun.castShadow && rSun.cascadeCount == 3,
+              "the directional light survives serialization whole");
+        check(findByTag("Spot").getComponent<SpotLightComponent>().castShadow,
+              "the spot shadow flag survives serialization (SLGT section v2)");
+    }
+
+    // --- SLGT version 1 files (pre-Phase-32) still load ------------------------------
+    {
+        engine::Scene scene;
+        auto spot = scene.createEntity("Spot");
+        spot.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& spotLight = spot.addComponent<SpotLightComponent>();
+        spotLight.intensity = 55.0f;
+        spotLight.castShadow = true;
+        std::vector<std::byte> bytes = scene.saveToGbqBytes();
+
+        // Downgrade the file to SLGT v1: drop the trailing byte of
+        // the (single) record and patch its TOC entry. The spot is
+        // the scene's only sectioned component after META/ENTY/
+        // TAGC/TRNF, so SLGT is the last section in the file.
+        const auto u32At = [&bytes](size_t offset) {
+            uint32_t value = 0;
+            std::memcpy(&value, bytes.data() + offset, 4);
+            return value;
+        };
+        const uint32_t sectionCount = u32At(12);
+        size_t slgtToc = 0;
+        uint64_t slgtSize = 0;
+        for (uint32_t i = 0; i < sectionCount; ++i) {
+            const size_t toc = 32 + static_cast<size_t>(i) * 32;
+            if (std::memcmp(bytes.data() + toc, "SLGT", 4) == 0) {
+                slgtToc = toc;
+                std::memcpy(&slgtSize, bytes.data() + toc + 16, 8);
+            }
+        }
+        check(slgtToc != 0 && slgtSize > 0, "fixture: the fresh save has an SLGT section to downgrade");
+        const uint32_t downgrade = 1; // section version word
+        bytes.erase(bytes.end() - 1); // trailing castShadow byte of the last record
+        std::memcpy(bytes.data() + slgtToc + 4, &downgrade, 4);
+        const uint64_t newSize = slgtSize - 1;
+        std::memcpy(bytes.data() + slgtToc + 16, &newSize, 8);
+
+        engine::Scene loaded;
+        check(engine::deserializeSceneFromBytes(loaded, bytes) && loaded.entityCount() == 1,
+              "a version-1 SLGT file still loads");
+        const SpotLightComponent& rSpot = [&loaded]() -> const SpotLightComponent& {
+            auto& registry = loaded.registry();
+            const auto view = registry.view<SpotLightComponent>();
+            return view.get<SpotLightComponent>(*view.begin());
+        }();
+        check(rSpot.intensity == 55.0f && !rSpot.castShadow,
+              "v1 records gain the default (shadow off) for the field they lack");
+    }
+}
+
 void testAsyncAssetPipeline() {
     std::cout << "Async asset pipeline (Phase 20)\n";
     using engine::AssetKind;
@@ -6423,9 +6692,15 @@ void testPhase21CullingAndLighting() {
         // UBO layout contract: view+proj (128) + 4 cascade matrices
         // (256) + three vec4s + environmentParams (64) + 4x16 light
         // vec4s (1024) = 1472 (Phase 22 added the environment vec4).
-        check(sizeof(engine::UniformBufferObject) == static_cast<size_t>(128 + 256 + 64 + 1024) &&
-                  offsetof(engine::UniformBufferObject, environmentParams) == 1456,
-              "ubo: C++ layout matches the GLSL byte budget (1472 bytes)");
+        // Phase 32 appends directionalColor (16) + spot shadow
+        // matrix (64) + spotShadowParams (16) at the end, so every
+        // pre-existing offset is unchanged: 1568 total.
+        check(sizeof(engine::UniformBufferObject) == static_cast<size_t>(128 + 256 + 64 + 1024 + 96) &&
+                  offsetof(engine::UniformBufferObject, environmentParams) == 1456 &&
+                  offsetof(engine::UniformBufferObject, directionalColor) == 1472 &&
+                  offsetof(engine::UniformBufferObject, spotShadowViewProj) == 1488 &&
+                  offsetof(engine::UniformBufferObject, spotShadowParams) == 1552,
+              "ubo: C++ layout matches the GLSL byte budget (1568 bytes, Phase 32 fields appended)");
     }
 }
 
@@ -8655,6 +8930,7 @@ int main() {
     testSceneSerialization();
     testPhase30Gbq();
     testPhase31PlayMode();
+    testPhase32Pbr();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();

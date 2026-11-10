@@ -295,7 +295,7 @@ Renderer::~Renderer() {
     if (m_descriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     }
-    for (const ShadowTarget& target : m_shadowTargets) {
+    const auto destroyShadowTarget = [device](const ShadowTarget& target) {
         if (target.framebuffer != VK_NULL_HANDLE) {
             vkDestroyFramebuffer(device, target.framebuffer, nullptr);
         }
@@ -308,7 +308,11 @@ Renderer::~Renderer() {
         if (target.memory != VK_NULL_HANDLE) {
             vkFreeMemory(device, target.memory, nullptr);
         }
+    };
+    for (const ShadowTarget& target : m_shadowTargets) {
+        destroyShadowTarget(target);
     }
+    destroyShadowTarget(m_spotShadowTarget);
     if (m_shadowRenderPass != VK_NULL_HANDLE) {
         vkDestroyRenderPass(device, m_shadowRenderPass, nullptr);
     }
@@ -330,6 +334,15 @@ void Renderer::createShadowResources() {
                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, target.image, target.memory);
         target.view = helpers::createImageView(m_context, target.image, kShadowFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
     }
+
+    // Phase 32: the spot shadow target (smaller — one light, one
+    // perspective slice) shares the depth format and sampler.
+    helpers::createImage(m_context, kSpotShadowMapSize, kSpotShadowMapSize, kShadowFormat,
+                         VK_IMAGE_TILING_OPTIMAL,
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_spotShadowTarget.image, m_spotShadowTarget.memory);
+    m_spotShadowTarget.view =
+        helpers::createImageView(m_context, m_spotShadowTarget.image, kShadowFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
 
     // Plain (non-comparison) sampler: the fragment shader fetches depth
     // and compares manually, which enables the 3x3 PCF kernel. Border is
@@ -412,6 +425,20 @@ void Renderer::createShadowResources() {
         framebufferInfo.layers = 1;
         if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &target.framebuffer) != VK_SUCCESS) {
             throw std::runtime_error("Renderer: failed to create shadow framebuffer");
+        }
+    }
+
+    {
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = m_shadowRenderPass;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = &m_spotShadowTarget.view;
+        framebufferInfo.width = kSpotShadowMapSize;
+        framebufferInfo.height = kSpotShadowMapSize;
+        framebufferInfo.layers = 1;
+        if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_spotShadowTarget.framebuffer) != VK_SUCCESS) {
+            throw std::runtime_error("Renderer: failed to create spot shadow framebuffer");
         }
     }
 
@@ -1134,8 +1161,8 @@ void Renderer::createDescriptorPool() {
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = m_framesInFlight;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    // shadow array (4) + material textures (32) + irradiance/prefilter/LUT/environment (4)
-    poolSizes[1].descriptorCount = m_framesInFlight * (kMaxShadowCascades + kMaxMaterialTextures + 4);
+    // shadow array (4) + material textures (32) + irradiance/prefilter/LUT/environment (4) + spot shadow (1)
+    poolSizes[1].descriptorCount = m_framesInFlight * (kMaxShadowCascades + kMaxMaterialTextures + 4 + 1);
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1198,8 +1225,12 @@ void Renderer::createDescriptorSets() {
         environmentInfo.sampler = m_environmentSampler;
         environmentInfo.imageView = m_environmentCube.view;
         environmentInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo spotShadowInfo{};
+        spotShadowInfo.sampler = m_shadowSampler;
+        spotShadowInfo.imageView = m_spotShadowTarget.view;
+        spotShadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        std::array<VkWriteDescriptorSet, 7> writes{};
+        std::array<VkWriteDescriptorSet, 8> writes{};
         const auto bufferWrite = [&writes](uint32_t index, VkDescriptorSet set, const VkDescriptorBufferInfo* info) {
             writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[index].dstSet = set;
@@ -1224,6 +1255,7 @@ void Renderer::createDescriptorSets() {
         imageWrite(4, m_descriptorSets[i], 4, 1, &prefilterInfo);
         imageWrite(5, m_descriptorSets[i], 5, 1, &lutInfo);
         imageWrite(6, m_descriptorSets[i], 6, 1, &environmentInfo);
+        imageWrite(7, m_descriptorSets[i], 7, 1, &spotShadowInfo);
 
         vkUpdateDescriptorSets(m_context.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0,
                                nullptr);
@@ -1251,6 +1283,11 @@ void Renderer::updateUniformBuffer(const glm::mat4& view, const glm::mat4& proje
     ubo.lightColorIntensity = lighting.lightColorIntensity;
     ubo.lightDirectionType = lighting.lightDirectionType;
     ubo.lightCone = lighting.lightCone;
+    ubo.directionalColor = glm::vec4{lighting.directionalColor, lighting.directionalCastShadow ? 1.0f : 0.0f};
+    ubo.spotShadowViewProj = lighting.spotShadowViewProj;
+    ubo.spotShadowParams = glm::vec4{lighting.spotShadowEnabled ? static_cast<float>(lighting.spotShadowLightIndex)
+                                                                 : -1.0f,
+                                     0.0f, 0.0f, 0.0f};
     void* mapped = m_uniformBuffers[m_currentFrame].mappedData();
     std::memcpy(mapped, &ubo, sizeof(ubo));
 }
@@ -1320,10 +1357,67 @@ void Renderer::recordShadowCascades(VkCommandBuffer commandBuffer, std::span<con
     (void)cascadeMatrices; // matrices live in the UBO; the index selects
 }
 
+void Renderer::recordSpotShadow(VkCommandBuffer commandBuffer, std::span<const DrawItem> drawItems) {
+    // One depth-only pass from the spot's point of view into its
+    // own target. Same pipeline and push block as the cascades;
+    // the push index kMaxShadowCascades selects the spot matrix
+    // (UBO.spotShadowViewProj) in shadow.vert.
+    VkClearValue clearValue{};
+    clearValue.depthStencil = {1.0f, 0};
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.shadowPipeline());
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(kSpotShadowMapSize);
+    viewport.height = static_cast<float>(kSpotShadowMapSize);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {kSpotShadowMapSize, kSpotShadowMapSize};
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    const VkBuffer vertexBuffers[] = {m_vertexBuffer.handle()};
+    constexpr VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+    vkCmdBindIndexBuffer(commandBuffer, m_indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.layout(), 0, 1,
+                            &m_descriptorSets[m_currentFrame], 0, nullptr);
+
+    VkRenderPassBeginInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    renderPassInfo.renderPass = m_shadowRenderPass;
+    renderPassInfo.framebuffer = m_spotShadowTarget.framebuffer;
+    renderPassInfo.renderArea.offset = {0, 0};
+    renderPassInfo.renderArea.extent = {kSpotShadowMapSize, kSpotShadowMapSize};
+    renderPassInfo.clearValueCount = 1;
+    renderPassInfo.pClearValues = &clearValue;
+    vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    for (const DrawItem& item : drawItems) {
+        struct ShadowPush {
+            DrawPushConstants draw;
+            uint32_t cascadeIndex;
+        };
+        const glm::ivec4 textureIndices{item.textureIndices[0], item.textureIndices[1], item.textureIndices[2],
+                                        item.textureIndices[3]};
+        const ShadowPush push{{item.model, item.baseColor, item.pbrParams, textureIndices}, kMaxShadowCascades};
+        vkCmdPushConstants(commandBuffer, m_pipeline.layout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ShadowPush),
+                           &push);
+        vkCmdDrawIndexed(commandBuffer, m_indexCount, 1, 0, 0, 0);
+    }
+
+    vkCmdEndRenderPass(commandBuffer);
+}
+
 void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
                                    std::span<const DrawItem> drawItems,
                                    const std::array<glm::mat4, kMaxShadowCascades>& cascadeMatrices,
-                                   uint32_t cascadeCount) {
+                                   uint32_t cascadeCount, bool spotShadowEnabled) {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
@@ -1332,6 +1426,9 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     // Shadow cascades first: they fill the depth textures the main pass samples.
     recordShadowCascades(commandBuffer, drawItems, cascadeMatrices, cascadeCount);
+    if (spotShadowEnabled) {
+        recordSpotShadow(commandBuffer, drawItems);
+    }
 
     const VkExtent2D extent = m_swapchain.extent();
 
@@ -1443,7 +1540,8 @@ bool Renderer::drawFrame(const glm::mat4& view, const glm::mat4& projection,
 
     VkCommandBuffer commandBuffer = m_commandBuffers[m_currentFrame];
     vkResetCommandBuffer(commandBuffer, 0);
-    recordCommandBuffer(commandBuffer, imageIndex, drawItems, lighting.cascades, lighting.cascadeCount);
+    recordCommandBuffer(commandBuffer, imageIndex, drawItems, lighting.cascades, lighting.cascadeCount,
+                        lighting.spotShadowEnabled);
 
     const VkSemaphore waitSemaphores[] = {m_imageAvailableSemaphores[m_currentFrame]};
     const VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};

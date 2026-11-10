@@ -20,9 +20,14 @@ layout(set = 0, binding = 0) uniform UniformBufferObject {
     vec4 lightDirectionType[16];
     vec4 lightCone[16];
     vec4 environmentParams; // x intensity, y prefilter max LOD, z skybox on
+    // Phase 32 appended fields (same offsets as Renderer.h).
+    vec4 directionalColor; // rgb key light tint, w cascade shadows on/off
+    mat4 spotShadowViewProj; // shadow-casting spot's light space
+    vec4 spotShadowParams; // x packed light index owning the spot shadow (-1 none)
 } ubo;
 
 layout(set = 0, binding = 1) uniform sampler2D shadowMaps[4];
+layout(set = 0, binding = 7) uniform sampler2D spotShadowMap;
 layout(set = 0, binding = 2) uniform sampler2D materialTextures[32];
 layout(set = 0, binding = 3) uniform samplerCube irradianceMap;
 layout(set = 0, binding = 4) uniform samplerCube prefilteredMap;
@@ -122,6 +127,30 @@ float shadowFactor(vec3 worldPosition, vec3 normal, vec3 lightDirection, float d
     return shadow / 9.0;
 }
 
+// --- Spot shadows (Phase 32): perspective reproject + 3x3 PCF --
+// Mirrors the cascade path, but the light space is a perspective
+// frustum (the spot cone), so the divide does the cone falloff.
+float spotShadowFactor(vec3 worldPosition, vec3 normal, vec3 lightDirection) {
+    vec4 lightPosition = ubo.spotShadowViewProj * vec4(worldPosition + normal * 0.02, 1.0);
+    vec3 projected = lightPosition.xyz / lightPosition.w;
+    vec2 uv = projected.xy * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || projected.z > 1.0 || projected.z < 0.0) {
+        return 1.0;
+    }
+    float facing = clamp(dot(normal, lightDirection), 0.0, 1.0);
+    float bias = max(0.002 * (1.0 - facing), 0.0005);
+    float receiverDepth = projected.z - bias;
+    vec2 texelSize = vec2(1.0) / vec2(textureSize(spotShadowMap, 0));
+    float shadow = 0.0;
+    for (int x = -1; x <= 1; ++x) {
+        for (int y = -1; y <= 1; ++y) {
+            float occluderDepth = texture(spotShadowMap, uv + vec2(x, y) * texelSize).r;
+            shadow += receiverDepth > occluderDepth ? 0.0 : 1.0;
+        }
+    }
+    return shadow / 9.0;
+}
+
 // Smooth windowed inverse-square attenuation (mirrors LightingSystem.h).
 float attenuation(float dist, float range) {
     if (range <= 0.0) return 0.0;
@@ -176,8 +205,9 @@ void main() {
 
     // Key directional light, cascaded-shadowed.
     vec3 lightDirection = normalize(ubo.lightDirection.xyz);
-    vec3 keyRadiance = vec3(1.0, 0.96, 0.88) * ubo.lightDirection.w;
-    float shadow = shadowFactor(fragWorldPosition, normal, lightDirection, viewDepth);
+    vec3 keyRadiance = ubo.directionalColor.rgb * ubo.lightDirection.w;
+    float shadow = ubo.directionalColor.w > 0.5 ? shadowFactor(fragWorldPosition, normal, lightDirection, viewDepth)
+                                                : 1.0;
     outgoing += evaluateDirectLight(normal, viewDir, lightDirection, keyRadiance, albedo, metallic, roughness) *
                 shadow;
 
@@ -204,6 +234,9 @@ void main() {
             }
         }
         vec3 radiance = ubo.lightColorIntensity[i].rgb * (ubo.lightColorIntensity[i].w * falloff * spotFactor);
+        if (float(i) == ubo.spotShadowParams.x) {
+            radiance *= spotShadowFactor(fragWorldPosition, normal, dirToLight);
+        }
         outgoing += evaluateDirectLight(normal, viewDir, dirToLight, radiance, albedo, metallic, roughness);
     }
 

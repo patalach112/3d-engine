@@ -245,10 +245,12 @@ bool parseHeaderAndToc(const std::vector<std::byte>& bytes, uint32_t& outVersion
     return true;
 }
 
+// Returns the section (any version — parseGbq vetoes unknown
+// versions of known sections before any lookup happens).
 const TocEntry* findSection(const std::vector<TocEntry>& toc, const char* type) {
     for (const TocEntry& entry : toc) {
         if (std::memcmp(entry.type.data(), type, 4) == 0) {
-            return entry.version == kGbqVersion ? &entry : nullptr;
+            return &entry;
         }
     }
     return nullptr;
@@ -290,6 +292,7 @@ struct StagedEntity {
     std::optional<ThrusterComponent> thruster;
     std::optional<PointLightComponent> pointLight;
     std::optional<SpotLightComponent> spotLight;
+    std::optional<DirectionalLightComponent> directionalLight;
     std::optional<std::string> script;
 };
 
@@ -323,13 +326,19 @@ bool readComponentSection(const std::vector<std::byte>& bytes, const std::vector
 }
 
 // A known section present with the wrong version must reject the
-// load (findSection hides it, which this check turns into a veto).
+// load (unknown sections are skipped for forward compatibility).
+// SLGT accepts 1 and 2: version 2 appends a castShadow byte per
+// record (Phase 32); version 1 files keep loading.
 bool sectionVersionsAcceptable(const std::vector<TocEntry>& toc) {
     static constexpr const char* kKnown[] = {"META", "ENTY", "TAGC", "TRNF", "CAMR", "MESH", "SPIN", "RGBD",
-                                             "CLDR", "GRVF", "JONT", "THRS", "PLGT", "SLGT", "NSCR"};
+                                             "CLDR", "GRVF", "JONT", "THRS", "PLGT", "SLGT", "NSCR", "DIRL"};
     for (const TocEntry& entry : toc) {
         for (const char* known : kKnown) {
-            if (std::memcmp(entry.type.data(), known, 4) == 0 && entry.version != kGbqVersion) {
+            if (std::memcmp(entry.type.data(), known, 4) != 0) {
+                continue;
+            }
+            const bool isSlgt = std::memcmp(entry.type.data(), "SLGT", 4) == 0;
+            if (entry.version != kGbqVersion && !(isSlgt && entry.version == 2)) {
                 return false;
             }
         }
@@ -563,14 +572,40 @@ bool parseGbq(const std::vector<std::byte>& bytes, StagedScene& staged) {
                               })) {
         return false;
     }
-    if (!readComponentSection(bytes, toc, "SLGT", entityCount,
+    // Spot lights (section v2 appended castShadow in Phase 32;
+    // v1 records load with castShadow = false).
+    if (const TocEntry* section = findSection(toc, "SLGT"); section != nullptr) {
+        ByteReader reader = sectionReader(bytes, *section);
+        uint32_t count = 0;
+        if (!reader.u32(count)) {
+            return false;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t index = 0;
+            if (!reader.u32(index) || index >= entityCount) {
+                return false;
+            }
+            SpotLightComponent value;
+            bool ok = reader.vec3(value.color) && reader.f32(value.intensity) && reader.f32(value.range) &&
+                      reader.f32(value.innerConeRadians) && reader.f32(value.outerConeRadians) &&
+                      reader.boolean(value.enabled);
+            if (ok && section->version >= 2) {
+                ok = reader.boolean(value.castShadow);
+            }
+            if (!ok) {
+                return false;
+            }
+            staged.entities[index].spotLight = value;
+        }
+    }
+    if (!readComponentSection(bytes, toc, "DIRL", entityCount,
                               [&staged](ByteReader& reader, uint32_t index) {
-                                  SpotLightComponent value;
+                                  DirectionalLightComponent value;
                                   const bool ok = reader.vec3(value.color) && reader.f32(value.intensity) &&
-                                                  reader.f32(value.range) && reader.f32(value.innerConeRadians) &&
-                                                  reader.f32(value.outerConeRadians) && reader.boolean(value.enabled);
+                                                  reader.vec3(value.direction) && reader.boolean(value.enabled) &&
+                                                  reader.boolean(value.castShadow) && reader.u32(value.cascadeCount);
                                   if (ok) {
-                                      staged.entities[index].spotLight = value;
+                                      staged.entities[index].directionalLight = value;
                                   }
                                   return ok;
                               })) {
@@ -596,12 +631,14 @@ bool parseGbq(const std::vector<std::byte>& bytes, StagedScene& staged) {
 
 struct SectionData {
     std::array<char, 4> type{};
+    uint32_t version = 1;
     ByteWriter body;
 };
 
-void addSection(std::vector<SectionData>& sections, const char* type, ByteWriter&& body) {
+void addSection(std::vector<SectionData>& sections, const char* type, ByteWriter&& body, uint32_t version = 1) {
     SectionData section;
     std::memcpy(section.type.data(), type, 4);
+    section.version = version;
     section.body = std::move(body);
     sections.push_back(std::move(section));
 }
@@ -627,6 +664,7 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
     collect(m_registry.view<SpinComponent>());
     collect(m_registry.view<PointLightComponent>());
     collect(m_registry.view<SpotLightComponent>());
+    collect(m_registry.view<DirectionalLightComponent>());
     collect(m_registry.view<NativeScriptComponent>());
     collect(m_registry.view<RigidBodyComponent>());
     collect(m_registry.view<ColliderComponent>());
@@ -661,7 +699,7 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
         addSection(sections, "ENTY", std::move(enty));
     }
 
-    const auto writeSection = [&](const char* type, auto&& writeRecord) {
+    const auto writeSection = [&](const char* type, auto&& writeRecord, uint32_t sectionVersion = 1) {
         ByteWriter records;
         uint32_t count = 0;
         for (const entt::entity entity : entities) {
@@ -675,7 +713,7 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
         ByteWriter body;
         body.u32(count);
         body.bytes(records.data.data(), records.data.size());
-        addSection(sections, type, std::move(body));
+        addSection(sections, type, std::move(body), sectionVersion);
     };
 
     writeSection("TAGC", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
@@ -874,6 +912,22 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
         out.f32(value->innerConeRadians);
         out.f32(value->outerConeRadians);
         out.boolean(value->enabled);
+        out.boolean(value->castShadow); // SLGT section version 2 (Phase 32)
+        return true;
+    },
+                 2);
+    writeSection("DIRL", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
+        const DirectionalLightComponent* value = m_registry.try_get<DirectionalLightComponent>(entity);
+        if (value == nullptr) {
+            return false;
+        }
+        out.u32(index);
+        out.vec3(value->color);
+        out.f32(value->intensity);
+        out.vec3(value->direction);
+        out.boolean(value->enabled);
+        out.boolean(value->castShadow);
+        out.u32(value->cascadeCount);
         return true;
     });
     writeSection("NSCR", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
@@ -905,7 +959,7 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
     }
     for (size_t i = 0; i < sections.size(); ++i) {
         file.bytes(sections[i].type.data(), 4);
-        file.u32(kGbqVersion);
+        file.u32(sections[i].version);
         file.u64(offsets[i]);
         file.u64(sections[i].body.data.size());
         file.u64(0); // reserved
@@ -1007,6 +1061,9 @@ bool Scene::loadFromGbqBytes(const std::vector<std::byte>& bytes) {
         }
         if (stagedEntity.spotLight.has_value()) {
             m_registry.emplace<SpotLightComponent>(handle, *stagedEntity.spotLight);
+        }
+        if (stagedEntity.directionalLight.has_value()) {
+            m_registry.emplace<DirectionalLightComponent>(handle, *stagedEntity.directionalLight);
         }
         if (stagedEntity.script.has_value()) {
             m_registry.emplace<NativeScriptComponent>(handle, *stagedEntity.script);

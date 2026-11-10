@@ -2363,3 +2363,68 @@ scene exactly as it was.
   passed, 0 failed** in Debug, Release (shared and static),
   hidden-visibility and ASan builds, warning-free, CTest
   1/1.
+
+## Phase 32 — Advanced Materials & PBR: Directional Light Entity, Spot Shadows, Live Material Editing ✅
+
+Phase 22's Cook-Torrance pipeline (GGX/Smith/Schlick for the
+cascaded key light and 16 dynamic lights, metallic-roughness
+maps incl. normal/AO, split-sum IBL) gains its missing
+author-facing pieces: the sun becomes an ECS entity, one spot
+light casts real-time shadows, and materials become editable
+live in the Inspector.
+
+- **DirectionalLightComponent** (new ECS component): `color`,
+  `intensity`, `direction` (toward the light), `enabled`,
+  `castShadow`, `cascadeCount` (1–4). `LightingSystem::gather`
+  lets the brightest enabled sun drive the key light; with no
+  sun entity the legacy fixed sun (direction 0.35/0.8/0.45,
+  warm tint, radiance 1) answers identically, so old scenes
+  don't change. Cascade splits/matrices past the count pin to
+  the last slice. The component is reflected (Inspector-ready),
+  registered in the reflection registry, primed in Scene
+  storage, and serialized in `.gbq` (new DIRL section).
+- **Spot shadows**: `SpotLightComponent::castShadow` opts a
+  spot into the one budgeted 1024² shadow map. Gather picks
+  the nearest shadow-casting spot *after* the nearest-16 sort
+  (a shadow spot outside the light budget casts none) and
+  computes its perspective light-space matrix
+  (`spotShadowViewProjection`, FOV = outer cone, Vulkan clip
+  conventions). The Renderer renders it through the existing
+  depth pipeline (push index 4) into a dedicated target bound
+  at descriptor 7; `cube.frag` reprojects fragments
+  (perspective divide + 3×3 PCF) only for the owning light.
+  Point lights stay shadowless by design (cube shadows = six
+  passes per light).
+- **UBO discipline**: `directionalColor` (rgb tint, w =
+  cascade-shadow toggle), `spotShadowViewProj` and
+  `spotShadowParams` are APPENDED to the uniform block — every
+  pre-existing offset is byte-identical in C++ and all three
+  shaders (1568 bytes now; the layout test pins the offsets).
+- **Live material editing**: `AssetManager::updateMaterial`
+  replaces a registered material's description in place (id
+  and descriptor slot stable, new `materialRegistryVersion`
+  counter bumped; unknown names refused). RenderSystem
+  rebuilds draw items every frame, so edits land in the very
+  next frame. The editor's Inspector shows a **Material
+  panel** for mesh entities (base color, metallic, roughness,
+  occlusion strength sliders) committing through that API,
+  next to the new DirectionalLight panel and the SpotLight
+  Cast Shadow toggle. The demo scene gains a `Sun` entity
+  reproducing the legacy look, and its floor spot now casts
+  shadows.
+- **Format evolution**: DIRL is a new section (old readers
+  skip it); SLGT grows to section version 2 (trailing
+  castShadow byte) while v1 files still load with the flag
+  defaulted off — the first exercised use of the GBQ
+  per-section versioning. Play-mode snapshots (Phase 31)
+  inherit both.
+- **Verification**: `testPhase32Pbr()` adds 25 checks —
+  legacy-vs-entity sun selection and cascade pinning, spot
+  shadow ownership/indexing and light-space projection,
+  spot VP math, material update/version/slot stability,
+  draw-item PBR + four-texture binding, live re-edit flow,
+  GBQ directional/spot round-trip, and a byte-downgraded
+  SLGT v1 fixture that still loads. **1047 passed, 0 failed**
+  in Debug, Release (shared and static), hidden-visibility
+  and ASan builds, warning-free, CTest 1/1; all shaders
+  compile with glslangValidator 15.4.

@@ -165,6 +165,39 @@ float inspectComponentAt(UIContext& ui, Scene::Registry& registry, entt::entity 
     return y + height + 6.0f;
 }
 
+// Phase 32 editor: live material panel for the selected entity's
+// MeshComponent. Materials are shared assets (not components), so
+// the panel edits a copy and commits through
+// AssetManager::updateMaterial when a widget changes it — the
+// next frame's draw items shade with the new PBR values.
+float inspectMaterialAt(UIContext& ui, AssetManager& assets, const MeshComponent& mesh, float x, float y,
+                        float width) {
+    const MaterialAsset* material = assets.material(mesh.materialName);
+    if (material == nullptr) {
+        return y;
+    }
+    MaterialDesc desc = material->desc;
+    const float rows = 8.0f; // title, name, base color (3), metallic, roughness, occlusion
+    const float height = 2.0f * UIContext::kPanelPadding + rows * (UIContext::kRowHeight + UIContext::kRowSpacing);
+    ui.beginPanel("Material", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+    ui.label("Material");
+    ui.label(mesh.materialName);
+    bool changed = false;
+    glm::vec3 baseColor = glm::vec3{desc.baseColor};
+    if (ui.vec3Sliders("Base Color", &baseColor, 0.0f, 1.0f)) {
+        desc.baseColor = glm::vec4{baseColor, desc.baseColor.w};
+        changed = true;
+    }
+    changed = ui.slider("Metallic", &desc.pbr.metallic, 0.0f, 1.0f) || changed;
+    changed = ui.slider("Roughness", &desc.pbr.roughness, 0.0f, 1.0f) || changed;
+    changed = ui.slider("Occlusion Strength", &desc.pbr.occlusionStrength, 0.0f, 1.0f) || changed;
+    ui.endPanel();
+    if (changed) {
+        assets.updateMaterial(mesh.materialName, desc);
+    }
+    return y + height + 6.0f;
+}
+
 } // namespace
 
 EngineContext Application::buildModuleContext(float deltaSeconds, float fixedDeltaSeconds) {
@@ -372,6 +405,16 @@ void Application::buildScene() {
     spot.range = 16.0f;
     spot.innerConeRadians = 0.45f;
     spot.outerConeRadians = 0.75f;
+    spot.castShadow = true; // Phase 32: real-time spot shadows
+
+    // Directional key light (Phase 32): the sun is an entity now.
+    // These values reproduce the pre-Phase-32 fixed sun exactly;
+    // the Inspector can retarget, recolor or shadow-tune it live.
+    Entity sun = m_scene.createEntity("Sun");
+    auto& sunLight = sun.addComponent<DirectionalLightComponent>();
+    sunLight.color = glm::vec3{1.0f, 0.96f, 0.88f};
+    sunLight.direction = glm::vec3{0.35f, 0.8f, 0.45f};
+    sunLight.intensity = 1.0f;
 
     // Falling/bouncing rigid-body cubes. Their unit-cube mesh is scaled
     // by TransformComponent; the box collider's local half-extents are
@@ -739,6 +782,12 @@ void Application::run() {
                                                             kInspectorWidth, inspectorOptions);
                 y = inspectComponentAt<SpotLightComponent>(m_uiContext, registry, selected, inspectorX, y,
                                                            kInspectorWidth, inspectorOptions);
+                y = inspectComponentAt<DirectionalLightComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                                  kInspectorWidth, inspectorOptions);
+                if (registry.all_of<MeshComponent>(selected)) {
+                    y = inspectMaterialAt(m_uiContext, m_assets, registry.get<MeshComponent>(selected),
+                                          inspectorX, y, kInspectorWidth);
+                }
                 inspectorBottom = y;
             } else if (!playing) {
                 const auto tags = registry.view<TagComponent>();

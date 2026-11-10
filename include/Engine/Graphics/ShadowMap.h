@@ -81,6 +81,28 @@ struct ShadowCascade {
 [[nodiscard]] ENGINE_GRAPHICS_API std::array<float, kMaxShadowCascades>
 computeCascadeSplits(float nearPlane, float farPlane, uint32_t cascadeCount, float splitLambda);
 
+// ---------------------------------------------------------------------------
+// Spot light shadows (Phase 32)
+//
+// One shadow-casting spot gets a dedicated 2D depth map rendered
+// from the light's point of view with a perspective projection
+// whose field of view is the spot's outer cone. The main pass
+// reprojects the fragment into that space (perspective divide)
+// and PCF-compares depths, mirroring the directional path. The
+// matrix below is the testable core; the Vulkan target lives in
+// Renderer.
+// ---------------------------------------------------------------------------
+inline constexpr uint32_t kSpotShadowMapSize = 1024;
+
+// Light-space view-projection for a spot at `position` shining
+// along `direction` (unit length not required): perspective FOV
+// = 2 * outerConeRadians, square aspect, Vulkan clip conventions
+// (depth 0..1, flipped Y) matching the camera projection.
+[[nodiscard]] ENGINE_GRAPHICS_API glm::mat4 spotShadowViewProjection(const glm::vec3& position,
+                                                                     const glm::vec3& direction,
+                                                                     float outerConeRadians, float nearPlane,
+                                                                     float farPlane);
+
 // Fits one light view-projection per cascade around its frustum
 // slice (bounding-sphere fit, texel-snapped against shimmer).
 // cameraUp need not be orthogonal to cameraFront.

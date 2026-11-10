@@ -2,6 +2,7 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <algorithm>
 #include <cmath>
 
 namespace engine {
@@ -16,6 +17,22 @@ glm::mat4 directionalLightViewProjection(const glm::vec3& lightDirection, const 
     const glm::mat4 lightView = glm::lookAt(lightPosition, center, up);
     const glm::mat4 lightProjection = glm::ortho(-extent, extent, -extent, extent, nearPlane, farPlane);
     return lightProjection * lightView;
+}
+
+glm::mat4 spotShadowViewProjection(const glm::vec3& position, const glm::vec3& direction,
+                                   float outerConeRadians, float nearPlane, float farPlane) {
+    const glm::vec3 dir = glm::normalize(direction);
+    // Any up vector not parallel to the spot direction; spots in
+    // the editor usually aim downward, so world Y is not safe.
+    const glm::vec3 up = std::abs(dir.y) < 0.99f ? glm::vec3{0.0f, 1.0f, 0.0f} : glm::vec3{1.0f, 0.0f, 0.0f};
+    const glm::mat4 view = glm::lookAt(position, position + dir, up);
+    // The cone half-angle becomes the perspective half-FOV;
+    // clamped so a degenerate cone cannot produce a singular or
+    // backward projection.
+    const float halfFov = std::clamp(outerConeRadians, 0.01f, 1.55f);
+    glm::mat4 projection = glm::perspective(2.0f * halfFov, 1.0f, nearPlane, farPlane);
+    projection[1][1] *= -1.0f; // Vulkan clip space (matches Camera)
+    return projection * view;
 }
 
 std::array<float, kMaxShadowCascades> computeCascadeSplits(float nearPlane, float farPlane,

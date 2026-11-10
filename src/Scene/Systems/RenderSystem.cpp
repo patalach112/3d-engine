@@ -308,6 +308,11 @@ bool RenderSystem::render(Scene& scene) {
     frameLighting.lightCone = frame.lighting.lightCone;
     frameLighting.directionalDirection = frame.lighting.directionalDirection;
     frameLighting.directionalRadiance = frame.lighting.directionalRadiance;
+    frameLighting.directionalColor = frame.lighting.directionalColor;
+    frameLighting.directionalCastShadow = frame.lighting.directionalCastShadow;
+    frameLighting.spotShadowEnabled = frame.lighting.spotShadowEnabled;
+    frameLighting.spotShadowViewProj = frame.lighting.spotShadowViewProj;
+    frameLighting.spotShadowLightIndex = frame.lighting.spotShadowLightIndex;
     return m_renderer.drawFrame(frame.view, frame.projection, frame.renderQueue.items(), frameLighting);
 }
 

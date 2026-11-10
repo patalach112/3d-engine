@@ -18,6 +18,9 @@ layout(set = 0, binding = 0) uniform UniformBufferObject {
     vec4 lightDirectionType[16];
     vec4 lightCone[16];
     vec4 environmentParams;
+    // Phase 32 appended fields (same offsets as Renderer.h).
+    vec4 directionalColor;
+    mat4 spotShadowViewProj;
 } ubo;
 
 // Same 112-byte draw payload as the main pass (only the model matrix
@@ -33,6 +36,9 @@ layout(push_constant) uniform PushConstants {
 layout(location = 0) in vec3 inPosition;
 
 void main() {
-    uint cascade = min(push.cascadeIndex, 3u);
-    gl_Position = ubo.lightViewProj[cascade] * push.model * vec4(inPosition, 1.0);
+    // Push indices 0..3 select directional cascades; index 4 is
+    // the Phase 32 spot shadow pass and uses its own matrix.
+    mat4 lightMatrix = push.cascadeIndex >= 4u ? ubo.spotShadowViewProj
+                                               : ubo.lightViewProj[min(push.cascadeIndex, 3u)];
+    gl_Position = lightMatrix * push.model * vec4(inPosition, 1.0);
 }

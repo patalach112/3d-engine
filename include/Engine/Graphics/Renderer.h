@@ -46,6 +46,13 @@ struct FrameLighting {
     std::array<glm::vec4, kMaxFrameLights> lightCone{};
     glm::vec3 directionalDirection{0.35f, 0.8f, 0.45f};
     float directionalRadiance = 1.0f;
+    // Phase 32: entity-driven key light extras + spot shadow.
+    // Defaults reproduce the legacy look (warm tint, shadows on).
+    glm::vec3 directionalColor{1.0f, 0.96f, 0.88f};
+    bool directionalCastShadow = true;
+    bool spotShadowEnabled = false;
+    glm::mat4 spotShadowViewProj{1.0f};
+    int32_t spotShadowLightIndex = -1;
 };
 
 // Cinematic post-processing settings (Phase 22), fed from
@@ -84,6 +91,12 @@ struct UniformBufferObject {
     std::array<glm::vec4, kMaxFrameLights> lightCone{};
     // x: environment intensity, y: prefilter max LOD, z: skybox on/off
     glm::vec4 environmentParams{1.0f, 4.0f, 1.0f, 0.0f};
+    // Phase 32 (appended: every offset above is unchanged).
+    // rgb: key light color, w: cascade shadows on (1) / off (0)
+    glm::vec4 directionalColor{1.0f, 0.96f, 0.88f, 1.0f};
+    glm::mat4 spotShadowViewProj{1.0f}; // shadow-casting spot's light space
+    // x: packed light index owning the spot shadow (-1 = none)
+    glm::vec4 spotShadowParams{-1.0f, 0.0f, 0.0f, 0.0f};
 };
 
 // ---------------------------------------------------------------------------
@@ -162,10 +175,13 @@ private:
     void recordShadowCascades(VkCommandBuffer commandBuffer, std::span<const DrawItem> drawItems,
                               const std::array<glm::mat4, kMaxShadowCascades>& cascadeMatrices,
                               uint32_t cascadeCount);
+    // Phase 32: the shadow-casting spot renders into its own depth
+    // target through the same depth pipeline (push index = kSpotShadowPushIndex).
+    void recordSpotShadow(VkCommandBuffer commandBuffer, std::span<const DrawItem> drawItems);
     void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
                              std::span<const DrawItem> drawItems,
                              const std::array<glm::mat4, kMaxShadowCascades>& cascadeMatrices,
-                             uint32_t cascadeCount);
+                             uint32_t cascadeCount, bool spotShadowEnabled);
     void updateUniformBuffer(const glm::mat4& view, const glm::mat4& projection,
                              const FrameLighting& lighting);
     void recreateSwapchain();
@@ -214,6 +230,7 @@ private:
         VkFramebuffer framebuffer = VK_NULL_HANDLE;
     };
     std::array<ShadowTarget, kMaxShadowCascades> m_shadowTargets{};
+    ShadowTarget m_spotShadowTarget{}; // Phase 32 spot shadow depth target (kSpotShadowMapSize)
 
     PostSettings m_postSettings;
 

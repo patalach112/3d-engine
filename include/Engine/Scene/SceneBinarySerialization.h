@@ -37,8 +37,10 @@ class Scene;
 //   CLDR colliders                          GRVF gravity fields
 //   JONT joints (entity links remapped)     THRS thrusters
 //   PLGT point lights                       SLGT spot lights
-//   NSCR native script names (instances are runtime state and
-//        are recreated by the script system, never persisted)
+//        (section v2: trailing castShadow byte; v1 still loads)
+//   DIRL directional key light              NSCR native script
+//        names (instances are runtime state and are recreated
+//        by the script system, never persisted)
 //
 // Entities are referenced by their index in ENTY only — EnTT
 // handles recycle and are never persisted. Unknown sections are

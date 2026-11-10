@@ -139,6 +139,26 @@ struct SpotLightComponent {
     float innerConeRadians = 0.35f; // full-intensity cone half-angle
     float outerConeRadians = 0.6f;  // fade to zero here
     bool enabled = true;
+    // Phase 32: this spot casts a real-time shadow (one 2D shadow
+    // map is budgeted: the nearest shadow-casting spot packed into
+    // the frame's 16 light slots wins).
+    bool castShadow = false;
+};
+
+// Directional key light (Phase 32): the scene's sun, driving the
+// cascaded-shadow directional term in the PBR shader. `direction`
+// points TOWARD the light (the convention the shader uses). A
+// directional light is infinitely far away, so the entity's
+// transform is ignored. When several are enabled, the highest
+// intensity wins; with none, the renderer keeps the legacy
+// fixed sun (direction 0.35/0.8/0.45, white-warm, intensity 1).
+struct DirectionalLightComponent {
+    glm::vec3 color{1.0f};
+    float intensity = 1.0f; // radiance scale (legacy fixed sun: 1)
+    glm::vec3 direction{0.35f, 0.8f, 0.45f}; // toward the light
+    bool enabled = true;
+    bool castShadow = true;            // sample the cascade shadow maps
+    uint32_t cascadeCount = 4;         // CSM slices, clamped to 1..4
 };
 
 // Placeholder for the future asset system: identifies which mesh the

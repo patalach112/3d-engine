@@ -48,6 +48,18 @@ struct SceneLightData {
     std::array<glm::vec4, kMaxSceneLights> lightCone{};
     glm::vec3 directionalDirection{0.35f, 0.8f, 0.45f};
     float directionalRadiance = 1.0f;
+    // Phase 32: entity-driven key light + spot shadow state.
+    // Defaults reproduce the legacy fixed sun exactly (warm tint,
+    // shadows on); directionalFromEntity distinguishes "the scene
+    // has a Sun entity" from that fallback for tools and tests.
+    glm::vec3 directionalColor{1.0f, 0.96f, 0.88f};
+    bool directionalCastShadow = true;
+    bool directionalFromEntity = false;
+    // The single shadow-casting spot: its index into the packed
+    // light arrays above (-1 = none) and its light-space matrix.
+    bool spotShadowEnabled = false;
+    int32_t spotShadowLightIndex = -1;
+    glm::mat4 spotShadowViewProj{1.0f};
 };
 
 // Smooth windowed inverse-square attenuation, mirrored exactly by

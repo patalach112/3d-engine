@@ -554,7 +554,21 @@ MaterialId AssetManager::registerMaterial(MaterialDesc desc) {
     asset.desc = std::move(desc);
     m_materialIds.emplace(asset.desc.name, asset.id);
     m_materials.push_back(std::move(asset));
+    ++m_materialRegistryVersion;
     return m_materials.back().id;
+}
+
+bool AssetManager::updateMaterial(std::string_view name, const MaterialDesc& desc) {
+    const auto it = m_materialIds.find(std::string(name));
+    if (it == m_materialIds.end()) {
+        return false;
+    }
+    MaterialAsset& asset = m_materials[it->second - 1];
+    const std::string registeredName = asset.desc.name;
+    asset.desc = desc;
+    asset.desc.name = registeredName; // identity (id + slot + name) is stable
+    ++m_materialRegistryVersion;
+    return true;
 }
 
 const MeshAsset* AssetManager::mesh(MeshId id) const {

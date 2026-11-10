@@ -25,7 +25,7 @@ void primeComponentStorages(Scene::Registry& registry) {
 Scene::Scene() {
     primeComponentStorages<TagComponent, TransformComponent, ParentComponent, ChildrenComponent,
                            WorldTransformComponent, CameraComponent, PointLightComponent, SpotLightComponent,
-                           MeshComponent, NativeScriptComponent, SpinComponent, RigidBodyComponent,
+                           DirectionalLightComponent, MeshComponent, NativeScriptComponent, SpinComponent, RigidBodyComponent,
                            ColliderComponent, GravityFieldComponent, JointComponent, ThrusterComponent>(
         m_registry);
 }

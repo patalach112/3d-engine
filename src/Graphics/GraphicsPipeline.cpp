@@ -181,9 +181,10 @@ void GraphicsPipeline::createDescriptorSetLayout() {
         result.pImmutableSamplers = nullptr;
         return result;
     };
-    const std::array<VkDescriptorSetLayoutBinding, 7> bindings = {
+    const std::array<VkDescriptorSetLayoutBinding, 8> bindings = {
         uboBinding, shadowBinding, samplerBinding(2, kMaxMaterialTextures), samplerBinding(3, 1),
-        samplerBinding(4, 1),      samplerBinding(5, 1),                    samplerBinding(6, 1)};
+        samplerBinding(4, 1),      samplerBinding(5, 1),                    samplerBinding(6, 1),
+        samplerBinding(7, 1)}; // Phase 32: spot shadow map
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
