@@ -1747,7 +1747,10 @@ Screen-space UI gets its own analytic-shader pipeline: rounded
 rectangles, borders and solid colors are evaluated per-pixel from
 a signed distance field, and — Step 2 — SDF text, textured images
 and a scissor stack turn it into a real immediate-mode UI layer,
-still flushed as a handful of indexed draws per frame.
+still flushed as a handful of indexed draws per frame. Step 3
+adds interactive widgets (buttons, sliders, checkboxes) with
+hit-testing/focus management, plus a reflection-driven Component
+Inspector built entirely from those widgets.
 
 - **UIVertex & analytic shaders** (`shaders/ui.vert`,
   `shaders/ui.frag`, compiled to SPIR-V by glslangValidator like
@@ -1795,14 +1798,36 @@ still flushed as a handful of indexed draws per frame.
   vertex-input contract lives in exactly one place
   (`UIRenderer::vertexInput()`), shared by pipeline creation and
   the tests.
+- **UIContext widgets** (`Graphics/UIContext.h`): immediate-mode
+  interaction state over the batch — hovered / active / focused
+  widget ids (FNV-1a of panel seed + label) carried across
+  frames. Hit-testing respects the batch's nested scissor stack,
+  so clipped pixels neither hover nor press; presses capture the
+  mouse until release (sliders follow the pointer off-row),
+  pressing a widget steals focus, and pressing empty space
+  clears it. `button()` (normal/hover/active states, click on
+  completed press+release), `slider()` (track jump, drag,
+  clamping, 1%-of-range keyboard steps while focused),
+  `checkbox()` and three-axis `vec3Sliders()` all draw with the
+  SDF batch and share one theme; panels provide the row layout.
+- **Component Inspector** (`Graphics/UIInspector.h`): renders any
+  Phase 25 `TypeInfo` as an interactive panel with zero per-type
+  code — floats become sliders, bools become checkbox toggles,
+  vec3s become per-axis sliders, ints render as read-only
+  readouts — and writes edits back through the reflected offsets
+  in place. Header-only reflection keeps it in EngineGraphics
+  with no EngineScene link dependency. The app live-inspects the
+  player ship's `RigidBodyComponent` whenever the flight module
+  has spawned it (inert while the mouse is flight-captured).
 - **Integration**: `Renderer` owns the UIRenderer next to the HUD
   and records it inside the present pass right after the 3D
   composite, under the HUD text; the Application issues a
   translucent rounded backdrop panel plus an accent rule behind
   the FPS HUD plus an SDF control hint along the bottom edge,
-  every frame through `Renderer::uiBatch()`.
+  every frame through `Renderer::uiBatch()`, and feeds real
+  mouse/arrow-key state into its `UIContext` for the inspector.
 
-Verification: 45 new headless checks cover vertex accumulation
+Verification: 74 new headless checks cover vertex accumulation
 and corner/uv layout, index offsets across quads, batch-bounds
 unions (including negative origins), radius/border clamping,
 degenerate-input rejection, the vertex-input layout (binding
@@ -1811,8 +1836,14 @@ truncation staying index-consistent, the SDF atlas bake
 (interior/ramp/empty-cell texel audit, lowercase folding, '?'
 fallback), save/load round-trip + corrupt-blob rejection, glyph
 layout (pen advance, newline, cell-halo quads, measureText),
-texture segment coalescing, and scissor nesting/intersection.
-**832 checks pass in Debug, Release-shared and Release-static
+texture segment coalescing, scissor nesting/intersection, and
+the full widget lifecycle driven by synthetic mouse frames —
+hover/press/drag/release semantics, clipped hit-testing, focus
+stealing and clearing, slider track math with clamping and
+keyboard steps, checkbox toggling, panel layout rows, and an
+inspector that edits a reflected struct's float/bool/vec3
+fields in place while read-only ints never write back.
+**861 checks pass in Debug, Release-shared and Release-static
 with zero warnings, CTest 1/1** — and additionally in a
 hidden-visibility build (simulating Windows DLL rules) and under
 AddressSanitizer.

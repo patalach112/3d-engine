@@ -9,6 +9,7 @@
 #include "Graphics/GraphicsPipeline.h"
 #include "Core/ModuleManager.h"
 #include "Graphics/Renderer.h"
+#include "Graphics/UIContext.h"
 #include "Graphics/VramBudget.h"
 #include "Graphics/Swapchain.h"
 #include "Graphics/VulkanContext.h"
@@ -68,6 +69,7 @@ private:
     Swapchain m_swapchain;
     GraphicsPipeline m_pipeline;
     Renderer m_renderer;
+    UIContext m_uiContext; // Phase 26 Step 3 widget state (CPU-only)
     GameLoop m_gameLoop;
     JobSystem m_jobSystem;
     VramBudget m_vramBudget;

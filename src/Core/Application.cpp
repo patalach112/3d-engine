@@ -8,6 +8,8 @@
 
 #include "Core/Logger.h"
 #include "Graphics/HudFont.h"
+#include "Graphics/UIInspector.h"
+#include "Scene/ComponentReflection.h"
 #include "Geometry/Cube.h"
 #include "Scene/Components.h"
 #include "Scene/Systems/CameraSystem.h"
@@ -550,6 +552,21 @@ void Application::run() {
             UIBatch& ui = m_renderer.uiBatch();
             ui.begin(static_cast<uint32_t>(std::max(m_window.width(), 0)),
                      static_cast<uint32_t>(std::max(m_window.height(), 0)));
+
+            // Phase 26 Step 3: interactive widgets. While the mouse
+            // is captured for flight the pointer is parked
+            // off-screen, so the UI stays visible but inert.
+            UIInput uiInput;
+            if (!m_input.isMouseCaptured()) {
+                const glm::vec2 mouse = m_input.mousePosition();
+                uiInput.mouseX = mouse.x;
+                uiInput.mouseY = mouse.y;
+                uiInput.mouseDown = m_input.isMouseButtonDown(MouseButton::Left);
+                uiInput.keyStep = (m_input.wasKeyPressed(Key::Right) ? 1 : 0) -
+                                  (m_input.wasKeyPressed(Key::Left) ? 1 : 0);
+            }
+            m_uiContext.beginFrame(uiInput, ui);
+
             ui.drawRoundedRect(6.0f, 6.0f, 372.0f, 118.0f,
                                UIRectStyle{10.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.16f}},
                                glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
@@ -559,6 +576,29 @@ void Application::run() {
             const float hintY = static_cast<float>(std::max(m_window.height() - 34, 0));
             ui.drawText("WASD + MOUSE FLY - SPACE/CTRL RISE/SINK - Q/E ROLL", 12.0f, hintY, 1.5f,
                         glm::vec4{0.75f, 0.85f, 1.0f, 0.85f});
+
+            // Live Component Inspector over the player ship's
+            // reflected RigidBodyComponent (present only when the
+            // flight module has spawned the ship).
+            auto& registry = m_scene.registry();
+            const auto tags = registry.view<TagComponent>();
+            for (const auto entity : tags) {
+                if (tags.get<TagComponent>(entity).tag != "Spacecraft" ||
+                    !registry.all_of<RigidBodyComponent>(entity)) {
+                    continue;
+                }
+                auto& body = registry.get<RigidBodyComponent>(entity);
+                UIInspectorOptions inspectorOptions;
+                inspectorOptions.floatMin = 0.0f;
+                inspectorOptions.floatMax = 5000.0f;
+                constexpr float kInspectorWidth = 322.0f;
+                inspectComponent(m_uiContext,
+                                 UIRect{static_cast<float>(m_window.width()) - kInspectorWidth - 8.0f, 8.0f,
+                                        kInspectorWidth, 252.0f},
+                                 reflect<RigidBodyComponent>(), &body, inspectorOptions);
+                break;
+            }
+            m_uiContext.endFrame();
         }
         return m_renderSystem.render(m_scene);
     };

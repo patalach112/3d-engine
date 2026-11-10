@@ -35,6 +35,8 @@
 #include "Graphics/HudFont.h"
 #include "Graphics/RenderQueue.h"
 #include "Graphics/SdfFont.h"
+#include "Graphics/UIContext.h"
+#include "Graphics/UIInspector.h"
 #include "Graphics/UIRenderer.h"
 #include "Graphics/ShadowMap.h"
 #include "Graphics/Renderer.h"
@@ -7018,6 +7020,222 @@ void testPhase26UIRenderer() {
           "ui scissor: a disjoint nested rect collapses to empty");
 }
 
+void testPhase26Widgets() {
+    struct Rig {
+        engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+        engine::UIBatch batch;
+        engine::UIContext ctx;
+        Rig() { batch.setFontAtlas(&atlas); }
+        void begin(float mouseX, float mouseY, bool mouseDown, int keyStep = 0) {
+            batch.begin(800, 600);
+            ctx.beginFrame(engine::UIInput{mouseX, mouseY, mouseDown, keyStep}, batch);
+        }
+        void end() { ctx.endFrame(); }
+    };
+    Rig rig;
+
+    // --- (a) Button hover / press / release ---------------------------------
+    const engine::UIRect fireRect{100.0f, 100.0f, 120.0f, 30.0f};
+    rig.begin(0.0f, 0.0f, false);
+    check(!rig.ctx.button(fireRect, "Fire") && rig.ctx.hoveredId() == engine::kUINoWidget,
+          "widgets: no hover away from the button");
+    rig.end();
+    rig.begin(150.0f, 110.0f, false);
+    check(!rig.ctx.button(fireRect, "Fire") && rig.ctx.hoveredId() != engine::kUINoWidget,
+          "widgets: hovering the button reports its id");
+    const engine::UIWidgetId fireId = rig.ctx.hoveredId();
+    rig.end();
+    rig.begin(150.0f, 110.0f, true);
+    check(!rig.ctx.button(fireRect, "Fire") && rig.ctx.activeId() == fireId && rig.ctx.focusedId() == fireId,
+          "widgets: press captures active + focus without firing");
+    rig.end();
+    rig.begin(150.0f, 110.0f, true);
+    check(!rig.ctx.button(fireRect, "Fire") && rig.ctx.activeId() == fireId, "widgets: hold keeps the capture");
+    rig.end();
+    rig.begin(150.0f, 110.0f, false);
+    check(rig.ctx.button(fireRect, "Fire") && rig.ctx.activeId() == engine::kUINoWidget,
+          "widgets: release over the button fires the click");
+    rig.end();
+    rig.begin(150.0f, 110.0f, true);
+    rig.ctx.button(fireRect, "Fire");
+    rig.end();
+    rig.begin(400.0f, 300.0f, true);
+    check(!rig.ctx.button(fireRect, "Fire") && rig.ctx.activeId() == fireId &&
+              rig.ctx.hoveredId() == engine::kUINoWidget,
+          "widgets: dragging off keeps the capture but loses hover");
+    rig.end();
+    rig.begin(400.0f, 300.0f, false);
+    check(!rig.ctx.button(fireRect, "Fire") && rig.ctx.activeId() == engine::kUINoWidget,
+          "widgets: releasing off the button cancels the click");
+    rig.end();
+    check(engine::UIContext::hashId(7, "Fire") == engine::UIContext::hashId(7, "Fire") &&
+              engine::UIContext::hashId(7, "Fire") != engine::UIContext::hashId(8, "Fire") &&
+              engine::UIContext::hashId(7, "Fire") != engine::kUINoWidget,
+          "widgets: ids are stable, seed-sensitive and never zero");
+
+    // --- (b) Focus stealing -----------------------------------------------------
+    const engine::UIRect alphaRect{50.0f, 50.0f, 120.0f, 30.0f};
+    const engine::UIRect betaRect{50.0f, 100.0f, 120.0f, 30.0f};
+    rig.begin(80.0f, 60.0f, true);
+    rig.ctx.button(alphaRect, "Alpha");
+    const engine::UIWidgetId alphaId = rig.ctx.focusedId();
+    rig.end();
+    check(alphaId != engine::kUINoWidget, "widgets: pressing Alpha focuses it");
+    rig.begin(80.0f, 60.0f, false);
+    rig.ctx.button(alphaRect, "Alpha");
+    rig.end();
+    rig.begin(80.0f, 110.0f, true);
+    rig.ctx.button(betaRect, "Beta");
+    check(rig.ctx.focusedId() != alphaId && rig.ctx.focusedId() != engine::kUINoWidget,
+          "widgets: pressing Beta steals focus from Alpha");
+    rig.end();
+    rig.begin(80.0f, 110.0f, false);
+    rig.ctx.button(betaRect, "Beta");
+    rig.end();
+    rig.begin(500.0f, 400.0f, true);
+    rig.ctx.button(alphaRect, "Alpha");
+    rig.ctx.button(betaRect, "Beta");
+    rig.end();
+    check(rig.ctx.focusedId() == engine::kUINoWidget, "widgets: pressing empty space clears focus");
+
+    // --- (c) Scissor-clipped hit-testing -----------------------------------------
+    const engine::UIRect clipPanelRect{0.0f, 0.0f, 200.0f, 100.0f};
+    const engine::UIRect clippedRect{150.0f, 80.0f, 120.0f, 30.0f}; // extends past the panel
+    rig.begin(240.0f, 95.0f, false);
+    rig.ctx.beginPanel("ClipPanel", clipPanelRect);
+    check(!rig.ctx.button(clippedRect, "Clipped") && rig.ctx.hoveredId() == engine::kUINoWidget,
+          "widgets: scissored-away pixels do not hover");
+    rig.ctx.endPanel();
+    rig.end();
+    rig.begin(240.0f, 95.0f, true);
+    rig.ctx.beginPanel("ClipPanel", clipPanelRect);
+    rig.ctx.button(clippedRect, "Clipped");
+    check(rig.ctx.activeId() == engine::kUINoWidget, "widgets: clicks in the clipped region never activate");
+    rig.ctx.endPanel();
+    rig.end();
+    rig.begin(240.0f, 95.0f, false);
+    rig.ctx.beginPanel("ClipPanel", clipPanelRect);
+    rig.ctx.button(clippedRect, "Clipped");
+    rig.ctx.endPanel();
+    rig.end();
+    rig.begin(180.0f, 90.0f, true);
+    rig.ctx.beginPanel("ClipPanel", clipPanelRect);
+    rig.ctx.button(clippedRect, "Clipped");
+    check(rig.ctx.activeId() != engine::kUINoWidget, "widgets: the visible part of a clipped widget still presses");
+    rig.ctx.endPanel();
+    rig.end();
+    rig.begin(180.0f, 90.0f, false);
+    rig.ctx.beginPanel("ClipPanel", clipPanelRect);
+    rig.ctx.button(clippedRect, "Clipped");
+    rig.ctx.endPanel();
+    rig.end();
+
+    // --- (d) Slider drag math + keyboard stepping ----------------------------------
+    const engine::UIRect speedRect{100.0f, 100.0f, 300.0f, 26.0f};
+    const engine::UIRect track = engine::UIContext::sliderTrackRect(speedRect);
+    check(track.x == 222.0f && track.width == 174.0f, "widgets: slider track follows the published layout");
+    float speed = 2.0f;
+    rig.begin(track.x + 87.0f, 113.0f, true);
+    check(rig.ctx.slider(speedRect, "Speed", &speed, 0.0f, 10.0f) && speed == 5.0f,
+          "widgets: pressing the track jumps to the mouse fraction");
+    rig.end();
+    rig.begin(track.x + track.width, 113.0f, true);
+    check(rig.ctx.slider(speedRect, "Speed", &speed, 0.0f, 10.0f) && speed == 10.0f,
+          "widgets: dragging to the track end reaches max");
+    rig.end();
+    rig.begin(600.0f, 113.0f, true);
+    check(!rig.ctx.slider(speedRect, "Speed", &speed, 0.0f, 10.0f) && speed == 10.0f,
+          "widgets: dragging past the end clamps at max (no change reported)");
+    rig.end();
+    rig.begin(260.0f, 400.0f, true);
+    check(rig.ctx.slider(speedRect, "Speed", &speed, 0.0f, 10.0f) && nearlyEqual(speed, 2.1839f, 0.01f),
+          "widgets: an active slider follows the mouse even off its row");
+    rig.end();
+    rig.begin(260.0f, 400.0f, false);
+    rig.ctx.slider(speedRect, "Speed", &speed, 0.0f, 10.0f);
+    check(rig.ctx.activeId() == engine::kUINoWidget, "widgets: release ends the slider drag");
+    rig.end();
+    rig.begin(0.0f, 0.0f, false, +1);
+    check(rig.ctx.slider(speedRect, "Speed", &speed, 0.0f, 10.0f) && nearlyEqual(speed, 2.2839f, 0.01f),
+          "widgets: a focused slider steps 1% of range per key press");
+    rig.end();
+
+    // --- (e) Checkbox ---------------------------------------------------------------
+    const engine::UIRect turboRect{100.0f, 200.0f, 200.0f, 26.0f};
+    bool turbo = false;
+    rig.begin(120.0f, 213.0f, true);
+    rig.ctx.checkbox(turboRect, "Turbo", &turbo);
+    rig.end();
+    rig.begin(120.0f, 213.0f, false);
+    check(rig.ctx.checkbox(turboRect, "Turbo", &turbo) && turbo, "widgets: checkbox toggles on a completed click");
+    rig.end();
+    rig.begin(120.0f, 213.0f, true);
+    rig.ctx.checkbox(turboRect, "Turbo", &turbo);
+    rig.end();
+    rig.begin(500.0f, 400.0f, false);
+    check(!rig.ctx.checkbox(turboRect, "Turbo", &turbo) && turbo,
+          "widgets: releasing outside leaves the checkbox unchanged");
+    rig.end();
+
+    // --- (f) Panel layout rows ---------------------------------------------------------
+    rig.begin(30.0f, 25.0f, false);
+    rig.ctx.beginPanel("LayoutPanel", engine::UIRect{10.0f, 10.0f, 300.0f, 200.0f});
+    rig.ctx.button("First");
+    rig.ctx.button("Second");
+    const engine::UIWidgetId firstId = rig.ctx.hoveredId();
+    rig.ctx.endPanel();
+    rig.end();
+    rig.begin(30.0f, 55.0f, false);
+    rig.ctx.beginPanel("LayoutPanel", engine::UIRect{10.0f, 10.0f, 300.0f, 200.0f});
+    rig.ctx.button("First");
+    rig.ctx.button("Second");
+    check(firstId != engine::kUINoWidget && rig.ctx.hoveredId() != firstId &&
+              rig.ctx.hoveredId() != engine::kUINoWidget,
+          "widgets: layout rows stack and hover independently");
+    rig.ctx.endPanel();
+    rig.end();
+
+    // --- (g) Reflection-driven Component Inspector ---------------------------------------
+    EditorWidgetSample sample;
+    sample.count = 7;
+    const engine::UIRect panel{0.0f, 0.0f, 360.0f, 260.0f};
+    const engine::UIInspectorOptions options{0.0f, 10.0f, -5.0f, 5.0f};
+    const auto rowRect = [&panel](int row) {
+        return engine::UIRect{panel.x + engine::UIContext::kPanelPadding,
+                              panel.y + engine::UIContext::kPanelPadding +
+                                  static_cast<float>(row) *
+                                      (engine::UIContext::kRowHeight + engine::UIContext::kRowSpacing),
+                              panel.width - 2.0f * engine::UIContext::kPanelPadding,
+                              engine::UIContext::kRowHeight};
+    };
+    const auto inspectorFrame = [&](float mouseX, float mouseY, bool mouseDown) {
+        rig.batch.begin(800, 600);
+        rig.ctx.beginFrame(engine::UIInput{mouseX, mouseY, mouseDown, 0}, rig.batch);
+        const bool changed = engine::inspectComponent(rig.ctx, panel, engine::reflect<EditorWidgetSample>(),
+                                                      &sample, options);
+        rig.ctx.endFrame();
+        return changed;
+    };
+    // Rows: 0 title, 1 count (label), 2 flags (label), 3 weight (slider),
+    // 4 active (checkbox), 5..7 position components (sliders).
+    check(!inspectorFrame(700.0f, 500.0f, false) && sample.weight == 0.0f && !rig.batch.empty(),
+          "inspector: builds all rows without changing values on an idle frame");
+    const engine::UIRect weightTrack = engine::UIContext::sliderTrackRect(rowRect(3));
+    check(inspectorFrame(weightTrack.x + weightTrack.width, rowRect(3).y + 13.0f, true) &&
+              sample.weight == 10.0f,
+          "inspector: dragging the float slider writes through the reflected offset");
+    inspectorFrame(weightTrack.x + weightTrack.width, rowRect(3).y + 13.0f, false);
+    inspectorFrame(30.0f, rowRect(4).y + 13.0f, true);
+    check(inspectorFrame(30.0f, rowRect(4).y + 13.0f, false) && sample.active,
+          "inspector: clicking the bool checkbox toggles the field");
+    const engine::UIRect posTrack = engine::UIContext::sliderTrackRect(rowRect(5));
+    check(inspectorFrame(posTrack.x + 0.75f * posTrack.width, rowRect(5).y + 13.0f, true) &&
+              nearlyEqual(sample.position.x, 2.5f, 0.001f) && sample.position.y == 0.0f,
+          "inspector: vec3 component sliders edit one axis at a time");
+    inspectorFrame(posTrack.x + 0.75f * posTrack.width, rowRect(5).y + 13.0f, false);
+    check(sample.count == 7, "inspector: read-only int rows never write back");
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -7044,6 +7262,7 @@ int main() {
     testPhase24SpaceFlight();
     testPhase25ReflectionScripting();
     testPhase26UIRenderer();
+    testPhase26Widgets();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();
