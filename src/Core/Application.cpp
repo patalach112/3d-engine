@@ -678,7 +678,13 @@ void Application::run() {
             const float outlinerHeight =
                 std::max(static_cast<float>(m_window.height()) - 148.0f, 120.0f);
             const UIRect outlinerRect{6.0f, 140.0f, 300.0f, outlinerHeight};
+            const glm::vec2 viewportSize{static_cast<float>(m_window.width()),
+                                         static_cast<float>(m_window.height())};
             m_outliner.build(m_uiContext, outlinerRect, m_scene);
+            // Phase 29: Asset Browser dock along the bottom edge,
+            // between the hierarchy (left) and inspector (right).
+            const UIRect assetRect{312.0f, std::max(viewportSize.y - 196.0f, 150.0f),
+                                   std::max(viewportSize.x - 650.0f, 240.0f), 188.0f};
 
             // Phase 28: transform gizmo over the selection, then
             // viewport picking. The gizmo runs first so a press that
@@ -686,8 +692,6 @@ void Application::run() {
             // for presses the UI left unconsumed, outside every dock
             // (HUD, toolbar, inspector, outliner), with no context
             // menu open at frame start and no widget mid-drag.
-            const glm::vec2 viewportSize{static_cast<float>(m_window.width()),
-                                         static_cast<float>(m_window.height())};
             if (const CameraComponent* activeCamera = m_scene.findActiveCamera(); activeCamera != nullptr) {
                 const bool gizmoBlocked = popupOpenAtFrameStart || m_input.isMouseCaptured();
                 const GizmoUpdateResult gizmoResult = m_gizmo.update(m_uiContext, m_scene, m_outliner.selected(),
@@ -703,7 +707,8 @@ void Application::run() {
                 if (!gizmoResult.pressConsumed && !gizmoBlocked && m_uiContext.activeId() == kUINoWidget &&
                     m_uiContext.pressedRect(UIRect{0.0f, 0.0f, viewportSize.x, viewportSize.y}) &&
                     !insideRect(UIRect{6.0f, 6.0f, 372.0f, 124.0f}, mouse) && !insideRect(toolbarRect, mouse) &&
-                    !insideRect(outlinerRect, mouse) && !insideRect(inspectorOccluder, mouse)) {
+                    !insideRect(outlinerRect, mouse) && !insideRect(inspectorOccluder, mouse) &&
+                    !insideRect(assetRect, mouse)) {
                     RaycastHit hit;
                     if (pickEntityAt(m_scene, activeCamera->camera, mouse, viewportSize, hit)) {
                         m_outliner.setSelected(hit.entity);
@@ -714,10 +719,61 @@ void Application::run() {
                     }
                 }
             }
+
+            // Phase 29: asset browser + drop targets. The browser
+            // registers its drag sources; the inspector dock is the
+            // assignment target (checked first — it wins over the
+            // viewport), the viewport spawns dropped meshes at the
+            // ground point under the cursor. Double-clicking a mesh
+            // file spawns it through the screen centre.
+            const UIAssetBrowser::Result browserResult = m_assetBrowser.build(m_uiContext, assetRect);
+            const UIDragPayload dragPayload = m_uiContext.dragPayload();
+            const glm::vec2 dragMouse = m_uiContext.mousePosition();
+            const auto overRect = [](const UIRect& rect, glm::vec2 point) {
+                return point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y &&
+                       point.y < rect.y + rect.height;
+            };
+            const UIRect inspectorDropRect{inspectorX, 0.0f, std::max(0.0f, viewportSize.x - inspectorX),
+                                           inspectorBottom};
+            const entt::entity dropSelection = m_outliner.selected();
+            if (dropSelection != entt::null && registry.valid(dropSelection)) {
+                const bool hot = m_uiContext.dropTargetHovered(inspectorDropRect, "AssetTexture") ||
+                                 m_uiContext.dropTargetHovered(inspectorDropRect, "AssetMesh") ||
+                                 m_uiContext.dropTargetHovered(inspectorDropRect, "AssetShader");
+                if (hot) {
+                    ui.drawRoundedRect(inspectorDropRect.x, inspectorDropRect.y, inspectorDropRect.width,
+                                       inspectorDropRect.height,
+                                       UIRectStyle{6.0f, 2.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.9f}},
+                                       glm::vec4{1.0f, 0.82f, 0.25f, 0.10f});
+                }
+                if (m_uiContext.dropTarget(inspectorDropRect, "AssetTexture") ||
+                    m_uiContext.dropTarget(inspectorDropRect, "AssetMesh") ||
+                    m_uiContext.dropTarget(inspectorDropRect, "AssetShader")) {
+                    applyDroppedAsset(dropSelection, dragPayload);
+                }
+            }
+            if (const CameraComponent* activeCamera = m_scene.findActiveCamera(); activeCamera != nullptr) {
+                const bool overDock = overRect(UIRect{6.0f, 6.0f, 372.0f, 124.0f}, dragMouse) ||
+                                      overRect(toolbarRect, dragMouse) || overRect(outlinerRect, dragMouse) ||
+                                      overRect(inspectorDropRect, dragMouse) || overRect(assetRect, dragMouse);
+                if (!overDock && m_uiContext.dropTarget(UIRect{0.0f, 0.0f, viewportSize.x, viewportSize.y},
+                                                        "AssetMesh")) {
+                    spawnDroppedMesh(dragPayload.data, dragMouse, activeCamera->camera, viewportSize);
+                }
+                if (browserResult.activated != nullptr && browserResult.activated->kind == AssetEntryKind::Mesh) {
+                    spawnDroppedMesh(browserResult.activated->relativePath,
+                                     glm::vec2{viewportSize.x * 0.5f, viewportSize.y * 0.5f}, activeCamera->camera,
+                                     viewportSize);
+                }
+            }
             m_uiContext.endFrame();
         }
         return m_renderSystem.render(m_scene);
     };
+
+    // Phase 29: the Asset Browser opens on the project assets
+    // folder (copied next to the executable by the build).
+    m_assetBrowser.setRootPath("assets");
 
     m_gameLoop.run(callbacks);
 
@@ -772,6 +828,128 @@ void Application::handleEventImpulse() {
     body->sleeping = false;
     body->sleepTimer = 0.0f;
     ENGINE_LOG_INFO("Impulse action: launched entity #" << entt::to_integral(selected));
+}
+
+void Application::spawnDroppedMesh(std::string_view relativePath, glm::vec2 mousePixels, const Camera& camera,
+                                   glm::vec2 viewportSize) {
+    std::filesystem::path absolute;
+    if (!UIAssetBrowser::resolveWithinRoot(m_assetBrowser.rootPath(), relativePath, absolute)) {
+        ENGINE_LOG_WARNING("Asset drop: '" << relativePath << "' escapes the asset root; refused");
+        return;
+    }
+    if (!UIAssetBrowser::isImportableMesh(relativePath)) {
+        ENGINE_LOG_WARNING("Asset drop: '" << relativePath << "' is recognized, but only OBJ meshes import today");
+        return;
+    }
+    const std::string name = std::filesystem::path{relativePath}.stem().string();
+    const MeshAsset* asset = m_assets.mesh(name);
+    if (asset == nullptr) {
+        if (m_assets.loadObj(name, absolute) == kInvalidAssetId) {
+            ENGINE_LOG_WARNING("Asset drop: failed to import '" << relativePath << "'");
+            return;
+        }
+        asset = m_assets.mesh(name);
+    }
+    if (asset == nullptr) {
+        return;
+    }
+    glm::vec3 position;
+    if (!dropPointOnGround(camera, mousePixels, viewportSize, position)) {
+        position = camera.position() + camera.front() * 6.0f; // hover it in front of the camera
+    }
+    const Entity spawned = m_scene.spawnImportedModel(*asset, name, position, 1.0f, 1.0f);
+    if (spawned.isValid()) {
+        m_outliner.setSelected(spawned.handle());
+        ENGINE_LOG_INFO("Asset drop: spawned '" << name << "' at (" << position.x << ", " << position.y << ", "
+                                                << position.z << ")");
+    }
+}
+
+std::string Application::deriveMaterial(MeshComponent& mesh, const std::string& derivedName,
+                                        const std::function<void(MaterialDesc&)>& mutate) {
+    if (m_assets.material(derivedName) == nullptr) {
+        MaterialDesc desc;
+        if (const MaterialAsset* base = m_assets.material(mesh.materialName); base != nullptr) {
+            desc = base->desc;
+        }
+        desc.name = derivedName;
+        mutate(desc);
+        m_assets.registerMaterial(std::move(desc));
+    }
+    mesh.materialName = derivedName;
+    return derivedName;
+}
+
+void Application::applyDroppedAsset(entt::entity entity, const UIDragPayload& payload) {
+    auto& registry = m_scene.registry();
+    if (entity == entt::null || !registry.valid(entity)) {
+        return;
+    }
+    std::filesystem::path absolute;
+    if (!UIAssetBrowser::resolveWithinRoot(m_assetBrowser.rootPath(), payload.data, absolute)) {
+        ENGINE_LOG_WARNING("Asset drop: '" << payload.data << "' escapes the asset root; refused");
+        return;
+    }
+    const std::string stem = std::filesystem::path{payload.data}.stem().string();
+    if (payload.type == "AssetMesh") {
+        if (!UIAssetBrowser::isImportableMesh(payload.data)) {
+            ENGINE_LOG_WARNING("Asset drop: '" << payload.data << "' is recognized, but only OBJ meshes import");
+            return;
+        }
+        const MeshAsset* asset = m_assets.mesh(stem);
+        if (asset == nullptr) {
+            if (m_assets.loadObj(stem, absolute) == kInvalidAssetId) {
+                ENGINE_LOG_WARNING("Asset drop: failed to import '" << payload.data << "'");
+                return;
+            }
+            asset = m_assets.mesh(stem);
+        }
+        if (asset == nullptr) {
+            return;
+        }
+        MeshComponent* mesh = registry.try_get<MeshComponent>(entity);
+        if (mesh == nullptr) {
+            mesh = &registry.emplace<MeshComponent>(entity);
+        }
+        mesh->assetId = stem;
+        mesh->localBounds = asset->bounds.aabb();
+        ENGINE_LOG_INFO("Asset drop: entity #" << entt::to_integral(entity) << " now renders '" << stem << "'");
+    } else if (payload.type == "AssetTexture") {
+        MeshComponent* mesh = registry.try_get<MeshComponent>(entity);
+        if (mesh == nullptr) {
+            ENGINE_LOG_WARNING("Asset drop: selected entity has no mesh to receive a texture");
+            return;
+        }
+        m_assets.declareTextureSource(stem, absolute);
+        m_assets.requestLoad(stem);
+        deriveMaterial(*mesh, "drop_" + stem,
+                       [&stem](MaterialDesc& desc) { desc.pbr.albedoTexture = stem; });
+        ENGINE_LOG_INFO("Asset drop: texture '" << stem << "' assigned as albedo of '" << mesh->materialName << "'");
+    } else if (payload.type == "AssetShader") {
+        MeshComponent* mesh = registry.try_get<MeshComponent>(entity);
+        if (mesh == nullptr) {
+            ENGINE_LOG_WARNING("Asset drop: selected entity has no mesh to receive a shader");
+            return;
+        }
+        const std::string fileName = std::filesystem::path{payload.data}.filename().string();
+        const bool fragment = fileName.ends_with(".frag.spv");
+        const bool vertex = fileName.ends_with(".vert.spv");
+        if (!fragment && !vertex) {
+            ENGINE_LOG_WARNING("Asset drop: shader '" << fileName << "' is not a .vert.spv/.frag.spv blob");
+            return;
+        }
+        m_assets.loadShader(fileName, absolute);
+        deriveMaterial(*mesh, "drop_" + stem, [&fileName, fragment](MaterialDesc& desc) {
+            if (fragment) {
+                desc.fragmentShader = fileName;
+            } else {
+                desc.vertexShader = fileName;
+            }
+        });
+        ENGINE_LOG_INFO("Asset drop: shader '" << fileName << "' assigned via '" << mesh->materialName << "'");
+    }
+    // Anything else (scripts, ...) has no inspector meaning today:
+    // the drop target simply never accepts those payload types.
 }
 
 void Application::handlePhysicsReset() {

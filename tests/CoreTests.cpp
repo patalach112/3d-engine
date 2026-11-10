@@ -20,6 +20,7 @@
 #include "Scene/DynamicAABBTree.h"
 #include "Scene/Scene.h"
 #include "Scene/UIOutliner.h"
+#include "Scene/UIAssetBrowser.h"
 #include "Scene/Raycast.h"
 #include "Scene/TransformGizmo.h"
 #include "Scene/Systems/RenderSystem.h"
@@ -7881,6 +7882,289 @@ void testPhase28Gizmos() {
     }
 }
 
+void testPhase29Assets() {
+    std::cout << "Phase 29: asset browser & drag-and-drop\n";
+    struct AssetRig {
+        engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+        engine::UIBatch batch;
+        engine::UIContext ctx;
+        AssetRig() { batch.setFontAtlas(&atlas); }
+        void frame(float mouseX, float mouseY, bool down, bool esc = false) {
+            batch.begin(800, 600);
+            engine::UIInput input;
+            input.mouseX = mouseX;
+            input.mouseY = mouseY;
+            input.mouseDown = down;
+            input.escapePressed = esc;
+            ctx.beginFrame(input, batch);
+        }
+        void end() { ctx.endFrame(); }
+    };
+
+    // --- Fixture tree ------------------------------------------------------------
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "engine_phase29_assets";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root / "models");
+    std::filesystem::create_directories(root / "textures");
+    const auto writeFile = [&root](const std::filesystem::path& relative, const std::string& content) {
+        std::ofstream out(root / relative, std::ios::binary);
+        out << content;
+    };
+    writeFile("models/cube.obj", "v 0 0 0\n");
+    writeFile("models/rock.gltf", "{}\n");
+    writeFile("textures/checker.ppm", "P6\n1 1\n255\n\xff\x00\x00");
+    writeFile("app.cpp", "int main() {}\n");
+    writeFile("notes.txt", "hello\n");
+    writeFile(".hidden", "secret\n");
+
+    using engine::AssetEntryKind;
+    using engine::UIAssetBrowser;
+
+    // --- (a) Asset type recognition ------------------------------------------------
+    check(UIAssetBrowser::classifyPath("cube.OBJ", false) == AssetEntryKind::Mesh &&
+              UIAssetBrowser::classifyPath("scene.gltf", false) == AssetEntryKind::Mesh &&
+              UIAssetBrowser::classifyPath("hero.glb", false) == AssetEntryKind::Mesh &&
+              UIAssetBrowser::classifyPath("skin.png", false) == AssetEntryKind::Texture &&
+              UIAssetBrowser::classifyPath("photo.JPG", false) == AssetEntryKind::Texture &&
+              UIAssetBrowser::classifyPath("checker.ppm", false) == AssetEntryKind::Texture &&
+              UIAssetBrowser::classifyPath("ui.frag.spv", false) == AssetEntryKind::Shader &&
+              UIAssetBrowser::classifyPath("sky.vert", false) == AssetEntryKind::Shader &&
+              UIAssetBrowser::classifyPath("gameplay.cpp", false) == AssetEntryKind::Script &&
+              UIAssetBrowser::classifyPath("plugin.lua", false) == AssetEntryKind::Script &&
+              UIAssetBrowser::classifyPath("module.so", false) == AssetEntryKind::Module &&
+              UIAssetBrowser::classifyPath("level.json", false) == AssetEntryKind::SceneFile &&
+              UIAssetBrowser::classifyPath("data.bin", false) == AssetEntryKind::Unknown &&
+              UIAssetBrowser::classifyPath("models.obj", true) == AssetEntryKind::Folder,
+          "assets: extensions classify into kinds (case-insensitive, folders win)");
+
+    // --- (b) Draggability and importability -------------------------------------------
+    check(UIAssetBrowser::payloadTypeFor(AssetEntryKind::Mesh) == "AssetMesh" &&
+              UIAssetBrowser::payloadTypeFor(AssetEntryKind::Texture) == "AssetTexture" &&
+              UIAssetBrowser::payloadTypeFor(AssetEntryKind::Shader) == "AssetShader" &&
+              UIAssetBrowser::payloadTypeFor(AssetEntryKind::Folder).empty() &&
+              UIAssetBrowser::payloadTypeFor(AssetEntryKind::SceneFile).empty() &&
+              UIAssetBrowser::payloadTypeFor(AssetEntryKind::Unknown).empty(),
+          "assets: only files with drop semantics carry payload types");
+    check(UIAssetBrowser::isImportableMesh("a/b/cube.obj") && !UIAssetBrowser::isImportableMesh("rock.gltf") &&
+              !UIAssetBrowser::isImportableMesh("checker.ppm"),
+          "assets: OBJ is the importable mesh format today");
+
+    // --- (c) Directory scanning ----------------------------------------------------------
+    {
+        const std::vector<engine::AssetEntry> entries = UIAssetBrowser::scanDirectory(root, "");
+        check(entries.size() == 4u && entries[0].name == "models" && entries[0].isDirectory &&
+                  entries[1].name == "textures" && entries[2].name == "app.cpp" &&
+                  entries[2].kind == AssetEntryKind::Script && entries[3].name == "notes.txt" &&
+                  entries[3].kind == AssetEntryKind::Unknown,
+              "assets: scan sorts folders first and skips dotfiles");
+        const std::vector<engine::AssetEntry> models = UIAssetBrowser::scanDirectory(root, "models");
+        check(models.size() == 2u && models[0].relativePath == "models/cube.obj" &&
+                  models[0].kind == AssetEntryKind::Mesh && models[1].relativePath == "models/rock.gltf",
+              "assets: scan reports root-relative paths and kinds");
+        check(UIAssetBrowser::scanDirectory(root / "does-not-exist", "").empty(),
+              "assets: an unreadable folder scans as empty");
+    }
+
+    // --- (d) Root containment for path resolution ------------------------------------------
+    {
+        std::filesystem::path absolute;
+        check(UIAssetBrowser::resolveWithinRoot(root, "models/cube.obj", absolute) &&
+                  absolute == std::filesystem::weakly_canonical(root / "models" / "cube.obj"),
+              "assets: a nested path resolves under the root");
+        check(UIAssetBrowser::resolveWithinRoot(root, "models/../textures/checker.ppm", absolute) &&
+                  absolute == std::filesystem::weakly_canonical(root / "textures" / "checker.ppm"),
+              "assets: normalized dot-dot that stays inside resolves");
+        check(!UIAssetBrowser::resolveWithinRoot(root, "../outside.obj", absolute) &&
+                  !UIAssetBrowser::resolveWithinRoot(root, "/etc/passwd", absolute) &&
+                  !UIAssetBrowser::resolveWithinRoot(root, "models/../../outside.obj", absolute),
+              "assets: escapes and absolute paths are refused");
+    }
+
+    // --- (e) Ground drop point ----------------------------------------------------------------
+    {
+        engine::CameraConfig flatConfig;
+        flatConfig.startPosition = glm::vec3{0.0f, 0.0f, 5.0f};
+        const engine::Camera flat{flatConfig};
+        engine::CameraConfig tiltedConfig;
+        tiltedConfig.startPosition = glm::vec3{0.0f, 2.5f, 5.0f};
+        tiltedConfig.startPitchDegrees = -26.565f;
+        const engine::Camera tilted{tiltedConfig};
+        glm::vec3 point{9.0f};
+        const glm::vec2 viewport{800.0f, 600.0f};
+        check(!engine::dropPointOnGround(flat, glm::vec2{400.0f, 300.0f}, viewport, point),
+              "assets: a level camera ray never lands (fallback territory)");
+        check(engine::dropPointOnGround(tilted, glm::vec2{400.0f, 300.0f}, viewport, point) &&
+                  glm::distance(point, glm::vec3{0.0f}) < 0.05f,
+              "assets: a downward centre ray lands on the floor under the crosshair");
+        check(!engine::dropPointOnGround(flat, glm::vec2{400.0f, 0.0f}, viewport, point),
+              "assets: a ray above the horizon lands nowhere");
+    }
+
+    // --- (f) Drag-and-drop state machine ------------------------------------------------------
+    {
+        AssetRig rig;
+        const engine::UIRect source{50.0f, 50.0f, 120.0f, 30.0f};
+        const engine::UIRect target{400.0f, 300.0f, 160.0f, 60.0f};
+        auto sourceCall = [&] { return rig.ctx.beginDragSource(source, "AssetMesh", "models/cube.obj", "cube.obj"); };
+
+        // Click without travel: no drag, no drop.
+        rig.frame(60.0f, 60.0f, true);
+        check(sourceCall() && !rig.ctx.dragActive(), "dnd: a press arms a pending drag only");
+        rig.end();
+        rig.frame(450.0f, 330.0f, false);
+        check(!rig.ctx.dropTarget(target, "AssetMesh"), "dnd: an un-dragged click drops nothing");
+        rig.end();
+
+        // A real drag: promote, hover, deliver exactly once.
+        rig.frame(60.0f, 60.0f, true);
+        sourceCall();
+        rig.end();
+        rig.frame(90.0f, 90.0f, true);
+        check(rig.ctx.dragActive() && rig.ctx.dragPayload().type == "AssetMesh" &&
+                  rig.ctx.dragPayload().data == "models/cube.obj",
+              "dnd: crossing the threshold promotes the drag with its payload");
+        check(!rig.ctx.beginDragSource(engine::UIRect{600.0f, 60.0f, 100.0f, 30.0f}, "AssetTexture",
+                                        "textures/checker.ppm", "checker.ppm") &&
+                  rig.ctx.dragPayload().data == "models/cube.obj",
+              "dnd: a second source cannot hijack a live drag");
+        rig.end();
+        rig.frame(450.0f, 330.0f, true);
+        check(!rig.ctx.dropTarget(target, "AssetMesh") && rig.ctx.dropTargetHovered(target, "AssetMesh"),
+              "dnd: targets report hover but deliver only on release");
+        rig.end();
+        rig.frame(450.0f, 330.0f, false);
+        check(rig.ctx.dropTarget(target, "AssetMesh") && !rig.ctx.dropTarget(target, "AssetMesh"),
+              "dnd: the drop delivers to exactly one target");
+        rig.end();
+        rig.frame(450.0f, 330.0f, false);
+        check(!rig.ctx.dragActive() && rig.ctx.dragPayload().type.empty(), "dnd: the drag fully resets afterwards");
+        rig.end();
+
+        // Wrong-typed targets never consume; the matching one still can.
+        rig.frame(60.0f, 60.0f, true);
+        sourceCall();
+        rig.end();
+        rig.frame(90.0f, 90.0f, true);
+        rig.end();
+        rig.frame(450.0f, 330.0f, false);
+        check(!rig.ctx.dropTarget(target, "AssetTexture") && rig.ctx.dropTarget(target, "AssetMesh"),
+              "dnd: payload type must match the target contract");
+        rig.end();
+
+        // Released over nothing: no delivery, state still resets.
+        rig.frame(60.0f, 60.0f, true);
+        sourceCall();
+        rig.end();
+        rig.frame(90.0f, 90.0f, true);
+        rig.end();
+        rig.frame(700.0f, 550.0f, false);
+        check(!rig.ctx.dropTarget(target, "AssetMesh"), "dnd: releasing off-target delivers nowhere");
+        rig.end();
+
+        // Esc cancels mid-drag.
+        rig.frame(60.0f, 60.0f, true);
+        sourceCall();
+        rig.end();
+        rig.frame(90.0f, 90.0f, true);
+        rig.end();
+        rig.frame(450.0f, 330.0f, true, true);
+        check(!rig.ctx.dropTargetHovered(target, "AssetMesh"), "dnd: Esc kills target highlighting");
+        rig.end();
+        rig.frame(450.0f, 330.0f, false);
+        check(!rig.ctx.dropTarget(target, "AssetMesh"), "dnd: a cancelled drag delivers nothing");
+        rig.end();
+    }
+
+    // --- (g) Browser panel: navigation, drag payloads, activation -------------------------------
+    {
+        AssetRig rig;
+        engine::UIAssetBrowser browser;
+        browser.setRootPath(root);
+        const engine::UIRect panel{0.0f, 0.0f, 360.0f, 240.0f};
+        auto build = [&](float x, float y, bool down) {
+            rig.frame(x, y, down);
+            const engine::UIAssetBrowser::Result result = browser.build(rig.ctx, panel);
+            rig.end();
+            return result;
+        };
+        check(browser.entries().size() == 4u, "browser: opens on the project root");
+        // Rows start at y=38, 22 px each: row 0 = models/, row 1 = textures/.
+        build(30.0f, 49.0f, true);
+        check(browser.selectedEntry() != nullptr && browser.selectedEntry()->name == "models",
+              "browser: clicking a row selects it");
+        build(30.0f, 49.0f, false);
+        const engine::UIAssetBrowser::Result navResult = build(30.0f, 49.0f, true);
+        check(navResult.navigated && browser.currentDirectory() == "models" &&
+                  browser.entries().size() == 2u,
+              "browser: double-clicking a folder navigates into it");
+        build(30.0f, 49.0f, false);
+        // Row 0 is now ".."; row 1 is cube.obj. Drag it into the viewport.
+        rig.frame(30.0f, 71.0f, true);
+        const engine::UIAssetBrowser::Result dragBuild = browser.build(rig.ctx, panel);
+        (void)dragBuild;
+        rig.end();
+        rig.frame(300.0f, 400.0f, true);
+        browser.build(rig.ctx, panel);
+        rig.end();
+        check(rig.ctx.dragActive() && rig.ctx.dragPayload().type == "AssetMesh" &&
+                  rig.ctx.dragPayload().data == "models/cube.obj",
+              "browser: item drags carry the kind payload and root-relative path");
+        rig.frame(500.0f, 400.0f, false);
+        check(rig.ctx.dropTarget(engine::UIRect{0.0f, 0.0f, 800.0f, 600.0f}, "AssetMesh"),
+              "browser: the viewport accepts the mesh payload");
+        rig.end();
+        // Back up via the parent row, then re-enter: staged clicks
+        // keep every double-click unambiguous.
+        build(30.0f, 49.0f, true);
+        build(30.0f, 49.0f, false);
+        build(30.0f, 49.0f, true);
+        check(browser.currentDirectory().empty() && browser.entries().size() == 4u,
+              "browser: the parent row walks back to the root");
+        build(30.0f, 49.0f, false);
+        build(30.0f, 49.0f, true);
+        build(30.0f, 49.0f, false);
+        build(30.0f, 49.0f, true); // double-click models/ again
+        build(30.0f, 49.0f, false);
+        // Double-click the file itself -> activation (no navigation).
+        build(30.0f, 71.0f, true);
+        build(30.0f, 71.0f, false);
+        const engine::UIAssetBrowser::Result activateResult = build(30.0f, 71.0f, true);
+        check(activateResult.activated != nullptr && activateResult.activated->name == "cube.obj" &&
+                  !activateResult.navigated && browser.currentDirectory() == "models",
+              "browser: double-clicking a file activates it in place");
+        build(30.0f, 71.0f, false);
+    }
+
+    // --- (h) Drop -> import -> spawn, as the application performs it ------------------------------
+    {
+        const std::filesystem::path objPath = root / "models" / "quad.obj";
+        {
+            std::ofstream out(objPath, std::ios::binary);
+            out << "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3\nf 1 3 4\n";
+        }
+        engine::VramBudget vram(64 * 1024 * 1024);
+        engine::VramBudget staging(64 * 1024 * 1024);
+        engine::AssetManager assets(vram, staging);
+        engine::Scene scene;
+        const engine::MeshId id = assets.loadObj("quad", objPath);
+        const engine::MeshAsset* asset = assets.mesh("quad");
+        check(id != engine::kInvalidAssetId && asset != nullptr, "assets: a dropped OBJ imports into the registry");
+        const engine::Entity spawned =
+            asset != nullptr ? scene.spawnImportedModel(*asset, "quad", glm::vec3{0.0f}, 1.0f, 1.0f) : engine::Entity{};
+        auto& registry = scene.registry();
+        const bool spawnOk = spawned.isValid() && registry.all_of<engine::MeshComponent>(spawned.handle()) &&
+                             registry.get<engine::MeshComponent>(spawned.handle()).assetId == "quad" &&
+                             registry.all_of<engine::ColliderComponent>(spawned.handle());
+        check(spawnOk, "assets: the imported mesh spawns fully wired (mesh + collider)");
+        const engine::MeshAsset emptyAsset{};
+        check(!scene.spawnImportedModel(emptyAsset, "empty", glm::vec3{0.0f}).isValid(),
+              "assets: spawning a geometry-less asset is refused");
+    }
+
+    std::filesystem::remove_all(root, ec);
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -7910,6 +8194,7 @@ int main() {
     testPhase26Widgets();
     testPhase27Editor();
     testPhase28Gizmos();
+    testPhase29Assets();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

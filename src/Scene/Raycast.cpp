@@ -32,6 +32,22 @@ bool pickEntityAt(const Scene& scene, const Camera& camera, glm::vec2 mousePixel
     return scene.raycast(cameraRay(camera, screenToNdc(mousePixels, viewportSize), aspectRatio), outHit);
 }
 
+bool dropPointOnGround(const Camera& camera, glm::vec2 mousePixels, glm::vec2 viewportSize, glm::vec3& outPoint) {
+    if (viewportSize.x <= 0.0f || viewportSize.y <= 0.0f) {
+        return false;
+    }
+    const Ray ray = cameraRay(camera, screenToNdc(mousePixels, viewportSize), viewportSize.x / viewportSize.y);
+    if (ray.direction.y > -1e-6f) {
+        return false; // level or rising ray never meets the floor
+    }
+    const float t = -ray.origin.y / ray.direction.y;
+    if (t < 0.0f) {
+        return false; // the plane is behind the camera
+    }
+    outPoint = ray.at(t);
+    return true;
+}
+
 namespace {
 
 // One entity's nearest intersection along the ray, in world space.

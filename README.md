@@ -2177,3 +2177,66 @@ the mouse.
   deletion, inert targets). **937 passed, 0 failed** in
   Debug, Release (shared and static), hidden-visibility and
   ASan builds, warning-free, CTest 1/1.
+
+## Phase 29 — Asset Browser, File Management & Drag-and-Drop ✅
+
+The editor gains its content pipeline: a docked Asset Browser
+over the project folder, an immediate-mode drag-and-drop system
+in `UIContext`, and drop wiring that spawns meshes into the
+scene and assigns meshes/textures/shaders onto the inspected
+entity.
+
+- **Drag & drop** (`Graphics/UIContext`): `beginDragSource`
+  arms a *pending* drag on press (plain clicks keep working);
+  traveling 6 px with the button held promotes it to a live
+  drag with a labeled ghost following the cursor, drawn last
+  in `endFrame`. `dropTarget(rect, type)` delivers exactly
+  once, on the release frame, to the first target whose type
+  contract matches the payload and whose rect holds the
+  pointer; `dropTargetHovered` drives target highlighting.
+  Esc cancels mid-drag (targets go dark, the release delivers
+  nowhere), and a second source can never hijack a live drag.
+- **Asset Browser** (`Scene/UIAssetBrowser`): scans the
+  current folder (folders first, then files, name-sorted,
+  dotfiles skipped) and classifies by extension — Mesh
+  (.obj/.gltf/.glb), Texture (.ppm/.png/.jpg/.tga/...),
+  Shader (.spv/.vert/.frag/.glsl), Script, Module, Scene —
+  rendered as minimalist colored kind chips. Click selects;
+  double-click navigates folders (with a ".." row back up) or
+  activates files. Payload data is always the root-relative
+  path, and `resolveWithinRoot` canonicalizes and refuses
+  anything escaping the root ("..", absolute paths).
+- **Viewport drops** spawn content: an OBJ payload resolves
+  under the asset root, imports through `AssetManager::loadObj`
+  (idempotent by name), and lands via
+  `Scene::spawnImportedModel` — auto-scaled, with a 1:1
+  bounds collider — at the ray∩ground-plane point under the
+  cursor (`dropPointOnGround`, falling back to a point in
+  front of the camera), then becomes the selection.
+  Double-clicking a mesh file spawns it through the screen
+  centre. Recognized-but-not-yet-importable formats (glTF)
+  are refused with a warning, never silently.
+- **Inspector drops** assign: Mesh → the entity's
+  `MeshComponent` asset (created if missing) with matching
+  local bounds; Texture → declares + async-loads the texture
+  and derives a new material (`drop_<texture>`) carrying it
+  as albedo, so the registry's immutable materials are never
+  mutated in place; Shader (.vert.spv/.frag.spv) → the same
+  derived-material route with the shader slot swapped.
+  Payloads with no inspector meaning (scripts) are never
+  accepted by any target — type contracts are the validation.
+- **Sample content**: `assets/` ships a starter project
+  (OBJ cube, PPM checker, GLSL sample, script) and is copied
+  next to the executable on every build; the browser opens
+  on it. The browser dock sits along the bottom edge and is
+  part of the picking occluder set, so drags never fall
+  through to viewport selection.
+- **Verification**: `testPhase29Assets()` adds 33 checks —
+  classification tables, scan ordering, root containment,
+  ground-point math, the full drag state machine (pending,
+  promotion, single delivery, type contracts, off-target
+  release, Esc cancel, hijack refusal), browser
+  navigation/activation against a real temp tree, and the
+  import→spawn chain. **970 passed, 0 failed** in Debug,
+  Release (shared and static), hidden-visibility and ASan
+  builds, warning-free, CTest 1/1.

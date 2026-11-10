@@ -1,5 +1,7 @@
 #include "Graphics/UIContext.h"
 
+#include <glm/geometric.hpp>
+
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -52,6 +54,17 @@ void UIContext::beginFrame(const UIInput& input, UIBatch& batch) {
         }
     }
 
+    // Drag & drop phase advancement: a pending drag promotes once
+    // the pointer travels past the threshold while held; Esc
+    // cancels a live drag (it will release into nothing).
+    if (m_dragPhase == DragPhase::Pending && input.mouseDown &&
+        glm::distance(glm::vec2{input.mouseX, input.mouseY}, m_dragStart) >= kDragThresholdPx) {
+        m_dragPhase = DragPhase::Dragging;
+    }
+    if (m_dragPhase == DragPhase::Dragging && input.escapePressed) {
+        m_dragCancelled = true;
+    }
+
     m_panels.clear();
     Panel root;
     root.rect = UIRect{0.0f, 0.0f, static_cast<float>(batch.viewportWidth()),
@@ -62,6 +75,26 @@ void UIContext::beginFrame(const UIInput& input, UIBatch& batch) {
 }
 
 void UIContext::endFrame() {
+    // Drag ghost: drawn last, on top of everything, following the
+    // cursor (dimmed once cancelled). The drag state itself resets
+    // below, once this frame's drop targets have had their chance.
+    if (m_dragPhase == DragPhase::Dragging && m_input.mouseDown && m_batch != nullptr) {
+        const glm::vec2 mouse = mousePosition();
+        const float width = m_batch->measureText(m_dragPayload.label, 1.2f) + 16.0f;
+        const glm::vec4 fill = m_dragCancelled ? glm::vec4{0.35f, 0.30f, 0.28f, 0.85f}
+                                               : glm::vec4{0.10f, 0.16f, 0.26f, 0.94f};
+        m_batch->drawRoundedRect(mouse.x + 14.0f, mouse.y + 12.0f, width, 24.0f,
+                                 UIRectStyle{5.0f, 1.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.8f}}, fill);
+        m_batch->drawText(m_dragPayload.label, mouse.x + 22.0f, mouse.y + 17.0f, 1.2f,
+                          m_dragCancelled ? glm::vec4{0.6f} : glm::vec4{0.95f, 0.97f, 1.0f, 1.0f});
+    }
+    if (m_dragPhase != DragPhase::Idle && !m_input.mouseDown) {
+        m_dragPhase = DragPhase::Idle;
+        m_dragPayload = {};
+        m_dragDelivered = false;
+        m_dragCancelled = false;
+    }
+
     // A press nobody claimed lands on empty space: focus is lost.
     if (m_pressedEdge && !m_pressClaimed) {
         m_focused = kUINoWidget;
@@ -411,6 +444,43 @@ bool UIContext::pressedRect(const UIRect& rect) {
 
 bool UIContext::rightPressedRect(const UIRect& rect) {
     return m_rightPressedEdge && hitTest(rect);
+}
+
+bool UIContext::beginDragSource(const UIRect& rect, std::string_view type, std::string_view data,
+                                std::string_view label) {
+    if (m_dragPhase == DragPhase::Idle) {
+        // Arm only: a plain click on the item must keep working, so
+        // the drag goes live in beginFrame once the pointer has
+        // travelled past the threshold with the button held.
+        if (!pressedRect(rect)) {
+            return false;
+        }
+        m_dragPhase = DragPhase::Pending;
+        m_dragPayload = UIDragPayload{std::string{type}, std::string{data}, std::string{label}};
+        m_dragStart = mousePosition();
+        m_dragDelivered = false;
+        m_dragCancelled = false;
+        return true;
+    }
+    // One drag at a time: only the source that armed it (same
+    // payload identity) reports active; every other source waits.
+    return m_dragPayload.type == type && m_dragPayload.data == data;
+}
+
+bool UIContext::dropTarget(const UIRect& rect, std::string_view expectedType) {
+    if (m_dragPhase != DragPhase::Dragging || m_dragCancelled || m_dragDelivered || !m_releasedEdge) {
+        return false;
+    }
+    if (m_dragPayload.type != expectedType || !hitTest(rect)) {
+        return false;
+    }
+    m_dragDelivered = true; // first matching target consumes the drop
+    return true;
+}
+
+bool UIContext::dropTargetHovered(const UIRect& rect, std::string_view expectedType) const {
+    return m_dragPhase == DragPhase::Dragging && !m_dragCancelled && m_dragPayload.type == expectedType &&
+           hitTest(rect);
 }
 
 } // namespace engine

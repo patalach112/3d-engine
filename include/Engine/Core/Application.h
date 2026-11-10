@@ -1,6 +1,10 @@
 #pragma once
 #include "Core/Export.h"
 
+#include <functional>
+#include <string>
+#include <string_view>
+
 #include "Assets/AssetManager.h"
 #include "Core/EngineConfig.h"
 #include "Core/EventBus.h"
@@ -17,6 +21,7 @@
 #include "Platform/Window.h"
 #include "Scene/Scene.h"
 #include "Scene/TransformGizmo.h"
+#include "Scene/UIAssetBrowser.h"
 #include "Scene/UIOutliner.h"
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/RenderSystem.h"
@@ -57,6 +62,15 @@ private:
     void registerAssets();
     void buildScene();
     void handleMouseCapture();
+    // Phase 29 asset drag-and-drop: spawn a dropped mesh into the
+    // scene, or apply a dropped asset to the selected entity.
+    void spawnDroppedMesh(std::string_view relativePath, glm::vec2 mousePixels, const Camera& camera,
+                          glm::vec2 viewportSize);
+    void applyDroppedAsset(entt::entity entity, const UIDragPayload& payload);
+    // Registers (once) a material derived from the mesh's current
+    // one and points the mesh at it. Returns the material name.
+    std::string deriveMaterial(MeshComponent& mesh, const std::string& derivedName,
+                               const std::function<void(MaterialDesc&)>& mutate);
     void handlePhysicsReset();
     void handleEventImpulse();
     void logLoopStats(const char* context) const;
@@ -73,6 +87,7 @@ private:
     UIContext m_uiContext; // Phase 26 Step 3 widget state (CPU-only)
     UIOutliner m_outliner; // Phase 27 entity hierarchy panel
     TransformGizmo m_gizmo; // Phase 28 viewport transform gizmo
+    UIAssetBrowser m_assetBrowser; // Phase 29 asset browser panel
     GameLoop m_gameLoop;
     JobSystem m_jobSystem;
     VramBudget m_vramBudget;

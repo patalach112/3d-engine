@@ -46,4 +46,12 @@ struct RaycastHit {
 [[nodiscard]] ENGINE_SCENE_API bool pickEntityAt(const Scene& scene, const Camera& camera, glm::vec2 mousePixels,
                                                  glm::vec2 viewportSize, RaycastHit& outHit);
 
+// Drag-and-drop landing point (Phase 29): intersects the picking
+// ray through a viewport pixel with the ground plane y = 0, so
+// assets dropped into the viewport land on the floor. False when
+// the ray runs parallel to (or away from) the plane — callers fall
+// back to a point in front of the camera.
+[[nodiscard]] ENGINE_SCENE_API bool dropPointOnGround(const Camera& camera, glm::vec2 mousePixels,
+                                                      glm::vec2 viewportSize, glm::vec3& outPoint);
+
 } // namespace engine

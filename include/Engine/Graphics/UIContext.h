@@ -1,10 +1,12 @@
 #pragma once
 #include "Core/Export.h"
 
+#include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -49,6 +51,15 @@ struct UIRect {
 // One frame of host input, in UI pixels (window coordinates).
 // A mouse position far off-screen means "no pointer" (e.g. while
 // the mouse is captured for first-person flight).
+// Payload carried by an in-flight drag (Phase 29). `type` is the
+// contract drop targets match on (e.g. "AssetMesh"); `data` is the
+// opaque payload (an asset path); `label` captions the drag ghost.
+struct UIDragPayload {
+    std::string type;
+    std::string data;
+    std::string label;
+};
+
 struct UIInput {
     float mouseX = -10000.0f;
     float mouseY = -10000.0f;
@@ -140,6 +151,26 @@ public:
     void menuSeparator();
     void endPopup();
 
+    // --- Drag & drop (Phase 29) ------------------------------------------
+    // Immediate-mode drag sources and drop targets:
+    //   if (ctx.beginDragSource(itemRect, "AssetMesh", path, name)) ...
+    //   if (ctx.dropTarget(viewportRect, "AssetMesh")) spawn(...);
+    // A press on a source arms a *pending* drag (so plain clicks still
+    // work); moving kDragThresholdPx while held promotes it to a real
+    // drag with a ghost following the cursor. dropTarget returns true
+    // exactly once, on the release frame, when the pointer is over a
+    // rect whose expected type matches the payload; the first target
+    // to claim a drop consumes it. Esc cancels mid-drag (no target
+    // will fire). Call drop targets after all sources each frame.
+    static constexpr float kDragThresholdPx = 6.0f;
+
+    bool beginDragSource(const UIRect& rect, std::string_view type, std::string_view data,
+                         std::string_view label);
+    [[nodiscard]] bool dragActive() const { return m_dragPhase == DragPhase::Dragging; }
+    [[nodiscard]] const UIDragPayload& dragPayload() const { return m_dragPayload; }
+    bool dropTarget(const UIRect& rect, std::string_view expectedType);
+    [[nodiscard]] bool dropTargetHovered(const UIRect& rect, std::string_view expectedType) const;
+
     // --- Hit queries for custom widgets (outliner rows, ...) --------------
     // All respect the current scissor + popup press consumption.
     [[nodiscard]] bool hoveredRect(const UIRect& rect) const { return hitTest(rect); }
@@ -200,6 +231,14 @@ private:
     UIWidgetId m_focused = kUINoWidget;
     PopupState m_popup;
     bool m_popupRendering = false;
+
+    enum class DragPhase : uint8_t { Idle, Pending, Dragging };
+    DragPhase m_dragPhase = DragPhase::Idle;
+    UIDragPayload m_dragPayload;
+    glm::vec2 m_dragStart{0.0f};
+    bool m_dragDelivered = false; // a target claimed this drop already
+    bool m_dragCancelled = false; // Esc mid-drag: released nowhere
+
     std::vector<Panel> m_panels; // [0] is the implicit full-viewport root
 };
 

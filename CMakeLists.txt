@@ -198,6 +198,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/NativeScript.cpp
     src/Scene/UIOutliner.cpp
     src/Scene/TransformGizmo.cpp
+    src/Scene/UIAssetBrowser.cpp
     src/Scene/SceneSerialization.cpp
     src/Scene/Components.cpp
     src/Scene/Raycast.cpp
@@ -349,6 +350,16 @@ add_custom_command(TARGET 3d-engine POST_BUILD
             ${CMAKE_CURRENT_SOURCE_DIR}/config/engine.ini
             $<TARGET_FILE_DIR:3d-engine>/config/engine.ini
     COMMENT "Copying engine configuration"
+    VERBATIM
+)
+
+# Sample project assets (Phase 29): mirrored next to the executable
+# so the editor's Asset Browser opens on real content.
+add_custom_command(TARGET 3d-engine POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/assets
+            $<TARGET_FILE_DIR:3d-engine>/assets
+    COMMENT "Copying sample assets"
     VERBATIM
 )
 
