@@ -16,6 +16,7 @@
 #include "Platform/Input.h"
 #include "Platform/Window.h"
 #include "Scene/Scene.h"
+#include "Scene/UIOutliner.h"
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/RenderSystem.h"
 
@@ -70,6 +71,7 @@ private:
     GraphicsPipeline m_pipeline;
     Renderer m_renderer;
     UIContext m_uiContext; // Phase 26 Step 3 widget state (CPU-only)
+    UIOutliner m_outliner; // Phase 27 entity hierarchy panel
     GameLoop m_gameLoop;
     JobSystem m_jobSystem;
     VramBudget m_vramBudget;

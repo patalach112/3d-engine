@@ -196,6 +196,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Scene.cpp
     src/Scene/Reflection.cpp
     src/Scene/NativeScript.cpp
+    src/Scene/UIOutliner.cpp
     src/Scene/SceneSerialization.cpp
     src/Scene/Components.cpp
     src/Scene/Raycast.cpp

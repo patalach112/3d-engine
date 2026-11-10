@@ -19,6 +19,7 @@
 #include "Scene/DenseIteration.h"
 #include "Scene/DynamicAABBTree.h"
 #include "Scene/Scene.h"
+#include "Scene/UIOutliner.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/TransformSystem.h"
@@ -7236,6 +7237,347 @@ void testPhase26Widgets() {
     check(sample.count == 7, "inspector: read-only int rows never write back");
 }
 
+void testPhase27Editor() {
+    std::cout << "Phase 27: editor shell, outliner & context menus\n";
+    struct EditorRig {
+        engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+        engine::UIBatch batch;
+        engine::UIContext ctx;
+        EditorRig() { batch.setFontAtlas(&atlas); }
+        void frame(float mouseX, float mouseY, bool down, bool right = false, bool esc = false, float scroll = 0.0f) {
+            batch.begin(800, 600);
+            engine::UIInput input;
+            input.mouseX = mouseX;
+            input.mouseY = mouseY;
+            input.mouseDown = down;
+            input.mouseRightDown = right;
+            input.escapePressed = esc;
+            input.scrollY = scroll;
+            ctx.beginFrame(input, batch);
+        }
+        void end() { ctx.endFrame(); }
+    };
+
+    // --- (a) Right-click dispatch is edge-only and button-independent ------------
+    {
+        EditorRig rig;
+        const engine::UIRect viewport{0.0f, 0.0f, 800.0f, 600.0f};
+        rig.frame(400.0f, 300.0f, false, true);
+        check(rig.ctx.rightPressedRect(viewport) && !rig.ctx.pressedRect(viewport),
+              "context: right press dispatches to rightPressedRect only");
+        rig.end();
+        rig.frame(400.0f, 300.0f, false, true);
+        check(!rig.ctx.rightPressedRect(viewport), "context: holding the right button does not re-fire");
+        rig.end();
+        rig.frame(400.0f, 300.0f, false, false);
+        check(!rig.ctx.rightPressedRect(viewport) && !rig.ctx.popupOpen(),
+              "context: release leaves no stray popup state");
+        rig.end();
+    }
+
+    // --- (b) Menu item fires on the press edge and closes the popup --------------
+    {
+        EditorRig rig;
+        rig.frame(200.0f, 150.0f, false, true);
+        if (rig.ctx.rightPressedRect(engine::UIRect{0.0f, 0.0f, 800.0f, 600.0f})) {
+            rig.ctx.openPopup("File", 200.0f, 150.0f);
+        }
+        rig.end();
+        check(rig.ctx.isPopupOpen("File"), "context: openPopup raises the named popup");
+        rig.frame(200.0f, 150.0f, false);
+        bool rendered = false;
+        if (rig.ctx.beginPopup("File")) {
+            rendered = true;
+            rig.ctx.menuItem("Open");
+            rig.ctx.menuItem("Close");
+            rig.ctx.endPopup();
+        }
+        check(rendered, "context: beginPopup renders the frame after opening");
+        rig.end();
+        rig.frame(215.0f, 164.0f, true); // first item: {204,154,176,20}
+        bool fired = false;
+        bool other = true;
+        if (rig.ctx.beginPopup("File")) {
+            fired = rig.ctx.menuItem("Open");
+            other = rig.ctx.menuItem("Close");
+            rig.ctx.endPopup();
+        }
+        check(fired && !other && !rig.ctx.popupOpen(),
+              "context: pressing an item fires it and dismisses the menu");
+        rig.end();
+    }
+
+    // --- (c) Esc dismisses; dismissal is safe with nothing open -------------------
+    {
+        EditorRig rig;
+        rig.frame(10.0f, 10.0f, false, false, true);
+        check(!rig.ctx.popupOpen(), "context: Esc with no popup is a harmless no-op");
+        rig.end();
+        rig.ctx.openPopup("Edit", 100.0f, 100.0f);
+        rig.frame(10.0f, 10.0f, false);
+        check(rig.ctx.beginPopup("Edit"), "context: popup renders while open");
+        rig.ctx.endPopup();
+        rig.end();
+        rig.frame(10.0f, 10.0f, false, false, true);
+        check(!rig.ctx.popupOpen() && !rig.ctx.beginPopup("Edit"),
+              "context: Esc dismisses the popup before widgets run");
+        rig.end();
+    }
+
+    // --- (d) Opening a popup replaces the previous one (single-menu stack) --------
+    {
+        EditorRig rig;
+        rig.frame(10.0f, 10.0f, false);
+        rig.ctx.openPopup("First", 10.0f, 10.0f);
+        rig.ctx.openPopup("Second", 50.0f, 50.0f);
+        check(!rig.ctx.isPopupOpen("First") && rig.ctx.isPopupOpen("Second"),
+              "context: opening a second menu replaces the first");
+        rig.end();
+        rig.frame(10.0f, 10.0f, false);
+        check(!rig.ctx.beginPopup("First") && rig.ctx.beginPopup("Second"),
+              "context: only the replacement menu renders");
+        rig.ctx.endPopup();
+        rig.end();
+        rig.ctx.closePopup();
+        rig.ctx.closePopup();
+        check(!rig.ctx.popupOpen(), "context: closePopup is idempotent");
+    }
+
+    // --- (e) Outside click: dismisses AND the press is consumed --------------------
+    {
+        EditorRig rig;
+        const engine::UIRect guarded{100.0f, 100.0f, 140.0f, 32.0f};
+        rig.ctx.openPopup("Ctx", 400.0f, 300.0f);
+        for (int i = 0; i < 2; ++i) {
+            rig.frame(700.0f, 500.0f, false);
+            if (rig.ctx.beginPopup("Ctx")) {
+                rig.ctx.menuItem("One");
+                rig.ctx.menuItem("Two");
+                rig.ctx.endPopup();
+            }
+            rig.end();
+        }
+        rig.frame(120.0f, 116.0f, true);
+        const bool clicked = rig.ctx.button(guarded, "Guarded");
+        check(!clicked && rig.ctx.activeId() == engine::kUINoWidget &&
+                  rig.ctx.focusedId() == engine::kUINoWidget && !rig.ctx.popupOpen(),
+              "context: clicking outside closes the menu and is consumed by it");
+        rig.end();
+        rig.frame(120.0f, 116.0f, false);
+        rig.ctx.button(guarded, "Guarded");
+        rig.end();
+        rig.frame(120.0f, 116.0f, true);
+        check(!rig.ctx.button(guarded, "Guarded") && rig.ctx.activeId() != engine::kUINoWidget,
+              "context: the next honest press reaches the widget again");
+        rig.end();
+        rig.frame(120.0f, 116.0f, false);
+        check(rig.ctx.button(guarded, "Guarded"), "context: ...and its release completes the click");
+        rig.end();
+        // A press inside the popup's own frame does not dismiss it.
+        rig.ctx.openPopup("Ctx", 400.0f, 300.0f);
+        rig.frame(700.0f, 500.0f, false);
+        if (rig.ctx.beginPopup("Ctx")) {
+            rig.ctx.menuItem("One");
+            rig.ctx.menuItem("Two");
+            rig.ctx.endPopup();
+        }
+        rig.end();
+        rig.frame(500.0f, 343.0f, true); // inside the menu frame, below the items
+        check(rig.ctx.popupOpen(), "context: pressing inside the menu frame keeps it open");
+        rig.end();
+    }
+
+    // --- (f) Disabled menu items never fire and keep the menu open -----------------
+    {
+        EditorRig rig;
+        rig.ctx.openPopup("Act", 100.0f, 100.0f);
+        rig.frame(0.0f, 0.0f, false);
+        if (rig.ctx.beginPopup("Act")) {
+            rig.ctx.menuItem("Locked", false);
+            rig.ctx.menuItem("Ready");
+            rig.ctx.endPopup();
+        }
+        rig.end();
+        rig.frame(120.0f, 114.0f, true); // first item row, but disabled
+        bool firedDisabled = true;
+        if (rig.ctx.beginPopup("Act")) {
+            firedDisabled = rig.ctx.menuItem("Locked", false);
+            rig.ctx.menuItem("Ready");
+            rig.ctx.endPopup();
+        }
+        check(!firedDisabled && rig.ctx.popupOpen(), "context: a disabled item swallows the press silently");
+        rig.end();
+        rig.frame(120.0f, 114.0f, false);
+        if (rig.ctx.beginPopup("Act")) {
+            rig.ctx.menuItem("Locked", false);
+            rig.ctx.menuItem("Ready");
+            rig.ctx.endPopup();
+        }
+        rig.end();
+        rig.frame(120.0f, 134.0f, true); // the enabled sibling
+        bool firedReady = false;
+        if (rig.ctx.beginPopup("Act")) {
+            rig.ctx.menuItem("Locked", false);
+            firedReady = rig.ctx.menuItem("Ready");
+            rig.ctx.endPopup();
+        }
+        check(firedReady && !rig.ctx.popupOpen(), "context: the enabled item fires on the next press");
+        rig.end();
+    }
+
+    // --- (g) Outliner: selection, per-entity context actions, scrolling --------------
+    {
+        EditorRig rig;
+        engine::Scene scene;
+        engine::UIOutliner outliner;
+        auto& registry = scene.registry();
+        const engine::UIRect panel{0.0f, 0.0f, 320.0f, 300.0f};
+        // Rows: top = panel.y + 38, height 22. Roots sort by name:
+        // Alpha (row 0), Beta (row 1). Creation order deliberately differs.
+        auto beta = scene.createEntity("Beta");
+        beta.addComponent<engine::TransformComponent>(glm::vec3{1.0f, 2.0f, 3.0f});
+        beta.addComponent<engine::RigidBodyComponent>(2.0f);
+        beta.addComponent<engine::NativeScriptComponent>(std::string("Orbit"));
+        auto alpha = scene.createEntity("Alpha");
+        const entt::entity alphaHandle = alpha.handle();
+        const entt::entity betaHandle = beta.handle();
+
+        auto build = [&](float x, float y, bool down, bool right = false, bool esc = false, float scroll = 0.0f) {
+            rig.frame(x, y, down, right, esc, scroll);
+            const engine::UIOutliner::Result result = outliner.build(rig.ctx, panel, scene);
+            rig.end();
+            return result;
+        };
+
+        check(build(700.0f, 500.0f, false).action == engine::UIOutliner::Action::None &&
+                  outliner.selected() == entt::null,
+              "outliner: an idle frame selects nothing");
+        check(build(30.0f, 49.0f, true).selectionChanged && outliner.selected() == alphaHandle,
+              "outliner: clicking row 0 selects Alpha (roots sorted by name)");
+        check(build(30.0f, 49.0f, false).action == engine::UIOutliner::Action::None,
+              "outliner: release is inert");
+        build(30.0f, 71.0f, true);
+        check(outliner.selected() == betaHandle, "outliner: clicking row 1 moves the selection to Beta");
+
+        // Right-click Beta -> menu; Duplicate from the menu.
+        check(build(60.0f, 71.0f, false, true).action == engine::UIOutliner::Action::None &&
+                  rig.ctx.isPopupOpen("EntityContextMenu") && outliner.selected() == betaHandle,
+              "outliner: right-click selects and opens the entity menu");
+        build(60.0f, 71.0f, false);
+        const auto duplicateResult = build(70.0f, 85.0f, true); // "Duplicate" item
+        const entt::entity copy = duplicateResult.entity;
+        check(duplicateResult.action == engine::UIOutliner::Action::Duplicated && copy != entt::null &&
+                  copy != betaHandle && registry.valid(copy),
+              "outliner: Duplicate creates a fresh entity");
+        check(registry.valid(copy) && registry.get<engine::TagComponent>(copy).tag == "Beta copy" &&
+                  nearlyVec3(registry.get<engine::TransformComponent>(copy).position,
+                             glm::vec3{1.0f, 2.0f, 3.0f}) &&
+                  nearlyEqual(registry.get<engine::RigidBodyComponent>(copy).inverseMass, 0.5) &&
+                  registry.get<engine::NativeScriptComponent>(copy).scriptName == "Orbit" &&
+                  !registry.all_of<engine::ParentComponent>(copy) && outliner.selected() == copy &&
+                  registry.view<engine::TagComponent>().size() == 3u,
+              "outliner: the copy inherits components and becomes the selection");
+
+        // Right-click the copy (now row 2) -> Create Child.
+        build(60.0f, 93.0f, false, true);
+        build(60.0f, 93.0f, false);
+        const auto childResult = build(70.0f, 127.0f, true); // "Create Child" item
+        const entt::entity child = childResult.entity;
+        bool childLinked = false;
+        if (registry.valid(child) && registry.valid(copy)) {
+            const auto* parent = registry.try_get<engine::ParentComponent>(child);
+            const auto* kids = registry.try_get<engine::ChildrenComponent>(copy);
+            bool listedAsChild = false;
+            if (kids != nullptr) {
+                for (const entt::entity candidate : kids->children) {
+                    listedAsChild = listedAsChild || candidate == child;
+                }
+            }
+            childLinked = parent != nullptr && parent->parent == copy && listedAsChild;
+        }
+        check(childResult.action == engine::UIOutliner::Action::CreatedChild && childLinked &&
+                  registry.get<engine::TagComponent>(child).tag == "Entity" && outliner.selected() == child,
+              "outliner: Create Child parents a new entity under the target");
+
+        // Retarget the open menu from Alpha to the copy, then Delete the copy.
+        build(60.0f, 49.0f, false, true);
+        check(outliner.selected() == alphaHandle && rig.ctx.isPopupOpen("EntityContextMenu"),
+              "outliner: a second right-click retargets selection and menu");
+        build(60.0f, 93.0f, false);       // release the right button first...
+        build(60.0f, 93.0f, false, true); // ...then right-click the copy row (row 2) instead
+        check(outliner.selected() == copy, "outliner: right-clicking another row switches the target");
+        build(60.0f, 93.0f, false);
+        const auto deleteResult = build(70.0f, 156.0f, true); // "Delete" item
+        // Default HierarchyDestroyMode::Orphan: the child survives as
+        // a root; only the target itself is destroyed.
+        check(deleteResult.action == engine::UIOutliner::Action::Deleted && !registry.valid(copy) &&
+                  registry.valid(child) && !registry.all_of<engine::ParentComponent>(child) &&
+                  outliner.selected() == entt::null && registry.view<engine::TagComponent>().size() == 3u,
+              "outliner: Delete destroys the target and clears the selection");
+
+        // Esc closes the menu without touching the scene.
+        build(60.0f, 71.0f, false, true);
+        check(rig.ctx.isPopupOpen("EntityContextMenu"), "outliner: menu reopened for the Esc test");
+        build(700.0f, 500.0f, false, false, true);
+        check(!rig.ctx.popupOpen() && registry.valid(betaHandle) &&
+                  registry.view<engine::TagComponent>().size() == 3u,
+              "outliner: Esc dismisses the menu and changes nothing");
+        // A consumed outside click likewise leaves scene and selection alone.
+        build(60.0f, 71.0f, false, true);
+        build(700.0f, 500.0f, true);
+        check(!rig.ctx.popupOpen() && outliner.selected() == betaHandle,
+              "outliner: outside click closes the menu without reselecting");
+
+        // Wheel scrolling over the panel.
+        for (int i = 0; i < 15; ++i) {
+            scene.createEntity("Filler");
+        }
+        build(100.0f, 150.0f, false, false, false, -5.0f);
+        const float scrolledDown = outliner.scrollOffset();
+        build(100.0f, 150.0f, false, false, false, 50.0f);
+        check(scrolledDown > 0.0f && outliner.scrollOffset() == 0.0f,
+              "outliner: the wheel scrolls the list and clamps at the top");
+    }
+
+    // --- (h) Duplicating a child keeps it under the same parent ---------------------
+    {
+        EditorRig rig;
+        engine::Scene scene;
+        engine::UIOutliner outliner;
+        auto& registry = scene.registry();
+        const engine::UIRect panel{0.0f, 0.0f, 320.0f, 300.0f};
+        scene.setHierarchyDestroyMode(engine::HierarchyDestroyMode::Cascade);
+        auto parent = scene.createEntity("Parent");
+        auto kid = scene.createEntity("Kid");
+        scene.setParent(kid, parent);
+
+        auto build = [&](float x, float y, bool down, bool right = false) {
+            rig.frame(x, y, down, right);
+            const engine::UIOutliner::Result result = outliner.build(rig.ctx, panel, scene);
+            rig.end();
+            return result;
+        };
+        build(60.0f, 71.0f, false, true); // right-click the Kid row (row 1, depth 1)
+        check(outliner.selected() == kid.handle(), "outliner: nested rows are selectable targets");
+        build(60.0f, 71.0f, false);
+        const auto duplicateResult = build(70.0f, 85.0f, true);
+        const entt::entity copy = duplicateResult.entity;
+        const auto* copiedParent =
+            registry.valid(copy) ? registry.try_get<engine::ParentComponent>(copy) : nullptr;
+        check(duplicateResult.action == engine::UIOutliner::Action::Duplicated && copiedParent != nullptr &&
+                  copiedParent->parent == parent.handle() &&
+                  registry.get<engine::TagComponent>(copy).tag == "Kid copy",
+              "outliner: a duplicated child is adopted by the source's parent");
+        // Deleting the parent cascades through both children.
+        build(60.0f, 49.0f, false, true); // right-click Parent (row 0)
+        build(60.0f, 49.0f, false);
+        const auto deleteResult = build(70.0f, 112.0f, true);
+        check(deleteResult.action == engine::UIOutliner::Action::Deleted &&
+                  registry.view<engine::TagComponent>().size() == 0u && outliner.selected() == entt::null,
+              "outliner: deleting a parent removes the whole subtree in Cascade mode");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -7263,6 +7605,7 @@ int main() {
     testPhase25ReflectionScripting();
     testPhase26UIRenderer();
     testPhase26Widgets();
+    testPhase27Editor();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

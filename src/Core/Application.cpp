@@ -141,6 +141,30 @@ Application::~Application() {
     m_context.waitIdle();
 }
 
+namespace {
+
+// Phase 27 editor: inspects one reflected component of `entity`
+// (when present) in a panel stacked at (x, y); returns the y just
+// below the panel so components pile up in the inspector dock.
+template <typename T>
+float inspectComponentAt(UIContext& ui, Scene::Registry& registry, entt::entity entity, float x, float y,
+                         float width, const UIInspectorOptions& options) {
+    if (!registry.all_of<T>(entity)) {
+        return y;
+    }
+    const TypeInfo& type = reflect<T>();
+    float rows = 1.0f; // title row
+    for (const PropertyInfo& property : type.properties) {
+        rows += property.type == PropertyType::Vec3 ? 3.0f : 1.0f;
+    }
+    const float height =
+        2.0f * UIContext::kPanelPadding + rows * (UIContext::kRowHeight + UIContext::kRowSpacing);
+    inspectComponent(ui, UIRect{x, y, width, height}, type, &registry.get<T>(entity), options);
+    return y + height + 6.0f;
+}
+
+} // namespace
+
 EngineContext Application::buildModuleContext(float deltaSeconds, float fixedDeltaSeconds) {
     EngineContext context;
     context.scene = &m_scene;
@@ -564,6 +588,10 @@ void Application::run() {
                 uiInput.mouseDown = m_input.isMouseButtonDown(MouseButton::Left);
                 uiInput.keyStep = (m_input.wasKeyPressed(Key::Right) ? 1 : 0) -
                                   (m_input.wasKeyPressed(Key::Left) ? 1 : 0);
+                // Phase 27: right-click context menus + Esc dismissal.
+                uiInput.mouseRightDown = m_input.isMouseButtonDown(MouseButton::Right);
+                uiInput.escapePressed = m_input.wasKeyPressed(Key::Escape);
+                uiInput.scrollY = m_input.scrollDelta().y;
             }
             m_uiContext.beginFrame(uiInput, ui);
 
@@ -577,27 +605,51 @@ void Application::run() {
             ui.drawText("WASD + MOUSE FLY - SPACE/CTRL RISE/SINK - Q/E ROLL", 12.0f, hintY, 1.5f,
                         glm::vec4{0.75f, 0.85f, 1.0f, 0.85f});
 
-            // Live Component Inspector over the player ship's
-            // reflected RigidBodyComponent (present only when the
-            // flight module has spawned the ship).
+            // Phase 27 editor layout: the Component Inspector dock
+            // (top-right) reflects the Outliner's selection over
+            // every reflected built-in component; the Scene
+            // Hierarchy panel (left, below the HUD backdrop) is
+            // built LAST so its context menu paints above the
+            // dock. With nothing selected the inspector falls back
+            // to the player ship's RigidBodyComponent (the Step 3
+            // behavior), present only when the flight module has
+            // spawned the ship.
             auto& registry = m_scene.registry();
-            const auto tags = registry.view<TagComponent>();
-            for (const auto entity : tags) {
-                if (tags.get<TagComponent>(entity).tag != "Spacecraft" ||
-                    !registry.all_of<RigidBodyComponent>(entity)) {
-                    continue;
+            UIInspectorOptions inspectorOptions;
+            inspectorOptions.floatMin = 0.0f;
+            inspectorOptions.floatMax = 5000.0f;
+            constexpr float kInspectorWidth = 322.0f;
+            const float inspectorX =
+                static_cast<float>(m_window.width()) - kInspectorWidth - 8.0f;
+            const entt::entity selected = m_outliner.selected();
+            if (selected != entt::null && registry.valid(selected)) {
+                float y = 8.0f;
+                y = inspectComponentAt<TransformComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                           kInspectorWidth, inspectorOptions);
+                y = inspectComponentAt<RigidBodyComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                           kInspectorWidth, inspectorOptions);
+                y = inspectComponentAt<SpinComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                      kInspectorWidth, inspectorOptions);
+                y = inspectComponentAt<PointLightComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                            kInspectorWidth, inspectorOptions);
+                y = inspectComponentAt<SpotLightComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                           kInspectorWidth, inspectorOptions);
+            } else {
+                const auto tags = registry.view<TagComponent>();
+                for (const auto entity : tags) {
+                    if (tags.get<TagComponent>(entity).tag != "Spacecraft" ||
+                        !registry.all_of<RigidBodyComponent>(entity)) {
+                        continue;
+                    }
+                    auto& body = registry.get<RigidBodyComponent>(entity);
+                    inspectComponent(m_uiContext, UIRect{inspectorX, 8.0f, kInspectorWidth, 252.0f},
+                                     reflect<RigidBodyComponent>(), &body, inspectorOptions);
+                    break;
                 }
-                auto& body = registry.get<RigidBodyComponent>(entity);
-                UIInspectorOptions inspectorOptions;
-                inspectorOptions.floatMin = 0.0f;
-                inspectorOptions.floatMax = 5000.0f;
-                constexpr float kInspectorWidth = 322.0f;
-                inspectComponent(m_uiContext,
-                                 UIRect{static_cast<float>(m_window.width()) - kInspectorWidth - 8.0f, 8.0f,
-                                        kInspectorWidth, 252.0f},
-                                 reflect<RigidBodyComponent>(), &body, inspectorOptions);
-                break;
             }
+            const float outlinerHeight =
+                std::max(static_cast<float>(m_window.height()) - 148.0f, 120.0f);
+            m_outliner.build(m_uiContext, UIRect{6.0f, 140.0f, 300.0f, outlinerHeight}, m_scene);
             m_uiContext.endFrame();
         }
         return m_renderSystem.render(m_scene);

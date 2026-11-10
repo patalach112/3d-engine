@@ -33,8 +33,24 @@ void UIContext::beginFrame(const UIInput& input, UIBatch& batch) {
     m_input = input;
     m_pressedEdge = input.mouseDown && !m_prevMouseDown;
     m_releasedEdge = !input.mouseDown && m_prevMouseDown;
+    m_rightPressedEdge = input.mouseRightDown && !m_prevRightDown;
     m_hovered = kUINoWidget;
     m_pressClaimed = false;
+    m_pressConsumed = false;
+
+    // Popup dismissal is decided before any widget runs, so the
+    // dismissing press can be consumed centrally: Esc closes, and
+    // a left press outside the popup closes it without the widgets
+    // underneath ever claiming the click.
+    if (m_popup.open) {
+        const UIRect popupRect{m_popup.x, m_popup.y, kPopupWidth, m_popup.height};
+        if (input.escapePressed) {
+            m_popup.open = false;
+        } else if (m_pressedEdge && !popupRect.contains(input.mouseX, input.mouseY)) {
+            m_popup.open = false;
+            m_pressConsumed = true;
+        }
+    }
 
     m_panels.clear();
     Panel root;
@@ -56,6 +72,7 @@ void UIContext::endFrame() {
         m_active = kUINoWidget;
     }
     m_prevMouseDown = m_input.mouseDown;
+    m_prevRightDown = m_input.mouseRightDown;
 }
 
 void UIContext::beginPanel(std::string_view id, const UIRect& rect, const UIRectStyle& style) {
@@ -139,7 +156,7 @@ bool UIContext::button(const UIRect& rect, std::string_view label, const UIRectS
     if (hit && (m_active == kUINoWidget || m_active == id)) {
         m_hovered = id;
     }
-    if (m_pressedEdge && hit && (m_active == kUINoWidget || m_active == id)) {
+    if (m_pressedEdge && !m_pressConsumed && hit && (m_active == kUINoWidget || m_active == id)) {
         m_active = id;
         m_focused = id; // pressing a widget steals focus
         m_pressClaimed = true;
@@ -195,7 +212,7 @@ bool UIContext::sliderRow(const UIRect& rect, std::string_view label, UIWidgetId
 
     bool changed = false;
     if (value != nullptr && min < max) {
-        if (m_pressedEdge && hit && (m_active == kUINoWidget || m_active == id)) {
+        if (m_pressedEdge && !m_pressConsumed && hit && (m_active == kUINoWidget || m_active == id)) {
             m_active = id;
             m_focused = id;
             m_pressClaimed = true;
@@ -266,7 +283,7 @@ bool UIContext::checkbox(const UIRect& rect, std::string_view label, bool* value
     if (hit && (m_active == kUINoWidget || m_active == id)) {
         m_hovered = id;
     }
-    if (m_pressedEdge && hit && (m_active == kUINoWidget || m_active == id)) {
+    if (m_pressedEdge && !m_pressConsumed && hit && (m_active == kUINoWidget || m_active == id)) {
         m_active = id;
         m_focused = id;
         m_pressClaimed = true;
@@ -313,6 +330,87 @@ bool UIContext::vec3Sliders(std::string_view label, glm::vec3* value, float min,
                         glm::vec4{0.45f, 0.65f, 1.0f, 1.0f}) ||
               changed;
     return changed;
+}
+
+// ---------------------------------------------------------------------------
+// Popups / context menus
+// ---------------------------------------------------------------------------
+
+void UIContext::openPopup(std::string_view id, float x, float y) {
+    m_popup.id = hashId(kRootSeed, id);
+    m_popup.x = x;
+    m_popup.y = y;
+    m_popup.height = 2.0f * kPopupPadding + kPopupItemHeight; // refined by endPopup each render
+    m_popup.open = true;
+}
+
+void UIContext::closePopup() {
+    m_popup.open = false;
+}
+
+bool UIContext::isPopupOpen(std::string_view id) const {
+    return m_popup.open && m_popup.id == hashId(kRootSeed, id);
+}
+
+bool UIContext::beginPopup(std::string_view id) {
+    if (m_batch == nullptr || m_popupRendering || !isPopupOpen(id)) {
+        return false;
+    }
+    m_popupRendering = true;
+    m_popup.cursorY = m_popup.y + kPopupPadding;
+    const UIRectStyle style{6.0f, 1.0f, m_theme.panelBorder};
+    m_batch->drawRoundedRect(m_popup.x, m_popup.y, kPopupWidth, m_popup.height, style, m_theme.panelFill);
+    m_batch->pushScissor(m_popup.x, m_popup.y, kPopupWidth, m_popup.height);
+    return true;
+}
+
+bool UIContext::menuItem(std::string_view label, bool enabled) {
+    if (m_batch == nullptr || !m_popupRendering) {
+        return false;
+    }
+    const UIRect rect{m_popup.x + kPopupPadding, m_popup.cursorY, kPopupWidth - 2.0f * kPopupPadding,
+                      kPopupItemHeight};
+    m_popup.cursorY += kPopupItemHeight;
+    const bool hit = enabled && hitTest(rect);
+    if (hit) {
+        m_batch->drawRoundedRect(rect.x, rect.y, rect.width, rect.height, UIRectStyle{4.0f, 0.0f, {}},
+                                 m_theme.buttonHovered);
+    }
+    const glm::vec4 textColor = enabled ? m_theme.text : glm::vec4{0.45f, 0.48f, 0.55f, 1.0f};
+    m_batch->drawText(label, rect.x + 6.0f, textTop(rect), kTextScale, textColor);
+    if (hit && m_pressedEdge && !m_pressConsumed) {
+        closePopup(); // selecting an item always dismisses the menu
+        return true;
+    }
+    return false;
+}
+
+void UIContext::menuSeparator() {
+    if (m_batch == nullptr || !m_popupRendering) {
+        return;
+    }
+    m_batch->drawRect(m_popup.x + 8.0f, m_popup.cursorY + 4.0f, kPopupWidth - 16.0f, 1.0f,
+                      glm::vec4{1.0f, 1.0f, 1.0f, 0.12f});
+    m_popup.cursorY += 9.0f;
+}
+
+void UIContext::endPopup() {
+    if (!m_popupRendering) {
+        return; // safe no-op when beginPopup returned false
+    }
+    m_popup.height = m_popup.cursorY - m_popup.y + kPopupPadding;
+    if (m_batch != nullptr) {
+        m_batch->popScissor();
+    }
+    m_popupRendering = false;
+}
+
+bool UIContext::pressedRect(const UIRect& rect) {
+    return m_pressedEdge && !m_pressConsumed && hitTest(rect);
+}
+
+bool UIContext::rightPressedRect(const UIRect& rect) {
+    return m_rightPressedEdge && hitTest(rect);
 }
 
 } // namespace engine

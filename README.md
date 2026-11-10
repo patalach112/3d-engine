@@ -2051,3 +2051,67 @@ what it depends on.
   settle to absolute rest in under a second
 - Later phases build the real engine core on top of this foundation —
   editors and visual tooling only arrive once the core is complete.
+
+## Phase 27 — Editor Shell, Entity Outliner & Right-Click Context Menus ✅
+
+The widget layer from Phase 26 Step 3 grows into a working editor
+shell: a floating right-click context menu system in `UIContext`,
+a docked Scene Hierarchy panel (`UIOutliner`, EngineScene) listing
+every ECS entity, and a unified layout in `Application` where the
+Outliner's selection drives the reflection-based Component
+Inspector around the 3D viewport.
+
+- **Floating popups** (`Graphics/UIContext`): `openPopup(id, x, y)`
+  raises a single active menu (opening one replaces any other —
+  the stacking discipline), `beginPopup`/`menuItem`/`menuSeparator`/
+  `endPopup` render it ImGui-style on the frame after the click
+  that opened it. Menu items fire on the press edge and dismiss
+  the menu; disabled items render dimmed and swallow nothing.
+  Dismissal is decided centrally in `beginFrame`: Esc closes, and
+  a left press outside the popup closes it *and is consumed*
+  (`m_pressConsumed` reaches `pressedRect` and every widget claim
+  site) so the button/slider underneath never sees the click.
+  The popup's hit height converges from the previous frame's
+  measured content, like immediate-mode GUIs do.
+- **UIInput extensions**: right-button state, an Esc edge and the
+  mouse-wheel delta are appended after the Step 3 fields, so all
+  existing aggregate initializations keep their meaning.
+  `rightPressedRect` (edge-only, scissor-aware like every hit
+  test) is the dispatch primitive for context clicks.
+- **UIOutliner** (`Scene/UIOutliner`, in EngineScene beside the
+  registry it drives): flattens the hierarchy each frame (roots
+  sorted by name for determinism, children in scene order,
+  depth-capped and cycle-guarded), rows scissor-Clipped to the
+  panel, wheel scrolling clamped to the content height.
+  Left-click selects (feeding the Inspector); right-click selects
+  *and* retargets the context menu. **Duplicate** copies the data
+  components (Tag gains a `" copy"` suffix), adopts the source's
+  parent, never copies children, and re-creates any
+  `NativeScriptComponent` fresh so a script instance is never
+  shared; **Create Child** parents a new entity under the target;
+  **Delete** delegates to `Scene::destroyEntity`, so the scene's
+  `HierarchyDestroyMode` decides the children's fate (orphaned to
+  roots by default, destroyed in Cascade mode). A selection that
+  goes stale (deleted directly or via an ancestor) is cleared on
+  the next build.
+- **Unified editor layout** (`Application`): the inspector dock
+  (top-right) reflects the Outliner's selection over every
+  reflected built-in (`TransformComponent`, `RigidBodyComponent`,
+  `SpinComponent`, `PointLightComponent`, `SpotLightComponent`),
+  stacked by measured panel height; with nothing selected it
+  keeps the Step 3 fallback — the player ship's live
+  RigidBodyComponent. The hierarchy panel docks left below the
+  HUD backdrop and builds last, so its context menu always
+  paints above the dock. Right button, Esc and wheel input are
+  wired from the platform `Input` alongside the existing keys.
+- **Verification**: `testPhase27Editor()` adds 36 checks —
+  right-click dispatch (edge-only), menu item firing, Esc
+  dismissal, outside-click consumption (guarded button stays
+  inert, next honest press clicks), popup replace semantics,
+  disabled items, and the full outliner workflow over real
+  scenes (sorted selection, Duplicate component fidelity and
+  parent adoption, Create Child linkage, retargeted Delete,
+  orphan-vs-cascade destroy modes, wheel clamp). **897 passed,
+  0 failed** in Debug, Release (shared and static),
+  hidden-visibility (Windows-symbol simulation) and ASan
+  builds, warning-free, CTest 1/1.

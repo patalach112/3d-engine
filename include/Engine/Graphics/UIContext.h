@@ -54,6 +54,9 @@ struct UIInput {
     float mouseY = -10000.0f;
     bool mouseDown = false; // left button held
     int keyStep = 0;        // -1/0/+1 step input for the focused widget (arrow keys)
+    bool mouseRightDown = false; // right button held (Phase 27: context menus)
+    bool escapePressed = false;  // Esc edge this frame (dismisses popups)
+    float scrollY = 0.0f;        // wheel delta in lines, positive = up
 };
 
 using UIWidgetId = uint32_t;
@@ -114,6 +117,37 @@ public:
     // Three slider rows (label.x/.y/.z) with per-axis accents.
     bool vec3Sliders(std::string_view label, glm::vec3* value, float min, float max);
 
+    // --- Context menus / popups (Phase 27) -------------------------------
+    // One popup is active at a time (opening replaces). The host
+    // typically opens it from a right-click and renders it LAST in
+    // the frame so it paints on top:
+    //   if (ctx.rightPressedRect(row)) ctx.openPopup("id", mx, my);
+    //   if (ctx.beginPopup("id")) { if (ctx.menuItem("Delete")) ...; ctx.endPopup(); }
+    // Dismissal is automatic: Esc closes, and a left press outside
+    // the popup closes it AND consumes that press (widgets beneath
+    // never see it). menuItem fires on the press edge and closes
+    // the popup; disabled items render dim and never fire.
+    static constexpr float kPopupWidth = 184.0f;
+    static constexpr float kPopupItemHeight = 20.0f;
+    static constexpr float kPopupPadding = 4.0f;
+
+    void openPopup(std::string_view id, float x, float y);
+    void closePopup();
+    [[nodiscard]] bool isPopupOpen(std::string_view id) const;
+    [[nodiscard]] bool popupOpen() const { return m_popup.open; }
+    bool beginPopup(std::string_view id);
+    bool menuItem(std::string_view label, bool enabled = true);
+    void menuSeparator();
+    void endPopup();
+
+    // --- Hit queries for custom widgets (outliner rows, ...) --------------
+    // All respect the current scissor + popup press consumption.
+    [[nodiscard]] bool hoveredRect(const UIRect& rect) const { return hitTest(rect); }
+    [[nodiscard]] bool pressedRect(const UIRect& rect);
+    [[nodiscard]] bool rightPressedRect(const UIRect& rect);
+    [[nodiscard]] glm::vec2 mousePosition() const { return {m_input.mouseX, m_input.mouseY}; }
+    [[nodiscard]] float scrollDelta() const { return m_input.scrollY; }
+
     [[nodiscard]] UIWidgetId hoveredId() const { return m_hovered; }
     [[nodiscard]] UIWidgetId activeId() const { return m_active; }
     [[nodiscard]] UIWidgetId focusedId() const { return m_focused; }
@@ -139,16 +173,30 @@ private:
     bool sliderRow(const UIRect& rect, std::string_view label, UIWidgetId id, float* value, float min,
                    float max, const glm::vec4& accent);
 
+    struct PopupState {
+        UIWidgetId id = kUINoWidget;
+        float x = 0.0f;
+        float y = 0.0f;
+        float height = 28.0f; // content height from the last render
+        float cursorY = 0.0f;
+        bool open = false;
+    };
+
     UIBatch* m_batch = nullptr;
     UITheme m_theme;
     UIInput m_input{};
     bool m_prevMouseDown = false;
+    bool m_prevRightDown = false;
     bool m_pressedEdge = false;
     bool m_releasedEdge = false;
+    bool m_rightPressedEdge = false;
     bool m_pressClaimed = false;
+    bool m_pressConsumed = false; // a popup dismissal ate this frame's press
     UIWidgetId m_hovered = kUINoWidget;
     UIWidgetId m_active = kUINoWidget;
     UIWidgetId m_focused = kUINoWidget;
+    PopupState m_popup;
+    bool m_popupRendering = false;
     std::vector<Panel> m_panels; // [0] is the implicit full-viewport root
 };
 
