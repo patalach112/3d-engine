@@ -46,6 +46,21 @@ struct SceneViewportRect {
     }
 };
 
+// Resolves the rect the GPU state is actually programmed with: the
+// rendered scene (VkViewport + VkRect2D of the scene pass, and the
+// composite's scissor) may only ever cover the framebuffer. An empty
+// request means "the whole framebuffer" (standalone player); a
+// non-empty request is clamped into the framebuffer -- a negative
+// offset grows the rect towards the origin (the same rect, just
+// entering from off-screen), an overhang is cut at the framebuffer
+// edge, and a rect parked fully off-screen collapses to zero size
+// (nothing of the scene shows). This is the ONLY rect the renderer
+// rasterizes into, so confinement to the requesting panel is
+// structural: geometry that would land in a neighbouring dock is
+// clipped by the GPU before it can be written.
+[[nodiscard]] SceneViewportRect resolveSceneViewport(const SceneViewportRect& requested,
+                                                     VkExtent2D framebufferExtent);
+
 // Per-frame data consumed by the cube shaders: camera matrices plus the
 // directional light's view-projection (shadow reprojection) and
 // direction. Per-entity model matrices travel through push constants
@@ -160,8 +175,11 @@ public:
     // Confines the 3D scene (HDR pass + composite) to a framebuffer
     // sub-rectangle; empty restores full-frame rendering. Cheap to
     // call every frame: the rect is consumed at command-record time
-    // and clamped to the current swapchain extent.
-    void setSceneViewport(SceneViewportRect viewport) { m_sceneViewport = viewport; }
+    // and clamped to the current swapchain extent (see
+    // resolveSceneViewport). A non-empty rect that cannot be honoured
+    // as given is logged once per value instead of silently widening
+    // the scene across the whole window.
+    void setSceneViewport(SceneViewportRect viewport);
     [[nodiscard]] SceneViewportRect sceneViewport() const { return m_sceneViewport; }
 
     // Mailbox/Immediate can replace or present work without waiting for
@@ -255,6 +273,10 @@ private:
     uint32_t m_indexCount = 0;
 
     SceneViewportRect m_sceneViewport{}; // empty = full framebuffer
+    // The last non-empty viewport request that could not be honoured
+    // as given (confinement warning already logged for it). Logging
+    // keys on the requested value so a steady bad rect warns once.
+    SceneViewportRect m_confinementWarned{};
 
     std::vector<Buffer> m_uniformBuffers;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;

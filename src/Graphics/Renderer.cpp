@@ -1028,20 +1028,57 @@ void Renderer::recordBloomChain(VkCommandBuffer commandBuffer) {
     }
 }
 
-SceneViewportRect Renderer::effectiveSceneViewport(VkExtent2D extent) const {
-    if (m_sceneViewport.empty() || extent.width == 0 || extent.height == 0) {
+SceneViewportRect resolveSceneViewport(const SceneViewportRect& requested, VkExtent2D extent) {
+    if (requested.empty() || extent.width == 0 || extent.height == 0) {
         return SceneViewportRect{0, 0, extent.width, extent.height};
     }
     const int32_t maxX = static_cast<int32_t>(extent.width);
     const int32_t maxY = static_cast<int32_t>(extent.height);
-    const int32_t x0 = std::clamp(m_sceneViewport.x, 0, maxX);
-    const int32_t y0 = std::clamp(m_sceneViewport.y, 0, maxY);
-    const int32_t x1 = std::clamp(m_sceneViewport.x + static_cast<int32_t>(m_sceneViewport.width), x0, maxX);
-    const int32_t y1 = std::clamp(m_sceneViewport.y + static_cast<int32_t>(m_sceneViewport.height), y0, maxY);
-    if (x1 <= x0 || y1 <= y0) {
-        return SceneViewportRect{0, 0, extent.width, extent.height};
+    const int32_t x0 = std::clamp(requested.x, 0, maxX);
+    const int32_t y0 = std::clamp(requested.y, 0, maxY);
+    const int32_t x1 = static_cast<int32_t>(
+        std::clamp(static_cast<int64_t>(requested.x) + requested.width, static_cast<int64_t>(x0),
+                   static_cast<int64_t>(maxX)));
+    const int32_t y1 = static_cast<int32_t>(
+        std::clamp(static_cast<int64_t>(requested.y) + requested.height, static_cast<int64_t>(y0),
+                   static_cast<int64_t>(maxY)));
+    // Fully off-screen (or clamped away entirely): collapse to zero
+    // size at the clamped origin. The scene simply shows nothing --
+    // it must NEVER fall back to the full framebuffer, which would
+    // splash the world across every neighbouring dock.
+    return SceneViewportRect{x0, y0, static_cast<uint32_t>(std::max(0, x1 - x0)),
+                             static_cast<uint32_t>(std::max(0, y1 - y0))};
+}
+
+SceneViewportRect Renderer::effectiveSceneViewport(VkExtent2D extent) const {
+    return resolveSceneViewport(m_sceneViewport, extent);
+}
+
+void Renderer::setSceneViewport(SceneViewportRect viewport) {
+    m_sceneViewport = viewport;
+    // Diagnostics: a non-empty confinement request that resolution
+    // had to alter (off-screen, oversized, clamped at an edge) means
+    // the caller's layout disagrees with the framebuffer. Warn once
+    // per distinct request value instead of rendering wrong quietly;
+    // a steady valid rect -- the editor's normal state -- stays
+    // silent. An empty request is the player's full-frame mode.
+    if (viewport.empty() || viewport == m_confinementWarned) {
+        return;
     }
-    return SceneViewportRect{x0, y0, static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)};
+    const VkExtent2D extent = m_swapchain.extent();
+    if (extent.width == 0 || extent.height == 0) {
+        return; // minimized / mid-recreate: nothing meaningful to check
+    }
+    const SceneViewportRect resolved = resolveSceneViewport(viewport, extent);
+    if (resolved == viewport) {
+        return;
+    }
+    m_confinementWarned = viewport;
+    ENGINE_LOG_WARNING("Scene viewport (" << viewport.x << ", " << viewport.y << ", " << viewport.width << "x"
+                                          << viewport.height << ") does not fit the " << extent.width << "x"
+                                          << extent.height << " framebuffer; scene confinement clamped to ("
+                                          << resolved.x << ", " << resolved.y << ", " << resolved.width << "x"
+                                          << resolved.height << ") -- the scene stays inside the framebuffer.");
 }
 
 void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
@@ -1503,12 +1540,16 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     // (full extent for the standalone player): the render area above
     // still spans the target so the clear defines every texel the
     // bloom chain may sample, but viewport + scissor clip all draws.
+    // (A fully off-screen request resolves to zero size; the viewport
+    // gets a harmless 1px floor so no driver ever sees a 0-size
+    // viewport, while the zero-size scissor below still clips every
+    // fragment -- confinement is the scissor's invariant.)
     const SceneViewportRect sceneRect = effectiveSceneViewport(extent);
     VkViewport viewport{};
     viewport.x = static_cast<float>(sceneRect.x);
     viewport.y = static_cast<float>(sceneRect.y);
-    viewport.width = static_cast<float>(sceneRect.width);
-    viewport.height = static_cast<float>(sceneRect.height);
+    viewport.width = static_cast<float>(std::max(sceneRect.width, 1u));
+    viewport.height = static_cast<float>(std::max(sceneRect.height, 1u));
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);

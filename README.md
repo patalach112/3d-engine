@@ -2871,3 +2871,50 @@ clean.
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, standalone player headless run
 clean.
+
+## Maintenance — Viewport/scissor confinement: scene, gizmos, wireframes clipped to the panel ✅
+
+- **Gap closed**: the HDR scene pass and the composite were
+  already confined to the docked "Viewport – Scene" rect
+  (scene pass: `VkViewport` + `VkRect2D` from
+  `effectiveSceneViewport`; composite: scissor-only, preserving
+  the 1:1 panel-pixel ↔ scene-texel mapping), but the
+  transform gizmo and the amber selection outline are
+  **UI-overlay draws** — outside the scene pass, so its scissor
+  never covered them. Any handle tip, rotate ring, or outline
+  edge projecting past the panel edge painted wire pixels
+  straight onto the Hierarchy/Inspector docks.
+- **Gizmo + wireframe confinement**: `TransformGizmo::update`
+  now wraps its whole rendering block, and
+  `drawSelectionOutline` its edge/dot submission, in
+  `UIBatch::pushScissor(viewport…)` / `popScissor()` — the same
+  mechanism the text fields and popup menus already use, which
+  `UIRenderer::record` turns into a per-segment `VkRect2D`.
+  Projected geometry is left untouched; the GPU hard-clips it
+  at the panel boundary. Play mode (full-window viewport) is a
+  no-op clip.
+- **Resolver hardening**: the confinement clamp is now the
+  pure, testable `engine::resolveSceneViewport(rect, extent)`.
+  A fully off-screen or clamped-to-zero request collapses to a
+  zero-size rect (scene shows nothing) instead of the previous
+  silent fallback to the **full framebuffer**, which splashed
+  the world across every dock. The scene-pass viewport takes a
+  harmless 1 px floor so a zero-size scissor never implies a
+  possibly-invalid 0-size `VkViewport`.
+- **Diagnostics**: `Renderer::setSceneViewport` (now out of
+  line) warns once per distinct non-empty request that
+  resolution had to alter — layout/framebuffer disagreement is
+  surfaced instead of rendered wrong quietly. The editor's
+  normal steady rect stays silent.
+- **Pins**: 9 new headless checks — resolver passthrough /
+  empty-request / negative-offset re-entry / edge overhang cut
+  / off-screen collapse / zero framebuffer; outline and gizmo
+  segments all record under exactly the panel scissor with the
+  scissor stack balanced, including an oversize entity whose
+  vertices genuinely leave the panel while every quad stays
+  clipped.
+
+1211 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, standalone player headless run
+clean.

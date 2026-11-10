@@ -9447,6 +9447,30 @@ void testEditorViewportAndFont() {
                                             static_cast<uint32_t>(edit.viewport.height)};
     check(!gpuRect.empty() && nearlyEqual(gpuRect.aspect(), edit.viewportAspect(), 1e-3),
           "viewport: the renderer rect carries the same geometry the layout computed");
+
+    // resolveSceneViewport: the exact rect the GPU state is built
+    // from. The scene (HDR pass viewport+scissor, composite scissor)
+    // may never rasterize one pixel outside this rect.
+    constexpr VkExtent2D kFb{1280, 720};
+    check(engine::resolveSceneViewport(gpuRect, kFb) == gpuRect,
+          "confinement: the editor's panel rect passes through resolution untouched");
+    check(engine::resolveSceneViewport(engine::SceneViewportRect{}, kFb) ==
+              engine::SceneViewportRect{0, 0, 1280, 720},
+          "confinement: an empty request is the player's full-framebuffer mode");
+    const engine::SceneViewportRect resolvedLeft =
+        engine::resolveSceneViewport(engine::SceneViewportRect{-40, 20, 300, 200}, kFb);
+    check(resolvedLeft == engine::SceneViewportRect{0, 20, 260, 200},
+          "confinement: a negative offset re-enters from the framebuffer edge (origin clamps, far edge kept)");
+    const engine::SceneViewportRect resolvedRight =
+        engine::resolveSceneViewport(engine::SceneViewportRect{1200, 700, 300, 200}, kFb);
+    check(resolvedRight == engine::SceneViewportRect{1200, 700, 80, 20},
+          "confinement: an overhanging rect is cut at the framebuffer edge, never past it");
+    const engine::SceneViewportRect resolvedOffscreen =
+        engine::resolveSceneViewport(engine::SceneViewportRect{5000, 10, 300, 200}, kFb);
+    check(resolvedOffscreen.empty() && resolvedOffscreen.x == 1280,
+          "confinement: a fully off-screen panel collapses to zero size (scene hidden, never splashed window-wide)");
+    check(engine::resolveSceneViewport(gpuRect, VkExtent2D{0, 0}).empty(),
+          "confinement: a zero-size framebuffer resolves to nothing drawable");
 }
 
 void testEditorSelectionOutline() {
@@ -9524,6 +9548,69 @@ void testEditorSelectionOutline() {
     std::array<glm::vec3, 8> noCorners{};
     check(!engine::TransformGizmo::selectionBoxCorners(scene, entt::null, noCorners),
           "outline: no selection -> no outline (deselected state draws nothing)");
+
+    // --- Viewport confinement: wireframe drawing clips to the panel --
+    // The outline and gizmo are UI-overlay draws, so the scene pass's
+    // GPU confinement cannot cover them; they clip themselves to the
+    // panel rect via the batch's scissor stack. Every recorded
+    // segment must carry exactly the panel scissor, and the stack
+    // must hand its depth back afterwards.
+    const engine::UIScissorRect panelScissor{viewport.x, viewport.y, viewport.width, viewport.height};
+    {
+        engine::UIBatch batch;
+        batch.begin(1280, 720);
+        const uint32_t depthBefore = batch.scissorDepth();
+        engine::TransformGizmo::drawSelectionOutline(batch, scene, cubeHandle, camera, viewport);
+        bool outlineClipped = !batch.segments().empty();
+        for (const engine::UISegment& segment : batch.segments()) {
+            outlineClipped = outlineClipped && batch.scissors()[segment.scissor] == panelScissor;
+        }
+        check(outlineClipped && batch.scissorDepth() == depthBefore,
+              "confinement: every selection-outline quad records under the panel scissor, stack balanced");
+
+        // An entity bigger than the panel: projected vertices really
+        // do leave the rect, so it is the GPU scissor -- not the CPU
+        // projection -- that keeps wire pixels off the docks.
+        auto big = scene.createEntity("Big");
+        big.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+        big.getComponent<engine::TransformComponent>().scale = glm::vec3{6.0f};
+        big.addComponent<engine::ColliderComponent>(engine::ColliderComponent::box(glm::vec3{0.5f}));
+        batch.begin(1280, 720);
+        engine::TransformGizmo::drawSelectionOutline(batch, scene, big.handle(), camera, viewport);
+        bool vertexOutsidePanel = false;
+        for (const engine::UIVertex& vertex : batch.vertices()) {
+            vertexOutsidePanel =
+                vertexOutsidePanel || !viewport.contains(vertex.position.x, vertex.position.y);
+        }
+        bool bigClipped = !batch.segments().empty();
+        for (const engine::UISegment& segment : batch.segments()) {
+            bigClipped = bigClipped && batch.scissors()[segment.scissor] == panelScissor;
+        }
+        check(vertexOutsidePanel && bigClipped,
+              "confinement: oversize wire geometry is submitted, but every quad is GPU-clipped to the panel");
+    }
+    {
+        // Gizmo handles: the same confinement spans the whole
+        // rendering block of update().
+        engine::FontAtlas atlas = engine::generateFontAtlas();
+        engine::UIBatch batch;
+        batch.setFontAtlas(&atlas);
+        engine::UIContext ctx;
+        batch.begin(1280, 720);
+        engine::UIInput input;
+        input.mouseX = viewport.x + 0.5f * viewport.width;
+        input.mouseY = viewport.y + 0.5f * viewport.height;
+        ctx.beginFrame(input, batch);
+        engine::TransformGizmo gizmo;
+        gizmo.update(ctx, scene, cubeHandle, camera, viewport);
+        ctx.endFrame();
+        bool gizmoClipped = !batch.segments().empty();
+        for (const engine::UISegment& segment : batch.segments()) {
+            gizmoClipped = gizmoClipped && batch.scissors()[segment.scissor] == panelScissor;
+        }
+        check(gizmoClipped && batch.scissorDepth() == 1,
+              "confinement: every gizmo handle quad records under the panel scissor, stack balanced");
+    }
 }
 
 void testPhase34EditorFixes() {

@@ -343,6 +343,13 @@ void TransformGizmo::drawSelectionOutline(UIBatch& batch, const Scene& scene, en
         {0, 2}, {1, 3}, {4, 6}, {5, 7}, // y-running
         {0, 4}, {1, 5}, {2, 6}, {3, 7}, // z-running
     }};
+    // Confinement: the outline is an overlay draw, so the scene
+    // pass's GPU scissor does not cover it. Clip every submitted
+    // quad to the panel rect instead -- a corner projecting past the
+    // panel edge must never paint wire pixels onto the docks (the
+    // batch maps this stack entry to the segment's VkRect2D, the
+    // same hard clip the renderer applies to the 3D scene).
+    batch.pushScissor(viewport.x, viewport.y, viewport.width, viewport.height);
     for (const auto& [a, b] : kEdges) {
         if (valid[a] && valid[b]) {
             drawDottedSegment(batch, pixels[a], pixels[b], outlineColor, 1.7f);
@@ -353,6 +360,7 @@ void TransformGizmo::drawSelectionOutline(UIBatch& batch, const Scene& scene, en
             drawDot(batch, pixels[i], 2.6f, outlineColor);
         }
     }
+    batch.popScissor();
 }
 
 void TransformGizmo::setMode(GizmoMode mode) {
@@ -545,6 +553,12 @@ GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::enti
     m_hoveredAxis = result.hoveredAxis;
 
     // --- Rendering (procedural, always on top) ------------------------------
+    // Confinement: handles are overlay draws, so clip the whole
+    // rendering block to the panel rect (GPU scissor via the batch).
+    // A handle tip past the panel edge -- selected entity at the
+    // panel border, camera zoomed close -- can then never paint
+    // gizmo pixels onto the neighbouring docks.
+    batch->pushScissor(viewport.x, viewport.y, viewport.width, viewport.height);
     for (int pass = 0; pass < 2; ++pass) {
         for (const HandleProjection& handle : handles) {
             const bool highlighted = handle.axis == result.hoveredAxis;
@@ -558,6 +572,7 @@ GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::enti
         batch->drawRoundedRect(center.x - 3.5f, center.y - 3.5f, 7.0f, 7.0f,
                                UIRectStyle{1.5f, 0.0f, glm::vec4{0.0f}}, glm::vec4{0.95f, 0.97f, 1.0f, 0.95f});
     }
+    batch->popScissor();
     return result;
 }
 

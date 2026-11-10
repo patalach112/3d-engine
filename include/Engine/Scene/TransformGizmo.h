@@ -98,7 +98,11 @@ public:
                              glm::vec2 viewportSize, bool inputBlocked = false);
     // Viewport-rect form (editor): handles project into the bounded
     // viewport panel and the cursor is read relative to it, so the
-    // gizmo can neither draw nor be grabbed over the docks.
+    // gizmo can neither draw nor be grabbed over the docks. Drawing
+    // is additionally GPU-scissor-confined to the panel rect for the
+    // whole rendering block: projected geometry that would land past
+    // the panel edge (entity at the border, camera close up) is
+    // clipped at rasterization, never painted onto the docks.
     GizmoUpdateResult update(UIContext& ui, Scene& scene, entt::entity selected, const Camera& camera,
                              const UIRect& viewport, bool inputBlocked = false);
 
