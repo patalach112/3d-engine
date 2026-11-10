@@ -86,25 +86,25 @@ using UIWidgetId = uint32_t;
 inline constexpr UIWidgetId kUINoWidget = 0;
 
 struct UITheme {
-    // True deep-dark theme (professional charcoal surfaces, one
-    // blue accent for interactive fills, one orange accent for
-    // focus/active states). Every neutral surface sits in the
-    // #121212-#252526 band: nothing grey may glare against the
-    // panels -- the old #3e3e42 hovers and near-white slider thumb
-    // read as light grey next to the docks. Docked editor panels
-    // are fully opaque: the 3D viewport is a bounded rectangle
-    // between them, so nothing of the world may bleed through the
-    // chrome (the old 0.92 alpha let scene colour wash over text
-    // whenever geometry passed behind a panel).
-    glm::vec4 panelFill{0.145f, 0.145f, 0.149f, 1.0f};      // #252526 panels
-    glm::vec4 toolbarFill{0.125f, 0.125f, 0.125f, 1.0f};    // #202020 toolbars/status bar
-    glm::vec4 backgroundFill{0.070f, 0.070f, 0.070f, 1.0f}; // #121212 deepest chrome base
-    glm::vec4 panelBorder{0.200f, 0.200f, 0.200f, 1.0f};    // #333333
-    glm::vec4 text{0.93f, 0.93f, 0.93f, 1.0f};              // near-white, high contrast
-    glm::vec4 buttonFill{0.145f, 0.145f, 0.149f, 1.0f};     // #252526, reads on #202020 bars
-    glm::vec4 buttonHovered{0.200f, 0.200f, 0.200f, 1.0f};  // #333333 lift
+    // True deep-black / charcoal theme (OLED-leaning professional
+    // dark, one blue accent for interactive fills, one orange
+    // accent for focus/active states). Every neutral surface is
+    // near-black: panels #121214 on a #0f0f11 chrome base,
+    // toolbars #161618, borders #2a2a2e -- nothing in the grey
+    // band that washed the old UI out. Docked editor panels are
+    // fully opaque: the 3D viewport is a bounded rectangle
+    // between them, so nothing of the world may bleed through
+    // the chrome (the old 0.92 alpha let scene colour wash over
+    // text whenever geometry passed behind a panel).
+    glm::vec4 panelFill{0.071f, 0.071f, 0.078f, 1.0f};      // #121214 panels
+    glm::vec4 toolbarFill{0.086f, 0.086f, 0.094f, 1.0f};    // #161618 toolbars/status bar
+    glm::vec4 backgroundFill{0.059f, 0.059f, 0.067f, 1.0f}; // #0f0f11 deepest chrome base
+    glm::vec4 panelBorder{0.165f, 0.165f, 0.180f, 1.0f};    // #2a2a2e
+    glm::vec4 text{0.878f, 0.878f, 0.878f, 1.0f};           // #e0e0e0, pops on near-black
+    glm::vec4 buttonFill{0.125f, 0.125f, 0.141f, 1.0f};     // #202024, reads on #161618 bars
+    glm::vec4 buttonHovered{0.165f, 0.165f, 0.180f, 1.0f};  // #2a2a2e lift
     glm::vec4 buttonActive{0.055f, 0.388f, 0.612f, 1.0f};   // #0e639c
-    glm::vec4 trackFill{0.094f, 0.094f, 0.094f, 1.0f};      // #181818 fields/tracks
+    glm::vec4 trackFill{0.094f, 0.094f, 0.110f, 1.0f};      // #18181c fields/tracks
     glm::vec4 sliderFill{0.0f, 0.478f, 0.800f, 1.0f};       // #007acc
     glm::vec4 thumbFill{0.55f, 0.55f, 0.56f, 1.0f};         // mid grey, visible without glare
     glm::vec4 checkFill{0.0f, 0.478f, 0.800f, 1.0f};        // #007acc
@@ -118,7 +118,7 @@ public:
     static constexpr float kRowHeight = 26.0f;
     static constexpr float kRowSpacing = 4.0f;
     static constexpr float kPanelPadding = 8.0f;
-    static constexpr float kTextScale = 1.5f;
+    static constexpr float kTextScale = 1.65f; // global UI text scale (+10% legibility)
     static constexpr float kSliderLabelFraction = 0.38f;
 
     // Frame lifecycle: beginFrame snapshots input (computing

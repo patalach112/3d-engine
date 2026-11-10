@@ -9902,13 +9902,13 @@ void testPhase34EditorFixes() {
     // --- (i) Theme + scroll clamp contracts --------------------------------------
     {
         const engine::UITheme theme;
-        check(theme.panelFill == glm::vec4{0.145f, 0.145f, 0.149f, 1.0f} &&
-                  theme.panelBorder == glm::vec4{0.200f, 0.200f, 0.200f, 1.0f} &&
-                  theme.trackFill == glm::vec4{0.094f, 0.094f, 0.094f, 1.0f} &&
+        check(theme.panelFill == glm::vec4{0.071f, 0.071f, 0.078f, 1.0f} &&
+                  theme.panelBorder == glm::vec4{0.165f, 0.165f, 0.180f, 1.0f} &&
+                  theme.trackFill == glm::vec4{0.094f, 0.094f, 0.110f, 1.0f} &&
                   theme.sliderFill == glm::vec4{0.0f, 0.478f, 0.800f, 1.0f} &&
                   theme.buttonActive == glm::vec4{0.055f, 0.388f, 0.612f, 1.0f} &&
                   theme.focusBorder == glm::vec4{1.0f, 0.60f, 0.10f, 1.0f},
-              "theme: deep-dark surfaces (#252526/#181818), #333 borders, blue fills, orange focus");
+              "theme: deep-black surfaces (#121214/#18181c), #2a2a2e borders, blue fills, orange focus");
         check(nearlyEqual(engine::UIContext::clampScrollOffset(50.0f, 100.0f, 40.0f), 50.0f) &&
                   nearlyEqual(engine::UIContext::clampScrollOffset(80.0f, 100.0f, 40.0f), 60.0f) &&
                   engine::UIContext::clampScrollOffset(-5.0f, 100.0f, 40.0f) == 0.0f &&
@@ -10045,16 +10045,16 @@ void testPhase35RenderingFixes() {
             return nearlyEqual(color.r, r, 1e-6f) && nearlyEqual(color.g, g, 1e-6f) &&
                    nearlyEqual(color.b, b, 1e-6f) && nearlyEqual(color.a, 1.0f, 1e-6f);
         };
-        check(near(theme.backgroundFill, 0.070f, 0.070f, 0.070f) && near(theme.toolbarFill, 0.125f, 0.125f, 0.125f) &&
-                  near(theme.trackFill, 0.094f, 0.094f, 0.094f),
-              "theme: #121212 chrome base, #202020 toolbars, #181818 tracks");
-        check(near(theme.panelFill, 0.145f, 0.145f, 0.149f) && near(theme.buttonFill, 0.145f, 0.145f, 0.149f) &&
-                  near(theme.panelBorder, 0.200f, 0.200f, 0.200f) && near(theme.buttonHovered, 0.200f, 0.200f, 0.200f),
-              "theme: #252526 panels/buttons, #333333 borders and hover lift");
+        check(near(theme.backgroundFill, 0.059f, 0.059f, 0.067f) && near(theme.toolbarFill, 0.086f, 0.086f, 0.094f) &&
+                  near(theme.trackFill, 0.094f, 0.094f, 0.110f),
+              "theme: #0f0f11 chrome base, #161618 toolbars, #18181c tracks");
+        check(near(theme.panelFill, 0.071f, 0.071f, 0.078f) && near(theme.buttonFill, 0.125f, 0.125f, 0.141f) &&
+                  near(theme.panelBorder, 0.165f, 0.165f, 0.180f) && near(theme.buttonHovered, 0.165f, 0.165f, 0.180f),
+              "theme: #121214 panels, #202024 buttons, #2a2a2e borders and hover lift");
         const float brightestSurface = std::max({theme.panelFill.r, theme.toolbarFill.r, theme.backgroundFill.r,
                                                  theme.panelBorder.r, theme.buttonFill.r, theme.buttonHovered.r,
                                                  theme.trackFill.r, theme.thumbFill.r});
-        check(brightestSurface <= 0.56f && theme.text.r >= 0.9f,
+        check(brightestSurface <= 0.56f && theme.text.r >= 0.85f,
               "theme: no neutral surface glares (thumb included); text stays high-contrast");
     }
 
@@ -10166,6 +10166,289 @@ void testPhase35RenderingFixes() {
     }
 }
 
+void testPhase36LayoutThemeFont() {
+    std::cout << "Phase 36: dock partition, panel clipping, deep-black theme, font scale, editor-scale SDF\n";
+
+    // --- (a) EditorLayout is a strict partition at every size: no two
+    // docks ever share a pixel, every dock stays inside the window,
+    // and the four authoring docks tile the middle band exactly (no
+    // gaps for the scene to leak through, no overlaps to bleed over).
+    {
+        const auto overlaps = [](const engine::UIRect& a, const engine::UIRect& b) {
+            return a.width > 0.0f && a.height > 0.0f && b.width > 0.0f && b.height > 0.0f &&
+                   a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height &&
+                   b.y < a.y + a.height;
+        };
+        bool partitioned = true;
+        bool contained = true;
+        bool tiled = true;
+        const std::array<std::pair<float, float>, 9> sizes{{{1920.0f, 1080.0f}, {1280.0f, 720.0f},
+                                                            {1024.0f, 640.0f},  {800.0f, 500.0f},
+                                                            {640.0f, 480.0f},   {375.0f, 300.0f},
+                                                            {220.0f, 160.0f},   {120.0f, 90.0f},
+                                                            {64.0f, 64.0f}}};
+        for (const auto& [w, h] : sizes) {
+            const engine::EditorLayout layout = engine::computeEditorLayout(w, h, false);
+            const engine::UIRect rects[6] = {layout.toolbar, layout.hierarchy, layout.inspector,
+                                             layout.assetBrowser, layout.viewport, layout.statusBar};
+            for (int i = 0; i < 6; ++i) {
+                contained = contained && rects[i].width >= 0.0f && rects[i].height >= 0.0f &&
+                            rects[i].x >= 0.0f && rects[i].y >= 0.0f &&
+                            rects[i].x + rects[i].width <= w + 1e-3f && rects[i].y + rects[i].height <= h + 1e-3f;
+                for (int j = i + 1; j < 6; ++j) {
+                    partitioned = partitioned && !overlaps(rects[i], rects[j]);
+                }
+            }
+            const float middleHeight = layout.statusBar.y - (layout.toolbar.y + layout.toolbar.height);
+            const float dockedArea = layout.hierarchy.width * layout.hierarchy.height +
+                                     layout.inspector.width * layout.inspector.height +
+                                     layout.assetBrowser.width * layout.assetBrowser.height +
+                                     layout.viewport.width * layout.viewport.height;
+            tiled = tiled && nearlyEqual(dockedArea, w * middleHeight, 1.0) && layout.viewportIsDockBounded();
+        }
+        check(partitioned, "layout: no two docks overlap at any window size (strict partition)");
+        check(contained, "layout: every dock stays inside the window with non-negative size");
+        check(tiled, "layout: hierarchy/inspector/assets/viewport tile the middle band exactly");
+
+        const engine::EditorLayout play = engine::computeEditorLayout(1280.0f, 720.0f, true);
+        check(play.hierarchy.width == 0.0f && play.inspector.width == 0.0f && play.assetBrowser.width == 0.0f &&
+                  nearlyEqual(play.viewport.width, 1280.0) &&
+                  nearlyEqual(play.viewport.y, play.toolbar.height) &&
+                  nearlyEqual(play.viewport.height, 720.0 - play.toolbar.height - play.statusBar.height),
+              "layout: Play mode collapses the docks; the viewport owns the middle band");
+        const engine::EditorLayout zero = engine::computeEditorLayout(0.0f, 0.0f, false);
+        check(zero.viewport.width == 0.0f && zero.viewport.height == 0.0f && zero.viewportIsDockBounded(),
+              "layout: a degenerate window yields an empty, bounded viewport");
+    }
+
+    const engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+    check(atlas.trueType && !atlas.empty(), "phase36: TrueType atlas baked for the font checks");
+
+    // --- (b) Dock clipping: a panel's children are bound to the panel
+    // rect by the batch scissor, even geometry emitted far outside it.
+    {
+        engine::UIBatch batch;
+        batch.setFontAtlas(&atlas);
+        batch.begin(800, 600);
+        batch.pushScissor(100.0f, 100.0f, 200.0f, 100.0f); // a dock rect
+        const engine::UIScissorRect panelScissor = batch.currentScissor();
+        batch.drawText("Clipped", 100.0f, 500.0f, 1.0f, glm::vec4{1.0f}); // far below the dock
+        const auto& segments = batch.segments();
+        check(nearlyEqual(panelScissor.x, 100.0) && nearlyEqual(panelScissor.y, 100.0) &&
+                  nearlyEqual(panelScissor.width, 200.0) && nearlyEqual(panelScissor.height, 100.0) &&
+                  !segments.empty() && batch.scissors()[segments.back().scissor] == panelScissor,
+              "clipping: geometry emitted inside a dock carries the dock's scissor, wherever it sits");
+        batch.pushScissor(150.0f, 50.0f, 200.0f, 200.0f); // nested, sticking out top/right
+        const engine::UIScissorRect nested = batch.currentScissor();
+        check(nearlyEqual(nested.x, 150.0) && nearlyEqual(nested.y, 100.0) &&
+                  nearlyEqual(nested.width, 150.0) && nearlyEqual(nested.height, 100.0),
+              "clipping: nested panel scissors intersect, never expand past the parent dock");
+        batch.popScissor();
+        batch.popScissor();
+        check(batch.currentScissor().width == 800.0f && batch.currentScissor().height == 600.0f,
+              "clipping: popping both docks restores the full-window scissor");
+    }
+
+    // --- (c) Deep-black theme ladder: surfaces ascend gently from the
+    // #0f0f11 base and stay in the near-black band; text is #e0e0e0.
+    {
+        const engine::UITheme theme;
+        check(nearlyEqual(theme.text.r, 0.878, 1e-6) && nearlyEqual(theme.text.g, 0.878, 1e-6) &&
+                  nearlyEqual(theme.text.b, 0.878, 1e-6) && nearlyEqual(theme.text.a, 1.0, 1e-6),
+              "theme: text is #e0e0e0, high contrast on near-black");
+        check(theme.backgroundFill.r < theme.panelFill.r && theme.panelFill.r < theme.toolbarFill.r &&
+                  theme.toolbarFill.r < theme.panelBorder.r && theme.trackFill.r < theme.panelBorder.r &&
+                  theme.panelBorder.r <= 0.18f,
+              "theme: background < panel < toolbar < border, all inside the near-black band");
+    }
+
+    // --- (d) Global font scale: bumped ~10% for legibility, and a
+    // line still fits the fixed row height so bounding boxes hold.
+    {
+        check(engine::UIContext::kTextScale == 1.65f, "font: global UI text scale is 1.65 (was 1.5, +10%)");
+        engine::UIBatch batch;
+        batch.setFontAtlas(&atlas);
+        batch.begin(800, 600);
+        check(nearlyEqual(batch.measureText("Hello", engine::UIContext::kTextScale),
+                          batch.measureText("Hello", 1.0f) * engine::UIContext::kTextScale, 1e-3),
+              "font: text metrics scale linearly with the global scale");
+        check(atlas.lineHeight * engine::UIContext::kTextScale < engine::UIContext::kRowHeight,
+              "font: a line at the global scale still fits the 26px widget rows");
+    }
+
+    // --- (e) Text quads are attribute-exact: every glyph quad's uvRect
+    // is its atlas glyph rect verbatim (no stride shift, no swapped
+    // corners), positions and indices strictly ordered.
+    {
+        engine::UIBatch batch;
+        batch.setFontAtlas(&atlas);
+        batch.begin(400, 100);
+        batch.drawText("Ag", 10.0f, 10.0f, 1.0f, glm::vec4{1.0f});
+        const auto& verts = batch.vertices();
+        const auto& idx = batch.indices();
+        const engine::SdfGlyph& glyphA = atlas.glyphFor('A');
+        const engine::SdfGlyph& glyphG = atlas.glyphFor('g');
+        check(verts.size() == 8 && idx.size() == 12 && batch.textItemCount() == 1,
+              "sdf attributes: 'Ag' emits exactly two glyph quads");
+        if (verts.size() == 8 && idx.size() == 12) {
+            const bool uvExact =
+                verts[0].uvRect == glm::vec4{glyphA.u0, glyphA.v0, glyphA.u1, glyphA.v1} &&
+                verts[4].uvRect == glm::vec4{glyphG.u0, glyphG.v0, glyphG.u1, glyphG.v1};
+            check(uvExact, "sdf attributes: quad uvRects equal the atlas glyph rects verbatim");
+            bool cornersOrdered = true;
+            for (size_t q = 0; q < 2; ++q) {
+                const auto& tl = verts[q * 4 + 0];
+                const auto& tr = verts[q * 4 + 1];
+                const auto& br = verts[q * 4 + 2];
+                const auto& bl = verts[q * 4 + 3];
+                cornersOrdered = cornersOrdered && tl.uv == glm::vec2{0.0f, 0.0f} && tr.uv == glm::vec2{1.0f, 0.0f} &&
+                                 br.uv == glm::vec2{1.0f, 1.0f} && bl.uv == glm::vec2{0.0f, 1.0f} &&
+                                 tl.kind == engine::kUITextPrimitive && tl.position.x < tr.position.x &&
+                                 tl.position.y < bl.position.y && tr.position.x == br.position.x &&
+                                 bl.position.y == br.position.y;
+            }
+            check(cornersOrdered, "sdf attributes: corners/UVs/kind are ordered per quad (TL,TR,BR,BL)");
+            check(idx == std::vector<uint32_t>{0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7},
+                  "sdf attributes: indices reference exact quad corners, no cross-quad bleed");
+            check(nearlyEqual(verts[0].position.x, 10.0 + glyphA.bearingX, 1e-4),
+                  "sdf attributes: first quad starts at pen + bearing (no pen drift)");
+        }
+    }
+
+    // --- (f) Crisp at the real editor scale: software-render "Hello"
+    // at kTextScale with the full mip chain + trilinear sampling +
+    // ui.frag's exact fwidth AA. Ink must be present per glyph and
+    // the partial-alpha fringe must stay a thin edge, not a smear.
+    if (!atlas.empty()) {
+        struct Level {
+            std::vector<float> px;
+            int w, h;
+        };
+        std::vector<Level> levels;
+        {
+            Level base;
+            base.w = static_cast<int>(atlas.width);
+            base.h = static_cast<int>(atlas.height);
+            base.px.resize(atlas.pixels.size());
+            for (size_t i = 0; i < atlas.pixels.size(); ++i) {
+                base.px[i] = atlas.pixels[i] / 255.0f;
+            }
+            levels.push_back(std::move(base));
+            while (levels.back().w > 1 || levels.back().h > 1) {
+                const Level& src = levels.back();
+                Level dst;
+                dst.w = std::max(1, src.w / 2);
+                dst.h = std::max(1, src.h / 2);
+                dst.px.assign(static_cast<size_t>(dst.w) * dst.h, 0.0f);
+                for (int y = 0; y < dst.h; ++y) {
+                    for (int x = 0; x < dst.w; ++x) {
+                        float sum = 0.0f;
+                        for (int dy = 0; dy < 2; ++dy) {
+                            for (int dx = 0; dx < 2; ++dx) {
+                                const int sx = std::min(src.w - 1, x * 2 + dx);
+                                const int sy = std::min(src.h - 1, y * 2 + dy);
+                                sum += src.px[static_cast<size_t>(sy) * src.w + sx];
+                            }
+                        }
+                        dst.px[static_cast<size_t>(y) * dst.w + x] = sum * 0.25f;
+                    }
+                }
+                levels.push_back(std::move(dst));
+            }
+        }
+        auto sampleLevel = [&](int lvl, float u, float v) {
+            const Level& level = levels[std::min<size_t>(static_cast<size_t>(std::max(lvl, 0)), levels.size() - 1)];
+            const float x = u * static_cast<float>(level.w) - 0.5f;
+            const float y = v * static_cast<float>(level.h) - 0.5f;
+            const int x0 = static_cast<int>(std::floor(x));
+            const int y0 = static_cast<int>(std::floor(y));
+            const float fx = x - static_cast<float>(x0);
+            const float fy = y - static_cast<float>(y0);
+            auto texel = [&](int tx, int ty) {
+                tx = std::clamp(tx, 0, level.w - 1);
+                ty = std::clamp(ty, 0, level.h - 1);
+                return level.px[static_cast<size_t>(ty) * level.w + static_cast<size_t>(tx)];
+            };
+            return (texel(x0, y0) * (1.0f - fx) + texel(x0 + 1, y0) * fx) * (1.0f - fy) +
+                   (texel(x0, y0 + 1) * (1.0f - fx) + texel(x0 + 1, y0 + 1) * fx) * fy;
+        };
+
+        engine::UIBatch batch;
+        batch.setFontAtlas(&atlas);
+        batch.begin(200, 60);
+        const float scale = engine::UIContext::kTextScale;
+        batch.drawText("Hello", 2.0f, 2.0f, scale, glm::vec4{1.0f});
+        const float textWidth = batch.measureText("Hello", scale);
+
+        constexpr int kW = 90;
+        constexpr int kH = 34;
+        std::vector<float> field(kW * kH, -1.0f);
+        const auto& verts = batch.vertices();
+        const auto& idx = batch.indices();
+        for (size_t t = 0; t + 2 < idx.size(); t += 3) {
+            const engine::UIVertex& a = verts[idx[t]];
+            const engine::UIVertex& b = verts[idx[t + 1]];
+            const engine::UIVertex& c = verts[idx[t + 2]];
+            if (a.kind < 1.5f) {
+                continue;
+            }
+            const float minx = std::min({a.position.x, b.position.x, c.position.x});
+            const float maxx = std::max({a.position.x, b.position.x, c.position.x});
+            const float miny = std::min({a.position.y, b.position.y, c.position.y});
+            const float maxy = std::max({a.position.y, b.position.y, c.position.y});
+            const float quadW = std::max(maxx - minx, 1e-5f);
+            const float quadH = std::max(maxy - miny, 1e-5f);
+            const float footprint = std::max((a.uvRect.z - a.uvRect.x) * static_cast<float>(atlas.width) / quadW,
+                                             (a.uvRect.w - a.uvRect.y) * static_cast<float>(atlas.height) / quadH);
+            const float lod = std::log2(std::max(footprint, 1.0f));
+            const int lod0 = static_cast<int>(std::floor(lod));
+            for (int y = std::max(0, static_cast<int>(miny)); y < std::min(kH, static_cast<int>(maxy) + 1); ++y) {
+                for (int x = std::max(0, static_cast<int>(minx)); x < std::min(kW, static_cast<int>(maxx) + 1); ++x) {
+                    const float fu = (static_cast<float>(x) + 0.5f - minx) / quadW;
+                    const float fv = (static_cast<float>(y) + 0.5f - miny) / quadH;
+                    const float u = a.uvRect.x + (a.uvRect.z - a.uvRect.x) * fu;
+                    const float v = a.uvRect.y + (a.uvRect.w - a.uvRect.y) * fv;
+                    const float f = std::clamp(lod - static_cast<float>(lod0), 0.0f, 1.0f);
+                    const float value = sampleLevel(lod0, u, v) * (1.0f - f) + sampleLevel(lod0 + 1, u, v) * f;
+                    float& cell = field[static_cast<size_t>(y) * kW + static_cast<size_t>(x)];
+                    cell = std::max(cell, value);
+                }
+            }
+        }
+        // ui.frag exactly: alpha = clamp((field-0.5)/max(fwidth,1e-4) + 0.5)
+        float ink = 0.0f;
+        float fringe = 0.0f;
+        std::array<float, 5> bandInk{};
+        for (int y = 0; y < kH; ++y) {
+            for (int x = 0; x < kW; ++x) {
+                const float value = field[static_cast<size_t>(y) * kW + static_cast<size_t>(x)];
+                if (value < 0.0f) {
+                    continue;
+                }
+                const float right = field[static_cast<size_t>(y) * kW + std::min(kW - 1, x + 1)];
+                const float down = field[static_cast<size_t>(std::min(kH - 1, y + 1)) * kW + static_cast<size_t>(x)];
+                const float fw = std::abs(right - value) + std::abs(down - value);
+                const float alpha = std::clamp((value - 0.5f) / std::max(fw, 1e-4f) + 0.5f, 0.0f, 1.0f);
+                if (alpha > 0.5f) {
+                    ink += 1.0f;
+                    const int band = std::clamp(static_cast<int>((static_cast<float>(x) - 2.0f) / (textWidth / 5.0f)),
+                                                0, 4);
+                    bandInk[static_cast<size_t>(band)] += 1.0f;
+                } else if (alpha > 0.05f) {
+                    fringe += 1.0f;
+                }
+            }
+        }
+        check(ink > 40.0f && ink < 1500.0f, "sdf editor scale: 'Hello' has real ink at kTextScale through the mip chain");
+        bool allGlyphs = true;
+        for (const float band : bandInk) {
+            allGlyphs = allGlyphs && band > 0.0f;
+        }
+        check(allGlyphs, "sdf editor scale: every glyph of 'Hello' inks at kTextScale (none missing)");
+        check(fringe < ink * 2.5f, "sdf editor scale: AA fringe stays a thin edge, not a smear");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -10205,6 +10488,7 @@ int main() {
     testPhase29Assets();
     testPhase34EditorFixes();
     testPhase35RenderingFixes();
+    testPhase36LayoutThemeFont();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

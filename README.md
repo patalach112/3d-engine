@@ -2749,3 +2749,45 @@ Four critical rendering/UI fixes:
 1172 passed / 0 failed across all five build configs (Debug,
 Release shared/static, hidden-visibility, ASan), CTest 1/1,
 zero warnings, standalone player headless run clean.
+
+## Maintenance — Dock partition lock, deep-black theme, larger UI text, SDF editor-scale lock ✅
+
+Four editor layout/theme/font fixes:
+
+- **Dock bleed / overlap**: `computeEditorLayout` already
+  partitioned the window, but nothing proved it at every
+  size. The suite now property-tests nine window sizes from
+  1920×1080 down to 64×64 (plus Play mode and a degenerate
+  0×0): all six docks are pairwise disjoint, contained in
+  the window, and the Hierarchy/Inspector/Asset
+  Browser/Viewport tile the middle band with zero gaps and
+  zero overlap. A second test binds clipping to the layout:
+  geometry emitted inside a dock carries exactly the dock's
+  scissor segment (nested scissors only ever intersect), so
+  panel children can never paint outside their dock.
+- **Deep-black theme**: the palette dropped from the
+  #202020–#252526 band to near-black — panels #121214,
+  chrome base #0f0f11, toolbars/status #161618, tracks and
+  fields #18181c, borders/hover #2a2a2e — with text pinned
+  to #e0e0e0 so it pops against the dark surfaces. The
+  blue/orange accents are unchanged.
+- **UI font size**: the global text scale `kTextScale`
+  rises 1.5 → 1.65 (+10%). Widget text stays vertically
+  centred by the atlas line box, and a regression check
+  pins that one line at the new scale still fits the fixed
+  26 px rows, so no bounding boxes move.
+- **SDF text**: third end-to-end audit (bake → quad/UV
+  generation → vertex/index emission → mip chain → shader
+  threshold), now locked at the real operating point: the
+  suite software-renders "Hello" at `kTextScale` through
+  the trilinear mip chain with ui.frag's exact fwidth AA
+  and requires per-glyph ink with a thin AA fringe, and a
+  second test pins emitted glyph quads attribute-exact
+  (uvRects verbatim from the atlas, ordered corners,
+  exact index tuples — no stride shift or cross-quad
+  corruption is possible without failing the suite).
+
+1194 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, standalone player headless run
+clean.
