@@ -113,7 +113,11 @@ function(engine_module target building_macro)
     set_target_properties(${target} PROPERTIES
         WINDOWS_EXPORT_ALL_SYMBOLS ON
         CXX_VISIBILITY_PRESET default
-        VISIBILITY_INLINES_HIDDEN OFF)
+        VISIBILITY_INLINES_HIDDEN OFF
+        # Game modules (Phase 24) link engine code into a shared
+        # library of their own, so archives must be PIC in static
+        # builds too.
+        POSITION_INDEPENDENT_CODE ON)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive-)
     else()
@@ -208,6 +212,39 @@ engine_module(EngineApp ENGINE_BUILDING_APP
 target_link_libraries(EngineApp
     PUBLIC EngineFoundation EngineCore EnginePlatform EngineGeometry EngineGraphics EngineAssets EngineScene
            Vulkan::Vulkan glfw glm::glm EnTT::EnTT Threads::Threads)
+
+# ---------------------------------------------------------------------------
+# Game modules (Phases 23-24): native shared libraries implementing
+# IGameModule. Branding policy: every module ships as
+# EngineRuntimeCore_<signature>, signature = first 10 hex chars of the
+# MD5 of the target name. ModuleManager enforces the same convention
+# plus the GetEngineModuleInfo handshake (magic token + ABI version).
+# ---------------------------------------------------------------------------
+function(engine_add_game_module target)
+    add_library(${target} MODULE ${ARGN})
+    string(MD5 module_signature "${target}")
+    string(SUBSTRING "${module_signature}" 0 10 module_signature)
+    set_target_properties(${target} PROPERTIES
+        OUTPUT_NAME "EngineRuntimeCore_${module_signature}"
+        PREFIX "")
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/Engine)
+    target_compile_definitions(${target} PRIVATE ENGINE_BUILDING_PLUGIN)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endfunction()
+
+# Newtonian 6-DOF space flight + procedural asteroid sandbox (Phase 24).
+# Unlike the ABI-only test fixtures, a real game module links the
+# engine module libraries whose APIs it drives (Scene/Assets/Input);
+# in shared builds those resolve to the already-loaded engine DLLs.
+engine_add_game_module(SpaceFlightModule modules/SpaceFlightModule.cpp)
+target_include_directories(SpaceFlightModule PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/modules)
+target_link_libraries(SpaceFlightModule
+    PRIVATE EngineScene EngineAssets EngineCore EnginePlatform EngineFoundation
+            Vulkan::Vulkan glm::glm EnTT::EnTT)
 
 # ---------------------------------------------------------------------------
 # Engine executable (thin host: main() + EngineApp shared library)
@@ -324,19 +361,25 @@ if(BUILD_TESTING)
         PRIVATE EngineApp EngineScene EngineAssets EngineGraphics EngineGeometry EngineCore
                 EnginePlatform EngineFoundation Threads::Threads Vulkan::Vulkan glfw glm::glm EnTT::EnTT)
 
-    # Phase 23: mock game modules for the hot-reload tests. They are
-    # standalone shared libraries (ABI header only, no engine link),
-    # loaded by path through ModuleManager exactly like real game code.
-    foreach(plugin TestGameModule TestBadGameModule TestThrowGameModule)
-        add_library(${plugin} MODULE tests/${plugin}.cpp)
-        target_include_directories(${plugin} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/Engine)
-        target_compile_definitions(${plugin} PRIVATE ENGINE_BUILDING_PLUGIN)
+    # Phase 23/24: mock game modules for the hot-reload and branding
+    # tests. They are standalone shared libraries (ABI header only, no
+    # engine link) shipping under engine-branded names, loaded by path
+    # through ModuleManager exactly like real game code.
+    foreach(plugin TestGameModule TestBadGameModule TestThrowGameModule
+                   TestForgedGameModule TestLegacyGameModule)
+        engine_add_game_module(${plugin} tests/${plugin}.cpp)
     endforeach()
-    add_dependencies(engine-core-tests TestGameModule TestBadGameModule TestThrowGameModule)
+    add_dependencies(engine-core-tests
+        TestGameModule TestBadGameModule TestThrowGameModule
+        TestForgedGameModule TestLegacyGameModule SpaceFlightModule)
+    target_include_directories(engine-core-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/modules)
     target_compile_definitions(engine-core-tests PRIVATE
         ENGINE_TEST_PLUGIN_PATH="$<TARGET_FILE:TestGameModule>"
         ENGINE_TEST_BAD_PLUGIN_PATH="$<TARGET_FILE:TestBadGameModule>"
-        ENGINE_TEST_THROW_PLUGIN_PATH="$<TARGET_FILE:TestThrowGameModule>")
+        ENGINE_TEST_THROW_PLUGIN_PATH="$<TARGET_FILE:TestThrowGameModule>"
+        ENGINE_TEST_FORGED_PLUGIN_PATH="$<TARGET_FILE:TestForgedGameModule>"
+        ENGINE_TEST_LEGACY_PLUGIN_PATH="$<TARGET_FILE:TestLegacyGameModule>"
+        ENGINE_TEST_SPACEFLIGHT_PLUGIN_PATH="$<TARGET_FILE:SpaceFlightModule>")
     engine_copy_runtime_dlls(engine-core-tests)
     if(MSVC)
         target_compile_options(engine-core-tests PRIVATE /W4 /permissive-)

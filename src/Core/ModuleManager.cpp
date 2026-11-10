@@ -2,6 +2,7 @@
 
 #include "Core/Logger.h"
 
+#include <algorithm>
 #include <exception>
 #include <atomic>
 #include <system_error>
@@ -10,6 +11,21 @@
 namespace engine {
 
 ModuleManager::~ModuleManager() { unload(); }
+
+bool ModuleManager::isEngineBrandedModuleName(const std::filesystem::path& path) {
+    const std::string extension = path.extension().string();
+    if (extension != ".so" && extension != ".dll" && extension != ".dylib") {
+        return false;
+    }
+    const std::string stem = path.stem().string();
+    constexpr std::string_view prefix = "EngineRuntimeCore_";
+    if (!stem.starts_with(prefix) || stem.size() == prefix.size()) {
+        return false;
+    }
+    return std::all_of(stem.begin() + static_cast<std::ptrdiff_t>(prefix.size()), stem.end(), [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+    });
+}
 
 bool ModuleManager::fail(std::string message) {
     m_lastError = std::move(message);
@@ -39,6 +55,7 @@ void ModuleManager::retireCurrent() {
         m_scratchPath.clear();
     }
     m_moduleName.clear();
+    m_moduleAbiVersion = 0;
 }
 
 bool ModuleManager::load(const std::filesystem::path& path, EngineContext& context) {
@@ -49,6 +66,13 @@ bool ModuleManager::load(const std::filesystem::path& path, EngineContext& conte
     const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(path, error);
     if (error) {
         return fail("cannot stat module file '" + path.string() + "': " + error.message());
+    }
+
+    // Engine-branded naming policy (Phase 24): game modules ship as
+    // EngineRuntimeCore_<signature>; anything else is not ours.
+    if (!isEngineBrandedModuleName(path)) {
+        return fail("module rejected: '" + path.filename().string() +
+                    "' does not follow the engine-branded naming convention EngineRuntimeCore_<signature>");
     }
 
     // Scratch copy: the OS loader only ever sees this file, so the
@@ -80,6 +104,35 @@ bool ModuleManager::load(const std::filesystem::path& path, EngineContext& conte
         discardScratch();
         return fail(loadError);
     }
+    // Branded handshake (Phase 24): the binary must prove it was
+    // built as an engine module — correct ABI token, exact ABI
+    // version — before any factory inside it is allowed to run.
+    const GetEngineModuleInfoFn getInfo = candidate.symbolAs<GetEngineModuleInfoFn>(kGetEngineModuleInfoSymbol);
+    if (getInfo == nullptr) {
+        discardScratch();
+        return fail("module '" + path.string() + "' has no engine handshake (GetEngineModuleInfo missing)");
+    }
+    const EngineModuleInfo* info = nullptr;
+    try {
+        info = getInfo();
+    } catch (...) {
+        info = nullptr;
+    }
+    if (info == nullptr || info->structSize < sizeof(EngineModuleInfo)) {
+        discardScratch();
+        return fail("module '" + path.string() + "' returned an invalid handshake descriptor");
+    }
+    if (info->magic != kEngineModuleMagic) {
+        discardScratch();
+        return fail("module '" + path.string() + "' failed the engine ABI token check");
+    }
+    if (info->abiVersion != kEngineModuleAbiVersion) {
+        discardScratch();
+        return fail("module '" + path.string() + "' ABI version mismatch (module " +
+                    std::to_string(info->abiVersion) + ", engine expects " +
+                    std::to_string(kEngineModuleAbiVersion) + ")");
+    }
+
     const CreateGameModuleFn create = candidate.symbolAs<CreateGameModuleFn>(kCreateGameModuleSymbol);
     const DestroyGameModuleFn destroy = candidate.symbolAs<DestroyGameModuleFn>(kDestroyGameModuleSymbol);
     if (create == nullptr || destroy == nullptr) {
@@ -128,6 +181,7 @@ bool ModuleManager::load(const std::filesystem::path& path, EngineContext& conte
         name = nullptr;
     }
     m_moduleName = name != nullptr ? name : "GameModule";
+    m_moduleAbiVersion = info->abiVersion;
     m_lastError.clear();
     ENGINE_LOG_INFO("ModuleManager: loaded game module '" << m_moduleName << "' (generation " << m_generation
                                                           << ") from " << path.string());

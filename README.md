@@ -1620,6 +1620,58 @@ passing checks** (24 new), zero warnings in Debug, Release-shared
 and Release-static, CTest 1/1, and all 11 shaders still compile
 under a real glslangValidator 15.4.
 
+## Phase 24 — Engine-Branded Modules & Newtonian Space Flight ✅
+
+The Phase 23 plugin system grew a security/naming policy and its
+first real game: a 6-DOF Newtonian space-flight sandbox delivered
+entirely as a hot-reloadable module.
+
+- **Engine-branded naming** (`engine_add_game_module` in CMake):
+  every game module ships as `EngineRuntimeCore_<signature>` where
+  the signature is the first 10 hex chars of the MD5 of the target
+  name (e.g. the flight module is `EngineRuntimeCore_31ba0de483.so`).
+  `ModuleManager::isEngineBrandedModuleName` enforces the same
+  convention at load — a valid binary under a generic name like
+  `game_logic.so` is rejected.
+- **Handshake validation** (`GetEngineModuleInfo`): modules built
+  with `ENGINE_IMPLEMENT_GAME_MODULE` now also export a descriptor
+  carrying the engine ABI token (`0x45474D4F` "EGMO"), the exact ABI
+  version, and its struct size. The manager validates all three
+  *before any factory runs*, so arbitrary DLLs, forged descriptors,
+  and modules built against a stale ABI are refused with distinct
+  errors. (Two adversarial fixtures — a forged-token module and a
+  legacy-ABI module — are part of the test suite.)
+- **`SpaceFlightModule`** (`modules/SpaceFlightModule.cpp`, model in
+  `modules/SpaceFlightModel.h`): flies a 1200 kg spacecraft with
+  true Newtonian physics — WASD/Space/Ctrl translational thrusters,
+  Q/E roll, mouse pitch/yaw — computed as body-frame forces/torques
+  and accumulated into the ship's `RigidBodyComponent`; the engine
+  physics integrates them (zero drag, angular momentum conserved;
+  the only counter-torque is an RCS flight-assist damper, itself
+  modeled thruster work). Editing `FlightParams` (mass-normalized
+  thrust, torque authority, damping), rebuilding the module and
+  letting the 0.5 s poll swap it in changes the flight feel
+  mid-flight with the ship's state untouched.
+- **Sandbox**: on load the module procedurally registers a jittered-
+  icosahedron asteroid mesh and a dart ship mesh with the
+  AssetManager, spawns 56 seeded asteroids (static sphere colliders
+  in the physics BVH — sized via transform scale, the engine's
+  collider convention), and parents three thruster-nozzle point
+  lights to the ship. Nozzle light intensity pulses with throttle
+  over a ~7 Hz flicker, and HDR-bright nozzle materials feed the
+  Phase 22 bloom chain; the Phase 22 IBL skybox is the backdrop.
+  All spawning is find-or-create, so reloads adopt the world
+  instead of duplicating it.
+
+Verification is fully headless: the real plugin binary is loaded
+through ModuleManager against a live Scene + PhysicsSystem with
+synthesized input (`Input::injectKeyState`) — a 0.5 s W burn
+reaches the expected ~10 m/s (24 kN / 1200 kg), engines-off coast
+conserves velocity, Q roll spins the ship up, lights pulse, and a
+mid-flight hot reload preserves velocity bit-exactly with zero
+duplicated entities. **759 checks (32 new) pass in Debug,
+Release-shared and Release-static with zero warnings, CTest 1/1.**
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
@@ -1714,7 +1766,10 @@ releases the mouse (press again to quit).
 │   └── composite.frag        # Exposure + ACES tone mapping + sRGB output
 ├── tests/
 │   ├── CoreTests.cpp         # Config/logger/physics/player/material tests (CTest)
-│   └── TestGameModule.cpp    # (+Bad/Throw variants) mock plugins for Phase 23
+│   └── TestGameModule.cpp    # (+Bad/Throw/Forged/Legacy) mock plugins
+├── modules/                    # Game modules (built as EngineRuntimeCore_*)
+│   ├── SpaceFlightModule.cpp # Newtonian 6-DOF flight game module (P24)
+│   └── SpaceFlightModel.h    # Shared flight math (plugin + tests)
 ├── include/Engine/           # Public headers (Phase 21): subsystem tree,
 │   ├── Core/                 #   installed-style; src/ holds .cpp only
 │   ├── Platform/

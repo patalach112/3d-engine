@@ -27,6 +27,12 @@ namespace engine {
 // running. Exceptions from module callbacks are caught and logged;
 // a throwing update retires the module instead of crashing the loop.
 // The engine-owned scene is never touched here — see EngineContext.
+//
+// Engine-branded module policy (Phase 24): only files named
+// EngineRuntimeCore_<signature> (.dll/.so/.dylib) whose
+// GetEngineModuleInfo handshake carries the engine ABI token and a
+// matching ABI version are accepted; anything else is rejected
+// before a single factory runs.
 // ---------------------------------------------------------------------------
 class ENGINE_CORE_API ModuleManager {
 public:
@@ -49,8 +55,13 @@ public:
     void update(EngineContext& context, float deltaSeconds);
     void fixedUpdate(EngineContext& context, float fixedDeltaSeconds);
 
+    // Naming-convention check of the Phase 24 branding policy.
+    [[nodiscard]] static bool isEngineBrandedModuleName(const std::filesystem::path& path);
+
     [[nodiscard]] bool isLoaded() const { return m_module != nullptr; }
     [[nodiscard]] std::string_view moduleName() const { return m_moduleName; }
+    // ABI version reported by the loaded module's handshake (0 = none).
+    [[nodiscard]] uint32_t moduleAbiVersion() const { return m_moduleAbiVersion; }
     [[nodiscard]] uint32_t generation() const { return m_generation; }
     [[nodiscard]] const std::string& lastError() const { return m_lastError; }
     [[nodiscard]] const std::filesystem::path& sourcePath() const { return m_sourcePath; }
@@ -67,6 +78,7 @@ private:
     std::filesystem::path m_scratchPath;
     std::filesystem::file_time_type m_sourceWriteTime{};
     std::string m_moduleName;
+    uint32_t m_moduleAbiVersion = 0;
     std::string m_lastError;
     uint32_t m_generation = 0;
 };

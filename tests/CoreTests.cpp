@@ -45,6 +45,7 @@
 #include "Graphics/ToneMapping.h"
 #include "Scene/Systems/LightingSystem.h"
 #include "Core/ModuleManager.h"
+#include "SpaceFlightModel.h"
 #include "Platform/DynamicLibrary.h"
 
 #include <atomic>
@@ -6186,7 +6187,8 @@ void testPhase23GameModules() {
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     const std::filesystem::path builtPlugin = ENGINE_TEST_PLUGIN_PATH;
-    const std::filesystem::path pluginSource = dir / ("game_logic" + builtPlugin.extension().string());
+    // Phase 24: module files must follow the branded naming policy.
+    const std::filesystem::path pluginSource = dir / ("EngineRuntimeCore_mock" + builtPlugin.extension().string());
     std::filesystem::copy_file(builtPlugin, pluginSource);
     const auto statePath = dir / "module_state.txt";
     const std::string statePathString = statePath.string();
@@ -6297,7 +6299,7 @@ void testPhase23GameModules() {
                                std::filesystem::copy_options::overwrite_existing);
     std::filesystem::last_write_time(
         pluginSource, std::filesystem::file_time_type::clock::now() + std::chrono::seconds(30));
-    check(!manager.pollForChanges(context), "manager: a module without factories is rejected");
+    check(!manager.pollForChanges(context), "manager: a module without the engine handshake is rejected");
     check(manager.isLoaded() && manager.generation() == 2 && !manager.lastError().empty(),
           "manager: the previous generation keeps running after a bad rebuild");
     context.frameIndex = 3;
@@ -6331,6 +6333,204 @@ void testPhase23GameModules() {
     }
 }
 
+void testPhase24SpaceFlight() {
+    std::cout << "Phase 24: branded modules & Newtonian space flight\n";
+
+    // --- (a) Engine-branded naming policy ------------------------------
+    check(engine::ModuleManager::isEngineBrandedModuleName("EngineRuntimeCore_0123abcd.so"),
+          "branding: conventional .so name accepted");
+    check(engine::ModuleManager::isEngineBrandedModuleName("EngineRuntimeCore_x.dll") &&
+              engine::ModuleManager::isEngineBrandedModuleName("EngineRuntimeCore_x.dylib"),
+          "branding: .dll and .dylib names accepted");
+    check(!engine::ModuleManager::isEngineBrandedModuleName("game_logic.so"),
+          "branding: generic names rejected");
+    check(!engine::ModuleManager::isEngineBrandedModuleName("EngineRuntimeCore_.so"),
+          "branding: an empty signature is rejected");
+    check(!engine::ModuleManager::isEngineBrandedModuleName("EngineRuntimeCore_bad name.so") &&
+              !engine::ModuleManager::isEngineBrandedModuleName("engineruntimecore_x.so") &&
+              !engine::ModuleManager::isEngineBrandedModuleName("EngineRuntimeCore_x.txt"),
+          "branding: malformed names rejected");
+
+    const std::filesystem::path shipPlugin = ENGINE_TEST_SPACEFLIGHT_PLUGIN_PATH;
+    check(engine::ModuleManager::isEngineBrandedModuleName(shipPlugin),
+          "branding: the shipped flight module follows the convention");
+
+    const auto dir = std::filesystem::temp_directory_path() / "engine_p24_space";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::filesystem::path brandedCopy = dir / shipPlugin.filename();
+    std::filesystem::copy_file(shipPlugin, brandedCopy);
+
+    engine::Scene scene;
+    engine::Input input;
+    engine::VramBudget vram(16 * 1024 * 1024);
+    engine::VramBudget staging(16 * 1024 * 1024);
+    engine::AssetManager assets(vram, staging);
+    engine::EngineContext context;
+    context.scene = &scene;
+    context.input = &input;
+    context.assets = &assets;
+
+    const auto findByTag = [&scene](const char* tag) -> entt::entity {
+        auto view = scene.registry().view<engine::TagComponent>();
+        for (const entt::entity entity : view) {
+            if (view.get<engine::TagComponent>(entity).tag == tag) {
+                return entity;
+            }
+        }
+        return entt::null;
+    };
+    const auto countByTag = [&scene](const char* tag) {
+        size_t count = 0;
+        auto view = scene.registry().view<engine::TagComponent>();
+        for (const entt::entity entity : view) {
+            if (view.get<engine::TagComponent>(entity).tag == tag) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    // --- (b) Handshake validation ---------------------------------------
+    engine::ModuleManager manager;
+    check(!manager.load(ENGINE_TEST_FORGED_PLUGIN_PATH, context) && !manager.isLoaded() &&
+              manager.lastError().find("token") != std::string::npos,
+          "handshake: a forged ABI token is rejected before factories run");
+    check(!manager.load(ENGINE_TEST_LEGACY_PLUGIN_PATH, context) &&
+              manager.lastError().find("ABI version mismatch") != std::string::npos,
+          "handshake: a stale ABI version is rejected");
+    check(!manager.load(ENGINE_TEST_BAD_PLUGIN_PATH, context) &&
+              manager.lastError().find("handshake") != std::string::npos,
+          "handshake: a module without GetEngineModuleInfo is rejected");
+    const std::filesystem::path unbranded = dir / ("game_logic" + shipPlugin.extension().string());
+    std::filesystem::copy_file(shipPlugin, unbranded);
+    check(!manager.load(unbranded, context) && manager.lastError().find("branded") != std::string::npos,
+          "branding: a valid binary under a generic name is rejected");
+
+    // --- (c) Flight model math (the plugin's own header) ------------------
+    {
+        const spaceflight::FlightParams params;
+        const glm::vec3 inertia{900.0f, 900.0f, 600.0f};
+        const spaceflight::FlightForces idle =
+            spaceflight::computeFlightForces(params, spaceflight::FlightInput{}, glm::vec3{0.0f}, inertia);
+        check(idle.forceLocal == glm::vec3{0.0f} && idle.torqueLocal == glm::vec3{0.0f},
+              "flight model: no input in zero-g means no force and no torque");
+
+        spaceflight::FlightInput burn;
+        burn.main = 1.0f;
+        const spaceflight::FlightForces thrust =
+            spaceflight::computeFlightForces(params, burn, glm::vec3{0.0f}, inertia);
+        check(nearlyEqual(thrust.forceLocal.z, -24000.0, 1e-3) && thrust.forceLocal.x == 0.0f &&
+                  thrust.mainThrottle == 1.0f && thrust.totalThrottle == 1.0f,
+              "flight model: full main throttle is 24 kN down the -Z ship axis");
+
+        spaceflight::FlightInput pitchUp;
+        pitchUp.pitch = 1.0f;
+        const spaceflight::FlightForces pitched =
+            spaceflight::computeFlightForces(params, pitchUp, glm::vec3{0.0f}, inertia);
+        check(nearlyEqual(pitched.torqueLocal.x, 4200.0, 1e-3),
+              "flight model: pitch demand maps to the pitch torque authority");
+
+        const spaceflight::FlightForces damped = spaceflight::computeFlightForces(
+            params, spaceflight::FlightInput{}, glm::vec3{0.0f, 2.0f, 0.0f}, inertia);
+        check(nearlyEqual(damped.torqueLocal.y, -0.35 * 900.0 * 2.0, 1e-2),
+              "flight model: the RCS damper opposes spin proportionally to I*omega");
+
+        spaceflight::FlightParams rawParams = params;
+        rawParams.angularDamping = 0.0f;
+        const spaceflight::FlightForces drifting = spaceflight::computeFlightForces(
+            rawParams, spaceflight::FlightInput{}, glm::vec3{1.0f, 2.0f, 3.0f}, inertia);
+        check(drifting.torqueLocal == glm::vec3{0.0f},
+              "flight model: with the damper off, angular momentum is conserved exactly");
+
+        // Closed-loop: F = ma integrated for one second of main burn.
+        const float acceleration = params.mainThrust / spaceflight::kShipMass;
+        float velocity = 0.0f;
+        for (int i = 0; i < 60; ++i) {
+            velocity += acceleration * (1.0f / 60.0f);
+        }
+        check(nearlyEqual(velocity, 20.0, 1e-3), "flight model: 24 kN on 1200 kg gains 20 m/s in one second");
+    }
+
+    // --- (d) The real module, driving the real physics --------------------
+    check(manager.load(brandedCopy, context) && manager.moduleName() == "SpaceFlightModule" &&
+              manager.moduleAbiVersion() == engine::kEngineModuleAbiVersion,
+          "flight module loads under its branded name with a valid handshake");
+
+    const entt::entity ship = findByTag("Spacecraft");
+    check(ship != entt::null, "flight module spawns the spacecraft");
+    auto& shipBody = scene.registry().get<engine::RigidBodyComponent>(ship);
+    check(!shipBody.useGravity && nearlyEqual(shipBody.mass, spaceflight::kShipMass, 1e-3),
+          "spacecraft is a gravity-free body with the module's mass");
+    check(countByTag("Asteroid") == static_cast<size_t>(spaceflight::kAsteroidCount),
+          "flight module spawns the procedural asteroid field");
+    check(countByTag("ThrusterNozzleMain") == 1 && countByTag("ThrusterNozzlePort") == 1 &&
+              countByTag("ThrusterNozzleStarboard") == 1,
+          "thruster nozzle lights are placed");
+
+    engine::PhysicsSystem physics;
+    engine::PhysicsSettings settings;
+    settings.gravity = glm::vec3{0.0f}; // deep space
+    const double fixedDt = 1.0 / 60.0;
+    const auto stepFlight = [&](int steps) {
+        for (int i = 0; i < steps; ++i) {
+            context.fixedDeltaSeconds = static_cast<float>(fixedDt);
+            manager.fixedUpdate(context, static_cast<float>(fixedDt));
+            physics.update(scene, fixedDt, settings);
+        }
+    };
+
+    stepFlight(60);
+    check(glm::length(shipBody.velocity) < 1e-3f && glm::length(scene.registry().get<engine::TransformComponent>(ship).position) < 1e-3f,
+          "zero-g: a full second without input produces no drift");
+
+    input.injectKeyState(engine::Key::W, true);
+    stepFlight(30); // 0.5 s main burn
+    check(shipBody.velocity.z < -8.5f && shipBody.velocity.z > -11.5f,
+          "main burn: ~10 m/s of forward velocity after half a second");
+    check(std::abs(shipBody.velocity.x) < 0.25f && std::abs(shipBody.velocity.y) < 0.25f,
+          "main burn: velocity stays on the ship axis");
+    const glm::vec3 velocityAfterBurn = shipBody.velocity;
+
+    context.elapsedSeconds = 1.0;
+    manager.update(context, 0.016f);
+    const entt::entity mainNozzle = findByTag("ThrusterNozzleMain");
+    check(mainNozzle != entt::null &&
+              scene.registry().get<engine::PointLightComponent>(mainNozzle).intensity > 12.0f,
+          "thruster nozzle light pulses up with throttle");
+
+    input.injectKeyState(engine::Key::W, false);
+    stepFlight(60); // 1 s coast
+    check(nearlyEqual(glm::length(shipBody.velocity), glm::length(velocityAfterBurn), 0.05),
+          "zero-g coast: engines off, velocity conserved (no drag)");
+
+    input.injectKeyState(engine::Key::Q, true);
+    stepFlight(60); // 1 s roll burn
+    check(glm::length(shipBody.angularVelocity) > 30.0f, "RCS roll torque spins the ship up");
+    input.injectKeyState(engine::Key::Q, false);
+
+    // --- (e) Hot reload mid-flight -----------------------------------------
+    const glm::vec3 velocityBeforeReload = shipBody.velocity;
+    std::filesystem::copy_file(shipPlugin, brandedCopy, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::last_write_time(brandedCopy,
+                                     std::filesystem::file_time_type::clock::now() + std::chrono::seconds(30));
+    check(manager.pollForChanges(context) && manager.generation() == 2, "flight module hot-reloads mid-flight");
+    check(countByTag("Asteroid") == static_cast<size_t>(spaceflight::kAsteroidCount) &&
+              countByTag("Spacecraft") == 1 && countByTag("ThrusterNozzleMain") == 1,
+          "reload adopts the existing sandbox instead of duplicating it");
+    check(glm::length(shipBody.velocity - velocityBeforeReload) < 1e-4f,
+          "ship velocity is bit-stable across the reload");
+    input.injectKeyState(engine::Key::W, true);
+    stepFlight(30);
+    check(shipBody.velocity.z < velocityBeforeReload.z - 5.0f,
+          "the reloaded generation flies the same ship immediately");
+    input.injectKeyState(engine::Key::W, false);
+
+    manager.unload();
+    check(countByTag("Spacecraft") == 1 && countByTag("Asteroid") == static_cast<size_t>(spaceflight::kAsteroidCount),
+          "unloading the module leaves the engine-owned world intact");
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -6354,6 +6554,7 @@ int main() {
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();
     testPhase23GameModules();
+    testPhase24SpaceFlight();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();
