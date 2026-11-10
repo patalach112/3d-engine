@@ -198,8 +198,10 @@ glm::mat4 Camera::projectionMatrix(float aspectRatio) const {
         glm::perspective(glm::radians(m_config.fieldOfViewDegrees), aspectRatio, m_config.nearPlane,
                          m_config.farPlane);
     // GLM was designed for OpenGL, whose clip-space Y axis points down
-    // compared to Vulkan. Flip it, otherwise the image is upside down
-    // (the pipeline's clockwise front-face setting compensates winding).
+    // compared to Vulkan. Flip it, otherwise the image is upside down.
+    // The flip reverses triangle winding once and the positive-height
+    // viewport reverses it again, so front faces stay
+    // counter-clockwise in framebuffer space (kEngineFrontFace).
     projection[1][1] *= -1.0f;
     return projection;
 }

@@ -2704,3 +2704,48 @@ inspector, hierarchy/viewport menus and theme:
 1154 passed / 0 failed across all five build configs (Debug,
 Release shared/static, hidden-visibility, ASan), CTest 1/1,
 zero warnings, standalone player headless run clean.
+
+## Maintenance — Culling winding, editor fly camera, true deep-dark theme, SDF text audit ✅
+
+Four critical rendering/UI fixes:
+
+- **Inside-out meshes (backface culling)**: the material,
+  shadow and skybox rasterizers declared
+  `VK_FRONT_FACE_CLOCKWISE` on the theory that the
+  projection's Y-flip reverses winding. It does — and the
+  positive-height viewport reverses it again, so front faces
+  arrive counter-clockwise in framebuffer space and CLOCKWISE
+  made back-face culling discard exactly the visible faces
+  (cubes looked hollow, walls see-through). All pipelines now
+  share `kEngineFrontFace = CounterClockwise`
+  (PipelineState.h); the shadow pass still renders back faces
+  into the depth map and the skybox still renders the inside
+  of the sky cube. A regression test projects the real cube
+  through the real camera projection and asserts exactly the
+  two camera-facing triangles classify front-facing.
+- **Editor fly camera**: holding the right mouse button in
+  the 3D viewport now flies as well as looks — WASD along the
+  camera basis, Q/E on the world vertical, Shift sprints
+  (`Camera::processMovement`, previously Play-mode only).
+  The Camera's exponential look/velocity smoothing carries
+  both, so releasing the button glides to a stop. Inert while
+  a rename text field owns the keyboard.
+- **True deep-dark theme**: #121212 chrome base, a dedicated
+  #202020 toolbar/status fill, #181818 tracks and text
+  fields, panels stay #252526, borders and hover lift are
+  #333333, and the near-white slider thumb is de-glared to
+  mid grey. Text and the blue/orange accents are unchanged.
+- **SDF text audit**: the whole pipeline — TrueType bake,
+  UIBatch quad/UV generation, atlas upload, shader sampling —
+  was audited (vertex layout/stride, buffer upload, mip
+  chain, scissor segments) and is now locked by an
+  end-to-end regression test that software-renders "Hello"
+  through the real batch and atlas exactly as ui.frag
+  samples it: glyph rects ordered and in-page, the field
+  below the edge value within 3 texels outside every rect
+  (no neighbour bleed), all five glyphs inked, no stray
+  coverage in empty canvas.
+
+1172 passed / 0 failed across all five build configs (Debug,
+Release shared/static, hidden-visibility, ASan), CTest 1/1,
+zero warnings, standalone player headless run clean.

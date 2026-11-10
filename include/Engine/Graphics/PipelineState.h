@@ -20,6 +20,19 @@ namespace engine {
 enum class PrimitiveTopology : uint8_t { TriangleList, TriangleStrip, LineList };
 enum class PolygonMode : uint8_t { Fill, Line };
 enum class CullMode : uint8_t { None, Back, Front };
+enum class FrontFace : uint8_t { Clockwise, CounterClockwise };
+
+// Engine-wide front-face convention. Geometry is authored wound
+// counter-clockwise as seen from the front (the GLM/OpenGL
+// convention Cube and the OBJ loader produce). The Vulkan
+// projection flips clip-space Y once and the positive-height
+// viewport flips it back, so a front face arrives in the
+// framebuffer still counter-clockwise: pipelines must declare
+// CounterClockwise, or back-face culling removes the visible
+// faces and meshes render inside-out (see the winding regression
+// test in the suite, which projects the real cube through the
+// real camera projection and checks the on-screen orientation).
+inline constexpr FrontFace kEngineFrontFace = FrontFace::CounterClockwise;
 enum class DepthCompare : uint8_t { Less, LessOrEqual, Equal, Always, Never };
 
 struct PipelineStateDesc {

@@ -774,12 +774,12 @@ void Application::run() {
             const float scale = layout.uiScale;
             const UITheme& theme = m_uiContext.theme(); // charcoal docks, blue/orange accents
             ui.drawRect(layout.toolbar.x, layout.toolbar.y, layout.toolbar.width, layout.toolbar.height,
-                        theme.panelFill);
+                        theme.toolbarFill);
             ui.drawRect(layout.toolbar.x, layout.toolbar.y + layout.toolbar.height - 2.0f,
                         layout.toolbar.width, 2.0f,
                         glm::vec4{theme.sliderFill.r, theme.sliderFill.g, theme.sliderFill.b, 0.9f});
             ui.drawRect(layout.statusBar.x, layout.statusBar.y, layout.statusBar.width,
-                        layout.statusBar.height, theme.panelFill);
+                        layout.statusBar.height, theme.toolbarFill);
             ui.drawRect(layout.statusBar.x, layout.statusBar.y, layout.statusBar.width, 1.0f,
                         theme.panelBorder);
             // No frame around the viewport: the docks tile flush
@@ -792,7 +792,8 @@ void Application::run() {
                 const float chipWidth = ui.measureText(viewportLabel, 1.2f) + 20.0f;
                 ui.drawRoundedRect(layout.viewport.x + 8.0f, layout.viewport.y + 8.0f, chipWidth, 24.0f,
                                    UIRectStyle{5.0f, 1.0f, theme.panelBorder},
-                                   glm::vec4{0.118f, 0.118f, 0.118f, 0.88f});
+                                   glm::vec4{theme.backgroundFill.r, theme.backgroundFill.g,
+                                             theme.backgroundFill.b, 0.92f});
                 ui.drawText(viewportLabel, layout.viewport.x + 18.0f, layout.viewport.y + 14.0f, 1.2f,
                             glm::vec4{0.90f, 0.90f, 0.90f, 1.0f});
             }
@@ -1221,15 +1222,27 @@ void Application::updateEditorCamera(double deltaSeconds) {
     if (activeCamera == nullptr) {
         return;
     }
-    // Look only while the right mouse button is held inside the
-    // viewport panel. The cursor stays visible and free the whole
-    // time -- this is an editor navigation gesture, not a capture.
+    // Fly navigation lives entirely behind the right mouse button
+    // held inside the viewport panel: mouse motion looks around and
+    // WASD/QE fly along the camera basis (Shift sprints), smoothed
+    // by the Camera's look/velocity convergence below. The cursor
+    // stays visible and free the whole time -- this is an editor
+    // navigation gesture, not a capture. While a rename text field
+    // owns the keyboard, the same keys are text, never flight.
+    Camera& camera = activeCamera->camera;
     const glm::vec2 mouse = uiMousePosition();
-    if (m_input.isMouseButtonDown(MouseButton::Right) &&
-        m_editorLayout.containsViewport(mouse.x, mouse.y)) {
-        activeCamera->camera.processLook(m_input.mouseDelta());
+    const bool flying = m_renameTarget == entt::null && m_input.isMouseButtonDown(MouseButton::Right) &&
+                        m_editorLayout.containsViewport(mouse.x, mouse.y);
+    if (flying) {
+        camera.processLook(m_input.mouseDelta());
+        camera.processMovement(m_input, deltaSeconds);
+    } else {
+        // Keep integrating with a zero desired velocity so a flight
+        // in progress glides to a stop over a few frames instead of
+        // halting dead the moment the button is released.
+        camera.updateMovement(glm::vec3{0.0f}, deltaSeconds);
     }
-    activeCamera->camera.update(deltaSeconds);
+    camera.update(deltaSeconds);
     // Deliberately no movement and no PlayerSystem::syncCamera here:
     // in Edit mode the authored player transform is scene data, and
     // the editor camera must not rewrite it (or be teleported by it).

@@ -86,24 +86,29 @@ using UIWidgetId = uint32_t;
 inline constexpr UIWidgetId kUINoWidget = 0;
 
 struct UITheme {
-    // Professional dark theme (charcoal surfaces, one blue accent
-    // for interactive fills, one orange accent for focus/active
-    // states). Docked editor panels are fully opaque: the 3D
-    // viewport is a bounded rectangle between them, so nothing of
-    // the world may bleed through the chrome (the old 0.92 alpha
-    // let scene colour wash over text whenever geometry passed
-    // behind a panel).
-    glm::vec4 panelFill{0.145f, 0.145f, 0.149f, 1.0f};   // #252526
-    glm::vec4 panelBorder{0.247f, 0.247f, 0.275f, 1.0f}; // #3f3f46
-    glm::vec4 text{0.93f, 0.93f, 0.93f, 1.0f};           // near-white, high contrast
-    glm::vec4 buttonFill{0.176f, 0.176f, 0.188f, 1.0f};    // #2d2d30
-    glm::vec4 buttonHovered{0.243f, 0.243f, 0.259f, 1.0f}; // #3e3e42
-    glm::vec4 buttonActive{0.055f, 0.388f, 0.612f, 1.0f};  // #0e639c
-    glm::vec4 trackFill{0.118f, 0.118f, 0.118f, 1.0f};     // #1e1e1e
-    glm::vec4 sliderFill{0.0f, 0.478f, 0.800f, 1.0f};      // #007acc
-    glm::vec4 thumbFill{0.85f, 0.85f, 0.86f, 1.0f};
-    glm::vec4 checkFill{0.0f, 0.478f, 0.800f, 1.0f}; // #007acc
-    glm::vec4 focusBorder{1.0f, 0.60f, 0.10f, 1.0f}; // orange accent
+    // True deep-dark theme (professional charcoal surfaces, one
+    // blue accent for interactive fills, one orange accent for
+    // focus/active states). Every neutral surface sits in the
+    // #121212-#252526 band: nothing grey may glare against the
+    // panels -- the old #3e3e42 hovers and near-white slider thumb
+    // read as light grey next to the docks. Docked editor panels
+    // are fully opaque: the 3D viewport is a bounded rectangle
+    // between them, so nothing of the world may bleed through the
+    // chrome (the old 0.92 alpha let scene colour wash over text
+    // whenever geometry passed behind a panel).
+    glm::vec4 panelFill{0.145f, 0.145f, 0.149f, 1.0f};      // #252526 panels
+    glm::vec4 toolbarFill{0.125f, 0.125f, 0.125f, 1.0f};    // #202020 toolbars/status bar
+    glm::vec4 backgroundFill{0.070f, 0.070f, 0.070f, 1.0f}; // #121212 deepest chrome base
+    glm::vec4 panelBorder{0.200f, 0.200f, 0.200f, 1.0f};    // #333333
+    glm::vec4 text{0.93f, 0.93f, 0.93f, 1.0f};              // near-white, high contrast
+    glm::vec4 buttonFill{0.145f, 0.145f, 0.149f, 1.0f};     // #252526, reads on #202020 bars
+    glm::vec4 buttonHovered{0.200f, 0.200f, 0.200f, 1.0f};  // #333333 lift
+    glm::vec4 buttonActive{0.055f, 0.388f, 0.612f, 1.0f};   // #0e639c
+    glm::vec4 trackFill{0.094f, 0.094f, 0.094f, 1.0f};      // #181818 fields/tracks
+    glm::vec4 sliderFill{0.0f, 0.478f, 0.800f, 1.0f};       // #007acc
+    glm::vec4 thumbFill{0.55f, 0.55f, 0.56f, 1.0f};         // mid grey, visible without glare
+    glm::vec4 checkFill{0.0f, 0.478f, 0.800f, 1.0f};        // #007acc
+    glm::vec4 focusBorder{1.0f, 0.60f, 0.10f, 1.0f};        // orange accent
 };
 
 class ENGINE_GRAPHICS_API UIContext {

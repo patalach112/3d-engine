@@ -9903,17 +9903,266 @@ void testPhase34EditorFixes() {
     {
         const engine::UITheme theme;
         check(theme.panelFill == glm::vec4{0.145f, 0.145f, 0.149f, 1.0f} &&
-                  theme.panelBorder == glm::vec4{0.247f, 0.247f, 0.275f, 1.0f} &&
-                  theme.trackFill == glm::vec4{0.118f, 0.118f, 0.118f, 1.0f} &&
+                  theme.panelBorder == glm::vec4{0.200f, 0.200f, 0.200f, 1.0f} &&
+                  theme.trackFill == glm::vec4{0.094f, 0.094f, 0.094f, 1.0f} &&
                   theme.sliderFill == glm::vec4{0.0f, 0.478f, 0.800f, 1.0f} &&
                   theme.buttonActive == glm::vec4{0.055f, 0.388f, 0.612f, 1.0f} &&
                   theme.focusBorder == glm::vec4{1.0f, 0.60f, 0.10f, 1.0f},
-              "theme: charcoal surfaces (#252526/#1e1e1e), #3f3f46 borders, blue fills, orange focus");
+              "theme: deep-dark surfaces (#252526/#181818), #333 borders, blue fills, orange focus");
         check(nearlyEqual(engine::UIContext::clampScrollOffset(50.0f, 100.0f, 40.0f), 50.0f) &&
                   nearlyEqual(engine::UIContext::clampScrollOffset(80.0f, 100.0f, 40.0f), 60.0f) &&
                   engine::UIContext::clampScrollOffset(-5.0f, 100.0f, 40.0f) == 0.0f &&
                   engine::UIContext::clampScrollOffset(10.0f, 30.0f, 40.0f) == 0.0f,
               "inspector scroll: offset clamps to [0, content - view], short content never scrolls");
+    }
+}
+
+void testPhase35RenderingFixes() {
+    std::cout << "Phase 35: culling winding, fly camera, deep-dark theme, SDF legibility\n";
+
+    // --- (a) Winding convention: project the real cube through the real
+    // camera and classify on-screen orientation exactly as the Vulkan
+    // rasterizer will. Framebuffer space is x-right/y-down; a triangle
+    // is counter-clockwise there (front-facing under
+    // VK_FRONT_FACE_COUNTER_CLOCKWISE) when its signed shoelace area is
+    // negative. With back-face culling the camera-facing (+Z) face of
+    // the cube must classify FRONT and every other face BACK -- the
+    // old CLOCKWISE declaration classified them the other way round
+    // and meshes rendered inside-out.
+    {
+        check(engine::kEngineFrontFace == engine::FrontFace::CounterClockwise &&
+                  engine::PipelineStateDesc{}.cullMode == engine::CullMode::Back,
+              "culling: engine front-face convention is counter-clockwise, default cull is Back");
+
+        engine::CameraConfig config;
+        config.startPosition = {0.0f, 0.0f, 3.0f};
+        config.startYawDegrees = -90.0f; // looking down -Z, at the cube
+        config.startPitchDegrees = 0.0f;
+        const engine::Camera camera(config);
+        const glm::mat4 viewProjection = camera.projectionMatrix(1.0f) * camera.viewMatrix();
+
+        const std::vector<engine::Vertex> vertices = engine::Cube::vertices();
+        const std::vector<uint32_t> indices = engine::Cube::indices();
+        auto framebufferArea = [&](uint32_t i0, uint32_t i1, uint32_t i2) {
+            glm::vec2 points[3];
+            const uint32_t tri[3] = {i0, i1, i2};
+            for (int k = 0; k < 3; ++k) {
+                const glm::vec4 clip = viewProjection * glm::vec4{vertices[tri[k]].position, 1.0f};
+                const glm::vec3 ndc = glm::vec3{clip} / clip.w;
+                // Vulkan positive-height viewport mapping into a
+                // 100x100 framebuffer (y grows downward on screen).
+                points[k] = {(ndc.x + 1.0f) * 50.0f, (ndc.y + 1.0f) * 50.0f};
+            }
+            return 0.5f * ((points[0].x * points[1].y - points[1].x * points[0].y) +
+                           (points[1].x * points[2].y - points[2].x * points[1].y) +
+                           (points[2].x * points[0].y - points[0].x * points[2].y));
+        };
+        int frontFacing = 0;
+        int backFacing = 0;
+        bool frontIsTheCameraFace = true;
+        for (size_t t = 0; t + 2 < indices.size(); t += 3) {
+            const float area = framebufferArea(indices[t], indices[t + 1], indices[t + 2]);
+            const glm::vec3 centroid = (vertices[indices[t]].position + vertices[indices[t + 1]].position +
+                                        vertices[indices[t + 2]].position) /
+                                       3.0f;
+            if (area < 0.0f) { // counter-clockwise on screen = front
+                ++frontFacing;
+                // The only front faces may be the +Z face (z == +0.5),
+                // the one facing the camera.
+                frontIsTheCameraFace = frontIsTheCameraFace && nearlyEqual(centroid.z, 0.5, 1e-6);
+            } else if (area > 0.0f) {
+                ++backFacing;
+            }
+        }
+        check(frontFacing == 2 && backFacing == 10 && frontIsTheCameraFace,
+              "culling: projected cube keeps exactly its camera-facing (+Z) triangles under CCW + Back");
+    }
+
+    // --- (b) Editor fly camera semantics (the unit-testable seam the
+    // RMB fly navigation in Application::updateEditorCamera drives):
+    // W flies along the (pitched) crosshair, A/D strafe, Q/E move on
+    // the WORLD vertical, Shift boosts, diagonals are not faster.
+    {
+        engine::CameraConfig config;
+        config.startPosition = {0.0f, 0.0f, 0.0f};
+        config.startYawDegrees = -90.0f;
+        config.startPitchDegrees = 0.0f;
+        config.movementSpeed = 3.0f;
+        config.boostMultiplier = 2.5f;
+        config.lookSmoothingSeconds = 0.0f;
+        config.movementSmoothingSeconds = 0.05f;
+
+        auto flyFor = [&](engine::Camera& cam, glm::vec3 direction, double seconds, bool boost) {
+            const glm::vec3 start = cam.position();
+            const int steps = 200;
+            for (int i = 0; i < steps; ++i) {
+                cam.updateMovement(direction, seconds / steps, boost);
+            }
+            return cam.position() - start;
+        };
+
+        // One second of flight with a 0.05 s smoothing constant
+        // travels speed * (1 - tau) ~= 2.85 units: the tolerances
+        // below absorb that exponential ramp-up.
+        engine::Camera forwardCam(config);
+        const glm::vec3 forwardMove = flyFor(forwardCam, {0.0f, 0.0f, 1.0f}, 1.0, false);
+        check(nearlyEqual(forwardMove.z, -3.0f, 0.2f) && nearlyEqual(forwardMove.x, 0.0f, 1e-4f) &&
+                  nearlyEqual(forwardMove.y, 0.0f, 1e-4f),
+              "fly camera: W travels along -Z (the crosshair) at movement speed");
+
+        engine::Camera strafeCam(config);
+        const glm::vec3 strafeMove = flyFor(strafeCam, {1.0f, 0.0f, 0.0f}, 1.0, false);
+        check(nearlyEqual(strafeMove.x, 3.0f, 0.2f) && nearlyEqual(strafeMove.z, 0.0f, 1e-4f),
+              "fly camera: D strafes right at the same speed");
+
+        engine::Camera pitchedCam(config);
+        pitchedCam.setOrientation(-90.0f, 45.0f); // looking up at 45 degrees
+        const glm::vec3 upMove = flyFor(pitchedCam, {0.0f, 1.0f, 0.0f}, 1.0, false);
+        check(nearlyEqual(upMove.y, 3.0f, 0.2f) && nearlyEqual(upMove.x, 0.0f, 1e-4f) &&
+                  nearlyEqual(upMove.z, 0.0f, 1e-4f),
+              "fly camera: E rises on the world vertical even while pitched");
+        engine::Camera downCam(config);
+        downCam.setOrientation(-90.0f, 45.0f);
+        const glm::vec3 downMove = flyFor(downCam, {0.0f, -1.0f, 0.0f}, 1.0, false);
+        check(nearlyEqual(downMove.y, -3.0f, 0.2f), "fly camera: Q descends on the world vertical");
+
+        engine::Camera boostCam(config);
+        const glm::vec3 boostMove = flyFor(boostCam, {0.0f, 0.0f, 1.0f}, 1.0, true);
+        check(nearlyEqual(glm::length(boostMove), 7.5f, 0.45f),
+              "fly camera: Shift sprint multiplies speed by the boost factor");
+
+        engine::Camera diagCam(config);
+        const glm::vec3 diagMove = flyFor(diagCam, {1.0f, 0.0f, 1.0f}, 1.0, false);
+        check(nearlyEqual(glm::length(diagMove), 3.0f, 0.2f),
+              "fly camera: diagonal flight is normalized, never faster than straight");
+    }
+
+    // --- (c) True deep-dark theme: every neutral surface token sits in
+    // the requested charcoal band; only accents and text stay bright.
+    {
+        const engine::UITheme theme;
+        auto near = [](const glm::vec4& color, float r, float g, float b) {
+            return nearlyEqual(color.r, r, 1e-6f) && nearlyEqual(color.g, g, 1e-6f) &&
+                   nearlyEqual(color.b, b, 1e-6f) && nearlyEqual(color.a, 1.0f, 1e-6f);
+        };
+        check(near(theme.backgroundFill, 0.070f, 0.070f, 0.070f) && near(theme.toolbarFill, 0.125f, 0.125f, 0.125f) &&
+                  near(theme.trackFill, 0.094f, 0.094f, 0.094f),
+              "theme: #121212 chrome base, #202020 toolbars, #181818 tracks");
+        check(near(theme.panelFill, 0.145f, 0.145f, 0.149f) && near(theme.buttonFill, 0.145f, 0.145f, 0.149f) &&
+                  near(theme.panelBorder, 0.200f, 0.200f, 0.200f) && near(theme.buttonHovered, 0.200f, 0.200f, 0.200f),
+              "theme: #252526 panels/buttons, #333333 borders and hover lift");
+        const float brightestSurface = std::max({theme.panelFill.r, theme.toolbarFill.r, theme.backgroundFill.r,
+                                                 theme.panelBorder.r, theme.buttonFill.r, theme.buttonHovered.r,
+                                                 theme.trackFill.r, theme.thumbFill.r});
+        check(brightestSurface <= 0.56f && theme.text.r >= 0.9f,
+              "theme: no neutral surface glares (thumb included); text stays high-contrast");
+    }
+
+    // --- (d) SDF text legibility, end to end on the CPU: bake the real
+    // TrueType atlas, emit real UIBatch glyph quads for a word, sample
+    // the atlas exactly like ui.frag (bilinear, 0.5 threshold) and
+    // require actual readable coverage -- every glyph present, ink
+    // inside the canvas only, and the moat around each glyph rect
+    // already below the edge value so neighbours cannot bleed in.
+    {
+        const engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+        check(atlas.trueType && !atlas.empty(), "sdf legibility: TrueType atlas baked");
+        if (atlas.trueType && !atlas.empty()) {
+            auto sampleAtlas = [&](float u, float v) {
+                const float x = u * static_cast<float>(atlas.width) - 0.5f;
+                const float y = v * static_cast<float>(atlas.height) - 0.5f;
+                const int x0 = static_cast<int>(std::floor(x));
+                const int y0 = static_cast<int>(std::floor(y));
+                const float fx = x - static_cast<float>(x0);
+                const float fy = y - static_cast<float>(y0);
+                auto texel = [&](int tx, int ty) {
+                    tx = std::clamp(tx, 0, static_cast<int>(atlas.width) - 1);
+                    ty = std::clamp(ty, 0, static_cast<int>(atlas.height) - 1);
+                    return atlas.pixels[static_cast<size_t>(ty) * atlas.width + static_cast<size_t>(tx)] / 255.0f;
+                };
+                return (texel(x0, y0) * (1.0f - fx) + texel(x0 + 1, y0) * fx) * (1.0f - fy) +
+                       (texel(x0, y0 + 1) * (1.0f - fx) + texel(x0 + 1, y0 + 1) * fx) * fy;
+            };
+
+            // Glyph rect integrity + moat: the centre of each glyph is
+            // deep inside the field, and three texels outside the rect
+            // the field is already below the 0.5 edge.
+            bool rectsSane = true;
+            bool moatClean = true;
+            for (const char32_t ch : {U'H', U'W', U'g', U'j', U'@'}) {
+                const engine::SdfGlyph& glyph = atlas.glyphFor(ch);
+                rectsSane = rectsSane && glyph.u0 >= 0.0f && glyph.v0 >= 0.0f && glyph.u1 <= 1.0f &&
+                            glyph.v1 <= 1.0f && glyph.u0 < glyph.u1 && glyph.v0 < glyph.v1;
+                const float texelU = 1.0f / static_cast<float>(atlas.width);
+                const float outside = sampleAtlas(glyph.u0 - 3.0f * texelU, (glyph.v0 + glyph.v1) * 0.5f);
+                moatClean = moatClean && outside < 0.5f;
+            }
+            check(rectsSane, "sdf legibility: glyph UV rects are ordered, in-page, and non-degenerate");
+            check(moatClean, "sdf legibility: field falls below the edge value within 3 texels of each rect");
+
+            // Software-render "Hello" through the batch's real quads.
+            engine::UIBatch batch;
+            batch.setFontAtlas(&atlas);
+            batch.begin(400, 120);
+            batch.drawText("Hello", 4.0f, 4.0f, 3.0f, glm::vec4{1.0f});
+            constexpr int kCanvasW = 200;
+            constexpr int kCanvasH = 60;
+            std::vector<float> ink(kCanvasW * kCanvasH, 0.0f);
+            const auto& verts = batch.vertices();
+            const auto& idx = batch.indices();
+            check(batch.textItemCount() > 0 && verts.size() == 20 && idx.size() == 30,
+                  "sdf legibility: 'Hello' emits five glyph quads");
+            for (size_t t = 0; t + 2 < idx.size(); t += 3) {
+                const engine::UIVertex& a = verts[idx[t]];
+                const engine::UIVertex& b = verts[idx[t + 1]];
+                const engine::UIVertex& c = verts[idx[t + 2]];
+                if (a.kind < 1.5f) {
+                    continue;
+                }
+                const float minx = std::min({a.position.x, b.position.x, c.position.x});
+                const float maxx = std::max({a.position.x, b.position.x, c.position.x});
+                const float miny = std::min({a.position.y, b.position.y, c.position.y});
+                const float maxy = std::max({a.position.y, b.position.y, c.position.y});
+                const float quadW = std::max(maxx - minx, 1e-5f);
+                const float quadH = std::max(maxy - miny, 1e-5f);
+                for (int y = std::max(0, static_cast<int>(miny)); y < std::min(kCanvasH, static_cast<int>(maxy) + 1);
+                     ++y) {
+                    for (int x = std::max(0, static_cast<int>(minx));
+                         x < std::min(kCanvasW, static_cast<int>(maxx) + 1); ++x) {
+                        const float fu = (static_cast<float>(x) + 0.5f - minx) / quadW;
+                        const float fv = (static_cast<float>(y) + 0.5f - miny) / quadH;
+                        const float u = a.uvRect.x + (a.uvRect.z - a.uvRect.x) * fu;
+                        const float v = a.uvRect.y + (a.uvRect.w - a.uvRect.y) * fv;
+                        const float field = sampleAtlas(u, v);
+                        float& cell = ink[static_cast<size_t>(y) * kCanvasW + static_cast<size_t>(x)];
+                        cell = std::max(cell, std::clamp((field - 0.5f) * 8.0f + 0.5f, 0.0f, 1.0f));
+                    }
+                }
+            }
+            float inkTotal = 0.0f;
+            for (const float value : ink) {
+                inkTotal += value > 0.5f ? 1.0f : 0.0f;
+            }
+            check(inkTotal > 200.0f && inkTotal < 8000.0f,
+                  "sdf legibility: software-rendered 'Hello' has real, bounded ink coverage");
+            // Every fifth of the word's width must contain ink (no
+            // glyph missing), and the canvas corners must stay clean
+            // (no corruption splatter).
+            bool bandsPopulated = true;
+            for (int band = 0; band < 5; ++band) {
+                float bandInk = 0.0f;
+                for (int y = 0; y < kCanvasH; ++y) {
+                    for (int x = band * 16; x < band * 16 + 16 && x < kCanvasW; ++x) {
+                        bandInk += ink[static_cast<size_t>(y) * kCanvasW + static_cast<size_t>(x)] > 0.5f ? 1.0f : 0.0f;
+                    }
+                }
+                bandsPopulated = bandsPopulated && bandInk > 3.0f;
+            }
+            check(bandsPopulated, "sdf legibility: all five glyphs of 'Hello' render ink");
+            check(ink[0] == 0.0f && ink[kCanvasW - 1] == 0.0f && ink[(kCanvasH - 1) * kCanvasW] == 0.0f &&
+                      ink[kCanvasH * kCanvasW - 1] == 0.0f,
+                  "sdf legibility: no stray ink in the canvas corners");
+        }
     }
 }
 
@@ -9955,6 +10204,7 @@ int main() {
     testPhase28Gizmos();
     testPhase29Assets();
     testPhase34EditorFixes();
+    testPhase35RenderingFixes();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

@@ -43,6 +43,10 @@ VkCullModeFlags toVulkan(CullMode mode) {
     return VK_CULL_MODE_BACK_BIT;
 }
 
+VkFrontFace toVulkan(FrontFace frontFace) {
+    return frontFace == FrontFace::Clockwise ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+}
+
 VkCompareOp toVulkan(DepthCompare compare) {
     switch (compare) {
     case DepthCompare::LessOrEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
@@ -241,7 +245,7 @@ VkPipeline GraphicsPipeline::createShadowPipeline(VkRenderPass shadowRenderPass)
     // culling) so the stored depth sits slightly inside each caster,
     // which together with the slope-scaled shader bias removes acne
     // without peter-panning. Front faces keep the same winding
-    // convention as the main pass (CLOCKWISE under the Y-flip).
+    // convention as the main pass (counter-clockwise, kEngineFrontFace).
     VkPipelineRasterizationStateCreateInfo rasterizer{};
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.depthClampEnable = VK_FALSE;
@@ -249,7 +253,7 @@ VkPipeline GraphicsPipeline::createShadowPipeline(VkRenderPass shadowRenderPass)
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
     rasterizer.cullMode = VK_CULL_MODE_FRONT_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.frontFace = toVulkan(kEngineFrontFace);
     rasterizer.depthBiasEnable = VK_TRUE;
     rasterizer.depthBiasConstantFactor = 1.0f;
     rasterizer.depthBiasSlopeFactor = 1.5f;
@@ -377,7 +381,7 @@ VkPipeline GraphicsPipeline::createSkyboxPipeline(VkRenderPass sceneRenderPass) 
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
     rasterizer.cullMode = VK_CULL_MODE_FRONT_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.frontFace = toVulkan(kEngineFrontFace);
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -503,10 +507,13 @@ VkPipeline GraphicsPipeline::createPipeline(VkRenderPass renderPass, const Pipel
     rasterizer.polygonMode = toVulkan(state.polygonMode);
     rasterizer.lineWidth = 1.0f;
     rasterizer.cullMode = toVulkan(state.cullMode);
-    // GLM's projection flips the framebuffer Y axis, which reverses triangle
-    // winding on screen. Declaring clockwise front faces keeps back-face
-    // culling correct for geometry wound CCW in model space.
-    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    // Front faces arrive counter-clockwise in framebuffer space:
+    // the projection's Y flip and the positive-height viewport
+    // cancel, so the shared engine convention (kEngineFrontFace)
+    // keeps the visible faces of CCW-authored geometry and culls
+    // its back faces. (The old CLOCKWISE declaration culled the
+    // front faces instead -- meshes rendered inside-out.)
+    rasterizer.frontFace = toVulkan(kEngineFrontFace);
     rasterizer.depthBiasEnable = VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo multisampling{};
