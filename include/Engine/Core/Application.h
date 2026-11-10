@@ -1,6 +1,7 @@
 #pragma once
 #include "Core/Export.h"
 
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -106,6 +107,14 @@ private:
     void handlePhysicsReset();
     void handleEventImpulse();
     void logLoopStats(const char* context) const;
+    // Editor feedback + context actions: a transient status-bar
+    // notification (Save/Load/Export results, context-menu actions)
+    // and the Focus camera move shared by both context menus.
+    void setStatusMessage(std::string message);
+    void focusEditorCameraOn(entt::entity entity);
+    // Arms the inspector rename field for `entity` (tag copied into
+    // the edit buffer, keyboard focus grabbed on its first frame).
+    void beginRename(entt::entity entity);
     // Assembles the context handed to the game module (Phase 23).
     EngineContext buildModuleContext(float deltaSeconds, float fixedDeltaSeconds);
 
@@ -149,6 +158,26 @@ private:
     // recomputes and republishes it each frame.
     EditorLayout m_editorLayout{};
     std::string m_statsText; // toolbar stats line (TrueType UI text)
+
+    // Editor interaction state. The inspector dock scrolls with the
+    // wheel (content height is last frame's stack, the standard
+    // immediate-mode feedback loop); the scroll resets whenever the
+    // selection changes. Rename is armed by either context menu and
+    // edited in a field at the top of the inspector. The viewport
+    // context menu opens on a right *click* (press+release without
+    // travel), so right-drag camera look never raises it.
+    float m_inspectorScroll = 0.0f;        // pixels scrolled in the Inspector dock
+    float m_inspectorContentHeight = 0.0f; // last frame's inspector stack height
+    entt::entity m_inspectorSelection = entt::null; // selection the scroll belongs to
+    entt::entity m_renameTarget = entt::null;
+    std::string m_renameBuffer;
+    bool m_renameFocusPending = false;
+    entt::entity m_viewportContextTarget = entt::null;
+    glm::vec2 m_rightPressPos{0.0f, 0.0f};
+    bool m_rightPressInViewport = false;
+    std::string m_statusMessage;           // transient status-bar notification
+    float m_statusSecondsRemaining = 0.0f; // decays in the update callback
+    std::filesystem::path m_activeScenePath; // scene file Save/Load last used
 
     double m_secondsSinceStatsLog = 0.0;
     double m_secondsSinceAssetPoll = 0.0;

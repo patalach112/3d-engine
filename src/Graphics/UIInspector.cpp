@@ -34,7 +34,25 @@ bool inspectComponent(UIContext& ui, const UIRect& rect, const TypeInfo& type, v
         }
         case PropertyType::Vec3: {
             glm::vec3 value = readProperty<glm::vec3>(instance, property);
-            if (ui.vec3Sliders(property.displayName, &value, options.componentMin, options.componentMax)) {
+            // Transform fields get editor-grade ranges: a rotation
+            // clamped to +/-10 degrees (the old options default) or
+            // a scale that cannot go below -10 is useless in a 3D
+            // editor. Everything else keeps the caller's range.
+            float rangeMin = options.componentMin;
+            float rangeMax = options.componentMax;
+            if (type.name == "TransformComponent") {
+                if (property.name == "rotationDegrees") {
+                    rangeMin = -3600.0f; // ten full turns each way
+                    rangeMax = 3600.0f;
+                } else if (property.name == "scale") {
+                    rangeMin = 0.001f; // never zero/negative via sliders
+                    rangeMax = 1000.0f;
+                } else if (property.name == "position") {
+                    rangeMin = -5000.0f;
+                    rangeMax = 5000.0f;
+                }
+            }
+            if (ui.vec3Sliders(property.displayName, &value, rangeMin, rangeMax)) {
                 writeProperty(instance, property, value);
                 changed = true;
             }

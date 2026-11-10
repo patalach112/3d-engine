@@ -148,6 +148,12 @@ public:
     void onMouseButtonEvent(int glfwButton, int glfwAction);
     void onCursorPositionEvent(double xPosition, double yPosition);
     void onScrollEvent(double xOffset, double yOffset);
+    // Character input (GLFW char callback): the codepoint is
+    // UTF-8-encoded into this frame's text buffer, read back with
+    // textInput() by text-entry widgets. Cleared by beginFrame(),
+    // refilled by polling — the same protocol as scrollDelta().
+    void onCharEvent(unsigned int codepoint);
+    [[nodiscard]] const std::string& textInput() const { return m_textInput; }
     void onFocusChanged(bool focused);
 
     // --- Engine-level event injection (tests, replays, tooling) ---------
@@ -185,6 +191,7 @@ private:
     glm::vec2 m_mousePosition{0.0f};
     glm::vec2 m_mouseDelta{0.0f};
     glm::vec2 m_scrollDelta{0.0f};
+    std::string m_textInput; // UTF-8 typed this frame (onCharEvent)
     bool m_hasMousePosition = false;
     bool m_mouseCaptured = false;
 

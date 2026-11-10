@@ -3,7 +3,9 @@
 #include "Physics/PhysicsEvents.h"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
+#include <glm/geometric.hpp>
 #include "Scene/Systems/TransformSystem.h"
 
 #include "Core/Logger.h"
@@ -581,6 +583,12 @@ void Application::run() {
     // Player control is frame-rate dependent by nature (mouse look), so
     // the camera system lives in the variable update.
     callbacks.update = [this](double deltaSeconds) {
+        // Status-bar notifications are transient: they decay here
+        // (real time) and the status bar falls back to its mode hint
+        // once the timer runs out.
+        if (m_statusSecondsRemaining > 0.0f) {
+            m_statusSecondsRemaining -= static_cast<float>(deltaSeconds);
+        }
         // Asset sync boundary (Phase 20): publish a bounded number of
         // finished async loads per frame, and poll source files for
         // hot reloads once a second.
@@ -696,6 +704,13 @@ void Application::run() {
                 uiInput.mouseRightDown = m_input.isMouseButtonDown(MouseButton::Right);
                 uiInput.escapePressed = m_input.wasKeyPressed(Key::Escape);
                 uiInput.scrollY = m_input.scrollDelta().y;
+                // Shift turns slider drags/steps fine-grained; the
+                // char-callback text feeds the rename textField.
+                uiInput.fineModifier =
+                    m_input.isKeyDown(Key::LeftShift) || m_input.isKeyDown(Key::RightShift);
+                uiInput.textInput = m_input.textInput();
+                uiInput.backspacePressed = m_input.wasKeyPressed(Key::Backspace);
+                uiInput.enterPressed = m_input.wasKeyPressed(Key::Enter);
             }
             m_uiContext.beginFrame(uiInput, ui);
             // A menu open at frame start owns this frame's clicks:
@@ -708,12 +723,27 @@ void Application::run() {
             // the runtime itself are live.
             const bool playing = m_playSession.isPlaying();
 
+            // Rename session bookkeeping: the session dies with its
+            // target, with Play mode, or on Esc (the textField also
+            // restores its own snapshot; the buffer is dropped here).
+            if (m_renameTarget != entt::null &&
+                (playing || !m_scene.registry().valid(m_renameTarget) ||
+                 m_outliner.selected() != m_renameTarget || m_input.wasKeyPressed(Key::Escape))) {
+                m_renameTarget = entt::null;
+                m_renameBuffer.clear();
+                m_renameFocusPending = false;
+            }
+            // While renaming, typed characters are text, not editor
+            // shortcuts: tool keys, scene shortcuts and the update
+            // handlers (C/F) all stay inert until commit/cancel.
+            const bool renaming = m_renameTarget != entt::null;
+
             // Phase 28 gizmo tool switching (also on the toolbar below).
-            if (!playing && m_input.wasKeyPressed(Key::Num1)) {
+            if (!playing && !renaming && m_input.wasKeyPressed(Key::Num1)) {
                 m_gizmo.setMode(GizmoMode::Translate);
-            } else if (!playing && m_input.wasKeyPressed(Key::Num2)) {
+            } else if (!playing && !renaming && m_input.wasKeyPressed(Key::Num2)) {
                 m_gizmo.setMode(GizmoMode::Rotate);
-            } else if (!playing && m_input.wasKeyPressed(Key::Num3)) {
+            } else if (!playing && !renaming && m_input.wasKeyPressed(Key::Num3)) {
                 m_gizmo.setMode(GizmoMode::Scale);
             }
 
@@ -724,15 +754,15 @@ void Application::run() {
             // toggles Play/Stop.
             const bool ctrlHeld =
                 m_input.isKeyDown(Key::LeftControl) || m_input.isKeyDown(Key::RightControl);
-            if (ctrlHeld && m_input.wasKeyPressed(Key::P)) {
+            if (!renaming && ctrlHeld && m_input.wasKeyPressed(Key::P)) {
                 if (playing) {
                     exitPlayMode();
                 } else {
                     enterPlayMode();
                 }
-            } else if (!playing && ctrlHeld && m_input.wasKeyPressed(Key::S)) {
+            } else if (!playing && !renaming && ctrlHeld && m_input.wasKeyPressed(Key::S)) {
                 saveSceneToGbq();
-            } else if (!playing && ctrlHeld && m_input.wasKeyPressed(Key::O)) {
+            } else if (!playing && !renaming && ctrlHeld && m_input.wasKeyPressed(Key::O)) {
                 loadSceneFromGbq();
             }
 
@@ -742,14 +772,16 @@ void Application::run() {
             // opaque editor surfaces, not overlays floating on the
             // world: the scene pass never rasterizes beneath them.
             const float scale = layout.uiScale;
+            const UITheme& theme = m_uiContext.theme(); // charcoal docks, blue/orange accents
             ui.drawRect(layout.toolbar.x, layout.toolbar.y, layout.toolbar.width, layout.toolbar.height,
-                        glm::vec4{0.07f, 0.08f, 0.11f, 1.0f});
+                        theme.panelFill);
             ui.drawRect(layout.toolbar.x, layout.toolbar.y + layout.toolbar.height - 2.0f,
-                        layout.toolbar.width, 2.0f, glm::vec4{0.35f, 0.75f, 1.0f, 0.9f});
+                        layout.toolbar.width, 2.0f,
+                        glm::vec4{theme.sliderFill.r, theme.sliderFill.g, theme.sliderFill.b, 0.9f});
             ui.drawRect(layout.statusBar.x, layout.statusBar.y, layout.statusBar.width,
-                        layout.statusBar.height, glm::vec4{0.07f, 0.08f, 0.11f, 1.0f});
+                        layout.statusBar.height, theme.panelFill);
             ui.drawRect(layout.statusBar.x, layout.statusBar.y, layout.statusBar.width, 1.0f,
-                        glm::vec4{1.0f, 1.0f, 1.0f, 0.14f});
+                        theme.panelBorder);
             // No frame around the viewport: the docks tile flush
             // (EditorLayout), so the scene surface runs edge-to-edge
             // against its neighbours and only this small label chip
@@ -759,20 +791,27 @@ void Application::run() {
                 const std::string viewportLabel = playing ? "Viewport - Play" : "Viewport - Scene";
                 const float chipWidth = ui.measureText(viewportLabel, 1.2f) + 20.0f;
                 ui.drawRoundedRect(layout.viewport.x + 8.0f, layout.viewport.y + 8.0f, chipWidth, 24.0f,
-                                   UIRectStyle{5.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
-                                   glm::vec4{0.05f, 0.06f, 0.09f, 0.88f});
+                                   UIRectStyle{5.0f, 1.0f, theme.panelBorder},
+                                   glm::vec4{0.118f, 0.118f, 0.118f, 0.88f});
                 ui.drawText(viewportLabel, layout.viewport.x + 18.0f, layout.viewport.y + 14.0f, 1.2f,
-                            glm::vec4{0.85f, 0.90f, 0.99f, 1.0f});
+                            glm::vec4{0.90f, 0.90f, 0.90f, 1.0f});
             }
+            // A fresh action notification (Save/Load/Export, context
+            // actions) owns the status bar until its timer decays;
+            // otherwise the bar carries the mode hint.
+            const bool showNotification = m_statusSecondsRemaining > 0.0f && !m_statusMessage.empty();
             const std::string statusText =
-                playing
-                    ? (m_input.isMouseCaptured()
-                           ? "Play mode - simulation running - Esc releases the mouse - Stop restores the edit scene"
-                           : "Play mode - click inside the viewport to capture the mouse - Stop (or Ctrl+P) restores the edit scene")
-                    : "Edit mode - click in the viewport to select - hold right-mouse in the viewport to look - Ctrl+P plays the scene";
+                showNotification
+                    ? m_statusMessage
+                    : (playing
+                           ? (m_input.isMouseCaptured()
+                                  ? "Play mode - simulation running - Esc releases the mouse - Stop restores the edit scene"
+                                  : "Play mode - click inside the viewport to capture the mouse - Stop (or Ctrl+P) restores the edit scene")
+                           : "Edit mode - click in the viewport to select - hold right-mouse in the viewport to look - Ctrl+P plays the scene");
             ui.drawText(statusText, layout.statusBar.x + 10.0f,
                         layout.statusBar.y + 0.5f * layout.statusBar.height - 6.0f * scale, 1.2f,
-                        glm::vec4{0.75f, 0.85f, 1.0f, 0.9f});
+                        showNotification ? glm::vec4{0.55f, 0.90f, 0.60f, 1.0f}
+                                         : glm::vec4{0.80f, 0.82f, 0.85f, 0.95f});
             if (!m_statsText.empty()) {
                 const float statsWidth = ui.measureText(m_statsText, 1.2f);
                 const float statsX = std::max(layout.toolbar.x + 8.0f,
@@ -816,7 +855,7 @@ void Application::run() {
                 m_gizmo.setMode(GizmoMode::Scale);
             }
             ui.drawRect(toolStartX + static_cast<float>(activeTool) * 80.0f,
-                        buttonY + buttonH + 3.0f, 74.0f, 3.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.95f});
+                        buttonY + buttonH + 3.0f, 74.0f, 3.0f, glm::vec4{1.0f, 0.60f, 0.10f, 0.95f});
             buttonX += 10.0f;
             // Scene file commands: Save serializes the registry to
             // the .gbq quicksave, Load restores it wholesale.
@@ -859,6 +898,10 @@ void Application::run() {
             const float inspectorX = inspectorRect.x + 6.0f;
             const float inspectorWidth = std::max(0.0f, inspectorRect.width - 12.0f);
             const entt::entity selected = m_outliner.selected();
+            if (selected != m_inspectorSelection) {
+                m_inspectorSelection = selected;
+                m_inspectorScroll = 0.0f; // a new entity starts at the top
+            }
             if (!playing) {
                 // One opaque dock behind the per-component panels.
                 // The component panels nest INSIDE the dock panel,
@@ -869,8 +912,51 @@ void Application::run() {
                 // to its own rect, wherever that landed).
                 m_uiContext.beginPanel("InspectorDock", inspectorRect,
                                        UIRectStyle{-1.0f, -1.0f, glm::vec4{}});
+                // Mouse-wheel scrolling: the wheel over the dock
+                // shifts the whole panel stack; the dock's nested
+                // scissor clips whatever slides past its edges, and
+                // hit-testing respects that scissor, so off-screen
+                // rows are inert. The clamp uses last frame's
+                // measured content height (immediate-mode loop).
+                if (m_uiContext.hoveredRect(inspectorRect)) {
+                    m_inspectorScroll -=
+                        m_uiContext.scrollDelta() * 3.0f * (UIContext::kRowHeight + UIContext::kRowSpacing);
+                }
+                m_inspectorScroll = UIContext::clampScrollOffset(m_inspectorScroll, m_inspectorContentHeight,
+                                                                 inspectorRect.height - 12.0f);
                 if (selected != entt::null && registry.valid(selected)) {
-                    float y = inspectorRect.y + 6.0f;
+                    const float contentTop = inspectorRect.y + 6.0f;
+                    float y = contentTop - m_inspectorScroll;
+                    if (renaming && m_renameTarget == selected) {
+                        // Rename field, armed by either context menu:
+                        // Enter writes the TagComponent, Esc abandons.
+                        const float renameHeight = 2.0f * UIContext::kPanelPadding +
+                                                   2.0f * (UIContext::kRowHeight + UIContext::kRowSpacing);
+                        m_uiContext.beginPanel("RenameEntity", UIRect{inspectorX, y, inspectorWidth, renameHeight},
+                                               UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+                        m_uiContext.label("Rename entity (Enter confirms, Esc cancels)");
+                        const bool committed =
+                            m_uiContext.textField("Name", &m_renameBuffer, m_renameFocusPending);
+                        m_renameFocusPending = false;
+                        m_uiContext.endPanel();
+                        y += renameHeight + 6.0f;
+                        if (committed) {
+                            if (!m_renameBuffer.empty()) {
+                                // A viewport-picked entity may carry
+                                // no tag yet: give it one so the new
+                                // name has somewhere to live.
+                                if (TagComponent* tag = registry.try_get<TagComponent>(m_renameTarget);
+                                    tag != nullptr) {
+                                    tag->tag = m_renameBuffer;
+                                } else {
+                                    registry.emplace<TagComponent>(m_renameTarget, m_renameBuffer);
+                                }
+                                setStatusMessage("Renamed entity to '" + m_renameBuffer + "'");
+                            }
+                            m_renameTarget = entt::null;
+                            m_renameBuffer.clear();
+                        }
+                    }
                     y = inspectComponentAt<TransformComponent>(m_uiContext, registry, selected, inspectorX, y,
                                                                inspectorWidth, inspectorOptions);
                     y = inspectComponentAt<RigidBodyComponent>(m_uiContext, registry, selected, inspectorX, y,
@@ -888,7 +974,9 @@ void Application::run() {
                         y = inspectMaterialAt(m_uiContext, m_assets, registry.get<MeshComponent>(selected),
                                               inspectorX, y, inspectorWidth);
                     }
-                    (void)y; // panels stack downward and clip at the dock's lower edge
+                    // Total stack height (undo the scroll shift) for
+                    // next frame's clamp.
+                    m_inspectorContentHeight = (y + m_inspectorScroll) - contentTop;
                 } else {
                     bool drewFallback = false;
                     const auto tags = registry.view<TagComponent>();
@@ -914,7 +1002,34 @@ void Application::run() {
                     }
                 }
                 m_uiContext.endPanel();
-                m_outliner.build(m_uiContext, layout.hierarchy, m_scene);
+                // Hierarchy context-menu verdicts: the outliner has
+                // already executed Duplicate/Create Child/Delete/
+                // Reset Transform on the scene; Rename and Focus are
+                // host work (text field, camera) finished here.
+                const UIOutliner::Result outlinerResult = m_outliner.build(m_uiContext, layout.hierarchy, m_scene);
+                switch (outlinerResult.action) {
+                    case UIOutliner::Action::RenameRequested:
+                        beginRename(outlinerResult.entity);
+                        break;
+                    case UIOutliner::Action::FocusRequested:
+                        focusEditorCameraOn(outlinerResult.entity);
+                        setStatusMessage("Camera focused on the selected entity");
+                        break;
+                    case UIOutliner::Action::TransformReset:
+                        setStatusMessage("Transform reset");
+                        break;
+                    case UIOutliner::Action::Duplicated:
+                        setStatusMessage("Entity duplicated");
+                        break;
+                    case UIOutliner::Action::CreatedChild:
+                        setStatusMessage("Child entity created");
+                        break;
+                    case UIOutliner::Action::Deleted:
+                        setStatusMessage("Entity deleted");
+                        break;
+                    case UIOutliner::Action::None:
+                        break;
+                }
             }
             const UIRect assetRect = layout.assetBrowser;
 
@@ -958,6 +1073,35 @@ void Application::run() {
                 }
             }
 
+            // Viewport context menu: a right *click* (press and
+            // release within a few pixels, still inside the panel)
+            // picks the entity under the cursor and raises the same
+            // menu the Hierarchy offers. A right *drag* stays camera
+            // look (updateEditorCamera) and raises nothing, and a
+            // release over a dock never opens anything.
+            if (!playing && !m_input.isMouseCaptured()) {
+                const glm::vec2 mouse = m_uiContext.mousePosition();
+                if (m_uiContext.rightPressedRect(layout.viewport)) {
+                    m_rightPressPos = mouse;
+                    m_rightPressInViewport = true;
+                }
+                if (m_rightPressInViewport && m_input.wasMouseButtonReleased(MouseButton::Right)) {
+                    m_rightPressInViewport = false;
+                    if (layout.viewport.contains(mouse.x, mouse.y) &&
+                        glm::distance(mouse, m_rightPressPos) < 6.0f && !m_uiContext.popupOpen()) {
+                        if (const CameraComponent* activeCamera = m_scene.findActiveCamera();
+                            activeCamera != nullptr) {
+                            RaycastHit hit;
+                            if (pickEntityAt(m_scene, activeCamera->camera, mouse, layout.viewport, hit)) {
+                                m_outliner.setSelected(hit.entity);
+                                m_viewportContextTarget = hit.entity;
+                                m_uiContext.openPopup("ViewportContextMenu", mouse.x, mouse.y);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Phase 29: asset browser + drop targets. The browser
             // registers its drag sources; the inspector dock is the
             // assignment target (checked first — it wins over the
@@ -985,8 +1129,8 @@ void Application::run() {
                 if (hot) {
                     ui.drawRoundedRect(inspectorDropRect.x, inspectorDropRect.y, inspectorDropRect.width,
                                        inspectorDropRect.height,
-                                       UIRectStyle{6.0f, 2.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.9f}},
-                                       glm::vec4{1.0f, 0.82f, 0.25f, 0.10f});
+                                       UIRectStyle{6.0f, 2.0f, glm::vec4{1.0f, 0.60f, 0.10f, 0.9f}},
+                                       glm::vec4{1.0f, 0.60f, 0.10f, 0.10f});
                 }
                 if (m_uiContext.dropTarget(inspectorDropRect, "AssetTexture") ||
                     m_uiContext.dropTarget(inspectorDropRect, "AssetMesh") ||
@@ -1004,6 +1148,43 @@ void Application::run() {
                                                layout.viewport.y + 0.5f * layout.viewport.height},
                                      activeCamera->camera, layout.viewport);
                 }
+            }
+            // The viewport context menu renders last, on top of
+            // every dock (the Hierarchy menu does the same inside
+            // UIOutliner::build). Its edits run through the exact
+            // helpers the Hierarchy menu uses.
+            if (!playing && m_viewportContextTarget != entt::null &&
+                !registry.valid(m_viewportContextTarget)) {
+                m_viewportContextTarget = entt::null; // deleted via the Hierarchy meanwhile
+            }
+            if (!playing && m_uiContext.beginPopup("ViewportContextMenu")) {
+                const entt::entity target = m_viewportContextTarget;
+                if (m_uiContext.menuItem("Duplicate", target != entt::null)) {
+                    const entt::entity copy = UIOutliner::duplicateEntity(m_scene, target);
+                    if (copy != entt::null) {
+                        m_outliner.setSelected(copy);
+                        setStatusMessage("Entity duplicated");
+                    }
+                }
+                if (m_uiContext.menuItem("Delete", target != entt::null)) {
+                    m_scene.destroyEntity(Entity{target, &m_scene});
+                    m_viewportContextTarget = entt::null;
+                    setStatusMessage("Entity deleted");
+                }
+                if (m_uiContext.menuItem("Rename", target != entt::null)) {
+                    beginRename(target);
+                }
+                if (m_uiContext.menuItem("Reset Transform",
+                                         target != entt::null &&
+                                             registry.try_get<TransformComponent>(target) != nullptr)) {
+                    UIOutliner::resetEntityTransform(m_scene, target);
+                    setStatusMessage("Transform reset");
+                }
+                if (m_uiContext.menuItem("Focus", target != entt::null)) {
+                    focusEditorCameraOn(target);
+                    setStatusMessage("Camera focused on the selected entity");
+                }
+                m_uiContext.endPopup();
             }
             m_uiContext.endFrame();
         }
@@ -1095,6 +1276,9 @@ void Application::handleEventImpulse() {
     // editor-selected body up and away from the camera. Selection is
     // the unified editor selection (Phase 27/28: outliner clicks and
     // viewport picking both feed it).
+    if (m_renameTarget != entt::null) {
+        return; // typing a name: 'f' is text, not the Impulse action
+    }
     const entt::entity selected = m_outliner.selected();
     if (!m_input.wasActionPressed("Impulse") || selected == entt::null) {
         return;
@@ -1148,15 +1332,22 @@ void Application::exitPlayMode() {
 }
 
 void Application::saveSceneToGbq() {
+    // Save always lands on the active scene path (the editor's
+    // .gbq quicksave under the asset root today); the status bar
+    // confirms it so the button never feels dead.
     const std::filesystem::path path = m_assetBrowser.rootPath() / "quicksave.gbq";
     if (const auto parent = path.parent_path(); !parent.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(parent, ec);
     }
+    m_activeScenePath = path;
     if (serializeScene(m_scene, path)) {
         ENGINE_LOG_INFO("Editor: scene saved to '" << path.string() << "' (" << m_scene.entityCount() << " entities)");
+        setStatusMessage("Saved scene to '" + path.filename().string() + "' (" +
+                         std::to_string(m_scene.entityCount()) + " entities)");
     } else {
         ENGINE_LOG_WARNING("Editor: scene save failed ('" << path.string() << "')");
+        setStatusMessage("Save failed: could not write '" + path.filename().string() + "'");
     }
 }
 
@@ -1165,10 +1356,14 @@ void Application::loadSceneFromGbq() {
     // The load rebuilds every entity handle: clear the selection
     // up front so the inspector/gizmo never see a recycled handle.
     m_outliner.setSelected(entt::null);
+    m_activeScenePath = path;
     if (deserializeScene(m_scene, path)) {
         ENGINE_LOG_INFO("Editor: scene loaded from '" << path.string() << "' (" << m_scene.entityCount() << " entities)");
+        setStatusMessage("Loaded scene from '" + path.filename().string() + "' (" +
+                         std::to_string(m_scene.entityCount()) + " entities)");
     } else {
         ENGINE_LOG_WARNING("Editor: scene load failed ('" << path.string() << "'); scene unchanged");
+        setStatusMessage("Load failed: '" + path.filename().string() + "' is missing or unreadable");
     }
 }
 
@@ -1182,13 +1377,69 @@ void Application::exportGame() {
         ENGINE_LOG_INFO("Editor: game exported to '" << bundlePath.string() << "' (" << report.bundleBytes
                                                     << " bytes, " << report.packed.size() << " entries: scene + "
                                                     << (report.packed.size() - 1) << " assets)");
+        setStatusMessage("Exported standalone bundle '" + bundlePath.filename().string() + "' (" +
+                         std::to_string(report.bundleBytes) + " bytes, " +
+                         std::to_string(report.packed.size()) + " entries)");
     } else {
         ENGINE_LOG_WARNING("Editor: game export FAILED: " << report.error << " -- " << report.missing.size()
                                                           << " unregistered reference(s):");
         for (const std::string& name : report.missing) {
             ENGINE_LOG_WARNING("Editor:   missing asset '" << name << "'");
         }
+        setStatusMessage("Export failed: " + report.error + " (" + std::to_string(report.missing.size()) +
+                         " unregistered reference(s), see log)");
     }
+}
+
+void Application::setStatusMessage(std::string message) {
+    m_statusMessage = std::move(message);
+    m_statusSecondsRemaining = 4.0f; // decayed in the update callback
+}
+
+void Application::beginRename(entt::entity entity) {
+    auto& registry = m_scene.registry();
+    if (entity == entt::null || !registry.valid(entity)) {
+        return;
+    }
+    m_renameTarget = entity;
+    m_renameBuffer.clear();
+    if (const TagComponent* tag = registry.try_get<TagComponent>(entity); tag != nullptr) {
+        m_renameBuffer = tag->tag;
+    }
+    m_renameFocusPending = true; // the field grabs the keyboard on its first frame
+}
+
+void Application::focusEditorCameraOn(entt::entity entity) {
+    CameraComponent* activeCamera = m_scene.findActiveCamera();
+    auto& registry = m_scene.registry();
+    if (activeCamera == nullptr || entity == entt::null || !registry.valid(entity)) {
+        return;
+    }
+    // Frame the selection box (the exact volume picking tests):
+    // centre the camera's current view direction on it, pulled
+    // back far enough for the whole box to read. Orientation is
+    // untouched — Focus repositions, it never re-aims the editor.
+    glm::vec3 target{0.0f};
+    float radius = 1.0f;
+    std::array<glm::vec3, 8> corners{};
+    if (TransformGizmo::selectionBoxCorners(m_scene, entity, corners)) {
+        for (const glm::vec3& corner : corners) {
+            target += corner;
+        }
+        target /= static_cast<float>(corners.size());
+        radius = 0.0f;
+        for (const glm::vec3& corner : corners) {
+            radius = std::max(radius, glm::distance(target, corner));
+        }
+    } else if (const TransformComponent* transform = registry.try_get<TransformComponent>(entity);
+               transform != nullptr) {
+        target = transform->position;
+    } else {
+        return;
+    }
+    Camera& camera = activeCamera->camera;
+    const float distance = std::clamp(3.0f * radius, 2.0f, 60.0f);
+    camera.setPosition(target - camera.front() * distance);
 }
 
 void Application::spawnDroppedMesh(std::string_view relativePath, glm::vec2 mousePixels, const Camera& camera,
@@ -1317,6 +1568,9 @@ void Application::handlePhysicsReset() {
     // wasKeyPressed is an edge trigger: holding C must not reset every
     // frame. The reset only rewrites existing component values, so it
     // cannot create entities, reallocate ECS storage, or leak resources.
+    if (m_renameTarget != entt::null) {
+        return; // typing a name: 'c' is text, not the reset shortcut
+    }
     if (!m_input.wasKeyPressed(Key::C)) {
         return;
     }

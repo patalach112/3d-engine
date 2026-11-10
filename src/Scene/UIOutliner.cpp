@@ -27,10 +27,12 @@ void copyComponent(Scene::Registry& registry, entt::entity from, entt::entity to
     }
 }
 
+} // namespace
+
 // Duplicates the data components onto a fresh entity (same parent;
 // children are NOT duplicated, and a script component is recreated
 // fresh so the duplicate never shares a script instance).
-entt::entity duplicateEntity(Scene& scene, entt::entity source) {
+entt::entity UIOutliner::duplicateEntity(Scene& scene, entt::entity source) {
     auto& registry = scene.registry();
     if (!registry.valid(source)) {
         return entt::null;
@@ -55,7 +57,7 @@ entt::entity duplicateEntity(Scene& scene, entt::entity source) {
     return target;
 }
 
-entt::entity createChildEntity(Scene& scene, entt::entity parent) {
+entt::entity UIOutliner::createChildEntity(Scene& scene, entt::entity parent) {
     if (!scene.registry().valid(parent)) {
         return entt::null;
     }
@@ -64,7 +66,19 @@ entt::entity createChildEntity(Scene& scene, entt::entity parent) {
     return child.handle();
 }
 
-} // namespace
+void UIOutliner::resetEntityTransform(Scene& scene, entt::entity entity) {
+    auto& registry = scene.registry();
+    if (!registry.valid(entity)) {
+        return;
+    }
+    if (TransformComponent* transform = registry.try_get<TransformComponent>(entity);
+        transform != nullptr) {
+        transform->position = glm::vec3{0.0f};
+        transform->rotationDegrees = glm::vec3{0.0f};
+        transform->scale = glm::vec3{1.0f};
+        transform->syncOrientationFromEuler(); // keep the quaternion in step
+    }
+}
 
 UIOutliner::Result UIOutliner::build(UIContext& ui, const UIRect& rect, Scene& scene) {
     Result result;
@@ -149,7 +163,7 @@ UIOutliner::Result UIOutliner::build(UIContext& ui, const UIRect& rect, Scene& s
         const bool isSelected = row.entity == m_selected;
         if (isSelected) {
             batch->drawRoundedRect(rowRect.x, rowRect.y, rowRect.width, rowRect.height,
-                                   UIRectStyle{4.0f, 0.0f, {}}, glm::vec4{0.16f, 0.38f, 0.68f, 0.55f});
+                                   UIRectStyle{4.0f, 0.0f, {}}, glm::vec4{0.035f, 0.278f, 0.443f, 0.9f});
         } else if (ui.hoveredRect(rowRect)) {
             batch->drawRoundedRect(rowRect.x, rowRect.y, rowRect.width, rowRect.height,
                                    UIRectStyle{4.0f, 0.0f, {}}, glm::vec4{1.0f, 1.0f, 1.0f, 0.08f});
@@ -209,6 +223,24 @@ UIOutliner::Result UIOutliner::build(UIContext& ui, const UIRect& rect, Scene& s
                 m_selected = entt::null;
                 result.selectionChanged = true;
             }
+        }
+        ui.menuSeparator();
+        // Rename and Focus are host work (text field / camera), so
+        // they are only signalled; Reset Transform edits in place.
+        if (ui.menuItem("Rename", m_contextTarget != entt::null)) {
+            result.action = Action::RenameRequested;
+            result.entity = m_contextTarget;
+        }
+        if (ui.menuItem("Reset Transform",
+                        m_contextTarget != entt::null &&
+                            registry.try_get<TransformComponent>(m_contextTarget) != nullptr)) {
+            resetEntityTransform(scene, m_contextTarget);
+            result.action = Action::TransformReset;
+            result.entity = m_contextTarget;
+        }
+        if (ui.menuItem("Focus", m_contextTarget != entt::null)) {
+            result.action = Action::FocusRequested;
+            result.entity = m_contextTarget;
         }
         ui.endPopup();
     }

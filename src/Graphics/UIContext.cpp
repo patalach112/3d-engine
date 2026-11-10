@@ -30,8 +30,13 @@ UIRect UIContext::sliderTrackRect(const UIRect& rowRect) {
     return UIRect{x, rowRect.y + 0.5f * rowRect.height - 3.0f, width, 6.0f};
 }
 
+float UIContext::clampScrollOffset(float offset, float contentHeight, float viewHeight) {
+    return std::clamp(offset, 0.0f, std::max(0.0f, contentHeight - std::max(0.0f, viewHeight)));
+}
+
 void UIContext::beginFrame(const UIInput& input, UIBatch& batch) {
     m_batch = &batch;
+    m_prevMouseX = m_input.mouseX; // yesterday's pointer, for relative (fine) drags
     m_input = input;
     m_pressedEdge = input.mouseDown && !m_prevMouseDown;
     m_releasedEdge = !input.mouseDown && m_prevMouseDown;
@@ -82,9 +87,9 @@ void UIContext::endFrame() {
         const glm::vec2 mouse = mousePosition();
         const float width = m_batch->measureText(m_dragPayload.label, 1.2f) + 16.0f;
         const glm::vec4 fill = m_dragCancelled ? glm::vec4{0.35f, 0.30f, 0.28f, 0.85f}
-                                               : glm::vec4{0.10f, 0.16f, 0.26f, 0.94f};
+                                               : glm::vec4{0.145f, 0.145f, 0.149f, 0.94f};
         m_batch->drawRoundedRect(mouse.x + 14.0f, mouse.y + 12.0f, width, 24.0f,
-                                 UIRectStyle{5.0f, 1.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.8f}}, fill);
+                                 UIRectStyle{5.0f, 1.0f, glm::vec4{1.0f, 0.60f, 0.10f, 0.8f}}, fill);
         m_batch->drawText(m_dragPayload.label, mouse.x + 22.0f, mouse.y + 17.0f, 1.2f,
                           m_dragCancelled ? glm::vec4{0.6f} : glm::vec4{0.95f, 0.97f, 1.0f, 1.0f});
     }
@@ -227,7 +232,7 @@ bool UIContext::button(const UIRect& rect, std::string_view label, const UIRectS
         effective.borderColor = m_theme.focusBorder;
     } else if (effective.borderWidth <= 0.0f) {
         effective.borderWidth = 1.0f;
-        effective.borderColor = glm::vec4{1.0f, 1.0f, 1.0f, 0.10f};
+        effective.borderColor = m_theme.panelBorder;
     }
     m_batch->drawRoundedRect(rect.x, rect.y, rect.width, rect.height, effective, fill);
     const float textWidth = m_batch->measureText(label, kTextScale);
@@ -266,17 +271,35 @@ bool UIContext::sliderRow(const UIRect& rect, std::string_view label, UIWidgetId
             m_pressClaimed = true;
         }
         if (m_active == id && m_input.mouseDown) {
-            const float fraction =
-                std::clamp((m_input.mouseX - track.x) / std::max(track.width, 1e-5f), 0.0f, 1.0f);
-            const float dragged = min + fraction * (max - min);
-            if (dragged != *value) {
-                *value = dragged;
-                changed = true;
+            if (m_input.fineModifier) {
+                // Fine drag (Shift): relative, never absolute. The
+                // grab frame only anchors — the value cannot jump —
+                // and afterwards each pixel of travel moves it by
+                // 0.05% of the range, so even a +/-3600-degree
+                // rotation field stays precisely steerable.
+                if (!m_pressedEdge) {
+                    const float dragged = std::clamp(
+                        *value + (m_input.mouseX - m_prevMouseX) * (max - min) * 0.0005f, min, max);
+                    if (dragged != *value) {
+                        *value = dragged;
+                        changed = true;
+                    }
+                }
+            } else {
+                const float fraction =
+                    std::clamp((m_input.mouseX - track.x) / std::max(track.width, 1e-5f), 0.0f, 1.0f);
+                const float dragged = min + fraction * (max - min);
+                if (dragged != *value) {
+                    *value = dragged;
+                    changed = true;
+                }
             }
         }
         if (m_focused == id && m_input.keyStep != 0) {
-            const float stepped =
-                std::clamp(*value + static_cast<float>(m_input.keyStep) * (max - min) * 0.01f, min, max);
+            // 1% of range per press; with Shift, 0.05% (20x finer).
+            const float stepFraction = m_input.fineModifier ? 0.0005f : 0.01f;
+            const float stepped = std::clamp(
+                *value + static_cast<float>(m_input.keyStep) * (max - min) * stepFraction, min, max);
             if (stepped != *value) {
                 *value = stepped;
                 changed = true;
@@ -347,7 +370,7 @@ bool UIContext::checkbox(const UIRect& rect, std::string_view label, bool* value
 
     const float boxSize = 16.0f;
     const UIRect box{rect.x + 1.0f, rect.y + 0.5f * (rect.height - boxSize), boxSize, boxSize};
-    UIRectStyle boxStyle{3.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.25f}};
+    UIRectStyle boxStyle{3.0f, 1.0f, m_theme.panelBorder};
     if (m_focused == id) {
         boxStyle.borderColor = m_theme.focusBorder;
     }
@@ -378,6 +401,77 @@ bool UIContext::vec3Sliders(std::string_view label, glm::vec3* value, float min,
                         glm::vec4{0.45f, 0.65f, 1.0f, 1.0f}) ||
               changed;
     return changed;
+}
+
+bool UIContext::textField(std::string_view label, std::string* text, bool grabFocus) {
+    return textField(nextRow(), label, text, grabFocus);
+}
+
+bool UIContext::textField(const UIRect& rect, std::string_view label, std::string* text, bool grabFocus) {
+    if (m_batch == nullptr || text == nullptr) {
+        return false;
+    }
+    const UIWidgetId id = hashId(m_panels.empty() ? kRootSeed : m_panels.back().seed, label);
+    const bool hit = hitTest(rect);
+    if (hit && (m_active == kUINoWidget || m_active == id)) {
+        m_hovered = id;
+    }
+    if (grabFocus && m_focused != id) {
+        m_focused = id; // the host just armed this field (e.g. Rename)
+        m_textEditId = id;
+        m_textSnapshot = *text;
+    }
+    if (m_pressedEdge && !m_pressConsumed && hit && m_focused != id) {
+        m_focused = id; // pressing the field starts editing it
+        m_textEditId = id;
+        m_textSnapshot = *text;
+        m_pressClaimed = true;
+    }
+
+    bool committed = false;
+    if (m_focused == id && m_textEditId == id) {
+        if (m_input.escapePressed) {
+            *text = m_textSnapshot; // Esc abandons the edit wholesale
+            m_focused = kUINoWidget;
+            m_textEditId = kUINoWidget;
+        } else {
+            for (const char raw : m_input.textInput) {
+                const auto byte = static_cast<unsigned char>(raw);
+                if ((byte >= 0x20 && byte != 0x7F) && text->size() < 256) {
+                    text->push_back(raw); // printable ASCII + UTF-8 bytes
+                }
+            }
+            if (m_input.backspacePressed && !text->empty()) {
+                // Delete one codepoint: trailing continuation bytes
+                // (10xxxxxx) go with their lead byte.
+                while (!text->empty() &&
+                       (static_cast<unsigned char>(text->back()) & 0xC0) == 0x80) {
+                    text->pop_back();
+                }
+                if (!text->empty()) {
+                    text->pop_back();
+                }
+            }
+            if (m_input.enterPressed) {
+                committed = true; // the host applies the new text now
+                m_focused = kUINoWidget;
+                m_textEditId = kUINoWidget;
+            }
+        }
+    }
+
+    const bool focused = m_focused == id;
+    const UIRectStyle boxStyle{4.0f, 1.0f,
+                               focused ? m_theme.focusBorder : glm::vec4{1.0f, 1.0f, 1.0f, 0.18f}};
+    m_batch->drawRoundedRect(rect.x, rect.y, rect.width, rect.height, boxStyle, m_theme.trackFill);
+    m_batch->pushScissor(rect.x, rect.y, rect.width, rect.height);
+    m_batch->drawText(*text, rect.x + 6.0f, textTop(rect), kTextScale, m_theme.text);
+    if (focused) { // steady caret just past the last character
+        const float caretX = rect.x + 6.0f + m_batch->measureText(*text, kTextScale) + 1.0f;
+        m_batch->drawRect(caretX, rect.y + 5.0f, 1.5f, rect.height - 10.0f, m_theme.focusBorder);
+    }
+    m_batch->popScissor();
+    return committed;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +532,7 @@ void UIContext::menuSeparator() {
         return;
     }
     m_batch->drawRect(m_popup.x + 8.0f, m_popup.cursorY + 4.0f, kPopupWidth - 16.0f, 1.0f,
-                      glm::vec4{1.0f, 1.0f, 1.0f, 0.12f});
+                      m_theme.panelBorder);
     m_popup.cursorY += 9.0f;
 }
 

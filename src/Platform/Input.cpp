@@ -79,6 +79,7 @@ void Input::beginFrame() {
     m_buttonsReleased.fill(false);
     m_mouseDelta = glm::vec2{0.0f};
     m_scrollDelta = glm::vec2{0.0f};
+    m_textInput.clear();
 }
 
 void Input::resetState() {
@@ -170,6 +171,34 @@ void Input::injectCursorPosition(glm::vec2 position) {
 
 void Input::injectScrollDelta(glm::vec2 delta) {
     m_scrollDelta += delta;
+}
+
+void Input::onCharEvent(unsigned int codepoint) {
+    // Encode the Unicode codepoint as UTF-8 into this frame's text
+    // buffer. Control codepoints never arrive here (GLFW reports
+    // them as key events instead), and surrogates/out-of-range
+    // values are dropped rather than encoded invalidly.
+    if (codepoint == 0 || codepoint > 0x10FFFFu || (codepoint >= 0xD800u && codepoint <= 0xDFFFu)) {
+        return;
+    }
+    char encoded[4];
+    size_t length = 0;
+    if (codepoint < 0x80u) {
+        encoded[length++] = static_cast<char>(codepoint);
+    } else if (codepoint < 0x800u) {
+        encoded[length++] = static_cast<char>(0xC0u | (codepoint >> 6));
+        encoded[length++] = static_cast<char>(0x80u | (codepoint & 0x3Fu));
+    } else if (codepoint < 0x10000u) {
+        encoded[length++] = static_cast<char>(0xE0u | (codepoint >> 12));
+        encoded[length++] = static_cast<char>(0x80u | ((codepoint >> 6) & 0x3Fu));
+        encoded[length++] = static_cast<char>(0x80u | (codepoint & 0x3Fu));
+    } else {
+        encoded[length++] = static_cast<char>(0xF0u | (codepoint >> 18));
+        encoded[length++] = static_cast<char>(0x80u | ((codepoint >> 12) & 0x3Fu));
+        encoded[length++] = static_cast<char>(0x80u | ((codepoint >> 6) & 0x3Fu));
+        encoded[length++] = static_cast<char>(0x80u | (codepoint & 0x3Fu));
+    }
+    m_textInput.append(encoded, length);
 }
 
 void Input::onKeyEvent(int glfwKey, int glfwAction) {

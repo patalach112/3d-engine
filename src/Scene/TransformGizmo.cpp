@@ -43,7 +43,7 @@ const char* axisLabel(GizmoAxis axis) {
 
 glm::vec4 axisColor(GizmoAxis axis, bool highlighted) {
     if (highlighted) {
-        return glm::vec4{1.0f, 0.82f, 0.25f, 0.98f};
+        return glm::vec4{1.0f, 0.55f, 0.10f, 0.98f}; // editor orange accent: the grabbed/hovered axis
     }
     switch (axis) {
         case GizmoAxis::X: return glm::vec4{0.93f, 0.27f, 0.27f, 0.95f};
@@ -54,9 +54,8 @@ glm::vec4 axisColor(GizmoAxis axis, bool highlighted) {
     return glm::vec4{1.0f};
 }
 
-// Orthonormal basis (u, v) of the plane perpendicular to `axis`.
-void ringBasis(GizmoAxis axis, glm::vec3& u, glm::vec3& v) {
-    const glm::vec3 normal = TransformGizmo::axisDirection(axis);
+// Orthonormal basis (u, v) of the plane perpendicular to `normal`.
+void ringBasis(glm::vec3 normal, glm::vec3& u, glm::vec3& v) {
     const glm::vec3 helper = std::abs(normal.y) < 0.9f ? glm::vec3{0.0f, 1.0f, 0.0f} : glm::vec3{1.0f, 0.0f, 0.0f};
     u = glm::normalize(glm::cross(helper, normal));
     v = glm::cross(normal, u);
@@ -114,15 +113,15 @@ struct HandleProjection {
     std::array<bool, kRingSamples> ringValid{};
 };
 
-HandleProjection projectHandle(GizmoMode mode, GizmoAxis axis, glm::vec3 anchor, float length,
-                               const glm::mat4& viewProjection, glm::vec2 viewportSize) {
+HandleProjection projectHandle(GizmoMode mode, GizmoAxis axis, glm::vec3 axisDirection, glm::vec3 anchor,
+                               float length, const glm::mat4& viewProjection, glm::vec2 viewportSize) {
     HandleProjection handle;
     handle.axis = axis;
     handle.centerValid = TransformGizmo::projectToScreen(anchor, viewProjection, viewportSize, handle.center);
     if (mode == GizmoMode::Rotate) {
         glm::vec3 u;
         glm::vec3 v;
-        ringBasis(axis, u, v);
+        ringBasis(axisDirection, u, v);
         for (int i = 0; i < kRingSamples; ++i) {
             const float angle = 2.0f * 3.14159265358979323846f * static_cast<float>(i) / static_cast<float>(kRingSamples);
             const glm::vec3 point = anchor + (u * std::cos(angle) + v * std::sin(angle)) * length;
@@ -130,10 +129,40 @@ HandleProjection projectHandle(GizmoMode mode, GizmoAxis axis, glm::vec3 anchor,
                 TransformGizmo::projectToScreen(point, viewProjection, viewportSize, handle.ring[static_cast<size_t>(i)]);
         }
     } else {
-        const glm::vec3 tipWorld = anchor + TransformGizmo::axisDirection(axis) * length;
+        const glm::vec3 tipWorld = anchor + axisDirection * length;
         handle.tipValid = TransformGizmo::projectToScreen(tipWorld, viewProjection, viewportSize, handle.tip);
     }
     return handle;
+}
+
+// The target's world orientation as three unit axes (its local
+// frame expressed in world space): the world matrix's basis
+// columns with scale divided out. Degenerate columns fall back to
+// the canonical axis so a zero-scale entity still gets handles.
+std::array<glm::vec3, 3> worldFrameAxes(const glm::mat4& worldMatrix) {
+    std::array<glm::vec3, 3> axes;
+    for (size_t i = 0; i < axes.size(); ++i) {
+        const glm::vec3 column{worldMatrix[static_cast<int>(i)]};
+        const float length = glm::length(column);
+        axes[i] = length > 1e-12f ? column / length : TransformGizmo::axisDirection(kAxes[i]);
+    }
+    return axes;
+}
+
+// Inverse of the target's parent world matrix (identity for
+// roots): converts a desired world position back into the local
+// position the TransformComponent stores.
+glm::mat4 parentWorldInverse(const Scene::Registry& registry, entt::entity entity) {
+    const ParentComponent* parent = registry.try_get<ParentComponent>(entity);
+    if (parent == nullptr || parent->parent == entt::null || !registry.valid(parent->parent)) {
+        return glm::mat4{1.0f};
+    }
+    const TransformComponent* parentTransform = registry.try_get<TransformComponent>(parent->parent);
+    if (parentTransform == nullptr) {
+        return glm::mat4{1.0f};
+    }
+    return glm::inverse(TransformSystem::effectiveWorldMatrix(
+        *parentTransform, registry.try_get<WorldTransformComponent>(parent->parent)));
 }
 
 float handleHoverDistance(const HandleProjection& handle, GizmoMode mode, glm::vec2 mouse) {
@@ -306,9 +335,9 @@ void TransformGizmo::drawSelectionOutline(UIBatch& batch, const Scene& scene, en
             pixels[i] += viewportOrigin;
         }
     }
-    // Editor amber; brighter than the gizmo's neutral centre dot so
-    // the two never read as one widget.
-    const glm::vec4 outlineColor{1.0f, 0.72f, 0.15f, 0.95f};
+    // Editor orange accent; brighter than the gizmo's neutral
+    // centre dot so the two never read as one widget.
+    const glm::vec4 outlineColor{1.0f, 0.60f, 0.10f, 0.95f};
     constexpr std::array<std::pair<size_t, size_t>, 12> kEdges{{
         {0, 1}, {2, 3}, {4, 5}, {6, 7}, // x-running
         {0, 2}, {1, 3}, {4, 6}, {5, 7}, // y-running
@@ -371,9 +400,14 @@ GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::enti
 
     const float aspectRatio = viewportSize.x / viewportSize.y;
     const glm::mat4 viewProjection = camera.projectionMatrix(aspectRatio) * camera.viewMatrix();
-    const glm::vec3 anchor = registry.try_get<WorldTransformComponent>(target) != nullptr
-                                 ? registry.get<WorldTransformComponent>(target).worldPosition
-                                 : transform->position;
+    // The gizmo lives in the target's local frame: anchor and axis
+    // directions come from the true world matrix, so handles sit on
+    // the entity as rendered (children included) and point along
+    // the entity's own axes whatever its rotation.
+    const glm::mat4 worldMatrix = TransformSystem::effectiveWorldMatrix(
+        *transform, registry.try_get<WorldTransformComponent>(target));
+    const glm::vec3 anchor{worldMatrix[3]};
+    const std::array<glm::vec3, 3> frameAxes = worldFrameAxes(worldMatrix);
     const float length = handleLength(glm::distance(camera.position(), anchor));
 
     const glm::vec2 rawMouse = ui.mousePosition();
@@ -387,8 +421,9 @@ GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::enti
 
     std::array<HandleProjection, 3> handles;
     for (int i = 0; i < 3; ++i) {
-        handles[static_cast<size_t>(i)] =
-            projectHandle(m_mode, kAxes[i], anchor, length, viewProjection, viewportSize);
+        const size_t index = static_cast<size_t>(i);
+        handles[index] = projectHandle(m_mode, kAxes[i], frameAxes[index], anchor, length, viewProjection,
+                                       viewportSize);
     }
 
     // --- Hover picking (screen space) --------------------------------------
@@ -405,72 +440,101 @@ GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::enti
     }
     m_hoveredAxis = m_dragging ? m_axis : hover;
 
-    const glm::vec3 axisDir = axisDirection(m_axis != GizmoAxis::None ? m_axis : hover);
+    const glm::vec3 hoverAxisWorld =
+        frameAxes[static_cast<size_t>(axisIndex(hover != GizmoAxis::None ? hover : GizmoAxis::X))];
     const Ray mouseRay = cameraRay(camera, screenToNdc(mouse, viewportSize), aspectRatio);
 
     // --- Drag start ----------------------------------------------------------
+    // Everything the drag needs is captured relative to THIS frame's
+    // mouse ray, so the first motion frame measures a zero delta and
+    // the entity stays exactly where it was grabbed.
     if (!m_dragging && hover != GizmoAxis::None && hasPointer && !inputBlocked && !ui.popupOpen() &&
         ui.activeId() == kUINoWidget && ui.pressedRect(viewport)) {
         bool started = true;
         if (m_mode == GizmoMode::Rotate) {
             glm::vec3 hitPoint;
-            if (rayPlanePoint(mouseRay, anchor, axisDir, hitPoint) &&
+            if (rayPlanePoint(mouseRay, anchor, hoverAxisWorld, hitPoint) &&
                 glm::dot(hitPoint - anchor, hitPoint - anchor) > 1e-10f) {
-                m_startPlaneVector = glm::normalize(hitPoint - anchor);
+                m_lastPlaneVector = glm::normalize(hitPoint - anchor);
+                m_hasPlaneVector = true;
             } else {
                 started = false; // ring plane edge-on: no meaningful angle
             }
         } else {
-            m_startParameter = rayAxisParameter(mouseRay, anchor, axisDir);
+            m_lastParameter = rayAxisParameter(mouseRay, anchor, hoverAxisWorld);
         }
         if (started) {
             m_dragging = true;
             m_axis = hover;
             m_target = target;
             m_anchor = anchor;
-            m_startPosition = transform->position;
-            m_startRotation = transform->rotationDegrees;
-            m_startScale = transform->scale;
+            m_axisWorld = hoverAxisWorld;
+            m_parentInverse = parentWorldInverse(registry, target);
             result.pressConsumed = true;
         }
     }
 
     // --- Drag update ---------------------------------------------------------
+    // Incremental: only this frame's motion along the grabbed local
+    // axis (or around the grabbed ring plane) is applied, to the
+    // LIVE transform. Nothing is ever assigned from the raw mouse
+    // ray, so there is no absolute snap on the grab frame or any
+    // other -- the increments telescope into exactly the analytic
+    // drag total for a static scene.
     if (m_dragging) {
         if (!ui.mouseDown()) {
             m_dragging = false; // released: the drag ends without a final write
         } else if (registry.valid(m_target) && registry.try_get<TransformComponent>(m_target) != nullptr) {
             TransformComponent& live = registry.get<TransformComponent>(m_target);
-            const glm::vec3 dragAxis = axisDirection(m_axis);
             const int component = axisIndex(m_axis);
             if (m_mode == GizmoMode::Rotate) {
                 glm::vec3 hitPoint;
-                if (rayPlanePoint(mouseRay, m_anchor, dragAxis, hitPoint)) {
+                if (rayPlanePoint(mouseRay, m_anchor, m_axisWorld, hitPoint)) {
                     const glm::vec3 toHit = hitPoint - m_anchor;
                     if (glm::dot(toHit, toHit) > 1e-10f) {
                         const glm::vec3 current = glm::normalize(toHit);
-                        const float angle = std::atan2(glm::dot(glm::cross(m_startPlaneVector, current), dragAxis),
-                                                       glm::dot(m_startPlaneVector, current));
-                        glm::vec3 rotation = m_startRotation;
-                        rotation[component] = wrapDegrees(m_startRotation[component] + glm::degrees(angle));
-                        live.rotationDegrees = rotation;
-                        live.syncOrientationFromEuler();
-                        result.changed = true;
+                        if (m_hasPlaneVector) {
+                            const float angle =
+                                std::atan2(glm::dot(glm::cross(m_lastPlaneVector, current), m_axisWorld),
+                                           glm::dot(m_lastPlaneVector, current));
+                            if (angle != 0.0f) {
+                                glm::vec3 rotation = live.rotationDegrees;
+                                rotation[component] = wrapDegrees(rotation[component] + glm::degrees(angle));
+                                live.rotationDegrees = rotation;
+                                live.syncOrientationFromEuler();
+                                result.changed = true;
+                            }
+                        }
+                        m_lastPlaneVector = current;
+                        m_hasPlaneVector = true;
                     }
                 }
             } else {
-                const float parameter = rayAxisParameter(mouseRay, m_anchor, dragAxis);
-                const float delta = parameter - m_startParameter;
-                if (m_mode == GizmoMode::Translate) {
-                    glm::vec3 position = m_startPosition;
-                    position[component] += delta;
-                    live.position = position;
-                } else {
-                    glm::vec3 scale = live.scale;
-                    scale[component] = std::clamp(m_startScale[component] + delta, kMinScale, kMaxScale);
-                    live.scale = scale;
+                const float parameter = rayAxisParameter(mouseRay, m_anchor, m_axisWorld);
+                const float delta = parameter - m_lastParameter;
+                m_lastParameter = parameter;
+                if (delta != 0.0f) {
+                    if (m_mode == GizmoMode::Translate) {
+                        // Slide the CURRENT world position along the
+                        // grabbed local axis, then write back through
+                        // the parent's inverse: children of rotated
+                        // parents move along their own axis too, and
+                        // the other local components stay untouched.
+                        const glm::mat4 parentWorld = glm::inverse(m_parentInverse);
+                        const glm::vec3 worldNow{(parentWorld * live.modelMatrix())[3]};
+                        const glm::vec3 desired = worldNow + m_axisWorld * delta;
+                        live.position = glm::vec3{m_parentInverse * glm::vec4{desired, 1.0f}};
+                    } else {
+                        // Scale is a local-space quantity (T * R * S):
+                        // the grabbed handle IS local axis `component`,
+                        // so exactly that component grows -- never its
+                        // neighbours, whatever the entity's rotation.
+                        glm::vec3 scale = live.scale;
+                        scale[component] = std::clamp(scale[component] + delta, kMinScale, kMaxScale);
+                        live.scale = scale;
+                    }
+                    result.changed = true;
                 }
-                result.changed = true;
             }
             result.dragging = true;
         } else {

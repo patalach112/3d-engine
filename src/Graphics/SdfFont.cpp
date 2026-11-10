@@ -213,7 +213,7 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
             glyph.bearingY = static_cast<float>(yoff) * unitsPerPixel;
             glyph.width = static_cast<float>(width) * unitsPerPixel;
             glyph.height = static_cast<float>(height) * unitsPerPixel;
-            shelfWidth += static_cast<uint32_t>(width) + 2;
+            shelfWidth += static_cast<uint32_t>(width) + 8; // matches kGlyphGapTexels below
         }
         if (sdf != nullptr) {
             stbtt_FreeSDF(sdf, nullptr);
@@ -234,6 +234,13 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
     }
 
     // Shelf-pack: rows of glyphs left-to-right, page grows downwards.
+    // Neighbouring glyphs keep an 8-texel empty moat: the atlas is
+    // mip-mapped (text renders at ~1/4 of the 48 px bake), and with
+    // the old 2-texel gap the wider mip footprints averaged a
+    // neighbour's bright ink into this glyph's halo — the white
+    // streaks that smeared across labels. 8 texels keeps even the
+    // mip-3 footprint inside empty space at UI text sizes.
+    constexpr uint32_t kGlyphGapTexels = 8;
     atlas.width = 1024;
     uint32_t penX = 1;
     uint32_t penY = 1;
@@ -245,7 +252,7 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
         }
         if (penX + static_cast<uint32_t>(entry.width) + 1 > atlas.width) {
             penX = 1;
-            penY += shelfHeight + 2;
+            penY += shelfHeight + kGlyphGapTexels;
             shelfHeight = 0;
         }
         SdfGlyph& glyph = atlas.glyphs[index];
@@ -253,7 +260,7 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
         glyph.v0 = static_cast<float>(penY);
         glyph.u1 = static_cast<float>(penX + static_cast<uint32_t>(entry.width));
         glyph.v1 = static_cast<float>(penY + static_cast<uint32_t>(entry.height));
-        penX += static_cast<uint32_t>(entry.width) + 2;
+        penX += static_cast<uint32_t>(entry.width) + kGlyphGapTexels;
         shelfHeight = std::max(shelfHeight, static_cast<uint32_t>(entry.height));
     }
     atlas.height = penY + shelfHeight + 1;
@@ -269,7 +276,7 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
         }
         if (penX + static_cast<uint32_t>(entry.width) + 1 > atlas.width) {
             penX = 1;
-            penY += shelfHeight + 2;
+            penY += shelfHeight + kGlyphGapTexels;
             shelfHeight = 0;
         }
         for (int row = 0; row < entry.height; ++row) {
@@ -282,7 +289,7 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
         glyph.v0 /= static_cast<float>(atlas.height);
         glyph.u1 /= static_cast<float>(atlas.width);
         glyph.v1 /= static_cast<float>(atlas.height);
-        penX += static_cast<uint32_t>(entry.width) + 2;
+        penX += static_cast<uint32_t>(entry.width) + kGlyphGapTexels;
         shelfHeight = std::max(shelfHeight, static_cast<uint32_t>(entry.height));
     }
     (void)shelfWidth;

@@ -42,6 +42,7 @@ Window::Window(int width, int height, const char* title, bool resizable, bool ca
     glfwSetFramebufferSizeCallback(m_window, &Window::framebufferResizeCallback);
     glfwSetWindowSizeCallback(m_window, &Window::windowSizeCallback);
     glfwSetKeyCallback(m_window, &Window::keyCallback);
+    glfwSetCharCallback(m_window, &Window::charCallback);
     glfwSetMouseButtonCallback(m_window, &Window::mouseButtonCallback);
     glfwSetCursorPosCallback(m_window, &Window::cursorPositionCallback);
     glfwSetScrollCallback(m_window, &Window::scrollCallback);
@@ -122,6 +123,12 @@ void Window::windowSizeCallback(GLFWwindow* window, int width, int height) {
 void Window::keyCallback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/) {
     if (Window* self = fromGlfwWindow(window); self != nullptr && self->m_inputHandler != nullptr) {
         self->m_inputHandler->onKeyEvent(key, action);
+    }
+}
+
+void Window::charCallback(GLFWwindow* window, unsigned int codepoint) {
+    if (Window* self = fromGlfwWindow(window); self != nullptr && self->m_inputHandler != nullptr) {
+        self->m_inputHandler->onCharEvent(codepoint);
     }
 }
 

@@ -2649,3 +2649,58 @@ rendering bug that invalidated the previous maintenance pass's
 
 1122 passed / 0 failed across all five build configs, CTest 1/1,
 zero warnings.
+
+## Maintenance — Editor usability: local-frame gizmo, inspector ranges/scrolling, context menus, dark theme ✅
+
+Nine reported editor defects, fixed as one pass over the gizmo,
+inspector, hierarchy/viewport menus and theme:
+
+- **Smeared SDF text**: the batch, vertex layout and shaders
+  audited clean (now pinned by CPU integrity tests: per-string
+  quad/index accounting, segment partitioning, attribute
+  offsets == `offsetof`, glyph rects never overlapping). The
+  real lever was the atlas: neighbouring glyphs sat 2 texels
+  apart, so mip footprints at editor text sizes averaged a
+  neighbour's ink into each glyph's halo — the white streaks.
+  Shelf packing now keeps an 8-texel moat (pinned for TrueType
+  atlases).
+- **Inspector ranges**: Transform fields get editor ranges —
+  Position ±5000, Rotation ±3600°, Scale 0.001..1000 — instead
+  of the generic ±10 component clamp; other types keep the
+  caller's range. Holding Shift turns any slider drag into a
+  slow relative drag (0.05% of range per pixel, no jump on
+  grab) and shrinks focused arrow steps 20×.
+- **Gizmo cross-talk & grab jumps**: handles now live in the
+  target's *local* frame (directions from its world matrix,
+  scale stripped), drags are incremental frame-to-frame deltas
+  applied to the live transform, and translations write back
+  through the parent's inverse world matrix. After a 90°
+  rotation the X handle still drives exactly local X — never
+  Y/Z — and the grab frame always measures a zero delta, so
+  nothing snaps on frame one. Unrotated drags telescope to the
+  exact analytic totals the old absolute math produced.
+- **Inspector scrolling**: the wheel over the Inspector dock
+  shifts the panel stack (3 rows per tick), clipped by the
+  dock's nested scissor; the offset clamps against last frame's
+  measured content height and resets on selection change.
+- **Context menus**: the Hierarchy menu gains Rename, Reset
+  Transform and Focus next to Duplicate/Create Child/Delete;
+  a right *click* (not drag — camera look is untouched) in the
+  3D viewport picks the entity and raises the same menu.
+  Rename edits the tag in a new UIContext textField fed by a
+  GLFW char callback (`Input::onCharEvent` → UTF-8 → UIInput);
+  Enter commits, Esc restores, and editor shortcuts go inert
+  while typing. Focus frames the selection box with the active
+  camera, orientation preserved.
+- **Dark theme**: charcoal surfaces (#252526 panels, #1e1e1e
+  tracks), #3f3f46 borders, #007acc/#0e639c blue fills, orange
+  focus borders, active gizmo handles and selection outline;
+  the Hierarchy selection is #094771.
+- **Save/Export feedback**: both were wired but only logged;
+  they (and Load + every context action) now post a 4-second
+  status-bar notification with the file/result, and the editor
+  tracks the active scene path.
+
+1154 passed / 0 failed across all five build configs (Debug,
+Release shared/static, hidden-visibility, ASan), CTest 1/1,
+zero warnings, standalone player headless run clean.

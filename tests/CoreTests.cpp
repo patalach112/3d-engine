@@ -9525,6 +9525,398 @@ void testEditorSelectionOutline() {
           "outline: no selection -> no outline (deselected state draws nothing)");
 }
 
+void testPhase34EditorFixes() {
+    std::cout << "Phase 34: editor fixes — SDF batch integrity, slider ranges, local-frame gizmo, "
+                 "context menus, text entry\n";
+    struct Rig {
+        engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+        engine::UIBatch batch;
+        engine::UIContext ctx;
+        Rig() { batch.setFontAtlas(&atlas); }
+        void begin(const engine::UIInput& input) {
+            batch.begin(800, 600);
+            ctx.beginFrame(input, batch);
+        }
+        void end() { ctx.endFrame(); }
+    };
+    const glm::vec4 white{1.0f};
+
+    // --- (a) SDF text batch integrity: glyph quads can never corrupt neighbours --
+    {
+        Rig rig;
+        rig.batch.begin(800, 600);
+        rig.batch.drawRoundedRect(10.0f, 10.0f, 100.0f, 40.0f, engine::UIRectStyle{}, white);
+        rig.batch.drawText("Hello", 20.0f, 20.0f, 1.5f, white);
+        const auto& vertices = rig.batch.vertices();
+        const auto& indices = rig.batch.indices();
+        const auto& segments = rig.batch.segments();
+        check(vertices.size() == 24 && indices.size() == 36,
+              "text batch: 1 shape quad + 5 glyph quads append exactly 4 verts / 6 indices each");
+        bool indicesValid = true;
+        for (const uint32_t index : indices) {
+            indicesValid = indicesValid && index < vertices.size();
+        }
+        check(indicesValid, "text batch: every index references a live vertex (no cross-quad corruption)");
+        check(segments.size() == 2 && segments[0].firstIndex == 0 && segments[0].indexCount == 6 &&
+                  segments[1].firstIndex == 6 && segments[1].indexCount == 30 &&
+                  segments[1].texture == engine::kUIFontTexture &&
+                  segments[0].indexCount + segments[1].indexCount == indices.size(),
+              "text batch: segments partition the index buffer contiguously, split on the texture switch");
+        const engine::SdfGlyph& glyphH = rig.atlas.glyphFor('H');
+        const engine::UIVertex& q0 = vertices[4];
+        const engine::UIVertex& q2 = vertices[6];
+        check(q0.kind == engine::kUITextPrimitive && q0.uvRect == glm::vec4{glyphH.u0, glyphH.v0, glyphH.u1, glyphH.v1} &&
+                  q0.position.x < q2.position.x && q0.position.y < q2.position.y &&
+                  vertices[5].position.y == q0.position.y && vertices[7].position.x == q0.position.x,
+              "text batch: a glyph quad is an axis-aligned rect carrying exactly its atlas rect");
+        // The GPU vertex layout must match the CPU struct field for
+        // field — a stride or offset drift smears quads on screen.
+        const engine::UIRenderer::VertexInput layout = engine::UIRenderer::vertexInput();
+        check(layout.binding.stride == sizeof(engine::UIVertex) &&
+                  layout.attributes[0].offset == offsetof(engine::UIVertex, position) &&
+                  layout.attributes[1].offset == offsetof(engine::UIVertex, uv) &&
+                  layout.attributes[2].offset == offsetof(engine::UIVertex, color) &&
+                  layout.attributes[3].offset == offsetof(engine::UIVertex, cornerRadius) &&
+                  layout.attributes[4].offset == offsetof(engine::UIVertex, borderWidth) &&
+                  layout.attributes[5].offset == offsetof(engine::UIVertex, borderColor) &&
+                  layout.attributes[6].offset == offsetof(engine::UIVertex, uvRect) &&
+                  layout.attributes[7].offset == offsetof(engine::UIVertex, kind),
+              "text batch: Vulkan attribute offsets/stride match the CPU vertex layout exactly");
+        // Atlas packing: glyph rects never overlap, and TrueType
+        // glyphs keep an 8-texel moat (the mip-bleed fix).
+        bool overlapFree = true;
+        bool moatKept = true;
+        const float atlasW = static_cast<float>(rig.atlas.width);
+        const float atlasH = static_cast<float>(rig.atlas.height);
+        for (size_t a = 0; a < rig.atlas.glyphs.size(); ++a) {
+            const engine::SdfGlyph& ga = rig.atlas.glyphs[a];
+            if (ga.width <= 0.0f || ga.height <= 0.0f) {
+                continue;
+            }
+            for (size_t b = a + 1; b < rig.atlas.glyphs.size(); ++b) {
+                const engine::SdfGlyph& gb = rig.atlas.glyphs[b];
+                if (gb.width <= 0.0f || gb.height <= 0.0f) {
+                    continue;
+                }
+                const float ax0 = ga.u0 * atlasW, ax1 = ga.u1 * atlasW;
+                const float ay0 = ga.v0 * atlasH, ay1 = ga.v1 * atlasH;
+                const float bx0 = gb.u0 * atlasW, bx1 = gb.u1 * atlasW;
+                const float by0 = gb.v0 * atlasH, by1 = gb.v1 * atlasH;
+                overlapFree = overlapFree && (ax1 <= bx0 || bx1 <= ax0 || ay1 <= by0 || by1 <= ay0);
+                const float sepX = std::max({bx0 - ax1, ax0 - bx1, 0.0f});
+                const float sepY = std::max({by0 - ay1, ay0 - by1, 0.0f});
+                moatKept = moatKept && (sepX >= 8.0f - 0.01f || sepY >= 8.0f - 0.01f);
+            }
+        }
+        check(overlapFree, "text atlas: no two glyph rects overlap in the page");
+        check(!rig.atlas.trueType || moatKept,
+              "text atlas: TrueType glyphs keep the 8-texel moat that stops mip bleed");
+    }
+
+    // --- (b) Inspector transform ranges: rotation/scale/position are editor-wide --
+    {
+        Rig rig;
+        engine::TransformComponent transform;
+        const engine::UIRect panel{0.0f, 0.0f, 360.0f, 400.0f};
+        const engine::UIInspectorOptions options{}; // default component range is only +/-10
+        const auto rowRect = [&panel](int row) {
+            return engine::UIRect{panel.x + engine::UIContext::kPanelPadding,
+                                  panel.y + engine::UIContext::kPanelPadding +
+                                      static_cast<float>(row) *
+                                          (engine::UIContext::kRowHeight + engine::UIContext::kRowSpacing),
+                                  panel.width - 2.0f * engine::UIContext::kPanelPadding,
+                                  engine::UIContext::kRowHeight};
+        };
+        const auto frame = [&](float mouseX, float mouseY, bool mouseDown) {
+            rig.begin(engine::UIInput{mouseX, mouseY, mouseDown, 0});
+            const bool changed = engine::inspectComponent(rig.ctx, panel, engine::reflect<engine::TransformComponent>(),
+                                                          &transform, options);
+            rig.end();
+            return changed;
+        };
+        // Rows: 0 title, 1..3 Position, 4..6 Rotation (degrees), 7..9 Scale.
+        const engine::UIRect rotTrack = engine::UIContext::sliderTrackRect(rowRect(4));
+        check(frame(rotTrack.x + 0.75f * rotTrack.width, rowRect(4).y + 13.0f, true) &&
+                  nearlyEqual(transform.rotationDegrees.x, 1800.0f, 1.0f),
+              "inspector ranges: rotation slider reaches +/-3600 degrees (75% = 1800)");
+        frame(rotTrack.x, rowRect(4).y + 13.0f, false);
+        const engine::UIRect scaleTrack = engine::UIContext::sliderTrackRect(rowRect(7));
+        check(frame(scaleTrack.x + 0.75f * scaleTrack.width, rowRect(7).y + 13.0f, true) &&
+                  nearlyEqual(transform.scale.x, 750.0f, 1.0f) && transform.scale.y == 1.0f,
+              "inspector ranges: scale slider spans 0.001..1000 (75% = 750), one axis at a time");
+        frame(scaleTrack.x, rowRect(7).y + 13.0f, false);
+        const engine::UIRect posTrack = engine::UIContext::sliderTrackRect(rowRect(1));
+        check(frame(posTrack.x + 0.75f * posTrack.width, rowRect(1).y + 13.0f, true) &&
+                  nearlyEqual(transform.position.x, 2500.0f, 1.0f),
+              "inspector ranges: position slider spans +/-5000 (75% = 2500)");
+        frame(posTrack.x, rowRect(1).y + 13.0f, false);
+    }
+
+    // --- (c) Fine slider control: Shift makes drags relative and steps 20x finer --
+    {
+        Rig rig;
+        const engine::UIRect sliderRect{100.0f, 100.0f, 300.0f, 26.0f};
+        const engine::UIRect track = engine::UIContext::sliderTrackRect(sliderRect);
+        float value = 5.0f;
+        const auto frame = [&](float x, bool down, bool fine, int keyStep = 0) {
+            engine::UIInput input;
+            input.mouseX = x;
+            input.mouseY = 113.0f;
+            input.mouseDown = down;
+            input.fineModifier = fine;
+            input.keyStep = keyStep;
+            rig.begin(input);
+            const bool changed = rig.ctx.slider(sliderRect, "Fine", &value, 0.0f, 10.0f);
+            rig.end();
+            return changed;
+        };
+        check(!frame(track.x + 2.0f, true, true) && value == 5.0f,
+              "fine slider: grabbing with Shift does not jump to the mouse (relative drag)");
+        check(frame(track.x + 22.0f, true, true) && nearlyEqual(value, 5.1f, 0.001f),
+              "fine slider: 20 px of travel moves 1% of the range (0.05% per px)");
+        check(!frame(track.x + 22.0f, true, true) && nearlyEqual(value, 5.1f, 0.001f),
+              "fine slider: holding still changes nothing");
+        frame(track.x + 22.0f, false, true);
+        check(frame(track.x + 22.0f, false, true, +1) && nearlyEqual(value, 5.105f, 0.001f),
+              "fine slider: a focused Shift+arrow step is 0.05% of the range");
+        check(frame(track.x + 22.0f, false, false, +1) && nearlyEqual(value, 5.205f, 0.001f),
+              "fine slider: without Shift the step is the classic 1% of range");
+        frame(track.x + 22.0f, false, false);
+    }
+
+    // --- (d) Text entry: typing, codepoint backspace, Enter commit, Esc restore --
+    {
+        Rig rig;
+        const engine::UIRect field{100.0f, 100.0f, 240.0f, 26.0f};
+        std::string name = "Cube";
+        const auto frame = [&](engine::UIInput input, bool grabFocus = false) {
+            rig.begin(input);
+            const bool committed = rig.ctx.textField(field, "Name", &name, grabFocus);
+            rig.end();
+            return committed;
+        };
+        const auto idleAt = [](float x, float y) {
+            engine::UIInput input;
+            input.mouseX = x;
+            input.mouseY = y;
+            return input;
+        };
+        frame(idleAt(700.0f, 500.0f), true); // armed: grabs keyboard focus
+        engine::UIInput typing = idleAt(700.0f, 500.0f);
+        typing.textInput = "X";
+        frame(typing);
+        typing.textInput = "\xC3\xA9"; // é as raw UTF-8 bytes
+        frame(typing);
+        check(name == "CubeX\xC3\xA9", "text field: typed ASCII + UTF-8 append while focused");
+        engine::UIInput erase = idleAt(700.0f, 500.0f);
+        erase.backspacePressed = true;
+        frame(erase);
+        check(name == "CubeX", "text field: Backspace deletes a whole codepoint, not one byte");
+        engine::UIInput commit = idleAt(700.0f, 500.0f);
+        commit.enterPressed = true;
+        check(frame(commit) && name == "CubeX", "text field: Enter commits and reports it once");
+        engine::UIInput stray = idleAt(700.0f, 500.0f);
+        stray.textInput = "Z";
+        frame(stray);
+        check(name == "CubeX", "text field: after commit the field is deaf until refocused");
+        engine::UIInput press = idleAt(220.0f, 113.0f);
+        press.mouseDown = true;
+        frame(press); // click back in: snapshot is "CubeX"
+        engine::UIInput edit = idleAt(220.0f, 113.0f);
+        edit.mouseDown = true;
+        edit.textInput = "Y";
+        frame(edit);
+        engine::UIInput cancel = idleAt(220.0f, 113.0f);
+        cancel.escapePressed = true;
+        check(name == "CubeXY" && !frame(cancel) && name == "CubeX",
+              "text field: Esc restores the text as it was when editing began");
+    }
+
+    // --- (e) Char callback encoding (UTF-8) + per-frame clearing ----------------
+    {
+        engine::Input input;
+        input.beginFrame();
+        input.onCharEvent('A');
+        input.onCharEvent(0xE9);   // é -> 2 bytes
+        input.onCharEvent(0x20AC); // € -> 3 bytes
+        input.onCharEvent(0xD800); // surrogate: dropped, never encoded
+        check(input.textInput() == "A\xC3\xA9\xE2\x82\xAC",
+              "char input: codepoints encode as UTF-8, surrogates are dropped");
+        input.beginFrame();
+        check(input.textInput().empty(), "char input: beginFrame clears the typed text");
+    }
+
+    // --- (f) Gizmo drags open with a zero delta: no snap on the grab frame ------
+    {
+        struct GizmoRig {
+            engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+            engine::UIBatch batch;
+            engine::UIContext ctx;
+            GizmoRig() { batch.setFontAtlas(&atlas); }
+        } rig;
+        engine::Scene scene;
+        engine::TransformGizmo gizmo;
+        engine::CameraConfig camConfig;
+        camConfig.startPosition = glm::vec3{0.0f, 0.0f, 5.0f};
+        const engine::Camera camera{camConfig};
+        const glm::vec2 viewport{800.0f, 600.0f};
+        auto cube = scene.createEntity("Cube");
+        cube.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+        const entt::entity handle = cube.handle();
+        auto& registry = scene.registry();
+        const auto update = [&](float x, float y, bool down) {
+            rig.batch.begin(800, 600);
+            engine::UIInput input;
+            input.mouseX = x;
+            input.mouseY = y;
+            input.mouseDown = down;
+            rig.ctx.beginFrame(input, rig.batch);
+            const engine::GizmoUpdateResult result = gizmo.update(rig.ctx, scene, handle, camera, viewport);
+            rig.ctx.endFrame();
+            return result;
+        };
+        // Translate: the grab frame and an unmoved held frame write nothing.
+        const engine::GizmoUpdateResult grab = update(501.0f, 300.0f, true);
+        const engine::GizmoUpdateResult held = update(501.0f, 300.0f, true);
+        const engine::TransformComponent& after = registry.get<engine::TransformComponent>(handle);
+        check(grab.pressConsumed && !grab.changed && !held.changed && after.position == glm::vec3{0.0f},
+              "gizmo smoothness: pressing a handle never snaps the entity to the mouse ray");
+        update(501.0f, 300.0f, false);
+        // Scale: the same zero-delta guarantee at the grab.
+        gizmo.setMode(engine::GizmoMode::Scale);
+        const engine::GizmoUpdateResult scaleGrab = update(501.0f, 300.0f, true);
+        const engine::GizmoUpdateResult scaleHeld = update(501.0f, 300.0f, true);
+        check(scaleGrab.pressConsumed && !scaleGrab.changed && !scaleHeld.changed &&
+                  registry.get<engine::TransformComponent>(handle).scale == glm::vec3{1.0f},
+              "gizmo smoothness: a scale grab also starts from the entity's own value");
+        update(501.0f, 300.0f, false);
+    }
+
+    // --- (g) Local-frame gizmo: a 90°-rotated entity scales/moves along ITS axes -
+    {
+        struct GizmoRig {
+            engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+            engine::UIBatch batch;
+            engine::UIContext ctx;
+            GizmoRig() { batch.setFontAtlas(&atlas); }
+        } rig;
+        engine::Scene scene;
+        engine::CameraConfig camConfig;
+        camConfig.startPosition = glm::vec3{0.0f, 0.0f, 5.0f};
+        const engine::Camera camera{camConfig};
+        const glm::vec2 viewport{800.0f, 600.0f};
+        auto dial = scene.createEntity("Dial");
+        auto& dialTransform = dial.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+        dialTransform.rotationDegrees = glm::vec3{0.0f, 0.0f, 90.0f};
+        dialTransform.syncOrientationFromEuler(); // local X now points up-screen
+        const entt::entity handle = dial.handle();
+        auto& registry = scene.registry();
+        engine::TransformGizmo gizmo;
+        gizmo.setMode(engine::GizmoMode::Scale);
+        const auto update = [&](float x, float y, bool down) {
+            rig.batch.begin(800, 600);
+            engine::UIInput input;
+            input.mouseX = x;
+            input.mouseY = y;
+            input.mouseDown = down;
+            rig.ctx.beginFrame(input, rig.batch);
+            const engine::GizmoUpdateResult result = gizmo.update(rig.ctx, scene, handle, camera, viewport);
+            rig.ctx.endFrame();
+            return result;
+        };
+        // The X handle of a Z-90° entity sits up-screen at (400, ~199);
+        // the world-axis gizmo would report the Y handle there.
+        const engine::GizmoUpdateResult hover = update(400.0f, 198.6f, false);
+        check(hover.hoveredAxis == engine::GizmoAxis::X,
+              "gizmo local frame: after a 90° rotation the up-screen handle is still X");
+        update(400.0f, 198.6f, true);
+        const engine::GizmoUpdateResult drag = update(400.0f, 98.6f, true);
+        const glm::vec3 scale = registry.get<engine::TransformComponent>(handle).scale;
+        check(drag.changed && nearlyEqual(scale.x, 1.69f, 0.05f) && scale.y == 1.0f && scale.z == 1.0f,
+              "gizmo local frame: dragging X scales strictly X (no Y/Z cross-talk)");
+        update(400.0f, 98.6f, false);
+        // Same story for translation: up-screen drag moves along the
+        // entity's local X, which reads as world +Y for a root.
+        gizmo.setMode(engine::GizmoMode::Translate);
+        update(400.0f, 198.6f, true);
+        update(400.0f, 98.6f, true);
+        const glm::vec3 position = registry.get<engine::TransformComponent>(handle).position;
+        check(nearlyEqual(position.y, 0.69f, 0.04f) && nearlyEqual(position.x, 0.0f, 1e-4f) &&
+                  position.z == 0.0f,
+              "gizmo local frame: translate follows the rotated axis, not the world axis");
+        update(400.0f, 98.6f, false);
+    }
+
+    // --- (h) Outliner context menu: Rename / Reset Transform / Focus ------------
+    {
+        struct EditorRig {
+            engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+            engine::UIBatch batch;
+            engine::UIContext ctx;
+            EditorRig() { batch.setFontAtlas(&atlas); }
+        } rig;
+        engine::Scene scene;
+        engine::UIOutliner outliner;
+        auto& registry = scene.registry();
+        const engine::UIRect panel{0.0f, 0.0f, 320.0f, 300.0f};
+        auto box = scene.createEntity("Box");
+        auto& boxTransform = box.addComponent<engine::TransformComponent>(glm::vec3{5.0f, 6.0f, 7.0f});
+        boxTransform.rotationDegrees = glm::vec3{10.0f, 20.0f, 30.0f};
+        boxTransform.scale = glm::vec3{2.0f, 3.0f, 4.0f};
+        boxTransform.syncOrientationFromEuler();
+        const entt::entity boxHandle = box.handle();
+        const auto build = [&](float x, float y, bool down, bool right = false) {
+            rig.batch.begin(800, 600);
+            engine::UIInput input;
+            input.mouseX = x;
+            input.mouseY = y;
+            input.mouseDown = down;
+            input.mouseRightDown = right;
+            rig.ctx.beginFrame(input, rig.batch);
+            const engine::UIOutliner::Result result = outliner.build(rig.ctx, panel, scene);
+            rig.ctx.endFrame();
+            return result;
+        };
+        // Menu (opened at 60,49): Duplicate 53, Create Child 73,
+        // Delete 102, Rename 131, Reset Transform 151, Focus 171.
+        build(60.0f, 49.0f, false, true);
+        build(60.0f, 49.0f, false);
+        const engine::UIOutliner::Result rename = build(70.0f, 141.0f, true);
+        check(rename.action == engine::UIOutliner::Action::RenameRequested && rename.entity == boxHandle,
+              "context menu: Rename is signalled to the host (it owns the text field)");
+        build(60.0f, 49.0f, false, true);
+        build(60.0f, 49.0f, false);
+        const engine::UIOutliner::Result reset = build(70.0f, 161.0f, true);
+        const engine::TransformComponent& after = registry.get<engine::TransformComponent>(boxHandle);
+        check(reset.action == engine::UIOutliner::Action::TransformReset &&
+                  after.position == glm::vec3{0.0f} && after.rotationDegrees == glm::vec3{0.0f} &&
+                  after.scale == glm::vec3{1.0f},
+              "context menu: Reset Transform zeroes position/rotation and restores unit scale");
+        build(60.0f, 49.0f, false, true);
+        build(60.0f, 49.0f, false);
+        const engine::UIOutliner::Result focus = build(70.0f, 181.0f, true);
+        check(focus.action == engine::UIOutliner::Action::FocusRequested && focus.entity == boxHandle,
+              "context menu: Focus is signalled to the host (it owns the camera)");
+    }
+
+    // --- (i) Theme + scroll clamp contracts --------------------------------------
+    {
+        const engine::UITheme theme;
+        check(theme.panelFill == glm::vec4{0.145f, 0.145f, 0.149f, 1.0f} &&
+                  theme.panelBorder == glm::vec4{0.247f, 0.247f, 0.275f, 1.0f} &&
+                  theme.trackFill == glm::vec4{0.118f, 0.118f, 0.118f, 1.0f} &&
+                  theme.sliderFill == glm::vec4{0.0f, 0.478f, 0.800f, 1.0f} &&
+                  theme.buttonActive == glm::vec4{0.055f, 0.388f, 0.612f, 1.0f} &&
+                  theme.focusBorder == glm::vec4{1.0f, 0.60f, 0.10f, 1.0f},
+              "theme: charcoal surfaces (#252526/#1e1e1e), #3f3f46 borders, blue fills, orange focus");
+        check(nearlyEqual(engine::UIContext::clampScrollOffset(50.0f, 100.0f, 40.0f), 50.0f) &&
+                  nearlyEqual(engine::UIContext::clampScrollOffset(80.0f, 100.0f, 40.0f), 60.0f) &&
+                  engine::UIContext::clampScrollOffset(-5.0f, 100.0f, 40.0f) == 0.0f &&
+                  engine::UIContext::clampScrollOffset(10.0f, 30.0f, 40.0f) == 0.0f,
+              "inspector scroll: offset clamps to [0, content - view], short content never scrolls");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -9562,6 +9954,7 @@ int main() {
     testPhase27Editor();
     testPhase28Gizmos();
     testPhase29Assets();
+    testPhase34EditorFixes();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

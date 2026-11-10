@@ -50,6 +50,14 @@ class Scene;
 // overlay (dotted axis lines, ring outlines, tip glyphs), so the
 // gizmo always draws on top of the scene.
 //
+// Handles live in the target's LOCAL frame: their world directions
+// come from the entity's world orientation, so after any rotation
+// the X handle still drives exactly the local X scale/translation
+// component (never a neighbouring axis), translations are written
+// back through the parent's inverse world matrix, and drags are
+// incremental (frame-to-frame deltas from the grab point) rather
+// than absolute snaps to the mouse ray.
+//
 // Drags lock onto their target at press time; deleting the target
 // mid-drag (or switching tools) cancels cleanly.
 // ---------------------------------------------------------------------------
@@ -136,13 +144,24 @@ private:
     GizmoAxis m_axis = GizmoAxis::None;
     bool m_dragging = false;
     entt::entity m_target = entt::null;
-    // Drag snapshot (taken on the press frame).
-    glm::vec3 m_anchor{0.0f};       // world position the drag pivots about
-    glm::vec3 m_startPosition{0.0f};
-    glm::vec3 m_startRotation{0.0f};
-    glm::vec3 m_startScale{1.0f};
-    float m_startParameter = 0.0f;  // axis-line parameter at press time
-    glm::vec3 m_startPlaneVector{1.0f, 0.0f, 0.0f}; // in-plane reference for Rotate
+    // Drag state, captured on the grab frame and advanced
+    // *incrementally*: every drag frame applies only that frame's
+    // (current - previous) motion along the grabbed axis/ring plane
+    // to the live transform, so the grab frame itself always has an
+    // exactly zero delta -- the entity can never snap to the raw
+    // ray intersection on frame one, and the motion stays correct
+    // even if something else nudges the transform mid-drag.
+    glm::vec3 m_anchor{0.0f}; // world pivot the axis line / ring plane hangs on
+    // The grabbed axis in world space, from the target's own world
+    // orientation (its local frame). After a 90-degree rotation the
+    // X handle points along the entity's X -- grabbing it can never
+    // drive the Y/Z scale or slide the entity along a world axis it
+    // is not aligned with (the old world-axes-only gizmo did both).
+    glm::vec3 m_axisWorld{1.0f, 0.0f, 0.0f};
+    glm::mat4 m_parentInverse{1.0f}; // parent world -> local, frozen at grab (identity at roots)
+    float m_lastParameter = 0.0f;    // axis-line parameter on the previous drag frame
+    glm::vec3 m_lastPlaneVector{1.0f, 0.0f, 0.0f}; // in-plane direction on the previous drag frame
+    bool m_hasPlaneVector = false;                 // Rotate: m_lastPlaneVector is meaningful
 };
 
 } // namespace engine

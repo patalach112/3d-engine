@@ -68,27 +68,42 @@ struct UIInput {
     bool mouseRightDown = false; // right button held (Phase 27: context menus)
     bool escapePressed = false;  // Esc edge this frame (dismisses popups)
     float scrollY = 0.0f;        // wheel delta in lines, positive = up
+    // Fine-adjust modifier (Shift) held this frame: slider drags
+    // become slow relative drags and focused key steps shrink 20x,
+    // so wide-range fields (a +/-3600-degree rotation) stay
+    // precisely editable. Defaulted off: the base absolute-drag /
+    // 1%-step contract is unchanged without it.
+    bool fineModifier = false;
+    // Text typed this frame (UTF-8 codepoints from the platform
+    // char callback), consumed by a focused textField. Empty in
+    // tests unless a test types something.
+    std::string textInput{};
+    bool backspacePressed = false; // one Backspace press this frame (textField)
+    bool enterPressed = false;     // one Enter press this frame (commits a textField)
 };
 
 using UIWidgetId = uint32_t;
 inline constexpr UIWidgetId kUINoWidget = 0;
 
 struct UITheme {
-    // Docked editor panels are fully opaque: the 3D viewport is a
-    // bounded rectangle between them, so nothing of the world may
-    // bleed through the chrome (the old 0.92 alpha let scene colour
-    // wash over text whenever geometry passed behind a panel).
-    glm::vec4 panelFill{0.07f, 0.08f, 0.11f, 1.0f};
-    glm::vec4 panelBorder{1.0f, 1.0f, 1.0f, 0.14f};
-    glm::vec4 text{0.92f, 0.95f, 1.0f, 1.0f};
-    glm::vec4 buttonFill{0.16f, 0.19f, 0.26f, 1.0f};
-    glm::vec4 buttonHovered{0.23f, 0.28f, 0.38f, 1.0f};
-    glm::vec4 buttonActive{0.12f, 0.38f, 0.68f, 1.0f};
-    glm::vec4 trackFill{0.10f, 0.11f, 0.15f, 1.0f};
-    glm::vec4 sliderFill{0.35f, 0.65f, 1.0f, 1.0f};
-    glm::vec4 thumbFill{0.80f, 0.86f, 0.95f, 1.0f};
-    glm::vec4 checkFill{0.35f, 0.65f, 1.0f, 1.0f};
-    glm::vec4 focusBorder{1.0f, 0.80f, 0.30f, 1.0f};
+    // Professional dark theme (charcoal surfaces, one blue accent
+    // for interactive fills, one orange accent for focus/active
+    // states). Docked editor panels are fully opaque: the 3D
+    // viewport is a bounded rectangle between them, so nothing of
+    // the world may bleed through the chrome (the old 0.92 alpha
+    // let scene colour wash over text whenever geometry passed
+    // behind a panel).
+    glm::vec4 panelFill{0.145f, 0.145f, 0.149f, 1.0f};   // #252526
+    glm::vec4 panelBorder{0.247f, 0.247f, 0.275f, 1.0f}; // #3f3f46
+    glm::vec4 text{0.93f, 0.93f, 0.93f, 1.0f};           // near-white, high contrast
+    glm::vec4 buttonFill{0.176f, 0.176f, 0.188f, 1.0f};    // #2d2d30
+    glm::vec4 buttonHovered{0.243f, 0.243f, 0.259f, 1.0f}; // #3e3e42
+    glm::vec4 buttonActive{0.055f, 0.388f, 0.612f, 1.0f};  // #0e639c
+    glm::vec4 trackFill{0.118f, 0.118f, 0.118f, 1.0f};     // #1e1e1e
+    glm::vec4 sliderFill{0.0f, 0.478f, 0.800f, 1.0f};      // #007acc
+    glm::vec4 thumbFill{0.85f, 0.85f, 0.86f, 1.0f};
+    glm::vec4 checkFill{0.0f, 0.478f, 0.800f, 1.0f}; // #007acc
+    glm::vec4 focusBorder{1.0f, 0.60f, 0.10f, 1.0f}; // orange accent
 };
 
 class ENGINE_GRAPHICS_API UIContext {
@@ -135,6 +150,19 @@ public:
     bool checkbox(const UIRect& rect, std::string_view label, bool* value);
     // Three slider rows (label.x/.y/.z) with per-axis accents.
     bool vec3Sliders(std::string_view label, glm::vec3* value, float min, float max);
+
+    // Single-line text entry. While the field holds keyboard focus
+    // (click it, or pass grabFocus on the frame it appears) typed
+    // characters append, Backspace deletes the last codepoint,
+    // Enter commits — the one frame this returns true — and Esc
+    // restores the text the field had when focus was gained. The
+    // label seeds the widget id only; hosts draw their own caption.
+    bool textField(std::string_view label, std::string* text, bool grabFocus = false);
+    bool textField(const UIRect& rect, std::string_view label, std::string* text, bool grabFocus = false);
+
+    // Shared scroll clamp for wheel-scrolled panels (inspector,
+    // hierarchy): keeps the offset inside [0, content - view].
+    [[nodiscard]] static float clampScrollOffset(float offset, float contentHeight, float viewHeight);
 
     // --- Context menus / popups (Phase 27) -------------------------------
     // One popup is active at a time (opening replaces). The host
@@ -227,6 +255,9 @@ private:
     UIBatch* m_batch = nullptr;
     UITheme m_theme;
     UIInput m_input{};
+    float m_prevMouseX = -10000.0f; // last frame's pointer x (fine slider drags)
+    UIWidgetId m_textEditId = kUINoWidget; // textField currently being edited
+    std::string m_textSnapshot;            // its content when focus was gained (Esc restores)
     bool m_prevMouseDown = false;
     bool m_prevRightDown = false;
     bool m_pressedEdge = false;

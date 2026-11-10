@@ -14,7 +14,12 @@ namespace engine {
 //
 //   Float        -> slider (options.floatMin..floatMax)
 //   Bool         -> checkbox toggle
-//   Vec3         -> three component sliders (options.…Min/…Max)
+//   Vec3         -> three component sliders (options.…Min/…Max),
+//                   except TransformComponent fields, which use
+//                   editor ranges: Position +/-5000, Rotation
+//                   (degrees) +/-3600, Scale 0.001..1000 -- a
+//                   +/-10 clamp on those made the inspector unable
+//                   to express ordinary scene placements.
 //   Int32/UInt32 -> read-only label row (value readout)
 //
 // Writes go through the reflected offsets (writeProperty), so the
