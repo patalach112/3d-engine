@@ -2240,3 +2240,66 @@ entity.
   import→spawn chain. **970 passed, 0 failed** in Debug,
   Release (shared and static), hidden-visibility and ASan
   builds, warning-free, CTest 1/1.
+
+## Phase 30 — Scene Serialization & Custom Binary Format (.gbq) ✅
+
+The Phase 19 JSON scene format gains a fast binary twin: the
+**GBQ1 container** — a protected, index-addressed file for
+whole-scene persistence with bit-exact floats and no text
+parsing on load, plus editor Save/Load commands.
+
+- **Container format** (`Scene/SceneBinarySerialization`):
+  a 32-byte header (magic `GBQ1`, format version, flags,
+  section count, TOC offset) followed immediately by a
+  **table of contents** — one 32-byte entry per section
+  (type code, section version, absolute offset, size) so any
+  section is located in O(1) without scanning the file.
+  Sections are 8-byte aligned, fixed-layout little-endian
+  records; strings are u32-length-prefixed byte runs, floats
+  travel as raw IEEE bits. `inspectGbqFile()` reads only the
+  header + TOC (version, entity count from META, section
+  list) for tooling that must peek without loading.
+- **Coverage**: META (destroy mode + entity count), ENTY
+  (parent indices), TAGC, TRNF (incl. quaternion orientation
+  mode), CAMR (full `CameraConfig` + live position/yaw/pitch),
+  MESH (asset/material/bounds), SPIN, RGBD (full dynamics
+  state incl. inertia tensors and sleep flags), CLDR (all six
+  collider shapes, hull points, trigger + layer/mask), GRVF,
+  JONT, THRS — plus **PLGT/SLGT lights and NSCR native script
+  names**, which the JSON format never stored. Scripts persist
+  by name only; the script system recreates the live instance,
+  which is runtime state. Transient physics forces are not
+  stored (same rule as JSON). Entities are referenced by file
+  index only — recycled EnTT handles are never persisted.
+  Unknown sections are skipped (forward compatibility); a
+  known section at an unexpected version, a bad magic, any
+  truncation, or an out-of-range entity/joint/parent index
+  rejects the whole load.
+- **Loader contract**: the file is staged into plain structs
+  and fully validated *before* the scene is touched — malformed
+  input leaves the workspace byte-for-byte unchanged. On
+  success the registry is cleared silently (no destroy events)
+  and rebuilt in file order; hierarchy is re-linked through
+  `setParent`, and joint `other` links are remapped in a
+  second pass once every handle exists. Camera components are
+  reconstructed through `Camera::setPosition/setOrientation`,
+  exactly like the JSON path.
+- **API**: `serializeScene(scene, path)` /
+  `deserializeScene(scene, path)` free functions, and
+  `Scene::saveToGbqFile` / `Scene::loadFromGbqFile` members
+  mirroring `saveToFile`/`loadFromFile`. The JSON serializer
+  is untouched; both formats describe the same scene.
+- **Editor integration**: a **Save / Load** toolbar segment
+  beside the gizmo tool switch and **Ctrl+S / Ctrl+O**
+  shortcuts round-trip `assets/quicksave.gbq`. Load drops the
+  editor selection first so the inspector and gizmo never
+  chase a recycled handle, and logs the outcome either way.
+- **Verification**: `testPhase30Gbq()` adds 30 checks — TOC
+  structure, binary-smaller-than-JSON, bit-for-bit round-trip
+  of transforms/quaternions/camera/rigid-body/hull/lights/
+  script name, nested hierarchy rebuild, joint link remapping
+  in both directions, transitive save→load→save→load stability,
+  JSON parity, and five malformed-input rejections that must
+  leave the scene untouched. **1000 passed, 0 failed** in
+  Debug, Release (shared and static), hidden-visibility and
+  ASan builds, warning-free, CTest 1/1.

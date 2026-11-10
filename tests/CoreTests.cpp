@@ -19,6 +19,7 @@
 #include "Scene/DenseIteration.h"
 #include "Scene/DynamicAABBTree.h"
 #include "Scene/Scene.h"
+#include "Scene/SceneBinarySerialization.h"
 #include "Scene/UIOutliner.h"
 #include "Scene/UIAssetBrowser.h"
 #include "Scene/Raycast.h"
@@ -5549,6 +5550,296 @@ void testSceneSerialization() {
     }
 }
 
+void testPhase30Gbq() {
+    std::cout << "Phase 30: binary scene serialization (.gbq)\n";
+    using engine::CameraComponent;
+    using engine::ColliderComponent;
+    using engine::GravityFieldComponent;
+    using engine::JointComponent;
+    using engine::MeshComponent;
+    using engine::NativeScriptComponent;
+    using engine::ParentComponent;
+    using engine::PointLightComponent;
+    using engine::RigidBodyComponent;
+    using engine::SpotLightComponent;
+    using engine::SpinComponent;
+    using engine::ThrusterComponent;
+    using engine::TransformComponent;
+
+    const auto findByTag = [](engine::Scene& scene, const std::string& tag) -> engine::Entity {
+        auto& registry = scene.registry();
+        for (const entt::entity entity : registry.view<engine::TagComponent>()) {
+            if (registry.get<engine::TagComponent>(entity).tag == tag) {
+                return engine::Entity{entity, &scene};
+            }
+        }
+        return engine::Entity{};
+    };
+    const auto bitsOf = [](float value) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, 4);
+        return bits;
+    };
+    const auto exactVec3 = [](const glm::vec3& a, const glm::vec3& b) { return a == b; };
+
+    // --- Build a component-rich nested scene -----------------------------------
+    engine::Scene scene;
+    scene.setHierarchyDestroyMode(engine::HierarchyDestroyMode::Cascade);
+
+    auto rig = scene.createEntity("Rig");
+    auto& rigTransform = rig.addComponent<TransformComponent>(glm::vec3{1.5f, -2.25f, 3.75f});
+    rigTransform.rotationDegrees = glm::vec3{10.0f, 20.0f, 30.0f};
+    rigTransform.orientation = glm::normalize(glm::quat{0.9238795f, 0.0f, 0.3826834f, 0.0f});
+    rigTransform.useQuaternionOrientation = true;
+
+    auto crate = scene.createEntity("Crate");
+    auto& crateTransform = crate.addComponent<TransformComponent>(glm::vec3{-4.5f, 0.125f, 8.0f});
+    crateTransform.scale = glm::vec3{2.0f, 0.5f, 1.25f};
+    auto& crateMesh = crate.addComponent<MeshComponent>(MeshComponent{std::string{"models/cube.obj"}});
+    crateMesh.materialName = "wood";
+    crateMesh.visible = false;
+    crateMesh.localBounds = engine::AABB{glm::vec3{-1.0f}, glm::vec3{1.0f}};
+    auto& crateBody = crate.addComponent<RigidBodyComponent>(2.5f);
+    crateBody.velocity = glm::vec3{1.0f, 2.0f, 3.0f};
+    crateBody.angularVelocity = glm::vec3{0.1f, 0.2f, 0.3f};
+    crateBody.restitution = 0.42f;
+    crateBody.friction = 0.77f;
+    crateBody.gravityScale = 0.5f;
+    crateBody.sleeping = true;
+    crateBody.allowSleep = false;
+    auto& crateCollider = crate.addComponent<ColliderComponent>();
+    crateCollider.type = ColliderComponent::Type::ConvexHull;
+    crateCollider.hullPoints = {glm::vec3{0.0f}, glm::vec3{1.0f, 0.0f, 0.0f}, glm::vec3{0.0f, 1.0f, 0.0f},
+                                glm::vec3{0.0f, 0.0f, -1.0f}};
+    crateCollider.hullPointCount = 4;
+    crateCollider.isTrigger = true;
+    crateCollider.layer = 0x8u;
+    crateCollider.mask = 0xF0u;
+    crate.addComponent<SpinComponent>(glm::vec3{15.0f, -30.0f, 45.0f});
+    scene.setParent(crate, rig);
+
+    auto lamp = scene.createEntity("Lamp");
+    lamp.addComponent<TransformComponent>(glm::vec3{0.0f, 2.0f, 0.0f});
+    auto& lampLight = lamp.addComponent<PointLightComponent>();
+    lampLight.color = glm::vec3{1.0f, 0.5f, 0.25f};
+    lampLight.intensity = 42.5f;
+    lampLight.range = 17.5f;
+    lampLight.enabled = false;
+    scene.setParent(lamp, crate);
+
+    auto cam = scene.createEntity("Cam");
+    cam.addComponent<TransformComponent>(glm::vec3{0.0f});
+    engine::CameraConfig cameraConfig;
+    cameraConfig.movementSpeed = 7.5f;
+    cameraConfig.fieldOfViewDegrees = 60.0f;
+    cameraConfig.invertY = true;
+    auto& cameraComponent = cam.addComponent<CameraComponent>(cameraConfig);
+    cameraComponent.camera.setPosition(glm::vec3{9.0f, 8.0f, 7.0f});
+    cameraComponent.camera.setOrientation(-45.0f, 15.0f);
+
+    auto spot = scene.createEntity("Spot");
+    spot.addComponent<TransformComponent>(glm::vec3{5.0f, 6.0f, 5.0f});
+    auto& spotLight = spot.addComponent<SpotLightComponent>();
+    spotLight.color = glm::vec3{0.25f, 0.5f, 1.0f};
+    spotLight.intensity = 99.0f;
+    spotLight.innerConeRadians = 0.31f;
+    spotLight.outerConeRadians = 0.77f;
+
+    auto drone = scene.createEntity("Drone");
+    drone.addComponent<TransformComponent>(glm::vec3{1.0f, 1.0f, 1.0f});
+    drone.addComponent<RigidBodyComponent>(3.0f);
+    auto& thruster = drone.addComponent<ThrusterComponent>();
+    thruster.force = glm::vec3{0.0f, 25.0f, 0.0f};
+    thruster.localPosition = glm::vec3{0.0f, -0.5f, 0.0f};
+    thruster.throttle = 0.75f;
+    drone.addComponent<NativeScriptComponent>(std::string{"DroneAI"});
+
+    auto planet = scene.createEntity("Planet");
+    planet.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, -20.0f});
+    auto& gravity = planet.addComponent<GravityFieldComponent>();
+    gravity.gravitationalParameter = 123.5f;
+    gravity.radius = 50.0f;
+    gravity.enabled = false;
+
+    auto linkA = scene.createEntity("LinkA");
+    linkA.addComponent<TransformComponent>(glm::vec3{0.0f, 4.0f, 0.0f});
+    auto linkB = scene.createEntity("LinkB");
+    linkB.addComponent<TransformComponent>(glm::vec3{2.0f, 4.0f, 0.0f});
+    auto& distance = linkA.addComponent<JointComponent>(
+        JointComponent::distance(linkB.handle(), glm::vec3{0.25f}, glm::vec3{-0.25f}, 2.0f));
+    distance.minDistance = 1.0f;
+    distance.maxDistance = 3.0f;
+    auto& hinge = linkB.addComponent<JointComponent>(
+        JointComponent::hinge(linkA.handle(), glm::vec3{0.5f, 0.0f, 0.0f}, glm::vec3{-0.5f, 0.0f, 0.0f},
+                              glm::vec3{0.0f, 0.0f, 1.0f}));
+    hinge.enableLimits = true;
+    hinge.minAngleDegrees = -30.0f;
+    hinge.maxAngleDegrees = 45.0f;
+    hinge.compliance = 0.25f;
+
+    const std::filesystem::path gbqPath = std::filesystem::temp_directory_path() / "engine_scene_phase30.gbq";
+    const std::filesystem::path gbqPath2 = std::filesystem::temp_directory_path() / "engine_scene_phase30_b.gbq";
+
+    // --- Container structure ------------------------------------------------------
+    check(engine::serializeScene(scene, gbqPath), "serializeScene writes the .gbq container");
+    engine::GbqFileInfo info;
+    check(engine::inspectGbqFile(gbqPath, info) && info.version == engine::kGbqVersion &&
+              info.entityCount == scene.entityCount() && !info.sections.empty(),
+          "the table of contents reports version, entity count and sections");
+    const auto hasSection = [&info](const char* type) {
+        for (const engine::GbqSectionInfo& section : info.sections) {
+            if (section.type == type) {
+                return true;
+            }
+        }
+        return false;
+    };
+    check(hasSection("TRNF") && hasSection("JONT") && hasSection("PLGT") && hasSection("SLGT") &&
+              hasSection("NSCR"),
+          "the index lists transform, joint, light and script sections");
+    check(info.fileSize < scene.saveToString().size(),
+          "the binary container is smaller than the same scene as JSON text");
+
+    // --- Round trip: bit-for-bit --------------------------------------------------
+    engine::Scene loaded;
+    loaded.createEntity("Junk");
+    check(engine::deserializeScene(loaded, gbqPath) && loaded.entityCount() == scene.entityCount() &&
+              !findByTag(loaded, "Junk").isValid(),
+          "deserializeScene clears the previous scene and restores every entity");
+    check(loaded.hierarchyDestroyMode() == engine::HierarchyDestroyMode::Cascade,
+          "hierarchy destroy mode round-trips through .gbq");
+
+    engine::Entity lRig = findByTag(loaded, "Rig");
+    engine::Entity lCrate = findByTag(loaded, "Crate");
+    engine::Entity lLamp = findByTag(loaded, "Lamp");
+    const TransformComponent& lCrateTransform = lCrate.getComponent<TransformComponent>();
+    check(bitsOf(lCrateTransform.position.x) == bitsOf(crateTransform.position.x) &&
+              exactVec3(lCrateTransform.position, crateTransform.position) &&
+              exactVec3(lCrateTransform.scale, crateTransform.scale),
+          "transform floats survive bit-for-bit");
+    const TransformComponent& lRigTransform = lRig.getComponent<TransformComponent>();
+    check(lRigTransform.useQuaternionOrientation && lRigTransform.orientation == rigTransform.orientation &&
+              lRigTransform.orientation.w == rigTransform.orientation.w,
+          "quaternion orientation mode and value round-trip");
+    check(lCrate.getComponent<ParentComponent>().parent == lRig.handle() &&
+              lLamp.getComponent<ParentComponent>().parent == lCrate.handle() &&
+              !loaded.registry().all_of<ParentComponent>(lRig.handle()),
+          "the nested hierarchy is rebuilt through parent links");
+
+    const MeshComponent& lMesh = lCrate.getComponent<MeshComponent>();
+    check(lMesh.assetId == "models/cube.obj" && lMesh.materialName == "wood" && !lMesh.visible &&
+              lMesh.localBounds.min == glm::vec3{-1.0f} && lMesh.localBounds.max == glm::vec3{1.0f},
+          "mesh asset reference, material, visibility and bounds round-trip");
+    const RigidBodyComponent& lBody = lCrate.getComponent<RigidBodyComponent>();
+    check(lBody.mass == 2.5f && exactVec3(lBody.velocity, glm::vec3{1.0f, 2.0f, 3.0f}) &&
+              bitsOf(lBody.restitution) == bitsOf(0.42f) && lBody.friction == 0.77f && lBody.gravityScale == 0.5f &&
+              lBody.sleeping && !lBody.allowSleep && lBody.inertiaTensor[0][0] == crateBody.inertiaTensor[0][0] &&
+              lBody.inverseInertiaTensor[2][2] == crateBody.inverseInertiaTensor[2][2],
+          "rigid body dynamics state, inertia tensors and flags round-trip");
+    const ColliderComponent& lCollider = lCrate.getComponent<ColliderComponent>();
+    check(lCollider.type == ColliderComponent::Type::ConvexHull && lCollider.hullPointCount == 4 &&
+              exactVec3(lCollider.hullPoints[3], glm::vec3{0.0f, 0.0f, -1.0f}) && lCollider.isTrigger &&
+              lCollider.layer == 0x8u && lCollider.mask == 0xF0u,
+          "convex hull points, trigger flag and collision filter round-trip");
+    check(exactVec3(lCrate.getComponent<SpinComponent>().degreesPerSecond, glm::vec3{15.0f, -30.0f, 45.0f}),
+          "spin rates round-trip");
+
+    const CameraComponent& lCamera = findByTag(loaded, "Cam").getComponent<CameraComponent>();
+    check(lCamera.camera.position() == glm::vec3{9.0f, 8.0f, 7.0f} && lCamera.camera.yawDegrees() == -45.0f &&
+              lCamera.camera.pitchDegrees() == 15.0f && lCamera.camera.config().movementSpeed == 7.5f &&
+              lCamera.camera.config().fieldOfViewDegrees == 60.0f && lCamera.camera.config().invertY,
+          "camera config and live view state round-trip");
+
+    const PointLightComponent& lPoint = lLamp.getComponent<PointLightComponent>();
+    check(exactVec3(lPoint.color, glm::vec3{1.0f, 0.5f, 0.25f}) && lPoint.intensity == 42.5f &&
+              lPoint.range == 17.5f && !lPoint.enabled,
+          "point light round-trips (a component the JSON format never stored)");
+    const SpotLightComponent& lSpot = findByTag(loaded, "Spot").getComponent<SpotLightComponent>();
+    check(lSpot.intensity == 99.0f && bitsOf(lSpot.innerConeRadians) == bitsOf(0.31f) &&
+              bitsOf(lSpot.outerConeRadians) == bitsOf(0.77f),
+          "spot light cones round-trip bit-for-bit");
+
+    engine::Entity lDrone = findByTag(loaded, "Drone");
+    check(exactVec3(lDrone.getComponent<ThrusterComponent>().force, glm::vec3{0.0f, 25.0f, 0.0f}) &&
+              lDrone.getComponent<ThrusterComponent>().throttle == 0.75f,
+          "thruster state round-trips");
+    check(lDrone.getComponent<NativeScriptComponent>().scriptName == "DroneAI",
+          "the native script name round-trips (the instance is recreated by the script system)");
+    const GravityFieldComponent& lGravity = findByTag(loaded, "Planet").getComponent<GravityFieldComponent>();
+    check(lGravity.gravitationalParameter == 123.5f && lGravity.radius == 50.0f && !lGravity.enabled,
+          "gravity field round-trips");
+
+    engine::Entity lLinkA = findByTag(loaded, "LinkA");
+    engine::Entity lLinkB = findByTag(loaded, "LinkB");
+    const JointComponent& lDistance = lLinkA.getComponent<JointComponent>();
+    const JointComponent& lHinge = lLinkB.getComponent<JointComponent>();
+
+    check(lDistance.other == lLinkB.handle() && lDistance.restLength == 2.0f && lDistance.minDistance == 1.0f &&
+              lDistance.maxDistance == 3.0f,
+          "the distance joint's entity link is remapped to the new handle");
+    check(lHinge.other == lLinkA.handle() && lHinge.type == engine::JointType::Hinge && lHinge.enableLimits &&
+              lHinge.minAngleDegrees == -30.0f && lHinge.maxAngleDegrees == 45.0f && lHinge.compliance == 0.25f,
+          "the hinge joint, its limits and its back-link round-trip");
+
+    // A second save -> load cycle must land on the same scene again
+    // (record order follows EnTT storage order, so the bytes may be
+    // permuted; the restored data must not drift).
+    check(engine::serializeScene(loaded, gbqPath2), "the restored scene re-serializes");
+    const auto readBytes = [](const std::filesystem::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+    engine::Scene loadedTwice;
+    check(engine::deserializeScene(loadedTwice, gbqPath2) && loadedTwice.entityCount() == scene.entityCount() &&
+              exactVec3(findByTag(loadedTwice, "Crate").getComponent<TransformComponent>().position,
+                        crateTransform.position) &&
+              findByTag(loadedTwice, "LinkB").getComponent<JointComponent>().other ==
+                  findByTag(loadedTwice, "LinkA").handle(),
+          "save -> load -> save -> load is stable");
+
+    // Both formats describe the same scene (JSON parity on shared fields).
+    engine::Scene fromJson;
+    check(fromJson.loadFromString(scene.saveToString()) && fromJson.entityCount() == loaded.entityCount() &&
+              exactVec3(findByTag(fromJson, "Crate").getComponent<TransformComponent>().position,
+                        lCrateTransform.position),
+          "the JSON scene and the .gbq scene agree on the shared data");
+
+    // --- Malformed input is rejected without touching the scene -------------------
+    engine::Scene guarded;
+    guarded.createEntity("Keeper");
+    const auto writeBytes = [](const std::filesystem::path& path, const std::string& bytes) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << bytes;
+    };
+    const std::string good = readBytes(gbqPath);
+    std::string truncated = good.substr(0, good.size() / 2);
+    writeBytes(gbqPath2, truncated);
+    check(!engine::deserializeScene(guarded, gbqPath2) && guarded.entityCount() == 1 &&
+              findByTag(guarded, "Keeper").isValid(),
+          "a truncated .gbq is rejected and leaves the scene untouched");
+    std::string badMagic = good;
+    badMagic[0] = 'X';
+    writeBytes(gbqPath2, badMagic);
+    check(!engine::deserializeScene(guarded, gbqPath2) && guarded.entityCount() == 1,
+          "a wrong magic is rejected");
+    std::string badVersion = good;
+    badVersion[4] = static_cast<char>(99); // format version, little-endian low byte
+    writeBytes(gbqPath2, badVersion);
+    check(!engine::deserializeScene(guarded, gbqPath2) && guarded.entityCount() == 1,
+          "an unsupported format version is rejected");
+    writeBytes(gbqPath2, "");
+    check(!engine::deserializeScene(guarded, gbqPath2) && guarded.entityCount() == 1, "an empty file is rejected");
+    check(!engine::deserializeScene(guarded, "/tmp/engine-scene-definitely-missing-12345.gbq") &&
+              guarded.entityCount() == 1,
+          "a missing .gbq file is rejected");
+    engine::GbqFileInfo badInfo;
+    check(!engine::inspectGbqFile("/tmp/engine-scene-definitely-missing-12345.gbq", badInfo),
+          "inspectGbqFile rejects a missing file");
+
+    std::filesystem::remove(gbqPath);
+    std::filesystem::remove(gbqPath2);
+}
+
 void testAsyncAssetPipeline() {
     std::cout << "Async asset pipeline (Phase 20)\n";
     using engine::AssetKind;
@@ -8184,6 +8475,7 @@ int main() {
     testPhysicsEvents();
     testSceneHierarchy();
     testSceneSerialization();
+    testPhase30Gbq();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();

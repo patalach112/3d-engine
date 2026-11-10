@@ -11,6 +11,7 @@
 #include "Graphics/UIInspector.h"
 #include "Scene/ComponentReflection.h"
 #include "Scene/Raycast.h"
+#include "Scene/SceneBinarySerialization.h"
 #include "Geometry/Cube.h"
 #include "Scene/Components.h"
 #include "Scene/Systems/CameraSystem.h"
@@ -601,6 +602,16 @@ void Application::run() {
                 m_gizmo.setMode(GizmoMode::Scale);
             }
 
+            // Phase 30 scene file shortcuts: Ctrl+S saves the whole
+            // registry to the .gbq quicksave, Ctrl+O restores it.
+            const bool ctrlHeld =
+                m_input.isKeyDown(Key::LeftControl) || m_input.isKeyDown(Key::RightControl);
+            if (ctrlHeld && m_input.wasKeyPressed(Key::S)) {
+                saveSceneToGbq();
+            } else if (ctrlHeld && m_input.wasKeyPressed(Key::O)) {
+                loadSceneFromGbq();
+            }
+
             ui.drawRoundedRect(6.0f, 6.0f, 372.0f, 118.0f,
                                UIRectStyle{10.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.16f}},
                                glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
@@ -628,6 +639,20 @@ void Application::run() {
             }
             if (m_uiContext.button(UIRect{kToolX[2], 17.0f, 74.0f, 28.0f}, "Scale")) {
                 m_gizmo.setMode(GizmoMode::Scale);
+            }
+
+            // Phase 30: scene file commands beside the tool switch —
+            // Save serializes the active registry to the .gbq
+            // quicksave, Load clears and restores it wholesale.
+            const UIRect sceneFileRect{640.0f, 8.0f, 168.0f, 46.0f};
+            ui.drawRoundedRect(sceneFileRect.x, sceneFileRect.y, sceneFileRect.width, sceneFileRect.height,
+                               UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
+                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
+            if (m_uiContext.button(UIRect{648.0f, 17.0f, 74.0f, 28.0f}, "Save")) {
+                saveSceneToGbq();
+            }
+            if (m_uiContext.button(UIRect{726.0f, 17.0f, 74.0f, 28.0f}, "Load")) {
+                loadSceneFromGbq();
             }
 
             // Phase 27 editor layout: the Component Inspector dock
@@ -828,6 +853,31 @@ void Application::handleEventImpulse() {
     body->sleeping = false;
     body->sleepTimer = 0.0f;
     ENGINE_LOG_INFO("Impulse action: launched entity #" << entt::to_integral(selected));
+}
+
+void Application::saveSceneToGbq() {
+    const std::filesystem::path path = m_assetBrowser.rootPath() / "quicksave.gbq";
+    if (const auto parent = path.parent_path(); !parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+    }
+    if (serializeScene(m_scene, path)) {
+        ENGINE_LOG_INFO("Editor: scene saved to '" << path.string() << "' (" << m_scene.entityCount() << " entities)");
+    } else {
+        ENGINE_LOG_WARNING("Editor: scene save failed ('" << path.string() << "')");
+    }
+}
+
+void Application::loadSceneFromGbq() {
+    const std::filesystem::path path = m_assetBrowser.rootPath() / "quicksave.gbq";
+    // The load rebuilds every entity handle: clear the selection
+    // up front so the inspector/gizmo never see a recycled handle.
+    m_outliner.setSelected(entt::null);
+    if (deserializeScene(m_scene, path)) {
+        ENGINE_LOG_INFO("Editor: scene loaded from '" << path.string() << "' (" << m_scene.entityCount() << " entities)");
+    } else {
+        ENGINE_LOG_WARNING("Editor: scene load failed ('" << path.string() << "'); scene unchanged");
+    }
 }
 
 void Application::spawnDroppedMesh(std::string_view relativePath, glm::vec2 mousePixels, const Camera& camera,

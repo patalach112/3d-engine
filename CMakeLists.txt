@@ -200,6 +200,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/TransformGizmo.cpp
     src/Scene/UIAssetBrowser.cpp
     src/Scene/SceneSerialization.cpp
+    src/Scene/SceneBinarySerialization.cpp
     src/Scene/Components.cpp
     src/Scene/Raycast.cpp
     src/Scene/DynamicAABBTree.cpp

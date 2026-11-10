@@ -67,6 +67,13 @@ private:
     void spawnDroppedMesh(std::string_view relativePath, glm::vec2 mousePixels, const Camera& camera,
                           glm::vec2 viewportSize);
     void applyDroppedAsset(entt::entity entity, const UIDragPayload& payload);
+
+    // Phase 30 editor scene file commands (.gbq quicksave under
+    // the asset root): save serializes the active registry; load
+    // clears and restores it, dropping the editor selection first
+    // so no stale entity handle survives the rebuild.
+    void saveSceneToGbq();
+    void loadSceneFromGbq();
     // Registers (once) a material derived from the mesh's current
     // one and points the mesh at it. Returns the material name.
     std::string deriveMaterial(MeshComponent& mesh, const std::string& derivedName,

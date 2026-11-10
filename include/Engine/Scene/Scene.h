@@ -246,6 +246,20 @@ public:
     bool saveToFile(const std::string& filepath) const;
     bool loadFromFile(const std::string& filepath);
 
+    // --- Binary scene serialization (Phase 30, .gbq) -------------------
+    // The same scene in the custom GBQ1 container: magic header,
+    // a table-of-contents section index for O(1) section access,
+    // and fixed-layout binary component records (bit-exact floats,
+    // no text parsing). Covers everything the JSON format does
+    // plus point/spot lights and native script names. The free
+    // serializeScene()/deserializeScene() wrappers live in
+    // Scene/SceneBinarySerialization.h. loadFromGbqFile validates
+    // the whole file before touching the scene (left untouched on
+    // malformed input); on success it clears and rebuilds like
+    // loadFromString.
+    bool saveToGbqFile(const std::string& filepath) const;
+    bool loadFromGbqFile(const std::string& filepath);
+
     // Memory pool backing all component storage of this scene.
     [[nodiscard]] memory::PoolStats memoryStats() const { return m_registry.get_allocator().stats(); }
 
