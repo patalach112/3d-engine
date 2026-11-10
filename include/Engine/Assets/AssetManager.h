@@ -221,6 +221,7 @@ public:
     [[nodiscard]] const MeshAsset* mesh(MeshId id) const;
     [[nodiscard]] const MeshAsset* mesh(std::string_view name) const;
     [[nodiscard]] const ShaderAsset* shader(ShaderId id) const;
+    [[nodiscard]] const ShaderAsset* shader(std::string_view name) const;
     [[nodiscard]] const MaterialAsset* material(MaterialId id) const;
     [[nodiscard]] const MaterialAsset* material(std::string_view name) const;
 

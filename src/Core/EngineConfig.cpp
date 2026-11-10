@@ -192,7 +192,7 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
             if (reader.applyInteger(value, intField, 0, 10000)) {
                 config.loop.maxFps = static_cast<uint32_t>(intField);
             }
-        } else if (key == "fixedtimestepsenabled") {
+        } else if (key == "fixedtimestepenabled") {
             reader.apply(value, config.loop.fixedTimestepEnabled);
         } else if (key == "statslogintervalseconds") {
             reader.applyDouble(value, config.loop.statsLogIntervalSeconds, -1.0, 3600.0);
@@ -281,6 +281,8 @@ bool applyValue(EngineConfig& config, const std::string& section, const std::str
     if (section == "game") {
         if (key == "modulepath") {
             config.game.modulePath = value;
+        } else if (key == "bundle") {
+            config.game.bundlePath = value;
         } else if (key == "modulehotreload") {
             reader.apply(value, config.game.moduleHotReload);
         } else {

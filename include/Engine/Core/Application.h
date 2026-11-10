@@ -75,6 +75,11 @@ private:
     // so no stale entity handle survives the rebuild.
     void saveSceneToGbq();
     void loadSceneFromGbq();
+    // Phase 33: "Export Game" (Edit mode only) — distills the
+    // live scene and every asset it references into a deployable
+    // GBQB bundle (plus manifest + game.ini) the standalone
+    // game-player boots. Failures list every missing reference.
+    void exportGame();
 
     // Phase 31 play mode: enterPlayMode snapshots the scene (GBQ
     // bytes) and starts the runtime simulation; exitPlayMode

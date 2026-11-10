@@ -14,6 +14,7 @@
 #include "Scene/SceneBinarySerialization.h"
 #include "Geometry/Cube.h"
 #include "Scene/Components.h"
+#include "Scene/ProjectExport.h"
 #include "Scene/Systems/CameraSystem.h"
 #include "Scene/NativeScript.h"
 #include "Scene/Systems/PhysicsSystem.h"
@@ -750,6 +751,19 @@ void Application::run() {
                 }
             }
 
+            // Phase 33: "Export Game" segment. Packages the live
+            // (Edit-mode) scene plus every asset it references into
+            // the GBQB bundle the standalone game-player boots.
+            // Inert while playing: an export always ships the
+            // authored world, never mid-simulation state.
+            const UIRect exportRect{992.0f, 8.0f, 92.0f, 46.0f};
+            ui.drawRoundedRect(exportRect.x, exportRect.y, exportRect.width, exportRect.height,
+                               UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
+                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
+            if (m_uiContext.button(UIRect{1000.0f, 17.0f, 74.0f, 28.0f}, "Export") && !playing) {
+                exportGame();
+            }
+
             // Phase 27 editor layout: the Component Inspector dock
             // (top-right) reflects the Outliner's selection over
             // every reflected built-in component; the Scene
@@ -1007,6 +1021,25 @@ void Application::loadSceneFromGbq() {
         ENGINE_LOG_INFO("Editor: scene loaded from '" << path.string() << "' (" << m_scene.entityCount() << " entities)");
     } else {
         ENGINE_LOG_WARNING("Editor: scene load failed ('" << path.string() << "'); scene unchanged");
+    }
+}
+
+void Application::exportGame() {
+    const std::filesystem::path bundlePath = m_assetBrowser.rootPath() / "export" / "game.gbq";
+    // Export the authored in-memory scene (the live registry while
+    // editing; the button is inert in Play mode, so the exported
+    // bundle never carries mid-simulation state).
+    const ExportReport report = ExportProject(m_scene, m_assets, bundlePath);
+    if (report.ok) {
+        ENGINE_LOG_INFO("Editor: game exported to '" << bundlePath.string() << "' (" << report.bundleBytes
+                                                    << " bytes, " << report.packed.size() << " entries: scene + "
+                                                    << (report.packed.size() - 1) << " assets)");
+    } else {
+        ENGINE_LOG_WARNING("Editor: game export FAILED: " << report.error << " -- " << report.missing.size()
+                                                          << " unregistered reference(s):");
+        for (const std::string& name : report.missing) {
+            ENGINE_LOG_WARNING("Editor:   missing asset '" << name << "'");
+        }
     }
 }
 

@@ -21,6 +21,7 @@
 #include "Scene/Scene.h"
 #include "Scene/SceneBinarySerialization.h"
 #include "Scene/PlaySession.h"
+#include "Scene/ProjectExport.h"
 #include "Scene/UIOutliner.h"
 #include "Scene/UIAssetBrowser.h"
 #include "Scene/Raycast.h"
@@ -6287,6 +6288,297 @@ void testPhase32Pbr() {
     }
 }
 
+// Phase 33 fixtures: a native script class the test "game build"
+// provides. The bundle packs only its name; the runtime (this test
+// binary) supplies the implementation through the registry.
+class Phase33ProbeScript final : public engine::INativeScript {};
+REGISTER_SCRIPT(Phase33ProbeScript)
+
+void testPhase33Export() {
+    std::cout << "Phase 33: standalone packaging & game export\n";
+    using engine::ColliderComponent;
+    using engine::MeshComponent;
+    using engine::NativeScriptComponent;
+    using engine::RigidBodyComponent;
+    using engine::TransformComponent;
+
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "engine_phase33_game";
+    const fs::path bundlePath = dir / "game.gbq";
+
+    // --- CRC-32 known vector ------------------------------------------------
+    check(engine::bundleCrc32("123456789", 9) == 0xCBF43926u,
+          "export: CRC-32 matches the ISO 3309 check value for \"123456789\"");
+
+    // --- Fixture: assets + scene --------------------------------------------
+    engine::VramBudget vram{64ull << 20};
+    engine::VramBudget staging{64ull << 20};
+    engine::AssetManager assets(vram, staging);
+
+    const std::vector<engine::Vertex> triVertices = {
+        engine::Vertex{glm::vec3{0.0f, 0.0f, 0.0f}, glm::vec3{0.0f, 0.0f, 1.0f}, glm::vec3{1.0f, 0.0f, 0.0f},
+                       glm::vec2{0.0f, 0.0f}},
+        engine::Vertex{glm::vec3{1.0f, 0.0f, 0.0f}, glm::vec3{0.0f, 0.0f, 1.0f}, glm::vec3{0.0f, 1.0f, 0.0f},
+                       glm::vec2{1.0f, 0.0f}},
+        engine::Vertex{glm::vec3{0.0f, 1.0f, 0.0f}, glm::vec3{0.0f, 0.0f, 1.0f}, glm::vec3{0.0f, 0.0f, 1.0f},
+                       glm::vec2{0.0f, 1.0f}},
+    };
+    const std::vector<uint32_t> triIndices{0, 1, 2};
+    check(assets.registerMesh("tri", std::span<const engine::Vertex>{triVertices},
+                              std::span<const uint32_t>{triIndices}) != engine::kInvalidAssetId,
+          "export fixture: triangle mesh registers");
+
+    const std::vector<uint8_t> texPixels{10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255};
+    check(assets.registerTexture("texA", 2, 2, std::span<const uint8_t>{texPixels}) != engine::kInvalidAssetId,
+          "export fixture: 2x2 texture registers");
+    const std::vector<uint8_t> bigPixels(32 * 32 * 4, 0x7F);
+    check(assets.registerTexture("texBig", 32, 32, std::span<const uint8_t>{bigPixels}) !=
+              engine::kInvalidAssetId,
+          "export fixture: flat 32x32 texture registers (compression fodder)");
+
+    const std::vector<uint32_t> vertWords{0x07230203u, 0x00010000u, 11u, 22u};
+    const std::vector<uint32_t> fragWords{0x07230203u, 0x00010000u, 33u, 44u};
+    check(assets.registerShader("a.vert.spv", std::span<const uint32_t>{vertWords}) != engine::kInvalidAssetId &&
+              assets.registerShader("a.frag.spv", std::span<const uint32_t>{fragWords}) !=
+                  engine::kInvalidAssetId,
+          "export fixture: shader pair registers");
+
+    engine::MaterialDesc matDesc;
+    matDesc.name = "matA";
+    matDesc.vertexShader = "a.vert.spv";
+    matDesc.fragmentShader = "a.frag.spv";
+    matDesc.baseColor = glm::vec4{0.2f, 0.4f, 0.6f, 1.0f};
+    matDesc.pbr.metallic = 0.75f;
+    matDesc.pbr.roughness = 0.3f;
+    matDesc.pbr.albedoTexture = "texA";
+    matDesc.pbr.normalTexture = "texBig";
+    check(assets.registerMaterial(matDesc) != engine::kInvalidAssetId, "export fixture: material registers");
+
+    engine::Scene scene;
+    {
+        auto floor = scene.createEntity("Floor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, 0.0f});
+        auto& floorMesh = floor.addComponent<MeshComponent>("tri");
+        floorMesh.materialName = "matA";
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto crate = scene.createEntity("Crate");
+        crate.addComponent<TransformComponent>(glm::vec3{0.0f, 2.0f, 0.0f});
+        auto& crateMesh = crate.addComponent<MeshComponent>("tri");
+        crateMesh.materialName = "matA";
+        crate.addComponent<RigidBodyComponent>(1.0f);
+        crate.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        auto scripted = scene.createEntity("Scripted");
+        scripted.addComponent<TransformComponent>(glm::vec3{3.0f, 0.0f, 0.0f});
+        scripted.addComponent<NativeScriptComponent>("Phase33ProbeScript");
+    }
+
+    // --- Export ----------------------------------------------------------------
+    const engine::ExportReport report = engine::ExportProject(scene, assets, bundlePath);
+    check(report.ok && report.error.empty() && report.missing.empty(), "export: a complete scene exports cleanly");
+    check(report.packed.size() == 8, "export: bundle packs 8 entries (scene, mesh, material, 2 textures, 2 "
+                                     "shaders, script)");
+    check(fs::exists(bundlePath) && fs::exists(dir / "game.manifest.json") && fs::exists(dir / "game.ini"),
+          "export: bundle, manifest sidecar and game.ini land side by side");
+    {
+        std::ifstream sidecar(dir / "game.manifest.json", std::ios::binary);
+        const std::string sidecarText{std::istreambuf_iterator<char>{sidecar}, std::istreambuf_iterator<char>{}};
+        std::ifstream configFile(dir / "game.ini", std::ios::binary);
+        const std::string configText{std::istreambuf_iterator<char>{configFile}, std::istreambuf_iterator<char>{}};
+        check(sidecarText.find("\"tri\"") != std::string::npos,
+              "export: the sidecar manifest indexes the packed assets by name");
+        check(configText.find("bundle = game.gbq") != std::string::npos,
+              "export: game.ini points the standalone player at the bundle");
+    }
+
+    // --- Bundle structure ---------------------------------------------------------
+    std::vector<std::byte> bundleBytes;
+    {
+        std::ifstream in(bundlePath, std::ios::binary);
+        const std::vector<char> chars{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+        bundleBytes.resize(chars.size());
+        std::memcpy(bundleBytes.data(), chars.data(), chars.size());
+    }
+    check(bundleBytes.size() > 32 && std::memcmp(bundleBytes.data(), "GBQB", 4) == 0,
+          "bundle: file starts with the GBQB magic");
+
+    engine::BundleInfo info;
+    check(engine::inspectBundle(bundlePath, info) && info.version == 1 && info.entries.size() == 8 &&
+              info.bundleFileSize == bundleBytes.size(),
+          "bundle: header + manifest parse (version 1, 8 entries, true file size)");
+    const engine::BundleEntryInfo* sceneEntry = nullptr;
+    const engine::BundleEntryInfo* meshEntry = nullptr;
+    const engine::BundleEntryInfo* bigTexEntry = nullptr;
+    for (const engine::BundleEntryInfo& entry : info.entries) {
+        if (entry.kind == engine::BundleEntryKind::Scene) {
+            sceneEntry = &entry;
+        } else if (entry.kind == engine::BundleEntryKind::Mesh && entry.name == "tri") {
+            meshEntry = &entry;
+        } else if (entry.kind == engine::BundleEntryKind::Texture && entry.name == "texBig") {
+            bigTexEntry = &entry;
+        }
+    }
+    check(sceneEntry != nullptr && sceneEntry->rawSize == scene.saveToGbqBytes().size(),
+          "bundle: the scene entry carries the exact GBQ scene bytes");
+    check(meshEntry != nullptr && meshEntry->rawSize == 8 + 3 * sizeof(engine::Vertex) + 3 * sizeof(uint32_t),
+          "bundle: the mesh entry is a counts header plus raw vertex/index bytes");
+    check(bigTexEntry != nullptr && bigTexEntry->storedSize < bigTexEntry->rawSize,
+          "bundle: the flat texture compresses below its raw size (LZ77 works)");
+
+    // --- Entry round-trips ---------------------------------------------------------
+    std::vector<std::byte> extracted;
+    check(engine::extractBundleEntry(bundlePath, "tri", extracted) && extracted.size() >= 8 &&
+              *reinterpret_cast<const uint32_t*>(extracted.data()) == 3 &&
+              *reinterpret_cast<const uint32_t*>(extracted.data() + 4) == 3,
+          "bundle: the mesh entry extracts with its vertex/index counts");
+    if (extracted.size() >= 8 + sizeof(engine::Vertex)) {
+        const auto* vertex = reinterpret_cast<const engine::Vertex*>(extracted.data() + 8);
+        check(vertex->position == triVertices[0].position && vertex->normal == triVertices[0].normal &&
+                  vertex->texCoord == triVertices[0].texCoord,
+              "bundle: mesh vertex data survives the pack/extract round trip");
+    } else {
+        check(false, "bundle: mesh vertex data survives the pack/extract round trip");
+    }
+    check(engine::extractBundleEntry(bundlePath, "texA", extracted) && extracted.size() == 8 + texPixels.size() &&
+              std::memcmp(extracted.data() + 8, texPixels.data(), texPixels.size()) == 0,
+          "bundle: texture pixels extract byte-identical");
+    check(!engine::extractBundleEntry(bundlePath, "no-such-entry", extracted),
+          "bundle: extracting an unlisted entry fails");
+
+    {
+        std::vector<std::byte> sceneBytes;
+        engine::Scene revived;
+        check(engine::extractBundleEntry(bundlePath, "scene", sceneBytes) &&
+                  engine::deserializeSceneFromBytes(revived, sceneBytes) && revived.entityCount() == 3,
+              "bundle: the packed scene entry deserializes to the exported entity set");
+    }
+
+    // --- Integrity: tamper + non-bundles ------------------------------------------------
+    const fs::path tamperedPath = dir / "tampered.gbq";
+    {
+        std::vector<char> chars(bundleBytes.size());
+        std::memcpy(chars.data(), bundleBytes.data(), chars.size());
+        const size_t flipAt = meshEntry != nullptr
+                                  ? static_cast<size_t>(meshEntry->dataOffset) + 2
+                                  : chars.size() / 2;
+        chars[flipAt] = static_cast<char>(chars[flipAt] ^ 0xFF);
+        std::ofstream out(tamperedPath, std::ios::binary | std::ios::trunc);
+        out.write(chars.data(), static_cast<std::streamsize>(chars.size()));
+    }
+    check(!engine::extractBundleEntry(tamperedPath, "tri", extracted),
+          "bundle: a flipped payload byte fails extraction (CRC integrity)");
+    {
+        std::ofstream junk(dir / "junk.gbq", std::ios::binary | std::ios::trunc);
+        junk << "this is not a bundle at all";
+    }
+    engine::BundleInfo unusedInfo;
+    check(!engine::inspectBundle(dir / "junk.gbq", unusedInfo) &&
+              !engine::inspectBundle(dir / "definitely-missing.gbq", unusedInfo),
+          "bundle: garbage and missing files are refused at inspection");
+
+    // --- Missing references fail atomically ------------------------------------------------
+    {
+        engine::Scene orphan;
+        auto ghost = orphan.createEntity("Ghost");
+        ghost.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& ghostMesh = ghost.addComponent<MeshComponent>("ghostMesh");
+        ghostMesh.materialName = "ghostMat";
+        engine::VramBudget v2{64ull << 20};
+        engine::VramBudget s2{64ull << 20};
+        engine::AssetManager emptyAssets(v2, s2);
+        const fs::path orphanPath = dir / "orphan.gbq";
+        const engine::ExportReport failed = engine::ExportProject(orphan, emptyAssets, orphanPath);
+        bool namesBoth = failed.missing.size() == 2;
+        for (const std::string& name : failed.missing) {
+            namesBoth = namesBoth && (name == "ghostMesh" || name == "ghostMat");
+        }
+        check(!failed.ok && namesBoth, "export: unregistered references are all reported by name");
+        check(!fs::exists(orphanPath), "export: a failed export writes nothing (atomic failure)");
+    }
+
+    // --- Determinism -------------------------------------------------------------------------
+    {
+        std::vector<char> before(bundleBytes.size());
+        std::memcpy(before.data(), bundleBytes.data(), before.size());
+        const engine::ExportReport again = engine::ExportProject(scene, assets, bundlePath);
+        std::ifstream in(bundlePath, std::ios::binary);
+        const std::vector<char> after{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+        check(again.ok && after == before, "export: re-exporting the same scene is byte-identical");
+    }
+
+    // --- Runtime boot (the player's load path) ---------------------------------------------------
+    engine::VramBudget vram2{64ull << 20};
+    engine::VramBudget staging2{64ull << 20};
+    engine::AssetManager runtimeAssets(vram2, staging2);
+    engine::Scene runtimeScene;
+    const engine::RuntimeLoadResult load =
+        engine::loadBundleIntoRuntime(bundlePath, runtimeAssets, runtimeScene);
+    check(load.ok && load.error.empty() && load.entityCount == 3 && runtimeScene.entityCount() == 3,
+          "runtime: the bundle boots into a fresh asset registry + scene");
+    check(load.scripts.size() == 1 && load.scripts.front() == "Phase33ProbeScript",
+          "runtime: the bundle reports the native script classes the scene requires");
+    check(engine::ScriptRegistry::instance().has("Phase33ProbeScript"),
+          "runtime: this build provides the required script class (player check passes)");
+    const engine::MeshAsset* rtMesh = runtimeAssets.mesh("tri");
+    const engine::TextureAsset* rtTex = runtimeAssets.texture("texA");
+    const engine::MaterialAsset* rtMat = runtimeAssets.material("matA");
+    const engine::ShaderAsset* rtShader = runtimeAssets.shader("a.vert.spv");
+    check(rtMesh != nullptr && rtMesh->vertices.size() == 3 && rtMesh->indices.size() == 3,
+          "runtime: the packed mesh registers with its geometry");
+    check(rtTex != nullptr && rtTex->width == 2 && rtTex->pixels == texPixels,
+          "runtime: the packed texture registers with its pixels");
+    check(rtShader != nullptr && rtShader->code == vertWords,
+          "runtime: the packed shader registers with its SPIR-V words");
+    check(rtMat != nullptr && rtMat->desc.baseColor == glm::vec4{0.2f, 0.4f, 0.6f, 1.0f} &&
+              rtMat->desc.pbr.metallic == 0.75f && rtMat->desc.pbr.roughness == 0.3f &&
+              rtMat->desc.pbr.albedoTexture == "texA" && rtMat->desc.vertexShader == "a.vert.spv",
+          "runtime: the packed material registers with its PBR/shader/texture wiring");
+
+    // --- Headless simulation over the booted scene -----------------------------------------------
+    {
+        entt::entity crateHandle = entt::null;
+        {
+            auto& registry = runtimeScene.registry();
+            for (const entt::entity entity : registry.view<engine::TagComponent>()) {
+                if (registry.get<engine::TagComponent>(entity).tag == "Crate") {
+                    crateHandle = entity;
+                }
+            }
+        }
+        check(crateHandle != entt::null, "runtime: the exported crate resolves in the booted scene");
+        engine::PhysicsSystem physics;
+        const engine::PhysicsSettings settings{};
+        const float startY = crateHandle != entt::null
+                                 ? runtimeScene.registry().get<TransformComponent>(crateHandle).position.y
+                                 : 0.0f;
+        for (int step = 0; step < 90; ++step) {
+            engine::TransformSystem::update(runtimeScene);
+            physics.update(runtimeScene, 1.0 / 60.0, settings, nullptr);
+            engine::RotationSystem::update(runtimeScene, 1.0 / 60.0);
+            engine::TransformSystem::update(runtimeScene);
+        }
+        const glm::vec3 rest = crateHandle != entt::null
+                                   ? runtimeScene.registry().get<TransformComponent>(crateHandle).position
+                                   : glm::vec3{0.0f};
+        check(std::isfinite(rest.x) && std::isfinite(rest.y) && std::isfinite(rest.z),
+              "runtime: 90 headless physics steps keep every transform finite");
+        check(startY == 2.0f && rest.y > 0.9f && rest.y < 1.1f,
+              "runtime: the crate falls from the exported scene and rests on the floor");
+    }
+
+    engine::Scene tamperedScene;
+    engine::VramBudget vram3{64ull << 20};
+    engine::VramBudget staging3{64ull << 20};
+    engine::AssetManager tamperedAssets(vram3, staging3);
+    check(!engine::loadBundleIntoRuntime(tamperedPath, tamperedAssets, tamperedScene).ok,
+          "runtime: a tampered bundle refuses to boot");
+
+    // The fixture bundle (dir/game.gbq) intentionally stays on disk:
+    // it is what `game-player --bundle <fixture> --headless 120`
+    // smoke-tests end to end.
+}
+
 void testAsyncAssetPipeline() {
     std::cout << "Async asset pipeline (Phase 20)\n";
     using engine::AssetKind;
@@ -8931,6 +9223,7 @@ int main() {
     testPhase30Gbq();
     testPhase31PlayMode();
     testPhase32Pbr();
+    testPhase33Export();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();

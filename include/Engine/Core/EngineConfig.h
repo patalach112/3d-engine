@@ -92,6 +92,10 @@ struct PerformanceConfig {
 struct GameConfig {
     std::string modulePath;
     bool moduleHotReload = true;
+    // Standalone bundle selected at boot (Phase 33): written into
+    // the exported game.ini by Export Game; the editor ignores it.
+    // Relative paths resolve against the config file's directory.
+    std::string bundlePath;
 };
 
 struct ENGINE_CORE_API EngineConfig {

@@ -201,6 +201,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/UIAssetBrowser.cpp
     src/Scene/SceneSerialization.cpp
     src/Scene/SceneBinarySerialization.cpp
+    src/Scene/ProjectExport.cpp
     src/Scene/PlaySession.cpp
     src/Scene/Components.cpp
     src/Scene/Raycast.cpp
@@ -340,6 +341,31 @@ target_compile_definitions(EngineGraphics
     PRIVATE
         ENGINE_SHADER_DIR="${SHADER_OUTPUT_DIR_SLASHES}"
 )
+
+# ---------------------------------------------------------------------------
+# Standalone game player (Phase 33): the ship build's entry point.
+# Boots a GBQB bundle written by the editor's Export Game straight
+# into the game — deliberately links no EngineApp (the editor shell
+# never ships). It resolves bundle shaders through the same
+# ENGINE_SHADER_DIR the pipeline reads, extracting any the install
+# does not already provide.
+# ---------------------------------------------------------------------------
+add_executable(game-player src/Standalone/StandaloneMain.cpp)
+target_link_libraries(game-player
+    PRIVATE EngineScene EngineAssets EngineGraphics EngineGeometry EngineCore
+            EnginePlatform EngineFoundation Threads::Threads Vulkan::Vulkan glfw
+            glm::glm EnTT::EnTT)
+engine_copy_runtime_dlls(game-player)
+add_dependencies(game-player engine_shaders)
+target_compile_definitions(game-player
+    PRIVATE
+        ENGINE_SHADER_DIR="${SHADER_OUTPUT_DIR_SLASHES}"
+)
+if(MSVC)
+    target_compile_options(game-player PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(game-player PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
 # ---------------------------------------------------------------------------
 # Engine configuration (config/engine.ini)

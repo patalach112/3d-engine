@@ -584,6 +584,11 @@ const ShaderAsset* AssetManager::shader(ShaderId id) const {
     return findById(m_shaders, id);
 }
 
+const ShaderAsset* AssetManager::shader(std::string_view name) const {
+    const auto it = m_shaderIds.find(std::string(name));
+    return it != m_shaderIds.end() ? &m_shaders[it->second - 1] : nullptr;
+}
+
 const MaterialAsset* AssetManager::material(MaterialId id) const {
     return findById(m_materials, id);
 }

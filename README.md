@@ -2428,3 +2428,72 @@ live in the Inspector.
   in Debug, Release (shared and static), hidden-visibility
   and ASan builds, warning-free, CTest 1/1; all shaders
   compile with glslangValidator 15.4.
+
+## Phase 33 — Standalone Packaging & Game Export ✅
+
+The editor can now ship what it authors: **Export Game**
+distills the live scene and every asset it references into one
+compressed, checksummed deployment bundle, and a new
+editor-free `game-player` binary boots that bundle straight
+into the game.
+
+- **`ExportProject()`** (`Scene/ProjectExport`, in
+  EngineScene): walks the scene's Mesh/NativeScript
+  components, resolves every referenced mesh, material,
+  texture and shader-pair in the AssetManager, and fails
+  *atomically* — listing every unregistered reference by
+  name, writing nothing — rather than shipping an incomplete
+  game. The bundle (new `GBQB` v1 container) carries the
+  scene as GBQ bytes plus mesh geometry (counts + raw
+  `Vertex`/index bytes), RGBA8 texture pixels, SPIR-V words,
+  material descriptions (JSON, inverse of the loader) and
+  native-script *name records* — scripts are compiled code,
+  so the bundle records which classes the build must
+  provide. Payloads are LZ77-compressed (flag-byte LZSS,
+  12-bit window, no external zlib dependency — the sandbox
+  has none) and CRC-32-checksummed; a JSON manifest inside
+  the bundle (name/kind/sizes/offset/CRC per entry) is
+  mirrored to `<name>.manifest.json` next to a generated
+  `game.ini` (`[Game] bundle`, `[Window]` defaults).
+  Exports are deterministic: same scene, byte-identical
+  bundle (Scene first, then kind/name-sorted entries,
+  8-byte-aligned blobs).
+- **`game-player`** (`src/Standalone/StandaloneMain.cpp`):
+  the ship build's entry point — links every engine
+  library *except* EngineApp, so no outliner/inspector,
+  gizmo, asset browser or editor system is even present in
+  the binary. `loadBundleIntoRuntime()` (shared with the
+  tests) registers bundle assets into a fresh AssetManager
+  and rebuilds the scene; missing native script classes
+  log an error and boot degraded, exactly like a missing
+  game module. `--headless <frames>` is the CI smoke
+  test: load, run N fixed steps (Transform → Physics →
+  Rotation → Transform), verify every transform stayed
+  finite, print a summary, exit 0/1 — no window, no GPU.
+  Windowed mode mirrors the editor's bring-up minus the
+  editor (window/input/Vulkan/pipelines/GameLoop, game
+  modules with hot reload, native scripts, CameraSystem),
+  extracts bundle SPIR-V into the shader directory when
+  the install doesn't provide it, and falls back to the
+  built-in cube + sandbox palette for assets the bundle
+  doesn't override. `[Game] bundle` is now a first-class
+  EngineConfig key, so `--config game.ini` alone boots an
+  exported game.
+- **Editor**: an **Export** segment joins the toolbar
+  after Play/Stop, exporting the live scene to
+  `assets/export/game.gbq` (+ manifest + `game.ini`); it
+  is inert in Play mode, so bundles always ship the
+  authored world.
+- **Verification**: `testPhase33Export()` adds 37 checks —
+  CRC-32 known vector, export completeness by entry kind,
+  scene/mesh/texture payload round-trips, compression of
+  flat textures, tamper → CRC refusal (extract *and*
+  boot), garbage/missing file refusal, atomic missing-
+  reference failure, byte-identical re-export,
+  `loadBundleIntoRuntime` asset/script resolution, and 90
+  simulated steps bringing the exported crate to rest on
+  the floor. `game-player --bundle <fixture> --headless
+  120` exits 0 (also under ASan); tampered/missing
+  bundles exit 1. **1084 passed, 0 failed** in Debug,
+  Release (shared and static), hidden-visibility and ASan
+  builds, warning-free, CTest 1/1.
