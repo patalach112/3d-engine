@@ -2,6 +2,7 @@
 
 #include "Physics/PhysicsEvents.h"
 
+#include <algorithm>
 #include <filesystem>
 #include "Scene/Systems/TransformSystem.h"
 
@@ -540,7 +541,22 @@ void Application::run() {
     };
     // Rendering always runs last, over fully updated scene state. The
     // return value lets GameLoop count only presented frames for FPS.
-    callbacks.render = [this](double /*interpolationAlpha*/) { return m_renderSystem.render(m_scene); };
+    callbacks.render = [this](double /*interpolationAlpha*/) {
+        // Phase 26 UI overlay: a translucent rounded backdrop panel
+        // behind the FPS HUD text plus an accent rule under it. The
+        // batch is per-frame (flushed and cleared by the renderer's
+        // overlay record), so it is issued fresh on every frame.
+        if (m_config.render.hudEnabled) {
+            UIBatch& ui = m_renderer.uiBatch();
+            ui.begin(static_cast<uint32_t>(std::max(m_window.width(), 0)),
+                     static_cast<uint32_t>(std::max(m_window.height(), 0)));
+            ui.drawRoundedRect(6.0f, 6.0f, 372.0f, 118.0f,
+                               UIRectStyle{10.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.16f}},
+                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
+            ui.drawRect(6.0f, 126.0f, 372.0f, 3.0f, glm::vec4{0.35f, 0.75f, 1.0f, 0.9f});
+        }
+        return m_renderSystem.render(m_scene);
+    };
 
     m_gameLoop.run(callbacks);
 

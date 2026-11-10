@@ -13,6 +13,7 @@
 #include "Graphics/Buffer.h"
 #include "Graphics/HudRenderer.h"
 #include "Graphics/RenderQueue.h"
+#include "Graphics/UIRenderer.h"
 #include "Graphics/ShadowMap.h"
 
 namespace engine {
@@ -134,6 +135,12 @@ public:
     // overlay re-lays-out only when the text actually changes.
     void setHudText(std::string text) { m_hud.setText(std::move(text)); }
 
+    // Accumulates this frame's Phase 26 UI primitives (panels,
+    // widgets). Issue draw calls between frames; the batch is
+    // uploaded and flushed as one overlay draw call inside the
+    // present pass, then cleared.
+    [[nodiscard]] UIBatch& uiBatch() { return m_ui.batch(); }
+
     void setPostSettings(const PostSettings& settings) { m_postSettings = settings; }
     [[nodiscard]] const PostSettings& postSettings() const { return m_postSettings; }
 
@@ -180,6 +187,7 @@ private:
     Swapchain& m_swapchain;
     GraphicsPipeline& m_pipeline;
     HudRenderer m_hud;
+    UIRenderer m_ui;
 
     std::vector<VkCommandBuffer> m_commandBuffers;
 

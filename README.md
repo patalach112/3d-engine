@@ -1741,6 +1741,54 @@ with zero warnings, CTest 1/1** — and additionally in a
 hidden-visibility build (simulating Windows DLL rules) and under
 AddressSanitizer.
 
+## Phase 26 — Custom Vulkan UI Renderer & Primitives Pipeline ✅
+
+Screen-space UI gets its own analytic-shader pipeline: rounded
+rectangles, borders and solid colors are evaluated per-pixel from
+a signed distance field — no texture atlas, no descriptors, one
+draw call per frame.
+
+- **UIVertex & analytic shaders** (`shaders/ui.vert`,
+  `shaders/ui.frag`, compiled to SPIR-V by glslangValidator like
+  every engine shader): position (pixels, top-left origin), uv
+  (0..1 across the quad), fill color, corner radius, border width,
+  border color. The fragment shader recovers the rect's exact
+  pixel size from the uv derivatives and evaluates one rounded-box
+  SDF into fill, border ring and anti-aliased coverage, so radius
+  and border stay in true pixel units at any rect size.
+- **UIBatch** (pure CPU, headless-testable): immediate-mode
+  accumulator — `begin()` per frame, `drawRect()` /
+  `drawRoundedRect()` (radius + border via `UIRectStyle`) append
+  one quad (4 vertices + 6 indices) each, and `bounds()` tracks
+  the union of all queued rects. The batch is capacity-capped
+  (65536 vertices / 98304 indices) and truncates whole quads
+  rather than overflowing; degenerate rects emit nothing.
+  `drawText()` is a stub for the future SDF/bitmap glyph batcher:
+  it accounts the item but emits no geometry yet.
+- **UIRenderer**: dedicated pipeline (dynamic viewport/scissor,
+  no depth test, alpha blending) over persistently mapped dynamic
+  vertex/index buffers; `record()` uploads the frame's batch and
+  flushes it as a single indexed draw call, then clears it. The
+  vertex-input contract lives in exactly one place
+  (`UIRenderer::vertexInput()`), shared by pipeline creation and
+  the tests.
+- **Integration**: `Renderer` owns the UIRenderer next to the HUD
+  and records it inside the present pass right after the 3D
+  composite, under the HUD text; the Application issues a
+  translucent rounded backdrop panel plus an accent rule behind
+  the FPS HUD every frame through `Renderer::uiBatch()`.
+
+Verification: 20 new headless checks cover vertex accumulation
+and corner/uv layout, index offsets across quads, batch-bounds
+unions (including negative origins), radius/border clamping,
+degenerate-input rejection, the drawText stub contract, the
+vertex-input layout (binding stride + all six attribute
+offsets/formats), and capacity truncation staying
+index-consistent. **807 checks pass in Debug, Release-shared
+and Release-static with zero warnings, CTest 1/1** — and
+additionally in a hidden-visibility build (simulating Windows
+DLL rules) and under AddressSanitizer.
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be

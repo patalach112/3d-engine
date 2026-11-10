@@ -239,7 +239,7 @@ void destroyImageTriple(VkDevice device, VkImage& image, VkDeviceMemory& memory,
 Renderer::Renderer(VulkanContext& context, Window& window, Swapchain& swapchain, GraphicsPipeline& pipeline,
                    uint32_t maxFramesInFlight)
     : m_context(context), m_window(window), m_swapchain(swapchain), m_pipeline(pipeline),
-      m_hud(context, swapchain),
+      m_hud(context, swapchain), m_ui(context, swapchain),
       m_framesInFlight(std::clamp(maxFramesInFlight, 1u, static_cast<uint32_t>(kMaxFramesInFlight))) {
     createVertexBuffer();
     createIndexBuffer();
@@ -1042,6 +1042,11 @@ void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageInde
     vkCmdPushConstants(commandBuffer, m_postPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(CompositePush),
                        &push);
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+    // Phase 26 UI overlay (analytic rounded-rect panels/widgets),
+    // drawn on the presented image after the composite, under the
+    // FPS HUD text.
+    m_ui.record(commandBuffer, extent);
 
     // FPS HUD overlay, drawn on the presented image after the composite.
     m_hud.record(commandBuffer, extent);

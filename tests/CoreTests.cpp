@@ -34,6 +34,7 @@
 #include "Graphics/VramBudget.h"
 #include "Graphics/HudFont.h"
 #include "Graphics/RenderQueue.h"
+#include "Graphics/UIRenderer.h"
 #include "Graphics/ShadowMap.h"
 #include "Graphics/Renderer.h"
 #include "Graphics/Swapchain.h"
@@ -6779,6 +6780,105 @@ void testPhase25ReflectionScripting() {
     }
 }
 
+void testPhase26UIRenderer() {
+    const glm::vec4 fill{0.2f, 0.4f, 0.8f, 0.9f};
+
+    // --- (a) Batch basics: one rect becomes one quad ----------------------
+    engine::UIBatch batch;
+    check(batch.empty() && batch.vertices().empty() && batch.indices().empty() && batch.bounds().empty,
+          "ui: a fresh batch is empty with empty bounds");
+    batch.begin(1280, 720);
+    check(batch.viewportWidth() == 1280 && batch.viewportHeight() == 720, "ui: begin records the viewport");
+    batch.drawRect(10.0f, 20.0f, 100.0f, 50.0f, fill);
+    check(batch.vertices().size() == 4 && batch.indices().size() == 6,
+          "ui: one rect accumulates 4 vertices / 6 indices");
+    {
+        const std::vector<engine::UIVertex>& v = batch.vertices();
+        check(v[0].position == glm::vec2{10.0f, 20.0f} && v[0].uv == glm::vec2{0.0f, 0.0f} &&
+                  v[2].position == glm::vec2{110.0f, 70.0f} && v[2].uv == glm::vec2{1.0f, 1.0f},
+              "ui: quad corners span the rect with 0..1 uv");
+        check(v[0].color == fill && v[0].cornerRadius == 0.0f && v[0].borderWidth == 0.0f,
+              "ui: solid rect carries fill color and no rounding/border");
+        const std::vector<uint32_t>& idx = batch.indices();
+        check(idx[0] == 0 && idx[1] == 1 && idx[2] == 2 && idx[3] == 0 && idx[4] == 2 && idx[5] == 3,
+              "ui: indices form two triangles over the quad");
+        const engine::UIBounds b = batch.bounds();
+        check(!b.empty && b.minX == 10.0f && b.minY == 20.0f && b.maxX == 110.0f && b.maxY == 70.0f &&
+                  b.width() == 100.0f && b.height() == 50.0f,
+              "ui: batch bounds equal the single rect");
+    }
+
+    // --- (b) Accumulation + bounds union ----------------------------------
+    batch.drawRect(-5.0f, 60.0f, 20.0f, 20.0f, fill);
+    check(batch.vertices().size() == 8 && batch.indices().size() == 12, "ui: a second rect appends a second quad");
+    check(batch.indices()[6] == 4 && batch.indices()[11] == 7, "ui: appended quad indices offset by the vertex base");
+    {
+        const engine::UIBounds b = batch.bounds();
+        check(b.minX == -5.0f && b.minY == 20.0f && b.maxX == 110.0f && b.maxY == 80.0f,
+              "ui: batch bounds are the union of all rects");
+    }
+
+    // --- (c) Rounding / border styling --------------------------------------
+    batch.begin(800, 600);
+    batch.drawRoundedRect(0.0f, 0.0f, 40.0f, 20.0f, 999.0f, fill);
+    check(batch.vertices()[0].cornerRadius == 10.0f, "ui: corner radius clamps to half the short side");
+    const glm::vec4 border{1.0f, 1.0f, 1.0f, 0.5f};
+    batch.drawRoundedRect(0.0f, 30.0f, 30.0f, 30.0f, engine::UIRectStyle{6.0f, 999.0f, border}, fill);
+    check(batch.vertices()[4].cornerRadius == 6.0f && batch.vertices()[4].borderWidth == 15.0f &&
+              batch.vertices()[4].borderColor == border,
+          "ui: styled rect carries radius, clamped border width and border color");
+
+    // --- (d) Degenerate calls + the drawText stub ---------------------------
+    const size_t vertsBefore = batch.vertices().size();
+    batch.drawRect(0.0f, 0.0f, 0.0f, 10.0f, fill);
+    batch.drawRoundedRect(0.0f, 0.0f, 10.0f, -3.0f, 2.0f, fill);
+    check(batch.vertices().size() == vertsBefore, "ui: degenerate (zero/negative size) rects emit nothing");
+    batch.drawText("FPS 60", 12.0f, 12.0f, 2.0f, fill);
+    batch.drawText("", 0.0f, 0.0f, 1.0f, fill);
+    check(batch.textItemCount() == 1 && batch.vertices().size() == vertsBefore,
+          "ui: drawText stub records non-empty items but emits no geometry yet");
+
+    // --- (e) Vertex input contract (pipeline creation safety) ---------------
+    {
+        const engine::UIRenderer::VertexInput input = engine::UIRenderer::vertexInput();
+        check(input.binding.binding == 0 && input.binding.inputRate == VK_VERTEX_INPUT_RATE_VERTEX &&
+                  input.binding.stride == sizeof(engine::UIVertex),
+              "ui: vertex binding 0 is per-vertex with stride sizeof(UIVertex)");
+        const std::array<VkVertexInputAttributeDescription, 6>& a = input.attributes;
+        check(a[0].location == 0 && a[0].format == VK_FORMAT_R32G32_SFLOAT &&
+                  a[0].offset == offsetof(engine::UIVertex, position) &&
+                  a[1].location == 1 && a[1].format == VK_FORMAT_R32G32_SFLOAT &&
+                  a[1].offset == offsetof(engine::UIVertex, uv) &&
+                  a[2].location == 2 && a[2].format == VK_FORMAT_R32G32B32A32_SFLOAT &&
+                  a[2].offset == offsetof(engine::UIVertex, color),
+              "ui: position/uv/color attributes match the UIVertex layout");
+        check(a[3].location == 3 && a[3].format == VK_FORMAT_R32_SFLOAT &&
+                  a[3].offset == offsetof(engine::UIVertex, cornerRadius) &&
+                  a[4].location == 4 && a[4].format == VK_FORMAT_R32_SFLOAT &&
+                  a[4].offset == offsetof(engine::UIVertex, borderWidth) &&
+                  a[5].location == 5 && a[5].format == VK_FORMAT_R32G32B32A32_SFLOAT &&
+                  a[5].offset == offsetof(engine::UIVertex, borderColor),
+              "ui: radius/border attributes match the UIVertex layout");
+    }
+
+    // --- (f) Capacity truncation stays index-consistent ----------------------
+    batch.begin(64, 64);
+    while (!batch.truncated()) {
+        batch.drawRect(0.0f, 0.0f, 4.0f, 4.0f, fill);
+    }
+    check(batch.vertices().size() == engine::UIBatch::kMaxVertices &&
+              batch.indices().size() == engine::UIBatch::kMaxIndices,
+          "ui: batch truncates exactly at capacity instead of overflowing");
+    uint32_t maxIndex = 0;
+    for (const uint32_t index : batch.indices()) {
+        maxIndex = std::max(maxIndex, index);
+    }
+    check(maxIndex < batch.vertices().size(), "ui: every index references an emitted vertex");
+    batch.begin(64, 64);
+    check(batch.empty() && !batch.truncated() && batch.textItemCount() == 0,
+          "ui: begin resets geometry, text items and truncation");
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -6804,6 +6904,7 @@ int main() {
     testPhase23GameModules();
     testPhase24SpaceFlight();
     testPhase25ReflectionScripting();
+    testPhase26UIRenderer();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

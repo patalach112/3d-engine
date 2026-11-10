@@ -178,6 +178,7 @@ engine_module(EngineGraphics ENGINE_BUILDING_GRAPHICS
     src/Graphics/Buffer.cpp
     src/Graphics/HudFont.cpp
     src/Graphics/HudRenderer.cpp
+    src/Graphics/UIRenderer.cpp
     src/Graphics/Renderer.cpp
 )
 target_link_libraries(EngineGraphics
@@ -289,6 +290,8 @@ set(SHADER_SOURCES
     ${SHADER_SOURCE_DIR}/composite.frag
     ${SHADER_SOURCE_DIR}/hud.vert
     ${SHADER_SOURCE_DIR}/hud.frag
+    ${SHADER_SOURCE_DIR}/ui.vert
+    ${SHADER_SOURCE_DIR}/ui.frag
 )
 
 set(SHADER_OUTPUTS "")
