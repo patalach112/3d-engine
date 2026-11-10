@@ -238,8 +238,23 @@ void Swapchain::createFramebuffers() {
 }
 
 VkSurfaceFormatKHR Swapchain::chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats) const {
+    // UNORM, deliberately -- not the usual SRGB preference. The
+    // composite pass tone-maps and encodes linear->sRGB itself, and
+    // the UI/HUD passes write display-ready sRGB values (the theme
+    // palette is authored as final hex colours). With an SRGB
+    // swapchain the hardware applies the sRGB encode a second time
+    // on every store: near-black theme values lift ~4x (a #121214
+    // panel displays as washed-out light grey) and the tone-mapped
+    // scene goes pastel. Writing the encoded values raw through a
+    // UNORM target keeps both exactly as authored.
     for (const VkSurfaceFormatKHR& format : formats) {
-        if (format.format == VK_FORMAT_B8G8R8A8_SRGB &&
+        if (format.format == VK_FORMAT_B8G8R8A8_UNORM &&
+            format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            return format;
+        }
+    }
+    for (const VkSurfaceFormatKHR& format : formats) {
+        if (format.format == VK_FORMAT_R8G8B8A8_UNORM &&
             format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             return format;
         }

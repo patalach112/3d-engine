@@ -1,4 +1,4 @@
-#include "Graphics/SdfFont.h"
+#include "Graphics/BitmapFont.h"
 
 #include "Graphics/HudFont.h"
 
@@ -35,25 +35,7 @@ namespace engine {
 namespace {
 
 constexpr uint32_t kAtlasColumns = 16;
-constexpr uint32_t kGlyphTexelOffset = 2; // glyph box inset inside a cell, texels
-
-// Exact squared distance from (x, y) to the nearest texel in `targets`.
-uint32_t nearestDistanceSquared(uint32_t x, uint32_t y, const std::vector<uint32_t>& targetsX,
-                                const std::vector<uint32_t>& targetsY) {
-    uint32_t best = 0xFFFFFFFFu;
-    for (size_t i = 0; i < targetsX.size(); ++i) {
-        const int dx = static_cast<int>(x) - static_cast<int>(targetsX[i]);
-        const int dy = static_cast<int>(y) - static_cast<int>(targetsY[i]);
-        const uint32_t dist = static_cast<uint32_t>(dx * dx + dy * dy);
-        if (dist < best) {
-            best = dist;
-            if (best <= 1) {
-                break; // cannot do better than an adjacent texel
-            }
-        }
-    }
-    return best;
-}
+constexpr uint32_t kFallbackTexelOffset = 2; // glyph box inset inside a cell, texels
 
 struct BlobWriter {
     std::vector<uint8_t> bytes;
@@ -100,11 +82,11 @@ std::vector<uint8_t> readWholeFile(const std::filesystem::path& path) {
 
 } // namespace
 
-const SdfGlyph& SdfFontAtlas::glyphFor(char character) const {
+const FontGlyph& FontAtlas::glyphFor(char character) const {
     const auto code = static_cast<uint32_t>(static_cast<unsigned char>(character));
-    const uint32_t fallback = static_cast<uint32_t>('?') - kSdfFirstChar;
+    const uint32_t fallback = static_cast<uint32_t>('?') - kFontFirstChar;
     const uint32_t index =
-        (code >= kSdfFirstChar && code <= kSdfLastChar) ? code - kSdfFirstChar : fallback;
+        (code >= kFontFirstChar && code <= kFontLastChar) ? code - kFontFirstChar : fallback;
     return glyphs[index];
 }
 
@@ -138,8 +120,8 @@ std::vector<std::string> uiFontCandidatePaths() {
     return paths;
 }
 
-SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float pixelHeight) {
-    SdfFontAtlas atlas;
+FontAtlas generateTrueTypeBitmapAtlas(std::span<const uint8_t> fontBytes, float pixelHeight) {
+    FontAtlas atlas;
     if (fontBytes.size() < 12 || pixelHeight <= 4.0f) {
         return atlas;
     }
@@ -162,10 +144,9 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
         return atlas;
     }
 
-    // Bake large, report small: glyphs are rasterized at `pixelHeight`
-    // for a crisp distance field, then every metric is divided into
-    // font units (em = kUiFontUnitsPerEm) so drawText scale semantics
-    // stay independent of the bake resolution.
+    // Rasterize at the target pixel size, report in font units: every
+    // metric is scaled into the kUiFontUnitsPerEm em so drawText
+    // scale semantics stay independent of the bake resolution.
     const float scale = stbtt_ScaleForPixelHeight(&font, pixelHeight);
     const float unitsPerPixel = kUiFontUnitsPerEm / pixelHeight;
     int ascentPx = 0;
@@ -177,56 +158,54 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
     atlas.lineHeight = static_cast<float>(ascentPx - descentPx + lineGapPx) * scale * unitsPerPixel;
     atlas.trueType = true;
 
-    // Rasterize every printable ASCII glyph's SDF, then shelf-pack
-    // the bitmaps into one page. Blank glyphs (space) only advance.
+    // Rasterize every printable ASCII glyph's coverage bitmap, then
+    // shelf-pack the bitmaps into one page. Blank glyphs (space)
+    // only advance. stbtt_GetCodepointBitmap returns 8-bit coverage
+    // with integer pen offsets -- the glyph is drawn exactly as it
+    // will appear, no field reconstruction in the shader.
     struct BakedGlyph {
         std::vector<uint8_t> bitmap;
         int width = 0;
         int height = 0;
     };
-    std::array<BakedGlyph, kSdfGlyphCount> baked;
-    constexpr int kPadding = 6;               // SDF halo, bake pixels
-    constexpr unsigned char kOnEdge = 128;    // shader thresholds at 0.5
-    uint32_t shelfWidth = 0;
-    for (uint32_t index = 0; index < kSdfGlyphCount; ++index) {
-        const int codepoint = static_cast<int>(kSdfFirstChar + index);
+    std::array<BakedGlyph, kFontGlyphCount> baked;
+    for (uint32_t index = 0; index < kFontGlyphCount; ++index) {
+        const int codepoint = static_cast<int>(kFontFirstChar + index);
         const int glyphIndex = stbtt_FindGlyphIndex(&font, codepoint);
         int advanceWidth = 0;
         int leftSideBearing = 0;
         stbtt_GetGlyphHMetrics(&font, glyphIndex, &advanceWidth, &leftSideBearing);
-        SdfGlyph& glyph = atlas.glyphs[index];
+        FontGlyph& glyph = atlas.glyphs[index];
         glyph.advance = static_cast<float>(advanceWidth) * scale * unitsPerPixel;
 
         int width = 0;
         int height = 0;
         int xoff = 0;
         int yoff = 0;
-        unsigned char* sdf = stbtt_GetGlyphSDF(&font, scale, glyphIndex, kPadding, kOnEdge,
-                                               static_cast<float>(kOnEdge) / static_cast<float>(kPadding),
-                                               &width, &height, &xoff, &yoff);
-        if (sdf != nullptr && width > 0 && height > 0) {
+        unsigned char* bitmap =
+            stbtt_GetCodepointBitmap(&font, 0.0f, scale, codepoint, &width, &height, &xoff, &yoff);
+        if (bitmap != nullptr && width > 0 && height > 0) {
             BakedGlyph& entry = baked[index];
             entry.width = width;
             entry.height = height;
-            entry.bitmap.assign(sdf, sdf + static_cast<size_t>(width) * static_cast<size_t>(height));
+            entry.bitmap.assign(bitmap, bitmap + static_cast<size_t>(width) * static_cast<size_t>(height));
             glyph.bearingX = static_cast<float>(xoff) * unitsPerPixel;
             glyph.bearingY = static_cast<float>(yoff) * unitsPerPixel;
             glyph.width = static_cast<float>(width) * unitsPerPixel;
             glyph.height = static_cast<float>(height) * unitsPerPixel;
-            shelfWidth += static_cast<uint32_t>(width) + 8; // matches kGlyphGapTexels below
         }
-        if (sdf != nullptr) {
-            stbtt_FreeSDF(sdf, nullptr);
+        if (bitmap != nullptr) {
+            stbtt_FreeBitmap(bitmap, nullptr);
         }
     }
-    atlas.advance = atlas.glyphs[static_cast<size_t>('M' - kSdfFirstChar)].advance;
+    atlas.advance = atlas.glyphs[static_cast<size_t>('M' - kFontFirstChar)].advance;
 
     // Pairwise kerning (font units) for every ASCII pair the font
     // kerns; most pairs stay exactly 0.
-    for (uint32_t first = 0; first < kSdfGlyphCount; ++first) {
-        for (uint32_t second = 0; second < kSdfGlyphCount; ++second) {
+    for (uint32_t first = 0; first < kFontGlyphCount; ++first) {
+        for (uint32_t second = 0; second < kFontGlyphCount; ++second) {
             const int kern = stbtt_GetCodepointKernAdvance(
-                &font, static_cast<int>(kSdfFirstChar + first), static_cast<int>(kSdfFirstChar + second));
+                &font, static_cast<int>(kFontFirstChar + first), static_cast<int>(kFontFirstChar + second));
             if (kern != 0) {
                 atlas.kerning[first][second] = static_cast<float>(kern) * scale * unitsPerPixel;
             }
@@ -234,18 +213,17 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
     }
 
     // Shelf-pack: rows of glyphs left-to-right, page grows downwards.
-    // Neighbouring glyphs keep an 8-texel empty moat: the atlas is
-    // mip-mapped (text renders at ~1/4 of the 48 px bake), and with
-    // the old 2-texel gap the wider mip footprints averaged a
-    // neighbour's bright ink into this glyph's halo — the white
-    // streaks that smeared across labels. 8 texels keeps even the
-    // mip-3 footprint inside empty space at UI text sizes.
-    constexpr uint32_t kGlyphGapTexels = 8;
+    // Neighbouring glyphs keep a 2-texel empty gap: glyph rects are
+    // the exact bitmaps, so a bilinear tap at a quad edge lands in
+    // zero-coverage texels and no neighbour ink can bleed in (and at
+    // the modest minification between bake and screen sizes, even
+    // the mip footprint stays inside the gap).
+    constexpr uint32_t kGlyphGapTexels = 2;
     atlas.width = 1024;
     uint32_t penX = 1;
     uint32_t penY = 1;
     uint32_t shelfHeight = 0;
-    for (uint32_t index = 0; index < kSdfGlyphCount; ++index) {
+    for (uint32_t index = 0; index < kFontGlyphCount; ++index) {
         const BakedGlyph& entry = baked[index];
         if (entry.width <= 0 || entry.height <= 0) {
             continue;
@@ -255,7 +233,7 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
             penY += shelfHeight + kGlyphGapTexels;
             shelfHeight = 0;
         }
-        SdfGlyph& glyph = atlas.glyphs[index];
+        FontGlyph& glyph = atlas.glyphs[index];
         glyph.u0 = static_cast<float>(penX);
         glyph.v0 = static_cast<float>(penY);
         glyph.u1 = static_cast<float>(penX + static_cast<uint32_t>(entry.width));
@@ -269,7 +247,7 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
     penX = 1;
     penY = 1;
     shelfHeight = 0;
-    for (uint32_t index = 0; index < kSdfGlyphCount; ++index) {
+    for (uint32_t index = 0; index < kFontGlyphCount; ++index) {
         const BakedGlyph& entry = baked[index];
         if (entry.width <= 0 || entry.height <= 0) {
             continue;
@@ -284,7 +262,7 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
                         &entry.bitmap[static_cast<size_t>(row) * static_cast<size_t>(entry.width)],
                         static_cast<size_t>(entry.width));
         }
-        SdfGlyph& glyph = atlas.glyphs[index];
+        FontGlyph& glyph = atlas.glyphs[index];
         glyph.u0 /= static_cast<float>(atlas.width);
         glyph.v0 /= static_cast<float>(atlas.height);
         glyph.u1 /= static_cast<float>(atlas.width);
@@ -292,17 +270,16 @@ SdfFontAtlas generateTrueTypeFontAtlas(std::span<const uint8_t> fontBytes, float
         penX += static_cast<uint32_t>(entry.width) + kGlyphGapTexels;
         shelfHeight = std::max(shelfHeight, static_cast<uint32_t>(entry.height));
     }
-    (void)shelfWidth;
     return atlas;
 }
 
-SdfFontAtlas generateSdfFontAtlas() {
+FontAtlas generateFontAtlas() {
     for (const std::string& candidate : uiFontCandidatePaths()) {
         const std::vector<uint8_t> bytes = readWholeFile(candidate);
         if (bytes.empty()) {
             continue;
         }
-        SdfFontAtlas atlas = generateTrueTypeFontAtlas(bytes);
+        FontAtlas atlas = generateTrueTypeBitmapAtlas(bytes);
         if (!atlas.empty()) {
             atlas.fontName = candidate;
             return atlas;
@@ -311,87 +288,50 @@ SdfFontAtlas generateSdfFontAtlas() {
     return generateBitmapFallbackAtlas();
 }
 
-SdfFontAtlas generateBitmapFallbackAtlas() {
-    SdfFontAtlas atlas;
-    atlas.width = kAtlasColumns * kSdfCellWidth;
-    atlas.height = ((kSdfGlyphCount + kAtlasColumns - 1) / kAtlasColumns) * kSdfCellHeight;
+FontAtlas generateBitmapFallbackAtlas() {
+    FontAtlas atlas;
+    atlas.width = kAtlasColumns * kFallbackCellWidth;
+    atlas.height = ((kFontGlyphCount + kAtlasColumns - 1) / kAtlasColumns) * kFallbackCellHeight;
     atlas.pixels.assign(static_cast<size_t>(atlas.width) * atlas.height, 0);
     atlas.advance = static_cast<float>(kHudGlyphAdvance);
     atlas.lineHeight = static_cast<float>(kHudLineAdvance);
     atlas.ascent = static_cast<float>(kHudGlyphHeight);
     atlas.descent = 0.0f;
-    atlas.cellWidth = static_cast<float>(kSdfCellWidth) / static_cast<float>(kSdfGlyphScale);
-    atlas.cellHeight = static_cast<float>(kSdfCellHeight) / static_cast<float>(kSdfGlyphScale);
-    atlas.cellInset = static_cast<float>(kGlyphTexelOffset) / static_cast<float>(kSdfGlyphScale);
+    atlas.cellWidth = static_cast<float>(kFallbackCellWidth) / static_cast<float>(kFallbackGlyphScale);
+    atlas.cellHeight = static_cast<float>(kFallbackCellHeight) / static_cast<float>(kFallbackGlyphScale);
+    atlas.cellInset = static_cast<float>(kFallbackTexelOffset) / static_cast<float>(kFallbackGlyphScale);
     atlas.trueType = false;
 
-    std::vector<uint8_t> mask(kSdfCellWidth * kSdfCellHeight);
-    std::vector<uint32_t> insideX;
-    std::vector<uint32_t> insideY;
-    std::vector<uint32_t> outsideX;
-    std::vector<uint32_t> outsideY;
-
-    for (uint32_t index = 0; index < kSdfGlyphCount; ++index) {
-        const char character = static_cast<char>(kSdfFirstChar + index);
+    for (uint32_t index = 0; index < kFontGlyphCount; ++index) {
+        const char character = static_cast<char>(kFontFirstChar + index);
         const HudGlyph& rows = hudGlyphFor(character);
-        std::fill(mask.begin(), mask.end(), 0);
-        // Rasterize the 5x7 bitmap into the cell at kSdfGlyphScale.
+        const uint32_t cellX = (index % kAtlasColumns) * kFallbackCellWidth;
+        const uint32_t cellY = (index / kAtlasColumns) * kFallbackCellHeight;
+        // Rasterize the 5x7 bitmap into the cell at
+        // kFallbackGlyphScale as hard coverage: '#' texels are solid
+        // ink, everything else is empty. (The pre-bitmap-text bake
+        // converted this mask into a distance field; with coverage
+        // text the mask IS the atlas.)
         for (uint32_t gy = 0; gy < kHudGlyphHeight; ++gy) {
             for (uint32_t gx = 0; gx < kHudGlyphWidth; ++gx) {
                 if (rows[gy][gx] != '#') {
                     continue;
                 }
-                for (uint32_t ty = 0; ty < kSdfGlyphScale; ++ty) {
-                    for (uint32_t tx = 0; tx < kSdfGlyphScale; ++tx) {
-                        const uint32_t x = kGlyphTexelOffset + gx * kSdfGlyphScale + tx;
-                        const uint32_t y = kGlyphTexelOffset + gy * kSdfGlyphScale + ty;
-                        mask[y * kSdfCellWidth + x] = 1;
+                for (uint32_t ty = 0; ty < kFallbackGlyphScale; ++ty) {
+                    for (uint32_t tx = 0; tx < kFallbackGlyphScale; ++tx) {
+                        const uint32_t x = cellX + kFallbackTexelOffset + gx * kFallbackGlyphScale + tx;
+                        const uint32_t y = cellY + kFallbackTexelOffset + gy * kFallbackGlyphScale + ty;
+                        atlas.pixels[y * atlas.width + x] = 255;
                     }
                 }
             }
         }
-        insideX.clear();
-        insideY.clear();
-        outsideX.clear();
-        outsideY.clear();
-        for (uint32_t y = 0; y < kSdfCellHeight; ++y) {
-            for (uint32_t x = 0; x < kSdfCellWidth; ++x) {
-                if (mask[y * kSdfCellWidth + x] != 0) {
-                    insideX.push_back(x);
-                    insideY.push_back(y);
-                } else {
-                    outsideX.push_back(x);
-                    outsideY.push_back(y);
-                }
-            }
-        }
 
-        const uint32_t cellX = (index % kAtlasColumns) * kSdfCellWidth;
-        const uint32_t cellY = (index / kAtlasColumns) * kSdfCellHeight;
-        for (uint32_t y = 0; y < kSdfCellHeight; ++y) {
-            for (uint32_t x = 0; x < kSdfCellWidth; ++x) {
-                const bool inside = mask[y * kSdfCellWidth + x] != 0;
-                // An empty opposite set (blank glyph) reads as fully outside.
-                float signedDistance = -static_cast<float>(kSdfSpread);
-                if (inside && !outsideX.empty()) {
-                    signedDistance = std::sqrt(
-                        static_cast<float>(nearestDistanceSquared(x, y, outsideX, outsideY)));
-                } else if (!inside && !insideX.empty()) {
-                    signedDistance = -std::sqrt(
-                        static_cast<float>(nearestDistanceSquared(x, y, insideX, insideY)));
-                }
-                const float value =
-                    std::clamp(0.5f + 0.5f * signedDistance / static_cast<float>(kSdfSpread), 0.0f, 1.0f);
-                atlas.pixels[(cellY + y) * atlas.width + (cellX + x)] =
-                    static_cast<uint8_t>(std::lround(value * 255.0f));
-            }
-        }
-
-        SdfGlyph& glyph = atlas.glyphs[index];
+        FontGlyph& glyph = atlas.glyphs[index];
         glyph.u0 = static_cast<float>(cellX) / static_cast<float>(atlas.width);
         glyph.v0 = static_cast<float>(cellY) / static_cast<float>(atlas.height);
-        glyph.u1 = static_cast<float>(cellX + kSdfCellWidth) / static_cast<float>(atlas.width);
-        glyph.v1 = static_cast<float>(cellY + kSdfCellHeight) / static_cast<float>(atlas.height);
+        glyph.u1 = static_cast<float>(cellX + kFallbackCellWidth) / static_cast<float>(atlas.width);
+        glyph.v1 = static_cast<float>(cellY + kFallbackCellHeight) / static_cast<float>(atlas.height);
         glyph.advance = atlas.advance;
         // Baseline-layout equivalents of the old cell blit: the quad
         // sat at (pen - inset, lineTop - inset) with lineTop one
@@ -404,10 +344,10 @@ SdfFontAtlas generateBitmapFallbackAtlas() {
     return atlas;
 }
 
-std::vector<uint8_t> saveSdfFontAtlas(const SdfFontAtlas& atlas) {
+std::vector<uint8_t> saveFontAtlas(const FontAtlas& atlas) {
     BlobWriter writer;
-    writer.writeBytes(std::array<uint8_t, 4>{'E', 'S', 'D', 'F'});
-    writer.write<uint32_t>(2); // format version (v2: metrics + kerning)
+    writer.writeBytes(std::array<uint8_t, 4>{'G', 'B', 'M', 'F'});
+    writer.write<uint32_t>(1); // format version (bitmap coverage atlas)
     writer.write(atlas.width);
     writer.write(atlas.height);
     writer.write(atlas.advance);
@@ -418,8 +358,8 @@ std::vector<uint8_t> saveSdfFontAtlas(const SdfFontAtlas& atlas) {
     writer.write(atlas.ascent);
     writer.write(atlas.descent);
     writer.write<uint32_t>(atlas.trueType ? 1u : 0u);
-    writer.write(kSdfGlyphCount);
-    for (const SdfGlyph& glyph : atlas.glyphs) {
+    writer.write(kFontGlyphCount);
+    for (const FontGlyph& glyph : atlas.glyphs) {
         writer.write(glyph.u0);
         writer.write(glyph.v0);
         writer.write(glyph.u1);
@@ -443,25 +383,25 @@ std::vector<uint8_t> saveSdfFontAtlas(const SdfFontAtlas& atlas) {
     return writer.bytes;
 }
 
-bool loadSdfFontAtlas(std::span<const uint8_t> blob, SdfFontAtlas& out) {
+bool loadFontAtlas(std::span<const uint8_t> blob, FontAtlas& out) {
     BlobReader reader{blob, 0};
     std::array<uint8_t, 4> magic{};
     uint32_t version = 0;
     uint32_t glyphCount = 0;
     uint32_t trueType = 0;
     uint32_t nameSize = 0;
-    SdfFontAtlas atlas;
-    if (!reader.read(magic) || magic != std::array<uint8_t, 4>{'E', 'S', 'D', 'F'} ||
-        !reader.read(version) || version != 2 || !reader.read(atlas.width) || !reader.read(atlas.height) ||
+    FontAtlas atlas;
+    if (!reader.read(magic) || magic != std::array<uint8_t, 4>{'G', 'B', 'M', 'F'} ||
+        !reader.read(version) || version != 1 || !reader.read(atlas.width) || !reader.read(atlas.height) ||
         atlas.width == 0 || atlas.height == 0 || atlas.width > 16384 || atlas.height > 16384 ||
         !reader.read(atlas.advance) || !reader.read(atlas.lineHeight) || !reader.read(atlas.cellWidth) ||
         !reader.read(atlas.cellHeight) || !reader.read(atlas.cellInset) || !reader.read(atlas.ascent) ||
         !reader.read(atlas.descent) || !reader.read(trueType) || !reader.read(glyphCount) ||
-        glyphCount != kSdfGlyphCount) {
+        glyphCount != kFontGlyphCount) {
         return false;
     }
     atlas.trueType = trueType != 0;
-    for (SdfGlyph& glyph : atlas.glyphs) {
+    for (FontGlyph& glyph : atlas.glyphs) {
         if (!reader.read(glyph.u0) || !reader.read(glyph.v0) || !reader.read(glyph.u1) ||
             !reader.read(glyph.v1) || !reader.read(glyph.advance) || !reader.read(glyph.bearingX) ||
             !reader.read(glyph.bearingY) || !reader.read(glyph.width) || !reader.read(glyph.height)) {

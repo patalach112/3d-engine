@@ -114,7 +114,7 @@ uint32_t decodeUtf8(std::string_view text, size_t& index) {
 // Atlas characters are printable ASCII; everything else (including
 // decoded non-ASCII codepoints) draws as '?', matching glyphFor.
 char atlasChar(uint32_t codepoint) {
-    return codepoint >= kSdfFirstChar && codepoint <= kSdfLastChar ? static_cast<char>(codepoint) : '?';
+    return codepoint >= kFontFirstChar && codepoint <= kFontLastChar ? static_cast<char>(codepoint) : '?';
 }
 
 } // namespace
@@ -127,7 +127,7 @@ void UIBatch::drawText(std::string_view text, float x, float y, float scale, con
     if (m_fontAtlas == nullptr || scale <= 0.0f) {
         return; // accounting stub until a font atlas is set
     }
-    const SdfFontAtlas& atlas = *m_fontAtlas;
+    const FontAtlas& atlas = *m_fontAtlas;
     float penX = x;
     // (x, y) is the first line's top; the baseline sits one ascent
     // below it, and each glyph quad hangs off the baseline by its
@@ -150,11 +150,17 @@ void UIBatch::drawText(std::string_view text, float x, float y, float scale, con
         if (previous != '\0') {
             penX += atlas.kernFor(previous, character) * scale;
         }
-        const SdfGlyph& glyph = atlas.glyphFor(character);
+        const FontGlyph& glyph = atlas.glyphFor(character);
         if (glyph.width > 0.0f && glyph.height > 0.0f) {
-            addQuad(penX + glyph.bearingX * scale, baselineY + glyph.bearingY * scale,
-                    glyph.width * scale, glyph.height * scale, UIRectStyle{}, color, kUITextPrimitive,
-                    kUIFontTexture, glm::vec4{glyph.u0, glyph.v0, glyph.u1, glyph.v1});
+            // Snap the quad origin to a whole pixel. The atlas is
+            // baked at the target pixel size, so a stem that starts
+            // on a pixel boundary keeps its rasterized coverage; a
+            // fractional origin would smear half of every thin
+            // stroke into the neighbouring pixel and grey it out.
+            const float quadX = std::floor(penX + glyph.bearingX * scale + 0.5f);
+            const float quadY = std::floor(baselineY + glyph.bearingY * scale + 0.5f);
+            addQuad(quadX, quadY, glyph.width * scale, glyph.height * scale, UIRectStyle{}, color,
+                    kUITextPrimitive, kUIFontTexture, glm::vec4{glyph.u0, glyph.v0, glyph.u1, glyph.v1});
         }
         penX += glyph.advance * scale;
         previous = character;
@@ -287,7 +293,7 @@ UIRenderer::VertexInput UIRenderer::vertexInput() {
 
 UIRenderer::UIRenderer(VulkanContext& context, const Swapchain& swapchain) : m_context(context) {
     createBuffers();
-    m_fontAtlas = generateSdfFontAtlas();
+    m_fontAtlas = generateFontAtlas();
     m_batch.setFontAtlas(&m_fontAtlas);
     createFontAtlasTexture();
     createPipeline(swapchain);
@@ -427,12 +433,12 @@ void UIRenderer::createFontAtlasTexture() {
     std::memcpy(staging.mappedData(), m_fontAtlas.pixels.data(), m_fontAtlas.pixels.size());
     staging.unmap();
 
-    // Editor text is drawn at roughly a quarter of the 48 px bake
-    // size, i.e. ~4x minified. Sampling a single mip level there
-    // makes the fragment shader's fwidth() gradient estimate noisy
-    // (glyphs shimmer and thin strokes wash out), so the atlas gets
-    // a full mip chain wherever the device can blit one; the
-    // single-level path stays as the portable fallback.
+    // Editor text is drawn close to (just under) the 20 px bake
+    // size. Coverage filters linearly -- each mip level is the
+    // exact area coverage of the next -- so a full mip chain keeps
+    // labels smooth when a small window shrinks them further,
+    // without the threshold wash-out a distance field suffered.
+    // The single-level path stays as the portable fallback.
     uint32_t mipLevels = 1;
     {
         VkFormatProperties properties{};

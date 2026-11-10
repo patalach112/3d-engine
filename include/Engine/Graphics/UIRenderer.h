@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "Graphics/Buffer.h"
-#include "Graphics/SdfFont.h"
+#include "Graphics/BitmapFont.h"
 
 namespace engine {
 
@@ -27,8 +27,9 @@ class Swapchain;
 // pipeline (shaders/ui.vert + ui.frag). Three primitive kinds
 // share the batch: analytic shapes (rounded-box SDF: rounded
 // rectangles, borders, solid colors), sampled images (texture *
-// tint, SDF-clipped) and SDF text (baked distance-field atlas,
-// crisp at any scale). UIBatch is the pure-CPU accumulator
+// tint, SDF-clipped) and bitmap text (coverage atlas baked at
+// the target pixel size, sampled as plain alpha). UIBatch is
+// the pure-CPU accumulator
 // (headless-testable); UIRenderer uploads the per-frame batch into
 // persistently mapped dynamic buffers and flushes it inside the
 // present render pass, after the 3D scene pass: consecutive quads
@@ -42,7 +43,7 @@ class Swapchain;
 // pixel size from the uv derivatives); textured kinds carry an
 // atlas rect in uvRect. Textures are referenced by small integer
 // ids so the batch stays Vulkan-free: kUIFontTexture is the
-// renderer's baked SDF atlas, custom ids come from
+// renderer's baked bitmap font atlas, custom ids come from
 // UIRenderer::registerTexture() with a ready-made descriptor set
 // (icons, thumbnails, render targets...).
 // ---------------------------------------------------------------------------
@@ -54,7 +55,7 @@ inline constexpr float kUITextPrimitive = 2.0f;
 
 using UITextureId = uint32_t;
 inline constexpr UITextureId kUINoTexture = 0;   // analytic shapes
-inline constexpr UITextureId kUIFontTexture = 1; // UIRenderer's SDF atlas
+inline constexpr UITextureId kUIFontTexture = 1; // UIRenderer's bitmap font atlas
 
 struct UIVertex {
     glm::vec2 position{0.0f, 0.0f};     // pixels, top-left origin
@@ -112,8 +113,8 @@ struct UIBounds {
 // overflowing (truncated() reports it). A push/pop scissor stack
 // gives nested clipping: the effective scissor is the intersection
 // of the whole stack, entry 0 of scissors() is always the full
-// viewport. drawText lays out real SDF glyph quads once a font
-// atlas is set (UIRenderer does this for its own batch); without
+// viewport. drawText lays out real bitmap glyph quads once a
+// font atlas is set (UIRenderer does this for its own batch);
 // an atlas it degrades to the Step 1 accounting stub.
 class ENGINE_GRAPHICS_API UIBatch {
 public:
@@ -125,8 +126,8 @@ public:
 
     // Font atlas used by drawText/measureText. Not owned; must
     // outlive the batch. Survives begin()/clear().
-    void setFontAtlas(const SdfFontAtlas* atlas) { m_fontAtlas = atlas; }
-    [[nodiscard]] const SdfFontAtlas* fontAtlas() const { return m_fontAtlas; }
+    void setFontAtlas(const FontAtlas* atlas) { m_fontAtlas = atlas; }
+    [[nodiscard]] const FontAtlas* fontAtlas() const { return m_fontAtlas; }
 
     void drawRect(float x, float y, float width, float height, const glm::vec4& color);
     void drawRoundedRect(float x, float y, float width, float height, float cornerRadius,
@@ -140,7 +141,7 @@ public:
                      const glm::vec4& tint);
     void drawTexture(UITextureId texture, float x, float y, float width, float height,
                      const glm::vec4& uvRect, const glm::vec4& tint);
-    // SDF text (kind 2) with (x, y) at the first line's glyph-box
+    // Bitmap text (kind 2) with (x, y) at the first line's
     // top-left; '\n' starts a new line. scale multiplies font
     // pixels into screen pixels. Without a font atlas this only
     // accounts the item (stub behavior).
@@ -178,7 +179,7 @@ private:
     std::vector<UIScissorRect> m_scissors{UIScissorRect{}}; // append-only; [0] = viewport
     std::vector<uint32_t> m_scissorStack{0}; // indices into m_scissors
     UIBounds m_bounds;
-    const SdfFontAtlas* m_fontAtlas = nullptr;
+    const FontAtlas* m_fontAtlas = nullptr;
     uint32_t m_viewportWidth = 0;
     uint32_t m_viewportHeight = 0;
     uint32_t m_textItems = 0;
@@ -188,7 +189,7 @@ private:
 // Vulkan side of the UI overlay: dedicated pipeline (one combined
 // image sampler descriptor, no depth test, alpha blending) +
 // persistently mapped dynamic vertex/index buffers sized to the
-// UIBatch caps + the baked SDF font atlas texture. record()
+// UIBatch caps + the baked bitmap font atlas texture. record()
 // uploads the accumulated batch and flushes it segment by segment
 // (vkCmdSetScissor + descriptor bind + one indexed draw per
 // segment), restores the full-frame scissor for the passes that
@@ -206,7 +207,7 @@ public:
 
     [[nodiscard]] UIBatch& batch() { return m_batch; }
     [[nodiscard]] const UIBatch& batch() const { return m_batch; }
-    [[nodiscard]] const SdfFontAtlas& fontAtlas() const { return m_fontAtlas; }
+    [[nodiscard]] const FontAtlas& fontAtlas() const { return m_fontAtlas; }
 
     // Registers a caller-owned descriptor set (binding 0 must be a
     // combined image sampler compatible with the UI pipeline) for
@@ -257,7 +258,7 @@ private:
     static constexpr size_t kFrameBufferSlots = 2;
     std::array<Buffer, kFrameBufferSlots> m_vertexBuffers;
     std::array<Buffer, kFrameBufferSlots> m_indexBuffers;
-    SdfFontAtlas m_fontAtlas;
+    FontAtlas m_fontAtlas;
     UIBatch m_batch;
     std::unordered_map<UITextureId, VkDescriptorSet> m_textures;
     UITextureId m_nextTexture = kUIFontTexture + 1;

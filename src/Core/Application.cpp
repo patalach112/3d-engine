@@ -53,8 +53,8 @@ Application::Application(EngineConfig config)
       m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
                      m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems, &m_assets,
                      m_config.render.occlusionCulling) {
-    if (const SdfFontAtlas& font = m_renderer.uiFontAtlas(); font.trueType) {
-        ENGINE_LOG_INFO("Editor UI font: '" << font.fontName << "' (TrueType SDF, " << font.width << 'x'
+    if (const FontAtlas& font = m_renderer.uiFontAtlas(); font.trueType) {
+        ENGINE_LOG_INFO("Editor UI font: '" << font.fontName << "' (TrueType bitmap, " << font.width << 'x'
                                            << font.height << " atlas)");
     } else {
         ENGINE_LOG_WARNING("Editor UI font: no TrueType font found; using the bitmap fallback atlas");

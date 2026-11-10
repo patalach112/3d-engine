@@ -17,7 +17,7 @@ namespace engine {
 // ---------------------------------------------------------------------------
 // UIContext (Phase 26 Step 3): immediate-mode widget state on top of
 // UIBatch. The caller feeds one UIInput per frame, calls widgets
-// (each appends its own SDF geometry to the batch and returns its
+// (each appends its own geometry to the batch and returns its
 // interaction result), and the context carries hover/active/focus
 // identity across frames exactly like Dear ImGui:
 //

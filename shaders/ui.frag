@@ -6,9 +6,11 @@
 //     ring and anti-aliased coverage; no texture involved.
 //   1 sampled image — texture * tint, clipped by the same SDF so
 //     icons get pixel-perfect rounded corners for free.
-//   2 SDF text — the baked distance field (uiFont atlas, red
-//     channel) is thresholded with a derivative-sized band, which
-//     stays crisp at any scale.
+//   2 bitmap text — the font atlas (red channel) stores glyph
+//     coverage baked at the target pixel size; the sampled
+//     coverage is the text alpha directly. Coverage filters
+//     linearly, so thin strokes keep their ink at small sizes
+//     (a thresholded distance field washed them out).
 // The rect's pixel size is recovered from the uv derivatives (uv
 // spans 0..1 across the quad), keeping radius/border widths in
 // exact pixel units without extra attributes.
@@ -34,26 +36,20 @@ void main() {
     vec2 atlasUv = mix(fragUvRect.xy, fragUvRect.zw, fragUv);
 
     if (fragKind > 1.5) {
-        // SDF text: 0.5 is the glyph edge in the baked field.
-        // Convert the field to a *screen-space* signed distance in
-        // pixels (field units divided by the field's own gradient)
-        // and anti-alias over exactly one pixel either side of the
-        // edge. The old form -- smoothstep over a +/-fwidth band --
-        // reaches full opacity only one whole pixel *inside* the
-        // edge, so at editor text sizes (drawn at roughly a quarter
-        // of the 48 px bake) thin strokes like 'i', 'l' and '.'
-        // never get there and render washed-out grey. Here, any
-        // coverage at least half a pixel inside the edge is fully
-        // opaque and the ramp is symmetric, so letters stay solid
-        // at any scale while edges remain smooth.
-        float field = texture(uiTexture, atlasUv).r;
-        float gradient = max(fwidth(field), 1e-4);
-        float distancePx = (field - 0.5) / gradient;
-        float alpha = clamp(distancePx + 0.5, 0.0, 1.0);
-        if (alpha <= 0.0) {
+        // Bitmap text: the atlas stores coverage (0 = no ink,
+        // 1 = solid) rasterized at the target pixel size, and the
+        // quads are emitted snapped to whole pixels, so a stem
+        // lands on pixel boundaries with its baked coverage
+        // intact. The two-texel zero gap packed around every glyph
+        // keeps bilinear edge taps free of neighbour ink. A small
+        // cutout drops the faintest fringe texels so text cannot
+        // halo against the panels; everything above it blends as
+        // ordinary alpha.
+        float coverage = texture(uiTexture, atlasUv).r;
+        if (coverage <= 0.1) {
             discard;
         }
-        outColor = vec4(fragColor.rgb, fragColor.a * alpha);
+        outColor = vec4(fragColor.rgb, fragColor.a * coverage);
         return;
     }
 

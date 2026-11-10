@@ -186,7 +186,7 @@ public:
 
     // The UI font atlas in use (TrueType source name inside), for
     // startup diagnostics.
-    [[nodiscard]] const SdfFontAtlas& uiFontAtlas() const { return m_ui.fontAtlas(); }
+    [[nodiscard]] const FontAtlas& uiFontAtlas() const { return m_ui.fontAtlas(); }
 
     void setPostSettings(const PostSettings& settings) { m_postSettings = settings; }
     [[nodiscard]] const PostSettings& postSettings() const { return m_postSettings; }

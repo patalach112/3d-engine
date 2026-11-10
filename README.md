@@ -2791,3 +2791,48 @@ Four editor layout/theme/font fixes:
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, standalone player headless run
 clean.
+
+## Maintenance — Bitmap text replaces SDF, swapchain gamma fix (washed-out UI root cause) ✅
+
+Two rendering changes, one of them the actual cure for the
+"UI is still light grey" reports that survived three palette
+reworks:
+
+- **Washed-out theme was a gamma bug, not a palette bug**:
+  the swapchain preferred `VK_FORMAT_B8G8R8A8_SRGB` while
+  the composite shader already encodes linear→sRGB itself
+  (ACES + `linearToSrgb`). Every store to the swapchain was
+  therefore encoded twice — near-black theme values lifted
+  ~4× on screen (#121214 displayed as light grey, the
+  tone-mapped scene went pastel), and no palette change
+  could ever fix it. `Swapchain::chooseSurfaceFormat` now
+  prefers `B8G8R8A8_UNORM` (then `R8G8B8A8_UNORM`), so the
+  composite's encoding and the UI's authored hex colours
+  reach the display exactly once-encoded. The deep-black
+  palette (#0f0f11/#121214/#161618/#18181c/#2a2a2e, text
+  #e0e0e0) now displays as specified; no code path calls
+  `setTheme`, so nothing can reset it.
+- **SDF text is gone; bitmap coverage text replaces it**:
+  the screenshot showed the SDF failure mode precisely —
+  "Floor" as "Foor", "Position" as "Posit on": at editor
+  sizes, trilinear filtering of a nonlinear distance field
+  averages thin-stroke interiors below the 0.5 threshold
+  and the strokes vanish. `SdfFont` is replaced wholesale
+  by `BitmapFont`: stb_truetype rasterizes coverage
+  (`stbtt_GetCodepointBitmap`) at a 20 px target em into an
+  R8 atlas (metrics/kerning/baseline layout unchanged, blob
+  format is now GBMF v1, the 5x7 fallback bakes coverage
+  too), `ui.frag` samples coverage as alpha with a 0.1
+  cutout (no distance field, no fwidth threshold), and
+  `UIBatch::drawText` snaps glyph quad origins to whole
+  pixels so stems land on pixel boundaries. Coverage is
+  linear, so mip filtering preserves ink instead of
+  erasing it. Tests were updated to the bitmap contract
+  (solid-coverage glyph rects, zero-coverage 2-texel gap,
+  coverage-based legibility renders at scale 3 and at
+  `kTextScale`, snapped-position expectations).
+
+1194 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, standalone player headless run
+clean.
