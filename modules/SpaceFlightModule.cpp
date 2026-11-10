@@ -1,24 +1,26 @@
 // ---------------------------------------------------------------------------
-// SpaceFlightModule (Phase 24) — a real game module for the Phase 23
-// plugin system, shipped as EngineRuntimeCore_<signature> and loaded
-// through ModuleManager like any third-party game.
+// SpaceFlightModule (Phase 24, refactored in Phase 25) — a real game
+// module for the plugin system, shipped as EngineRuntimeCore_<sig>
+// and loaded through ModuleManager like any third-party game.
 //
-// It flies one spacecraft with true Newtonian 6-DOF physics: pilot
-// input becomes forces/torques accumulated into the ship's
-// RigidBodyComponent every fixed step, and the engine's PhysicsSystem
-// integrates them (linear/angular momentum conserved, zero drag —
-// the only counter-torque is the RCS flight-assist damper, which is
-// modeled thruster work, see SpaceFlightModel.h). On load it builds
-// the sandbox: the ship, a procedural asteroid field with static
-// BVH-collided bodies, and thruster-nozzle point lights whose
-// intensity tracks throttle (plus HDR-bright nozzle meshes feeding
-// the Phase 22 bloom chain).
+// The module itself only builds the sandbox on load (procedural
+// asteroid field, ship, nozzle lights — all find-or-create against
+// engine-owned scene state). All per-frame behaviour lives in
+// SpaceFlightScript, an INativeScript attached to the ship through
+// NativeScriptComponent and driven by the host's NativeScriptSystem
+// — the Unity/UE component model, not a monolithic module loop.
+// Editing FlightParams (SpaceFlightModel.h), rebuilding this
+// module and letting the hot-reload poll swap it in retunes the
+// flight model mid-flight: the module's onUnload destroys the old
+// script instance before the library unloads, and the next script
+// tick re-creates it from the new generation's factory, on the same
+// ship, with the same velocity.
 //
-// Reload contract: everything here is find-or-create against engine-
-// owned scene state, so a hot reload adopts the existing ship and
-// field instead of duplicating them, and the ship keeps its exact
-// position/velocity across the swap. Tuning = edit FlightParams in
-// SpaceFlightModel.h, rebuild this module, wait for the poll.
+// Flight model: true Newtonian 6-DOF — pilot input becomes
+// forces/torques accumulated into the ship's RigidBodyComponent;
+// the engine physics integrates them (zero drag, angular momentum
+// conserved; the only counter-torque is the RCS flight-assist
+// damper, modeled thruster work — see SpaceFlightModel.h).
 // ---------------------------------------------------------------------------
 
 #include "Core/GameModule.h"
@@ -30,10 +32,13 @@
 #include "Physics/PhysicsComponents.h"
 #include "Platform/Input.h"
 #include "Scene/Components.h"
+#include "Scene/NativeScript.h"
+#include "Scene/Reflection.h"
 #include "Scene/Scene.h"
 
 #include <glm/gtc/quaternion.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -45,6 +50,7 @@ namespace {
 using namespace spaceflight;
 
 constexpr const char* kShipTag = "Spacecraft";
+constexpr const char* kFlightScriptName = "SpaceFlightScript";
 
 struct NozzleSpec {
     const char* tag;
@@ -298,40 +304,30 @@ void ensureNozzles(engine::Scene& scene, entt::entity shipHandle) {
     }
 }
 
-class SpaceFlightModule final : public engine::IGameModule {
+// --- The flight behaviour, as a native script (Phase 25) ----------------------
+//
+// One instance per ship, created by ScriptRegistry under the name
+// "SpaceFlightScript" and ticked by NativeScriptSystem. Tuning the
+// m_params defaults (or exposing them to the reflection-driven
+// editor later) + rebuilding this module is the whole workflow.
+
+class SpaceFlightScript final : public engine::INativeScript {
 public:
-    void onLoad(engine::EngineContext& context) override {
-        if (context.scene == nullptr) {
-            return;
+    void onAwake() override {
+        if (scene() != nullptr) {
+            ensureNozzles(*scene(), entity().handle());
         }
-        if (context.assets != nullptr) {
-            registerAssets(*context.assets);
-        }
-        const entt::entity ship = ensureShip(*context.scene);
-        ensureAsteroids(*context.scene);
-        ensureNozzles(*context.scene, ship);
     }
 
-    void onUnload() override {
-        // The scene is engine-owned: ship, field and lights stay
-        // exactly where they are for the next generation (or for the
-        // un-modded engine) to adopt.
-    }
-
-    void onFixedUpdate(engine::EngineContext& context, float) override {
-        if (context.scene == nullptr) {
+    void onFixedUpdate(float) override {
+        if (scene() == nullptr || !hasComponent<engine::RigidBodyComponent>()) {
             return;
         }
-        engine::Scene& scene = *context.scene;
-        const entt::entity shipHandle = findByTag(scene, kShipTag);
-        if (shipHandle == entt::null) {
-            return;
-        }
-        auto& body = scene.registry().get<engine::RigidBodyComponent>(shipHandle);
+        auto& body = getComponent<engine::RigidBodyComponent>();
 
         FlightInput input;
-        if (context.input != nullptr) {
-            const engine::Input& keys = *context.input;
+        if (context().input != nullptr) {
+            const engine::Input& keys = *context().input;
             const auto axis = [&keys](engine::Key negative, engine::Key positive) {
                 return (keys.isKeyDown(positive) ? 1.0f : 0.0f) - (keys.isKeyDown(negative) ? 1.0f : 0.0f);
             };
@@ -359,31 +355,116 @@ public:
         m_lateralThrottle = forces.lateralThrottle;
     }
 
-    void onUpdate(engine::EngineContext& context, float) override {
-        if (context.scene == nullptr) {
+    void onUpdate(float) override {
+        if (scene() == nullptr) {
             return;
         }
         // Thruster-nozzle lights pulse with throttle: a hard flicker
         // (~7 Hz) over a throttle-proportional base intensity lights
         // up nearby asteroid rock whenever an engine burns.
-        const float flicker = 0.87f + 0.13f * std::sin(static_cast<float>(context.elapsedSeconds) * 43.0f);
+        const float flicker = 0.87f + 0.13f * std::sin(static_cast<float>(context().elapsedSeconds) * 43.0f);
         for (const NozzleSpec& spec : kNozzles) {
-            const entt::entity nozzle = findByTag(*context.scene, spec.tag);
+            const entt::entity nozzle = findByTag(*scene(), spec.tag);
             if (nozzle == entt::null) {
                 continue;
             }
-            auto& light = context.scene->registry().get<engine::PointLightComponent>(nozzle);
+            auto& light = scene()->registry().get<engine::PointLightComponent>(nozzle);
             const float throttle = spec.main ? m_mainThrottle : m_lateralThrottle;
             light.intensity = ((spec.main ? 1.4f : 0.9f) + (spec.main ? 30.0f : 15.0f) * throttle) * flicker;
         }
     }
 
-    [[nodiscard]] const char* moduleName() const override { return "SpaceFlightModule"; }
-
 private:
     FlightParams m_params;
     float m_mainThrottle = 0.0f;
     float m_lateralThrottle = 0.0f;
+};
+
+engine::INativeScript* createSpaceFlightScript() { return new SpaceFlightScript(); }
+
+} // namespace
+
+REGISTER_SCRIPT(SpaceFlightScript)
+
+namespace {
+
+class SpaceFlightModule final : public engine::IGameModule {
+public:
+    void onLoad(engine::EngineContext& context) override {
+        m_scene = context.scene;
+        if (context.scene == nullptr) {
+            return;
+        }
+        if (context.assets != nullptr) {
+            registerAssets(*context.assets);
+        }
+        // Make the flight parameters visible to reflection tooling.
+        engine::ReflectionRegistry::instance().registerType(engine::reflect<spaceflight::FlightParams>());
+        // Bridge the script class into the host's registry (covers
+        // statically linked modules, whose REGISTER_SCRIPT lands in
+        // a private registry copy). The named factory's address is
+        // this generation's ownership token for unregistration.
+        m_scriptRegistry = context.scripts != nullptr ? context.scripts : &engine::ScriptRegistry::instance();
+        m_scriptRegistry->registerScript(kFlightScriptName, &createSpaceFlightScript);
+        const entt::entity ship = ensureShip(*context.scene);
+        ensureAsteroids(*context.scene);
+        ensureNozzles(*context.scene, ship);
+        // Attach the behaviour; NativeScriptSystem instantiates it
+        // by name on the next tick.
+        auto& registry = context.scene->registry();
+        if (!registry.all_of<engine::NativeScriptComponent>(ship)) {
+            registry.emplace<engine::NativeScriptComponent>(ship, kFlightScriptName);
+        }
+    }
+
+    void onUnload() override {
+        // Withdraw this generation's registrations first (pointer-
+        // identity checked: a newer generation that already
+        // re-registered under the same name is left untouched), so
+        // the host never holds factories or reflection tables into
+        // a binary that is about to be unmapped.
+        if (m_scriptRegistry != nullptr) {
+            m_scriptRegistry->unregisterScript(kFlightScriptName, &createSpaceFlightScript);
+        }
+        engine::ReflectionRegistry::instance().unregisterType(engine::reflect<spaceflight::FlightParams>());
+        // The live script instance is owned by this binary and its
+        // code is about to be unmapped: destroy it now. The next
+        // generation's onLoad re-registers the class and the script
+        // system re-creates the instance on the same ship.
+        if (m_scene == nullptr) {
+            return;
+        }
+        const entt::entity ship = findByTag(*m_scene, kShipTag);
+        if (ship == entt::null) {
+            return;
+        }
+        auto& registry = m_scene->registry();
+        if (!registry.all_of<engine::NativeScriptComponent>(ship)) {
+            return;
+        }
+        auto& component = registry.get<engine::NativeScriptComponent>(ship);
+        if (component.instance != nullptr) {
+            try {
+                component.instance->onDestroy();
+            } catch (...) {
+                // A dying module must never throw across the boundary.
+            }
+            delete component.instance;
+            component.instance = nullptr;
+            component.started = false;
+        }
+    }
+
+    // Per-frame behaviour lives in SpaceFlightScript (driven by
+    // NativeScriptSystem); the module only owns load-time setup.
+    void onUpdate(engine::EngineContext&, float) override {}
+    void onFixedUpdate(engine::EngineContext&, float) override {}
+
+    [[nodiscard]] const char* moduleName() const override { return "SpaceFlightModule"; }
+
+private:
+    engine::Scene* m_scene = nullptr;
+    engine::ScriptRegistry* m_scriptRegistry = nullptr;
 };
 
 } // namespace

@@ -17,6 +17,8 @@
 
 namespace engine {
 
+class INativeScript;
+
 // Human-readable entity name (debugging, future tooling, logs).
 struct TagComponent {
     std::string tag;
@@ -156,6 +158,39 @@ struct MeshComponent {
 
     MeshComponent() = default;
     explicit MeshComponent(std::string assetId_) : assetId(std::move(assetId_)) {}
+};
+
+// Behaviour attachment (Phase 25): names an INativeScript class
+// registered with ScriptRegistry; NativeScriptSystem instantiates
+// it on first tick and drives its lifecycle. `scriptName` is the
+// serialization identifier — the instance itself is runtime state,
+// created and destroyed inside the process (and, for game modules,
+// inside the module binary that registered the class). Move-only:
+// exactly one component owns the instance.
+struct NativeScriptComponent {
+    INativeScript* instance = nullptr;
+    std::string scriptName;
+    bool started = false; // onStart delivered
+
+    NativeScriptComponent() = default;
+    explicit NativeScriptComponent(std::string name) : scriptName(std::move(name)) {}
+    NativeScriptComponent(const NativeScriptComponent&) = delete;
+    NativeScriptComponent& operator=(const NativeScriptComponent&) = delete;
+    NativeScriptComponent(NativeScriptComponent&& other) noexcept
+        : instance(other.instance), scriptName(std::move(other.scriptName)), started(other.started) {
+        other.instance = nullptr;
+        other.started = false;
+    }
+    NativeScriptComponent& operator=(NativeScriptComponent&& other) noexcept {
+        if (this != &other) {
+            instance = other.instance;
+            scriptName = std::move(other.scriptName);
+            started = other.started;
+            other.instance = nullptr;
+            other.started = false;
+        }
+        return *this;
+    }
 };
 
 

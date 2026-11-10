@@ -1,6 +1,7 @@
 #include "Scene/Scene.h"
 
 #include "Core/Logger.h"
+#include "Physics/PhysicsComponents.h"
 #include "Scene/Systems/TransformSystem.h"
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -8,6 +9,26 @@
 #include <algorithm>
 
 namespace engine {
+namespace {
+
+// Creates the storage for each listed component type (a no-op where
+// one already exists). Called once per Scene from engine code so
+// every built-in storage is host-owned for the scene's whole
+// lifetime — see the module-boundary contract on Scene's constructor.
+template <typename... Components>
+void primeComponentStorages(Scene::Registry& registry) {
+    (registry.storage<Components>(), ...);
+}
+
+} // namespace
+
+Scene::Scene() {
+    primeComponentStorages<TagComponent, TransformComponent, ParentComponent, ChildrenComponent,
+                           WorldTransformComponent, CameraComponent, PointLightComponent, SpotLightComponent,
+                           MeshComponent, NativeScriptComponent, SpinComponent, RigidBodyComponent,
+                           ColliderComponent, GravityFieldComponent, JointComponent, ThrusterComponent>(
+        m_registry);
+}
 
 Entity Scene::createEntity(const std::string& name) {
     Entity entity{m_registry.create(), this};

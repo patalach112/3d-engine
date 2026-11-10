@@ -24,6 +24,8 @@
 // numbers fly the existing ship, in the existing scene, instantly.
 // ---------------------------------------------------------------------------
 
+#include "Scene/Reflection.h"
+
 #include <glm/glm.hpp>
 
 #include <algorithm>
@@ -96,5 +98,18 @@ struct FlightForces {
     out.totalThrottle = std::clamp(out.mainThrottle + 0.6f * out.lateralThrottle + 0.35f * rotationDemand, 0.0f, 1.0f);
     return out;
 }
+
+// Editor-facing metadata (Phase 25): the same macro registry the
+// engine components use, so an inspector can tune flight parameters
+// generically. Registered with ReflectionRegistry by the module.
+ENGINE_REFLECT_BEGIN(FlightParams)
+    ENGINE_REFLECT_PROPERTY(mainThrust, "Main Thrust (N)")
+    ENGINE_REFLECT_PROPERTY(strafeThrust, "Strafe Thrust (N)")
+    ENGINE_REFLECT_PROPERTY(pitchTorque, "Pitch Torque (N·m)")
+    ENGINE_REFLECT_PROPERTY(yawTorque, "Yaw Torque (N·m)")
+    ENGINE_REFLECT_PROPERTY(rollTorque, "Roll Torque (N·m)")
+    ENGINE_REFLECT_PROPERTY(angularDamping, "Angular Damping (1/s)")
+    ENGINE_REFLECT_PROPERTY(mouseTorqueScale, "Mouse Torque Scale")
+ENGINE_REFLECT_END()
 
 } // namespace spaceflight

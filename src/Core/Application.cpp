@@ -10,6 +10,7 @@
 #include "Geometry/Cube.h"
 #include "Scene/Components.h"
 #include "Scene/Systems/CameraSystem.h"
+#include "Scene/NativeScript.h"
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RotationSystem.h"
@@ -143,6 +144,7 @@ EngineContext Application::buildModuleContext(float deltaSeconds, float fixedDel
     context.input = &m_input;
     context.assets = &m_assets;
     context.jobs = &m_jobSystem;
+    context.scripts = &ScriptRegistry::instance();
     context.deltaSeconds = deltaSeconds;
     context.fixedDeltaSeconds = fixedDeltaSeconds;
     context.elapsedSeconds = m_moduleElapsedSeconds;
@@ -463,6 +465,10 @@ void Application::run() {
         {
             EngineContext context = buildModuleContext(0.0f, static_cast<float>(fixedDeltaSeconds));
             m_moduleManager.fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
+            // Native scripts (Phase 25) tick in the fixed step too,
+            // before physics, so script-driven forces are resolved
+            // by the same step that produced them.
+            NativeScriptSystem::fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
         }
         // Rigid-body physics is deterministic simulation, so it lives in
         // the fixed step (never the variable/render-rate update). Its
@@ -496,6 +502,7 @@ void Application::run() {
         {
             EngineContext context = buildModuleContext(static_cast<float>(deltaSeconds), 0.0f);
             m_moduleManager.update(context, static_cast<float>(deltaSeconds));
+            NativeScriptSystem::update(context, static_cast<float>(deltaSeconds));
             if (m_config.game.moduleHotReload) {
                 m_secondsSinceModulePoll += deltaSeconds;
                 if (m_secondsSinceModulePoll >= 0.5) {

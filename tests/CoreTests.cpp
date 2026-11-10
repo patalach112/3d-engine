@@ -45,6 +45,8 @@
 #include "Graphics/ToneMapping.h"
 #include "Scene/Systems/LightingSystem.h"
 #include "Core/ModuleManager.h"
+#include "Scene/ComponentReflection.h"
+#include "Scene/NativeScript.h"
 #include "SpaceFlightModel.h"
 #include "Platform/DynamicLibrary.h"
 
@@ -6180,6 +6182,44 @@ void testPhase22PbrIblPost() {
     }
 }
 
+
+// --- Phase 25 fixtures -------------------------------------------------------
+
+std::vector<std::string> g_scriptEvents;
+int g_probeScriptAlive = 0;
+std::string g_probeScriptEntityName;
+
+class ProbeScript final : public engine::INativeScript {
+public:
+    ProbeScript() { ++g_probeScriptAlive; }
+    ~ProbeScript() override { --g_probeScriptAlive; }
+    void onAwake() override { g_scriptEvents.push_back("awake"); }
+    void onStart() override {
+        g_scriptEvents.push_back("start");
+        g_probeScriptEntityName = entity().name();
+    }
+    void onUpdate(float) override { g_scriptEvents.push_back("update"); }
+    void onFixedUpdate(float) override { g_scriptEvents.push_back("fixed"); }
+    void onDestroy() override { g_scriptEvents.push_back("destroy"); }
+};
+REGISTER_SCRIPT(ProbeScript)
+
+struct EditorWidgetSample {
+    int32_t count = 0;
+    uint32_t flags = 0;
+    float weight = 0.0f;
+    bool active = false;
+    glm::vec3 position{0.0f};
+};
+
+ENGINE_REFLECT_BEGIN(EditorWidgetSample)
+    ENGINE_REFLECT_PROPERTY(count, "Count")
+    ENGINE_REFLECT_PROPERTY(flags, "Flags")
+    ENGINE_REFLECT_PROPERTY(weight, "Weight")
+    ENGINE_REFLECT_PROPERTY(active, "Active")
+    ENGINE_REFLECT_PROPERTY(position, "Position")
+ENGINE_REFLECT_END()
+
 void testPhase23GameModules() {
     std::cout << "Phase 23: game modules & hot reload\n";
 
@@ -6370,6 +6410,7 @@ void testPhase24SpaceFlight() {
     context.scene = &scene;
     context.input = &input;
     context.assets = &assets;
+    context.scripts = &engine::ScriptRegistry::instance(); // Phase 25 script bridge
 
     const auto findByTag = [&scene](const char* tag) -> entt::entity {
         auto view = scene.registry().view<engine::TagComponent>();
@@ -6476,6 +6517,7 @@ void testPhase24SpaceFlight() {
         for (int i = 0; i < steps; ++i) {
             context.fixedDeltaSeconds = static_cast<float>(fixedDt);
             manager.fixedUpdate(context, static_cast<float>(fixedDt));
+            engine::NativeScriptSystem::fixedUpdate(context, static_cast<float>(fixedDt)); // Phase 25: script-driven flight
             physics.update(scene, fixedDt, settings);
         }
     };
@@ -6494,6 +6536,7 @@ void testPhase24SpaceFlight() {
 
     context.elapsedSeconds = 1.0;
     manager.update(context, 0.016f);
+    engine::NativeScriptSystem::update(context, 0.016f); // script pulses the nozzle lights
     const entt::entity mainNozzle = findByTag("ThrusterNozzleMain");
     check(mainNozzle != entt::null &&
               scene.registry().get<engine::PointLightComponent>(mainNozzle).intensity > 12.0f,
@@ -6531,6 +6574,211 @@ void testPhase24SpaceFlight() {
           "unloading the module leaves the engine-owned world intact");
 }
 
+void testPhase25ReflectionScripting() {
+    std::cout << "Phase 25: reflection & native scripting\n";
+
+    // --- (a) Reflection traits & offsets --------------------------------
+    const engine::TypeInfo& rigid = engine::reflect<engine::RigidBodyComponent>();
+    check(std::string_view(rigid.name) == "RigidBodyComponent" && rigid.properties.size() == 8,
+          "reflection: RigidBodyComponent exposes its property table");
+    const engine::PropertyInfo* mass = rigid.findProperty("mass");
+    check(mass != nullptr && mass->type == engine::PropertyType::Float &&
+              mass->offset == offsetof(engine::RigidBodyComponent, mass) &&
+              std::string_view(mass->displayName) == "Mass (kg)",
+          "reflection: mass carries type, display name and the true byte offset");
+    const engine::TypeInfo& transformInfo = engine::reflect<engine::TransformComponent>();
+    const engine::PropertyInfo* position = transformInfo.findProperty("position");
+    check(position != nullptr && position->type == engine::PropertyType::Vec3,
+          "reflection: vec3 fields are typed as Vec3");
+    check(rigid.findProperty("useGravity") != nullptr &&
+              rigid.findProperty("useGravity")->type == engine::PropertyType::Bool,
+          "reflection: bool fields are typed as Bool");
+    check(rigid.findProperty("noSuchField") == nullptr, "reflection: unknown properties resolve to null");
+
+    {
+        engine::RigidBodyComponent body;
+        body.mass = 5.0f;
+        check(nearlyEqual(engine::readProperty<float>(&body, *mass), 5.0),
+              "reflection: values read back through the offset");
+        engine::writeProperty<float>(&body, *mass, 42.0f);
+        const engine::PropertyInfo* velocity = rigid.findProperty("velocity");
+        engine::writeProperty<glm::vec3>(&body, *velocity, glm::vec3{1.0f, 2.0f, 3.0f});
+        check(nearlyEqual(body.mass, 42.0) && body.velocity == glm::vec3{1.0f, 2.0f, 3.0f},
+              "reflection: generic writes land in the real fields (editor-style editing)");
+    }
+
+    {
+        const engine::TypeInfo& widget = engine::reflect<EditorWidgetSample>();
+        check(widget.properties.size() == 5 && widget.findProperty("count")->type == engine::PropertyType::Int32 &&
+                  widget.findProperty("flags")->type == engine::PropertyType::UInt32,
+              "reflection: int32/uint32 fields are typed distinctly");
+        EditorWidgetSample sample;
+        engine::writeProperty<int32_t>(&sample, *widget.findProperty("count"), -7);
+        engine::writeProperty<bool>(&sample, *widget.findProperty("active"), true);
+        check(sample.count == -7 && sample.active, "reflection: POD fields of any reflected struct are writable");
+    }
+
+    // --- (b) Reflection registry -----------------------------------------
+    engine::ReflectionRegistry& reflection = engine::ReflectionRegistry::instance();
+    const engine::TypeInfo* registeredRigid = reflection.find("RigidBodyComponent");
+    // Lookup is by name; the registered table's identity belongs to
+    // whichever binary registered it (engine builtins register from
+    // EngineScene), so content equality — not pointer identity — is
+    // the contract across module boundaries.
+    check(registeredRigid != nullptr && registeredRigid->name == rigid.name &&
+              registeredRigid->properties.size() == rigid.properties.size() &&
+              registeredRigid->findProperty("mass") != nullptr &&
+              reflection.find("TransformComponent") != nullptr && reflection.find("NoSuchType") == nullptr,
+          "reflection registry: built-in types are findable by name");
+    {
+        size_t totalProperties = 0;
+        for (const engine::TypeInfo* type : reflection.types()) {
+            totalProperties += type->properties.size();
+        }
+        const size_t typeCountBefore = reflection.types().size();
+        engine::registerReflection<engine::RigidBodyComponent>(); // duplicate: replaces in place
+        check(typeCountBefore >= 5 && totalProperties >= 20 && reflection.types().size() == typeCountBefore,
+              "reflection registry: iteration covers all builtins; re-registration replaces, never duplicates");
+    }
+
+    // Flight parameters are reflected too — an editor edit changes physics.
+    {
+        spaceflight::FlightParams params;
+        const engine::TypeInfo& paramsInfo = engine::reflect<spaceflight::FlightParams>();
+        engine::writeProperty<float>(&params, *paramsInfo.findProperty("mainThrust"), 48000.0f);
+        spaceflight::FlightInput burn;
+        burn.main = 1.0f;
+        const spaceflight::FlightForces forces =
+            spaceflight::computeFlightForces(params, burn, glm::vec3{0.0f}, glm::vec3{900.0f});
+        check(paramsInfo.properties.size() == 7 && nearlyEqual(forces.forceLocal.z, -48000.0, 1e-2),
+              "reflection: writing FlightParams.mainThrust doubles the burn");
+    }
+
+    // --- (c) Script registry ----------------------------------------------
+    engine::ScriptRegistry& scripts = engine::ScriptRegistry::instance();
+    check(scripts.has("ProbeScript") && !scripts.has("NoSuchScript"),
+          "scripts: REGISTER_SCRIPT self-registers by class name");
+    {
+        engine::INativeScript* raw = scripts.create("ProbeScript");
+        check(raw != nullptr && g_probeScriptAlive == 1, "scripts: the factory instantiates by name");
+        delete raw;
+        check(g_probeScriptAlive == 0 && scripts.create("NoSuchScript") == nullptr,
+              "scripts: unknown names instantiate to null");
+    }
+
+    // --- (d) Lifecycle order ------------------------------------------------
+    {
+        engine::Scene scene;
+        engine::EngineContext context;
+        context.scene = &scene;
+        g_scriptEvents.clear();
+
+        engine::Entity probe = scene.createEntity("Probe");
+        probe.addComponent<engine::NativeScriptComponent>("ProbeScript");
+        engine::NativeScriptSystem::update(context, 0.016f);
+        check(g_scriptEvents == std::vector<std::string>{"awake", "start", "update"},
+              "scripts: awake -> start -> update on the first tick");
+        check(g_probeScriptAlive == 1 && g_probeScriptEntityName == "Probe",
+              "scripts: the instance knows its entity and scene");
+        engine::NativeScriptSystem::fixedUpdate(context, 1.0f / 60.0f);
+        engine::NativeScriptSystem::update(context, 0.016f);
+        check(g_scriptEvents == std::vector<std::string>{"awake", "start", "update", "fixed", "update"},
+              "scripts: start fires exactly once; fixed and variable ticks interleave");
+
+        auto& component = probe.getComponent<engine::NativeScriptComponent>();
+        check(component.instance != nullptr && component.started && component.scriptName == "ProbeScript",
+              "scripts: the component tracks instance, started state and serialization name");
+
+        scene.destroyEntity(probe);
+        check(g_scriptEvents.back() == "destroy" && g_probeScriptAlive == 0,
+              "scripts: entity destruction runs onDestroy and deletes the instance");
+
+        engine::Entity orphan = scene.createEntity("Orphan");
+        orphan.addComponent<engine::NativeScriptComponent>("NoSuchScript");
+        engine::NativeScriptSystem::update(context, 0.016f);
+        check(orphan.getComponent<engine::NativeScriptComponent>().instance == nullptr,
+              "scripts: an unregistered name stays dormant instead of crashing");
+        engine::NativeScriptSystem::shutdown(scene);
+    }
+
+    // --- (e) The flight module, script-driven -------------------------------
+    {
+        const std::filesystem::path shipPlugin = ENGINE_TEST_SPACEFLIGHT_PLUGIN_PATH;
+        const auto dir = std::filesystem::temp_directory_path() / "engine_p25_space";
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+        const std::filesystem::path brandedCopy = dir / shipPlugin.filename();
+        std::filesystem::copy_file(shipPlugin, brandedCopy);
+
+        engine::Scene scene;
+        engine::Input input;
+        engine::VramBudget vram(16 * 1024 * 1024);
+        engine::VramBudget staging(16 * 1024 * 1024);
+        engine::AssetManager assets(vram, staging);
+        engine::EngineContext context;
+        context.scene = &scene;
+        context.input = &input;
+        context.assets = &assets;
+        context.scripts = &scripts;
+
+        engine::ModuleManager manager;
+        check(manager.load(brandedCopy, context) && scripts.has("SpaceFlightScript"),
+              "flight module registers SpaceFlightScript with the host");
+
+        entt::entity ship = entt::null;
+        {
+            auto view = scene.registry().view<engine::TagComponent>();
+            for (const entt::entity entity : view) {
+                if (view.get<engine::TagComponent>(entity).tag == "Spacecraft") {
+                    ship = entity;
+                }
+            }
+        }
+        check(ship != entt::null && scene.registry().all_of<engine::NativeScriptComponent>(ship) &&
+                  scene.registry().get<engine::NativeScriptComponent>(ship).scriptName == "SpaceFlightScript",
+              "the ship carries a NativeScriptComponent naming the flight script");
+
+        engine::PhysicsSystem physics;
+        engine::PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        const double fixedDt = 1.0 / 60.0;
+        const auto stepScripts = [&](int steps) {
+            for (int i = 0; i < steps; ++i) {
+                context.fixedDeltaSeconds = static_cast<float>(fixedDt);
+                engine::NativeScriptSystem::fixedUpdate(context, static_cast<float>(fixedDt));
+                physics.update(scene, fixedDt, settings);
+            }
+        };
+        auto& shipBody = scene.registry().get<engine::RigidBodyComponent>(ship);
+        stepScripts(10);
+        check(scene.registry().get<engine::NativeScriptComponent>(ship).instance != nullptr,
+              "the script system instantiates the flight script on the ship");
+
+        input.injectKeyState(engine::Key::W, true);
+        stepScripts(30);
+        check(shipBody.velocity.z < -8.5f && shipBody.velocity.z > -11.5f,
+              "script-driven burn reaches the same ~10 m/s as the old module loop");
+        input.injectKeyState(engine::Key::W, false);
+
+        const glm::vec3 velocityBeforeReload = shipBody.velocity;
+        std::filesystem::copy_file(shipPlugin, brandedCopy, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::last_write_time(brandedCopy,
+                                         std::filesystem::file_time_type::clock::now() + std::chrono::seconds(30));
+        check(manager.pollForChanges(context) && manager.generation() == 2, "flight module hot-reloads");
+        stepScripts(10);
+        check(scene.registry().get<engine::NativeScriptComponent>(ship).instance != nullptr &&
+                  glm::length(shipBody.velocity - velocityBeforeReload) < 1e-3f,
+              "after reload a fresh script instance adopts the same ship (velocity untouched, engines off)");
+        input.injectKeyState(engine::Key::W, true);
+        stepScripts(30);
+        check(shipBody.velocity.z < velocityBeforeReload.z - 4.0f,
+              "the reloaded script generation flies the same ship immediately");
+        input.injectKeyState(engine::Key::W, false);
+        engine::NativeScriptSystem::shutdown(scene);
+        manager.unload();
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -6555,6 +6803,7 @@ int main() {
     testPhase22PbrIblPost();
     testPhase23GameModules();
     testPhase24SpaceFlight();
+    testPhase25ReflectionScripting();
     testPlayerCollision();
     testSceneAndSystems();
     testPoolAllocator();

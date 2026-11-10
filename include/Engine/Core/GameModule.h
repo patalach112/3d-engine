@@ -10,6 +10,7 @@ class AssetManager;
 class Input;
 class JobSystem;
 class Scene;
+class ScriptRegistry;
 
 // ---------------------------------------------------------------------------
 // EngineContext — everything a game module may touch, handed over by
@@ -30,6 +31,12 @@ struct EngineContext {
     const Input* input = nullptr;
     AssetManager* assets = nullptr;
     JobSystem* jobs = nullptr;
+    // Native-script directory (Phase 25): game modules register
+    // their INativeScript classes here so the host's
+    // NativeScriptSystem can instantiate them by name — including
+    // from statically linked modules, whose own registration
+    // singleton would otherwise be a private copy.
+    ScriptRegistry* scripts = nullptr;
     float deltaSeconds = 0.0f;      // variable step, valid in onUpdate
     float fixedDeltaSeconds = 0.0f; // fixed step, valid in onFixedUpdate
     double elapsedSeconds = 0.0;    // host clock at call time

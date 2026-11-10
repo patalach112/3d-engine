@@ -87,7 +87,19 @@ enum class HierarchyDestroyMode { Orphan, Cascade };
 // ---------------------------------------------------------------------------
 class ENGINE_SCENE_API Scene {
 public:
-    Scene() = default;
+    // The constructor primes the EnTT storage of every built-in
+    // component type from engine code. This is a module-boundary
+    // contract (Phase 25): game modules are separate binaries that
+    // are unloaded while scenes outlive them (hot reload), and a
+    // component storage carries the vtable and shared_ptr control
+    // block of whichever binary's template instantiation created
+    // it — a storage first created by module code would later be
+    // destroyed through unmapped code. With the storages primed,
+    // module code only ever finds existing, host-owned storages.
+    // Corollary: module-local component types must never be stored
+    // in a host Scene; module state belongs in script instances
+    // (INativeScript) that the module destroys in onUnload.
+    Scene();
     ~Scene() = default;
 
     Scene(const Scene&) = delete;

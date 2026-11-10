@@ -1672,6 +1672,75 @@ mid-flight hot reload preserves velocity bit-exactly with zero
 duplicated entities. **759 checks (32 new) pass in Debug,
 Release-shared and Release-static with zero warnings, CTest 1/1.**
 
+## Phase 25 — Native Component Reflection & Unity/UE-Style Scripting ✅
+
+Game logic moves from monolithic module frame callbacks to
+per-entity script components, and component fields become visible
+to reflection tooling — the foundation for editor inspectors.
+
+- **Zero-overhead reflection** (`Scene/Reflection.h`,
+  `Scene/ComponentReflection.h`): `ENGINE_REFLECT_BEGIN(Type)` /
+  `ENGINE_REFLECT_PROPERTY(field, "Display Name")` /
+  `ENGINE_REFLECT_END()` generate an ADL `reflectType()` overload
+  per type (works in any namespace), yielding a static `TypeInfo` —
+  name plus a `PropertyInfo` table (name, display name,
+  `PropertyType` {Float, Int32, UInt32, Bool, Vec3}, true `offsetof`
+  byte offset). No RTTI, no registration ceremony, no runtime cost
+  beyond the static tables. `readProperty`/`writeProperty` memcpy
+  through the offset, so tools (and tests) edit real fields
+  generically. Built-ins (Transform, RigidBody, Point/SpotLight,
+  Spin) are reflected in `ComponentReflection.h`.
+- **ReflectionRegistry**: a name → TypeInfo directory for tooling
+  that does not know the C++ type at compile time. Built-ins
+  register lazily on first `instance()`; registration replaces
+  same-name entries (hot-reload safe) and `unregisterType` removes
+  by table-pointer identity, so a retiring module generation can
+  never erase its replacement's table. Names are `std::string_view`
+  so comparisons stay content-based across binary boundaries.
+- **Native scripts** (`Scene/NativeScript.h`): `INativeScript`
+  exposes the Unity/UE lifecycle — `onAwake`, `onStart`,
+  `onUpdate(float)`, `onFixedUpdate(float)`, `onDestroy` — and
+  `NativeScriptComponent` (script-class name + instance) attaches
+  one to any entity. `ScriptRegistry` instantiates scripts by name
+  from factories registered with `REGISTER_SCRIPT(ClassName)`;
+  factories are plain function pointers, never `std::function`,
+  because a callable created inside a game module must never be
+  destroyed or invoked by the host after that module unloads.
+  `unregisterScript` is pointer-checked for the same reason.
+  `NativeScriptSystem` drives the lifecycle from the host frame
+  loop (awake/start on first tick, update/fixed-update per frame,
+  destroy + delete on entity destruction via one EnTT `on_destroy`
+  hook) and prefers `EngineContext::scripts`, so statically linked
+  modules register into the host's registry.
+- **SpaceFlightModule refactored**: all flight behaviour now lives
+  in `SpaceFlightScript`, an `INativeScript` attached to the ship;
+  the module only builds the sandbox in `onLoad` (its frame
+  callbacks are no-ops) and destroys the live script instance in
+  `onUnload`, before its code unmaps. `FlightParams` is reflected
+  (7 properties), so an editor editing `mainThrust` retunes the
+  burn — the tests double thrust purely through reflection writes.
+- **Module-boundary storage contract**: a Scene now primes every
+  built-in component storage from engine code at construction. An
+  EnTT storage carries the vtable and shared_ptr control block of
+  whichever binary's instantiation created it; priming guarantees
+  module code only ever finds host-owned storages, so scenes safely
+  outlive unloaded modules. (Found by crash bisection: glibc does
+  not reliably unmap dlclosed libraries, which had masked
+  plugin-created storages since Phase 24.)
+
+Verification: 28 new headless checks cover reflection tables
+(exact `offsetof`, typed reads/writes through offsets), registry
+replace/unregister semantics, script registration and
+instantiation by name, lifecycle order (awake → start → update →
+fixed → destroy), dormant unregistered names, reflection-edited
+thrust changing the burn, script-driven flight matching the
+Phase 24 numbers, and hot-reload adoption (fresh instance,
+velocity preserved, the new generation flying the same ship).
+**787 checks pass in Debug, Release-shared and Release-static
+with zero warnings, CTest 1/1** — and additionally in a
+hidden-visibility build (simulating Windows DLL rules) and under
+AddressSanitizer.
+
 ## Configuration
 
 `config/engine.ini` is copied next to the executable at build time and can be
