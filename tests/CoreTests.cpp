@@ -34,6 +34,7 @@
 #include "Graphics/VramBudget.h"
 #include "Graphics/HudFont.h"
 #include "Graphics/RenderQueue.h"
+#include "Graphics/SdfFont.h"
 #include "Graphics/UIRenderer.h"
 #include "Graphics/ShadowMap.h"
 #include "Graphics/Renderer.h"
@@ -6844,7 +6845,7 @@ void testPhase26UIRenderer() {
         check(input.binding.binding == 0 && input.binding.inputRate == VK_VERTEX_INPUT_RATE_VERTEX &&
                   input.binding.stride == sizeof(engine::UIVertex),
               "ui: vertex binding 0 is per-vertex with stride sizeof(UIVertex)");
-        const std::array<VkVertexInputAttributeDescription, 6>& a = input.attributes;
+        const std::array<VkVertexInputAttributeDescription, 8>& a = input.attributes;
         check(a[0].location == 0 && a[0].format == VK_FORMAT_R32G32_SFLOAT &&
                   a[0].offset == offsetof(engine::UIVertex, position) &&
                   a[1].location == 1 && a[1].format == VK_FORMAT_R32G32_SFLOAT &&
@@ -6859,6 +6860,11 @@ void testPhase26UIRenderer() {
                   a[5].location == 5 && a[5].format == VK_FORMAT_R32G32B32A32_SFLOAT &&
                   a[5].offset == offsetof(engine::UIVertex, borderColor),
               "ui: radius/border attributes match the UIVertex layout");
+        check(a[6].location == 6 && a[6].format == VK_FORMAT_R32G32B32A32_SFLOAT &&
+                  a[6].offset == offsetof(engine::UIVertex, uvRect) &&
+                  a[7].location == 7 && a[7].format == VK_FORMAT_R32_SFLOAT &&
+                  a[7].offset == offsetof(engine::UIVertex, kind),
+              "ui: uvRect/kind attributes match the UIVertex layout");
     }
 
     // --- (f) Capacity truncation stays index-consistent ----------------------
@@ -6877,6 +6883,139 @@ void testPhase26UIRenderer() {
     batch.begin(64, 64);
     check(batch.empty() && !batch.truncated() && batch.textItemCount() == 0,
           "ui: begin resets geometry, text items and truncation");
+
+    // --- (g) SDF font atlas generation (Step 2) ------------------------------
+    const engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
+    check(!atlas.empty() && atlas.width == 384 && atlas.height == 192 &&
+              atlas.pixels.size() == static_cast<size_t>(atlas.width) * atlas.height,
+          "ui sdf: atlas page bakes to 384x192 R8");
+    const engine::SdfGlyph& glyphA = atlas.glyphFor('A');
+    check(glyphA.u0 >= 0.0f && glyphA.v0 >= 0.0f && glyphA.u1 <= 1.0f && glyphA.v1 <= 1.0f &&
+              glyphA.u1 > glyphA.u0 && glyphA.advance == 6.0f,
+          "ui sdf: glyph rects sit inside the page with monospace advance");
+    check(atlas.glyphFor('a').u0 == glyphA.u0 && atlas.glyphFor('\x01').u0 == atlas.glyphFor('?').u0,
+          "ui sdf: lowercase folds to uppercase; unknown glyphs fall back to '?'");
+    {
+        // Inspect the 'A' cell: deep-interior texels, a populated ramp
+        // band (a true distance field, not a binary mask), an outside
+        // corner; and the space cell: entirely outside.
+        const uint32_t cellX = static_cast<uint32_t>('A' - 32) % 16 * engine::kSdfCellWidth;
+        const uint32_t cellY = static_cast<uint32_t>('A' - 32) / 16 * engine::kSdfCellHeight;
+        uint32_t mid = 0;
+        uint8_t deepest = 0;
+        uint8_t spaceMax = 0;
+        for (uint32_t y = 0; y < engine::kSdfCellHeight; ++y) {
+            for (uint32_t x = 0; x < engine::kSdfCellWidth; ++x) {
+                const uint8_t value = atlas.pixels[(cellY + y) * atlas.width + (cellX + x)];
+                deepest = std::max(deepest, value);
+                if (value > 64 && value < 192) {
+                    ++mid;
+                }
+                spaceMax = std::max(spaceMax, atlas.pixels[y * atlas.width + x]); // space cell is (0,0)
+            }
+        }
+        check(deepest >= 160 && mid > 0 && atlas.pixels[cellY * atlas.width + cellX] < 128 && spaceMax == 0,
+              "ui sdf: field has interior, ramp and empty cells where expected");
+    }
+
+    // --- (h) Atlas save/load round-trip ----------------------------------------
+    {
+        const std::vector<uint8_t> blob = engine::saveSdfFontAtlas(atlas);
+        engine::SdfFontAtlas loaded;
+        check(engine::loadSdfFontAtlas(blob, loaded) && loaded.width == atlas.width &&
+                  loaded.height == atlas.height && loaded.pixels == atlas.pixels &&
+                  loaded.glyphFor('A').u1 == glyphA.u1 && loaded.advance == atlas.advance,
+              "ui sdf: save/load round-trips page, glyph table and metrics");
+        engine::SdfFontAtlas untouched;
+        const std::vector<uint8_t> shortBlob(blob.begin(), blob.begin() + 20);
+        std::vector<uint8_t> corrupt = blob;
+        corrupt[0] = 'X';
+        check(!engine::loadSdfFontAtlas(shortBlob, untouched) && !engine::loadSdfFontAtlas(corrupt, untouched) &&
+                  untouched.empty(),
+              "ui sdf: truncated/corrupt blobs are rejected without touching the output");
+    }
+
+    // --- (i) SDF text layout -----------------------------------------------------
+    engine::UIBatch textBatch;
+    textBatch.setFontAtlas(&atlas);
+    textBatch.begin(1280, 720);
+    check(textBatch.measureText("AB", 1.0f) == 12.0f && textBatch.measureText("", 3.0f) == 0.0f &&
+              textBatch.measureText("ABC\nD", 2.0f) == 36.0f,
+          "ui text: measureText reports the widest line in screen pixels");
+    textBatch.drawText("AB", 100.0f, 50.0f, 1.0f, fill);
+    check(textBatch.vertices().size() == 8 && textBatch.indices().size() == 12 && textBatch.textItemCount() == 1,
+          "ui text: two glyphs emit two quads");
+    {
+        const std::vector<engine::UIVertex>& v = textBatch.vertices();
+        const engine::SdfGlyph& glyphB = atlas.glyphFor('B');
+        check(v[0].kind == engine::kUITextPrimitive &&
+                  v[0].uvRect == glm::vec4{glyphA.u0, glyphA.v0, glyphA.u1, glyphA.v1},
+              "ui text: glyph quad samples its atlas cell as SDF text");
+        check(v[0].position == glm::vec2{99.5f, 49.5f}, "ui text: quad covers the cell halo (0.5 font px inset)");
+        check(v[4].position.x - v[0].position.x == 6.0f && v[4].uvRect.x == glyphB.u0,
+              "ui text: pen advances one monospace step per glyph");
+        check(textBatch.segments().size() == 1 && textBatch.segments()[0].texture == engine::kUIFontTexture,
+              "ui text: glyphs batch into one font-texture segment");
+    }
+    textBatch.drawText("A\nB", 0.0f, 0.0f, 2.0f, fill);
+    check(textBatch.vertices()[12].position == glm::vec2{-1.0f, 19.0f},
+          "ui text: newline resets the pen and steps one line height");
+
+    // --- (j) Texture batching splits segments by texture id ----------------------
+    engine::UIBatch texBatch;
+    texBatch.begin(800, 600);
+    texBatch.drawRect(0.0f, 0.0f, 10.0f, 10.0f, fill);
+    texBatch.drawTexture(7, 20.0f, 0.0f, 10.0f, 10.0f, fill);
+    texBatch.drawTexture(7, 40.0f, 0.0f, 10.0f, 10.0f, fill);
+    texBatch.drawTexture(9, 60.0f, 0.0f, 10.0f, 10.0f, glm::vec4{0.25f, 0.5f, 0.75f, 1.0f}, fill);
+    texBatch.drawRect(80.0f, 0.0f, 10.0f, 10.0f, fill);
+    {
+        const std::vector<engine::UISegment>& segs = texBatch.segments();
+        check(segs.size() == 4 && segs[0].texture == engine::kUINoTexture && segs[1].texture == 7 &&
+                  segs[2].texture == 9 && segs[3].texture == engine::kUINoTexture,
+              "ui texture: consecutive same-texture quads coalesce into segments");
+        check(segs[0].indexCount == 6 && segs[1].indexCount == 12 && segs[1].firstIndex == 6 &&
+                  segs[2].firstIndex == 18 && segs[3].firstIndex == 24 && segs[3].indexCount == 6,
+              "ui texture: segment index ranges tile the index buffer");
+        const std::vector<engine::UIVertex>& v = texBatch.vertices();
+        check(v[4].kind == engine::kUIImagePrimitive && v[12].uvRect == glm::vec4{0.25f, 0.5f, 0.75f, 1.0f},
+              "ui texture: image quads carry kind + atlas sub-rect");
+        check(texBatch.bounds().maxX == 90.0f, "ui texture: images contribute to batch bounds");
+    }
+
+    // --- (k) Scissor stack nesting ------------------------------------------------
+    engine::UIBatch clipBatch;
+    clipBatch.begin(800, 600);
+    check(clipBatch.scissorDepth() == 1 && clipBatch.currentScissor() == engine::UIScissorRect{0, 0, 800, 600},
+          "ui scissor: the root scissor is the full viewport");
+    clipBatch.drawRect(0.0f, 0.0f, 10.0f, 10.0f, fill);
+    clipBatch.pushScissor(100.0f, 50.0f, 300.0f, 200.0f);
+    clipBatch.pushScissor(200.0f, 25.0f, 300.0f, 100.0f);
+    check(clipBatch.scissorDepth() == 3 && clipBatch.currentScissor() == engine::UIScissorRect{200, 50, 200, 75},
+          "ui scissor: nested pushes intersect with the parent rect");
+    clipBatch.drawRect(0.0f, 0.0f, 10.0f, 10.0f, fill);
+    clipBatch.popScissor();
+    check(clipBatch.currentScissor() == engine::UIScissorRect{100, 50, 300, 200},
+          "ui scissor: pop restores the parent rect");
+    clipBatch.drawRect(0.0f, 0.0f, 10.0f, 10.0f, fill);
+    clipBatch.popScissor();
+    clipBatch.popScissor(); // root pop: no-op
+    check(clipBatch.scissorDepth() == 1 && clipBatch.currentScissor() == engine::UIScissorRect{0, 0, 800, 600},
+          "ui scissor: popping the root is a safe no-op");
+    clipBatch.drawRect(0.0f, 0.0f, 10.0f, 10.0f, fill);
+    {
+        const std::vector<engine::UISegment>& segs = clipBatch.segments();
+        const std::vector<engine::UIScissorRect>& rects = clipBatch.scissors();
+        check(segs.size() == 4 && rects.size() == 3, "ui scissor: every push appends one effective rect");
+        check(rects[segs[0].scissor] == engine::UIScissorRect{0, 0, 800, 600} &&
+                  rects[segs[1].scissor] == engine::UIScissorRect{200, 50, 200, 75} &&
+                  rects[segs[2].scissor] == engine::UIScissorRect{100, 50, 300, 200} &&
+                  rects[segs[3].scissor] == engine::UIScissorRect{0, 0, 800, 600},
+              "ui scissor: segments reference the scissor active at emit time");
+    }
+    clipBatch.pushScissor(1000.0f, 1000.0f, 10.0f, 10.0f);
+    check(clipBatch.currentScissor().width == 0.0f && clipBatch.currentScissor().height == 0.0f,
+          "ui scissor: a disjoint nested rect collapses to empty");
 }
 
 int main() {

@@ -1745,8 +1745,9 @@ AddressSanitizer.
 
 Screen-space UI gets its own analytic-shader pipeline: rounded
 rectangles, borders and solid colors are evaluated per-pixel from
-a signed distance field — no texture atlas, no descriptors, one
-draw call per frame.
+a signed distance field, and — Step 2 — SDF text, textured images
+and a scissor stack turn it into a real immediate-mode UI layer,
+still flushed as a handful of indexed draws per frame.
 
 - **UIVertex & analytic shaders** (`shaders/ui.vert`,
   `shaders/ui.frag`, compiled to SPIR-V by glslangValidator like
@@ -1763,12 +1764,34 @@ draw call per frame.
   the union of all queued rects. The batch is capacity-capped
   (65536 vertices / 98304 indices) and truncates whole quads
   rather than overflowing; degenerate rects emit nothing.
-  `drawText()` is a stub for the future SDF/bitmap glyph batcher:
-  it accounts the item but emits no geometry yet.
-- **UIRenderer**: dedicated pipeline (dynamic viewport/scissor,
-  no depth test, alpha blending) over persistently mapped dynamic
-  vertex/index buffers; `record()` uploads the frame's batch and
-  flushes it as a single indexed draw call, then clears it. The
+- **SDF text** (`Graphics/SdfFont.h`): the built-in 5x7 bitmap
+  font data is baked by an exact signed-distance transform into
+  one 384x192 R8 atlas page (128 = glyph edge, 6-texel spread),
+  with save/load round-tripping through a small "ESDF" blob for
+  future asset caching. `drawText()` lays out real glyph quads
+  (whole-cell quads carrying the cell's atlas rect, pen advance,
+  newline handling, '?' fallback; `measureText()` reports the
+  widest line), and the fragment shader thresholds the field with
+  a derivative-sized band — crisp at any scale from one texture.
+  Without an atlas, `drawText()` degrades to accounting only.
+- **Texture descriptors**: `drawTexture(id, ...)` samples a
+  caller-registered descriptor set (`UIRenderer::registerTexture`
+  hands out never-reused ids; binding 0 = combined image sampler)
+  for icons/thumbnails/render targets, tinted and SDF-clipped, so
+  images get rounded corners for free. Consecutive quads sharing
+  texture + scissor coalesce into one flush segment, so state
+  changes cost exactly one extra draw each.
+- **Scissor stack**: `pushScissor()`/`popScissor()` nest clip
+  rects (each push intersects with its parent; the root is the
+  viewport; popping the root is a no-op). The flush programs
+  `vkCmdSetScissor` per segment and restores the full-frame
+  scissor afterwards for the HUD pass — scroll views and nested
+  panels clip correctly.
+- **UIRenderer**: dedicated pipeline (one sampler descriptor,
+  dynamic viewport/scissor, no depth test, alpha blending) over
+  persistently mapped dynamic vertex/index buffers plus the
+  uploaded font atlas texture; `record()` uploads the frame's
+  batch and flushes it segment by segment, then clears it. The
   vertex-input contract lives in exactly one place
   (`UIRenderer::vertexInput()`), shared by pipeline creation and
   the tests.
@@ -1776,18 +1799,23 @@ draw call per frame.
   and records it inside the present pass right after the 3D
   composite, under the HUD text; the Application issues a
   translucent rounded backdrop panel plus an accent rule behind
-  the FPS HUD every frame through `Renderer::uiBatch()`.
+  the FPS HUD plus an SDF control hint along the bottom edge,
+  every frame through `Renderer::uiBatch()`.
 
-Verification: 20 new headless checks cover vertex accumulation
+Verification: 45 new headless checks cover vertex accumulation
 and corner/uv layout, index offsets across quads, batch-bounds
 unions (including negative origins), radius/border clamping,
-degenerate-input rejection, the drawText stub contract, the
-vertex-input layout (binding stride + all six attribute
-offsets/formats), and capacity truncation staying
-index-consistent. **807 checks pass in Debug, Release-shared
-and Release-static with zero warnings, CTest 1/1** — and
-additionally in a hidden-visibility build (simulating Windows
-DLL rules) and under AddressSanitizer.
+degenerate-input rejection, the vertex-input layout (binding
+stride + all eight attribute offsets/formats), capacity
+truncation staying index-consistent, the SDF atlas bake
+(interior/ramp/empty-cell texel audit, lowercase folding, '?'
+fallback), save/load round-trip + corrupt-blob rejection, glyph
+layout (pen advance, newline, cell-halo quads, measureText),
+texture segment coalescing, and scissor nesting/intersection.
+**832 checks pass in Debug, Release-shared and Release-static
+with zero warnings, CTest 1/1** — and additionally in a
+hidden-visibility build (simulating Windows DLL rules) and under
+AddressSanitizer.
 
 ## Configuration
 

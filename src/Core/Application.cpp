@@ -554,6 +554,11 @@ void Application::run() {
                                UIRectStyle{10.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.16f}},
                                glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
             ui.drawRect(6.0f, 126.0f, 372.0f, 3.0f, glm::vec4{0.35f, 0.75f, 1.0f, 0.9f});
+            // SDF text (Step 2): a control hint along the bottom edge,
+            // crisp at any window size from the baked distance atlas.
+            const float hintY = static_cast<float>(std::max(m_window.height() - 34, 0));
+            ui.drawText("WASD + MOUSE FLY - SPACE/CTRL RISE/SINK - Q/E ROLL", 12.0f, hintY, 1.5f,
+                        glm::vec4{0.75f, 0.85f, 1.0f, 0.85f});
         }
         return m_renderSystem.render(m_scene);
     };

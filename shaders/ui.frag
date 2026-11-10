@@ -1,17 +1,27 @@
 #version 450
 
-// Analytic rounded-rectangle UI (Phase 26): no textures, no atlas.
+// Screen-space UI fragment shader (Phase 26). Three primitive
+// kinds share one pipeline:
+//   0 analytic shape — one rounded-box SDF yields fill, border
+//     ring and anti-aliased coverage; no texture involved.
+//   1 sampled image — texture * tint, clipped by the same SDF so
+//     icons get pixel-perfect rounded corners for free.
+//   2 SDF text — the baked distance field (uiFont atlas, red
+//     channel) is thresholded with a derivative-sized band, which
+//     stays crisp at any scale.
 // The rect's pixel size is recovered from the uv derivatives (uv
-// spans 0..1 across the quad), so corner radius and border width
-// stay in exact pixel units at any rect size. One rounded-box SDF
-// evaluation yields the fill, the border ring and anti-aliased
-// coverage — pixel-perfect at every resolution.
+// spans 0..1 across the quad), keeping radius/border widths in
+// exact pixel units without extra attributes.
 
 layout(location = 0) in vec2 fragUv;
 layout(location = 1) in vec4 fragColor;
 layout(location = 2) in float fragCornerRadius;
 layout(location = 3) in float fragBorderWidth;
 layout(location = 4) in vec4 fragBorderColor;
+layout(location = 5) in vec4 fragUvRect;
+layout(location = 6) flat in float fragKind;
+
+layout(set = 0, binding = 0) uniform sampler2D uiTexture;
 
 layout(location = 0) out vec4 outColor;
 
@@ -21,6 +31,20 @@ float roundedBoxSdf(vec2 point, vec2 halfSize, float radius) {
 }
 
 void main() {
+    vec2 atlasUv = mix(fragUvRect.xy, fragUvRect.zw, fragUv);
+
+    if (fragKind > 1.5) {
+        // SDF text: 0.5 is the glyph edge in the baked field.
+        float field = texture(uiTexture, atlasUv).r;
+        float band = max(fwidth(field), 1e-4);
+        float alpha = smoothstep(0.5 - band, 0.5 + band, field);
+        if (alpha <= 0.0) {
+            discard;
+        }
+        outColor = vec4(fragColor.rgb, fragColor.a * alpha);
+        return;
+    }
+
     vec2 rectSize = 1.0 / max(fwidth(fragUv), vec2(1e-5));
     vec2 halfSize = 0.5 * rectSize;
     vec2 point = (fragUv - 0.5) * rectSize;
@@ -31,6 +55,14 @@ void main() {
     if (coverage <= 0.0) {
         discard;
     }
+
+    if (fragKind > 0.5) {
+        // Sampled image, SDF-clipped, tinted.
+        vec4 texel = texture(uiTexture, atlasUv);
+        outColor = vec4(texel.rgb * fragColor.rgb, texel.a * fragColor.a * coverage);
+        return;
+    }
+
     vec4 color = fragColor;
     if (fragBorderWidth > 0.0) {
         float border = min(fragBorderWidth, min(halfSize.x, halfSize.y));
