@@ -9201,6 +9201,146 @@ void testPhase29Assets() {
     std::filesystem::remove_all(root, ec);
 }
 
+void testSceneTeardown() {
+    std::cout << "Scene/module teardown ordering (Windows module-unload segfault fix)\n";
+
+    // --- (1) ~Scene retires live script instances ----------------------
+    // Regression: EnTT's raw storage destruction bypasses the
+    // on_destroy sink, so a scene destroyed with live script
+    // instances silently leaked them (no onDestroy, no delete) and
+    // left teardown order vs module unloading undefined — the
+    // teardown sequencing behind the Windows-only segfault in
+    // testPhase24SpaceFlight (FreeLibrary unmaps where dlclose
+    // happens to keep the module mapped). ~Scene now clears the
+    // entities through the sink-connected path first.
+    {
+        g_scriptEvents.clear();
+        const int aliveBefore = g_probeScriptAlive;
+        {
+            engine::Scene scene;
+            engine::EngineContext context;
+            context.scene = &scene;
+            engine::Entity probe = scene.createEntity("TeardownProbe");
+            probe.addComponent<engine::TransformComponent>(glm::vec3{0.0f});
+            probe.addComponent<engine::NativeScriptComponent>("ProbeScript");
+            engine::NativeScriptSystem::update(context, 0.016f);
+            check(g_probeScriptAlive == aliveBefore + 1, "teardown: the probe script instantiates");
+            // Deliberately no shutdown(): the scene simply dies.
+        }
+        check(g_probeScriptAlive == aliveBefore,
+              "teardown: ~Scene destroys live script instances instead of leaking them");
+        const bool sawDestroy =
+            std::find(g_scriptEvents.begin(), g_scriptEvents.end(), "destroy") != g_scriptEvents.end();
+        check(sawDestroy, "teardown: ~Scene runs onDestroy through the destruction sink");
+    }
+
+    // --- (2) Explicit shutdown, then ~Scene: no double destroy ----------
+    {
+        const int aliveBefore = g_probeScriptAlive;
+        g_scriptEvents.clear();
+        {
+            engine::Scene scene;
+            engine::EngineContext context;
+            context.scene = &scene;
+            engine::Entity probe = scene.createEntity("ShutdownProbe");
+            probe.addComponent<engine::NativeScriptComponent>("ProbeScript");
+            engine::NativeScriptSystem::update(context, 0.016f);
+            engine::NativeScriptSystem::shutdown(scene);
+            check(g_probeScriptAlive == aliveBefore, "teardown: explicit shutdown retires the instance");
+        }
+        check(g_probeScriptAlive == aliveBefore,
+              "teardown: ~Scene after shutdown is a no-op (no double destroy)");
+    }
+
+    // --- (3) Flight module, contract order: retire module, then scene ---
+    namespace fs = std::filesystem;
+    const fs::path shipPlugin = ENGINE_TEST_SPACEFLIGHT_PLUGIN_PATH;
+    const auto dir = fs::temp_directory_path() / "engine_teardown_fix";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path brandedCopy = dir / shipPlugin.filename();
+    fs::copy_file(shipPlugin, brandedCopy);
+
+    const auto flyBriefly = [](engine::Scene& flightScene, engine::EngineContext& context,
+                               engine::ModuleManager& manager, engine::PhysicsSystem& physics,
+                               engine::PhysicsSettings& settings) {
+        for (int i = 0; i < 30; ++i) {
+            context.fixedDeltaSeconds = 1.0f / 60.0f;
+            manager.fixedUpdate(context, 1.0f / 60.0f);
+            engine::NativeScriptSystem::fixedUpdate(context, 1.0f / 60.0f);
+            physics.update(flightScene, 1.0 / 60.0, settings, nullptr);
+        }
+    };
+    const auto liveScriptInstances = [](engine::Scene& flightScene) {
+        size_t live = 0;
+        auto view = flightScene.registry().view<engine::NativeScriptComponent>();
+        for (const entt::entity entity : view) {
+            if (view.get<engine::NativeScriptComponent>(entity).instance != nullptr) {
+                ++live;
+            }
+        }
+        return live;
+    };
+
+    {
+        engine::VramBudget vram(16 * 1024 * 1024);
+        engine::VramBudget staging(16 * 1024 * 1024);
+        engine::AssetManager assets(vram, staging);
+        engine::Input input;
+        auto scene = std::make_unique<engine::Scene>();
+        engine::EngineContext context;
+        context.scene = scene.get();
+        context.input = &input;
+        context.assets = &assets;
+        context.scripts = &engine::ScriptRegistry::instance();
+        engine::ModuleManager manager;
+        check(manager.load(brandedCopy, context), "teardown: flight module loads for the ordering test");
+        engine::PhysicsSystem physics;
+        engine::PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        flyBriefly(*scene, context, manager, physics, settings);
+        check(scene->entityCount() > 3 && liveScriptInstances(*scene) == 1,
+              "teardown: the module's script instance is live before unloading");
+        // Contract order: the module retires first (its onUnload
+        // destroys the instance and withdraws the factory), then
+        // the scene dies holding nothing module-owned.
+        manager.unload();
+        check(!engine::ScriptRegistry::instance().has("SpaceFlightScript"),
+              "teardown: unloading withdraws the module's script factory");
+        scene.reset();
+        engine::Scene fresh;
+        check(fresh.createEntity("Alive").isValid() && fresh.entityCount() == 1,
+              "teardown: scene destruction after module retirement leaves the engine healthy");
+    }
+
+    // --- (4) Host shutdown first (the standalone player's order) ---------
+    {
+        engine::VramBudget vram(16 * 1024 * 1024);
+        engine::VramBudget staging(16 * 1024 * 1024);
+        engine::AssetManager assets(vram, staging);
+        engine::Input input;
+        auto scene = std::make_unique<engine::Scene>();
+        engine::EngineContext context;
+        context.scene = scene.get();
+        context.input = &input;
+        context.assets = &assets;
+        context.scripts = &engine::ScriptRegistry::instance();
+        engine::ModuleManager manager;
+        check(manager.load(brandedCopy, context), "teardown: flight module reloads for the shutdown order");
+        engine::PhysicsSystem physics;
+        engine::PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f};
+        flyBriefly(*scene, context, manager, physics, settings);
+        engine::NativeScriptSystem::shutdown(*scene);
+        check(liveScriptInstances(*scene) == 0,
+              "teardown: host shutdown retires instances while the module is loaded");
+        manager.unload();
+        check(!engine::ScriptRegistry::instance().has("SpaceFlightScript") && !manager.isLoaded(),
+              "teardown: unload after host shutdown stays clean (module skips its dead instance)");
+        scene.reset();
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -9224,6 +9364,7 @@ int main() {
     testPhase31PlayMode();
     testPhase32Pbr();
     testPhase33Export();
+    testSceneTeardown();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();

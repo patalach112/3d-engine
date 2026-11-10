@@ -337,7 +337,14 @@ public:
         }
     }
 
-    ~PlayerRuntime() { m_context.waitIdle(); }
+    ~PlayerRuntime() {
+        // Same teardown contract as the editor: retire script
+        // instances while the module manager's module is still
+        // loaded (run() already shut them down on the normal
+        // path; this covers early exits), then drain the GPU.
+        engine::NativeScriptSystem::shutdown(m_scene);
+        m_context.waitIdle();
+    }
 
     PlayerRuntime(const PlayerRuntime&) = delete;
     PlayerRuntime& operator=(const PlayerRuntime&) = delete;

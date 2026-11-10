@@ -139,6 +139,14 @@ Application::Application(EngineConfig config)
 }
 
 Application::~Application() {
+    // Retire native script instances while every member (above all
+    // the module manager and its still-loaded module) is alive:
+    // deleting an instance calls module code through its vtable,
+    // which must never happen after the module has been unloaded.
+    // Member destruction would retire the module BEFORE the scene
+    // (reverse declaration order), so this cannot be left to
+    // ~Scene's entity clear — by then it would be too late.
+    NativeScriptSystem::shutdown(m_scene);
     // Make sure no frame is still using the resources that member
     // destruction is about to release (Renderer, buffers, swapchain...).
     m_context.waitIdle();

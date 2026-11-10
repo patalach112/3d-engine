@@ -59,6 +59,21 @@ struct EngineContext {
 // per frame -> onUnload before destruction. Any callback may throw;
 // the host catches, logs, and falls back to running without a module
 // (or keeps the previous generation on a failed reload).
+//
+// Teardown contract (script instances): INativeScript instances are
+// created by module factories and deleted through their (module)
+// vtables, so an instance must never be deleted after its module
+// has been unmapped — on Windows FreeLibrary really unmaps, which
+// is why violating this crashed in Scene teardown. The engine
+// guarantees instances are retired, in order of preference, by
+// (1) the module's onUnload destroying every live instance it
+// caused to be created, or (2) the host calling
+// NativeScriptSystem::shutdown(scene) before unloading; ~Scene
+// destroying the remaining entities is only a safety net and is
+// valid solely while the owning module is still loaded. Hosts
+// therefore always retire modules before destroying the scene
+// (never the other way round: module code may hold a raw Scene*
+// from its EngineContext and dereference it in onUnload).
 // ---------------------------------------------------------------------------
 class IGameModule {
 public:

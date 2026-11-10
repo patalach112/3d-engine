@@ -30,6 +30,18 @@ Scene::Scene() {
         m_registry);
 }
 
+Scene::~Scene() {
+    // Destroy every entity through the sink-connected path (see
+    // the lifetime contract on the declaration). Note this must
+    // NOT go through Scene::destroyEntity: that publishes on the
+    // event bus and unlinks hierarchy bookkeeping, neither of
+    // which may be touched while the scene is half-destroyed.
+    // registry.clear() runs each pool's pop_all(), which is what
+    // publishes the destruction sinks.
+    m_registry.clear();
+    m_entityCount = 0;
+}
+
 Entity Scene::createEntity(const std::string& name) {
     Entity entity{m_registry.create(), this};
     ++m_entityCount;

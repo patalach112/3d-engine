@@ -100,7 +100,26 @@ public:
     // in a host Scene; module state belongs in script instances
     // (INativeScript) that the module destroys in onUnload.
     Scene();
-    ~Scene() = default;
+    // Deterministic teardown: every entity is destroyed through
+    // the registry's sink-connected path before any member dies,
+    // so component on_destroy hooks actually run — above all the
+    // native-script hook, which onDestroy()s and deletes script
+    // instances created by game-module factories. (EnTT's raw
+    // storage destruction bypasses the sinks: live instances used
+    // to leak here, and on Windows — where FreeLibrary really
+    // unmaps the module, unlike glibc's dlclose — pool teardown
+    // then released shared_ptr control blocks amid that wreckage;
+    // that was the testPhase24SpaceFlight teardown segfault.)
+    // Lifetime contract: a Scene must outlive the retirement of
+    // the modules that populated it OR have its script instances
+    // retired first (module onUnload, or the host calling
+    // NativeScriptSystem::shutdown); instance deletion calls
+    // module code through the instance vtable, so it must never
+    // happen after the owning module has been unmapped. Hosts
+    // satisfy this by construction: Application and the
+    // standalone player shut scripts down before their module
+    // manager unloads anything.
+    ~Scene();
 
     Scene(const Scene&) = delete;
     Scene& operator=(const Scene&) = delete;

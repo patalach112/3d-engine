@@ -2497,3 +2497,45 @@ into the game.
   bundles exit 1. **1084 passed, 0 failed** in Debug,
   Release (shared and static), hidden-visibility and ASan
   builds, warning-free, CTest 1/1.
+
+## Maintenance — Windows scene-teardown segfault fix ✅
+
+A MinGW x64 crash in `testPhase24SpaceFlight` teardown
+(`std::_Sp_counted_base::_M_release` from `Scene::~Scene`)
+traced to undefined teardown ordering, invisible on Linux
+for a subtle reason: glibc refuses to actually unmap a
+module whose TUs include EnTT headers (the EnTT meta
+locator's `__cxa_atexit` entanglement marks it NODELETE —
+verified empirically: segments stay mapped after
+`dlclose`), while Windows `FreeLibrary` unmaps for real,
+exposing any host-side teardown that reaches module-owned
+code late. The concrete engine defects, both reproduced
+on Linux:
+
+- **`~Scene()` leaked live native-script instances.**
+  `~Scene() = default` let EnTT destroy pool storages
+  directly, which never publishes the `on_destroy`
+  destruction sink — so the NativeScriptSystem hook that
+  `onDestroy()`s and deletes module-created script
+  instances never ran at scene teardown (probe: instance
+  alive after `~Scene`, no `onDestroy`). `~Scene` now
+  destroys every entity first via `registry.clear()`
+  (whose `pop_all` publishes the sinks) and is out-of-line.
+- **Instance deletion could be sequenced after module
+  unload.** Deleting a script instance calls module code
+  through its vtable; the editor never shut scripts down
+  at exit, and its member order retires the module before
+  the scene dies. `Application` and the standalone player
+  now call `NativeScriptSystem::shutdown` up front in
+  their destructors, and the module contract (module
+  `onUnload` retires instances → host shutdown → `~Scene`
+  as a loaded-module-only safety net; modules always
+  retire before their scene is destroyed) is documented
+  on `IGameModule` and `Scene`.
+
+`testSceneTeardown()` adds 12 checks: the leak fix,
+no double-destroy after explicit shutdown, and both
+contract teardown orders against the real flight module.
+**1096 passed, 0 failed** in Debug, Release (shared and
+static), hidden-visibility and ASan builds, warning-free,
+CTest 1/1.
