@@ -174,6 +174,11 @@ private:
     bool m_renameFocusPending = false;
     entt::entity m_viewportContextTarget = entt::null;
     glm::vec2 m_rightPressPos{0.0f, 0.0f};
+    // True while the editor fly-look owns the GLFW cursor capture:
+    // engaged by an RMB press inside the viewport, held for the
+    // whole drag (cursor hidden/locked, raw deltas drive the
+    // camera), released with the button.
+    bool m_editorFlyCapture = false;
     bool m_rightPressInViewport = false;
     std::string m_statusMessage;           // transient status-bar notification
     float m_statusSecondsRemaining = 0.0f; // decays in the update callback

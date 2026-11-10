@@ -2836,3 +2836,38 @@ reworks:
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, standalone player headless run
 clean.
+
+## Maintenance — Larger crisper bitmap text, pointer-locked viewport fly-look ✅
+
+- **Text size & clarity**: the global UI text scale rises
+  1.65 → 1.8 and the bitmap bake rises 20 px → 26 px em
+  (`kBitmapFontBakePixels`), keeping the bake comfortably
+  above the ~18 px on-screen em so coverage minifies
+  slightly rather than magnifying. Glyph quad origins are
+  snapped with `std::round` (half away from zero, exact for
+  the negative origins of scrolled/clipped panels) instead
+  of the previous `floor(x + 0.5f)`. A 26 px-row still fits
+  a full line at the new scale (verified in the suite), so
+  no widget bounding boxes moved.
+- **Pointer lock for the viewport fly-look**: Edit mode used
+  to forbid cursor capture outright, so an RMB look-drag
+  died at the window border. `handleMouseCapture` now owns
+  a fly-capture state: an RMB press inside the viewport
+  engages capture (`Input::setMouseCaptured` →
+  `glfwSetInputMode(GLFW_CURSOR_DISABLED)`, cursor hidden
+  and locked, look driven by raw incremental deltas — the
+  capture toggle already zeroes the delta baseline, so
+  there is no first-frame jump), and releasing the button
+  restores `GLFW_CURSOR_NORMAL` and a live UI. Play mode's
+  click-to-capture is unchanged and never inherits the fly
+  state. The viewport right-click context menu keeps
+  working: its press bookkeeping is no longer gated on
+  `isMouseCaptured()` (the fly capture engages on the press
+  frame; the existing <6 px click-vs-drag test is what
+  separates a menu click from a fly drag). A headless Input
+  test pins the capture delta contract.
+
+1202 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, standalone player headless run
+clean.

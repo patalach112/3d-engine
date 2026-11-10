@@ -8008,9 +8008,9 @@ void testPhase26UIRenderer() {
         check(v[0].kind == engine::kUITextPrimitive &&
                   v[0].uvRect == glm::vec4{glyphA.u0, glyphA.v0, glyphA.u1, glyphA.v1},
               "ui text: glyph quad samples its atlas rect as bitmap text");
-        check(v[0].position == glm::vec2{std::floor(100.0f + glyphA.bearingX + 0.5f),
-                                         std::floor(50.0f + atlas.ascent + glyphA.bearingY + 0.5f)},
-              "ui text: quad hangs off the baseline by the glyph's bearing, snapped to a whole pixel");
+        check(v[0].position == glm::vec2{std::round(100.0f + glyphA.bearingX),
+                                         std::round(50.0f + atlas.ascent + glyphA.bearingY)},
+              "ui text: quad hangs off the baseline by the glyph's bearing, std::round-snapped to a pixel");
         check(nearlyEqual(v[4].position.x - v[0].position.x,
                           glyphA.advance + atlas.kernFor('A', 'B') + glyphB.bearingX - glyphA.bearingX, 1.0) &&
                   v[4].uvRect.x == glyphB.u0,
@@ -8020,9 +8020,9 @@ void testPhase26UIRenderer() {
     }
     textBatch.drawText("A\nB", 0.0f, 0.0f, 2.0f, fill);
     check(nearlyEqual(textBatch.vertices()[12].position.y - textBatch.vertices()[8].position.y,
-                      atlas.lineHeight * 2.0f + (glyphB.bearingY - glyphA.bearingY) * 2.0f, 1e-4) &&
-              nearlyEqual(textBatch.vertices()[12].position.x, glyphB.bearingX * 2.0f, 1e-4),
-          "ui text: newline resets the pen and steps one (font-metric) line height");
+                      atlas.lineHeight * 2.0f + (glyphB.bearingY - glyphA.bearingY) * 2.0f, 1.0) &&
+              nearlyEqual(textBatch.vertices()[12].position.x, glyphB.bearingX * 2.0f, 0.75),
+          "ui text: newline resets the pen and steps one (font-metric) line height (within the 1px snap)");
 
     // --- (j) Texture batching splits segments by texture id ----------------------
     engine::UIBatch texBatch;
@@ -10281,7 +10281,13 @@ void testPhase36LayoutThemeFont() {
     // --- (d) Global font scale: bumped ~10% for legibility, and a
     // line still fits the fixed row height so bounding boxes hold.
     {
-        check(engine::UIContext::kTextScale == 1.65f, "font: global UI text scale is 1.65 (was 1.5, +10%)");
+        check(engine::UIContext::kTextScale == 1.8f, "font: global UI text scale is 1.8 (comfortably legible)");
+        check(engine::kBitmapFontBakePixels == 26.0f, "font: glyphs bake at a 26px em, above the on-screen size");
+        {
+            const engine::FontGlyph& glyphH = atlas.glyphFor('H');
+            const float texelHeight = (glyphH.v1 - glyphH.v0) * static_cast<float>(atlas.height);
+            check(texelHeight > 15.5f, "font: the baked 'H' carries >15 texels of cap height (26px bake)");
+        }
         engine::UIBatch batch;
         batch.setFontAtlas(&atlas);
         batch.begin(800, 600);
@@ -10462,6 +10468,35 @@ void testPhase36LayoutThemeFont() {
         }
         check(allGlyphs, "bitmap editor scale: every glyph of 'Hello' inks at kTextScale (none missing)");
         check(fringe < ink * 2.5f, "bitmap editor scale: AA fringe stays a thin edge, not a smear");
+    }
+
+    // --- (g) Pointer lock contract: engaging capture (the editor's
+    // RMB fly-look, GLFW_CURSOR_DISABLED at the window layer) must
+    // not replay pre-capture motion as a look jump, and motion
+    // during capture arrives as raw incremental deltas. Driven
+    // headlessly through Input's inject* seam.
+    {
+        engine::Input input; // headless: no window attached
+        input.injectCursorPosition({100.0f, 100.0f});
+        input.beginFrame();
+        input.injectCursorPosition({110.0f, 95.0f});
+        check(nearlyEqual(input.mouseDelta().x, 10.0, 1e-6) && nearlyEqual(input.mouseDelta().y, -5.0, 1e-6),
+              "pointer lock: free-cursor motion accumulates as position deltas");
+        input.setMouseCaptured(true);
+        check(input.isMouseCaptured() && nearlyEqual(input.mouseDelta().x, 0.0, 1e-6) &&
+                  nearlyEqual(input.mouseDelta().y, 0.0, 1e-6),
+              "pointer lock: engaging capture zeroes the accumulated delta (no look jump)");
+        input.injectCursorPosition({500.0f, 500.0f}); // first virtual sample under GLFW_CURSOR_DISABLED
+        check(nearlyEqual(input.mouseDelta().x, 0.0, 1e-6) && nearlyEqual(input.mouseDelta().y, 0.0, 1e-6),
+              "pointer lock: the first captured sample only sets the delta baseline");
+        input.injectCursorPosition({505.0f, 498.0f});
+        check(nearlyEqual(input.mouseDelta().x, 5.0, 1e-6) && nearlyEqual(input.mouseDelta().y, -2.0, 1e-6),
+              "pointer lock: captured motion arrives as raw incremental deltas");
+        input.setMouseCaptured(false);
+        check(!input.isMouseCaptured(), "pointer lock: releasing capture restores the free cursor state");
+        check(engine::Window::cursorModeForCapture(true) == GLFW_CURSOR_DISABLED &&
+                  engine::Window::cursorModeForCapture(false) == GLFW_CURSOR_NORMAL,
+              "pointer lock: capture maps to GLFW_CURSOR_DISABLED, release to GLFW_CURSOR_NORMAL");
     }
 }
 

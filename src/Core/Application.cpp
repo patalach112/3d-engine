@@ -808,7 +808,7 @@ void Application::run() {
                            ? (m_input.isMouseCaptured()
                                   ? "Play mode - simulation running - Esc releases the mouse - Stop restores the edit scene"
                                   : "Play mode - click inside the viewport to capture the mouse - Stop (or Ctrl+P) restores the edit scene")
-                           : "Edit mode - click in the viewport to select - hold right-mouse in the viewport to look - Ctrl+P plays the scene");
+                           : "Edit mode - click in the viewport to select - hold right-mouse in the viewport to fly (cursor captured) - Ctrl+P plays the scene");
             ui.drawText(statusText, layout.statusBar.x + 10.0f,
                         layout.statusBar.y + 0.5f * layout.statusBar.height - 6.0f * scale, 1.2f,
                         showNotification ? glm::vec4{0.55f, 0.90f, 0.60f, 1.0f}
@@ -1080,7 +1080,12 @@ void Application::run() {
             // menu the Hierarchy offers. A right *drag* stays camera
             // look (updateEditorCamera) and raises nothing, and a
             // release over a dock never opens anything.
-            if (!playing && !m_input.isMouseCaptured()) {
+            // Note: no capture exclusion here. The fly-look captures
+            // on the press frame itself, so gating on
+            // isMouseCaptured() would swallow the press and the menu
+            // could never open; the <6 px test below is what keeps a
+            // fly drag (hundreds of virtual pixels) from raising it.
+            if (!playing) {
                 const glm::vec2 mouse = m_uiContext.mousePosition();
                 if (m_uiContext.rightPressedRect(layout.viewport)) {
                     m_rightPressPos = mouse;
@@ -1225,14 +1230,15 @@ void Application::updateEditorCamera(double deltaSeconds) {
     // Fly navigation lives entirely behind the right mouse button
     // held inside the viewport panel: mouse motion looks around and
     // WASD/QE fly along the camera basis (Shift sprints), smoothed
-    // by the Camera's look/velocity convergence below. The cursor
-    // stays visible and free the whole time -- this is an editor
-    // navigation gesture, not a capture. While a rename text field
-    // owns the keyboard, the same keys are text, never flight.
+    // by the Camera's look/velocity convergence below. For the
+    // whole drag the cursor is captured (hidden and locked by
+    // handleMouseCapture), so the look is driven by raw incremental
+    // deltas and never stalls at a window edge; releasing the
+    // button hands the free cursor back to the UI. While a rename
+    // text field owns the keyboard, the same keys are text, never
+    // flight.
     Camera& camera = activeCamera->camera;
-    const glm::vec2 mouse = uiMousePosition();
-    const bool flying = m_renameTarget == entt::null && m_input.isMouseButtonDown(MouseButton::Right) &&
-                        m_editorLayout.containsViewport(mouse.x, mouse.y);
+    const bool flying = m_editorFlyCapture && m_renameTarget == entt::null;
     if (flying) {
         camera.processLook(m_input.mouseDelta());
         camera.processMovement(m_input, deltaSeconds);
@@ -1249,14 +1255,39 @@ void Application::updateEditorCamera(double deltaSeconds) {
 }
 
 void Application::handleMouseCapture() {
-    // Edit mode never captures: release any stale capture (e.g. a
-    // mode transition that raced a click) so the UI is always live.
     if (!m_playSession.isPlaying()) {
-        if (m_input.isMouseCaptured()) {
-            m_input.setMouseCaptured(false);
-            ENGINE_LOG_DEBUG("Mouse released (Edit mode never captures)");
+        // Edit mode: the fly-look owns the cursor capture for
+        // exactly the duration of a right-button drag that began
+        // inside the viewport. Engaging capture switches GLFW to
+        // GLFW_CURSOR_DISABLED (Window::setCursorCaptured): the
+        // pointer hides and locks, so look-around is driven by raw
+        // incremental deltas and can never die at a window border
+        // mid-drag. Releasing the button restores
+        // GLFW_CURSOR_NORMAL and the UI is live again -- there is
+        // no captured state outside the drag. While a rename owns
+        // the keyboard the right button stays a UI gesture
+        // (context menus), never a capture, and Play mode starts
+        // from a clean slate (see below).
+        const glm::vec2 mouse = uiMousePosition();
+        const bool pressInViewport = m_input.wasMouseButtonPressed(MouseButton::Right) &&
+                                     m_renameTarget == entt::null &&
+                                     m_editorLayout.containsViewport(mouse.x, mouse.y);
+        m_editorFlyCapture = (m_editorFlyCapture || pressInViewport) &&
+                             m_input.isMouseButtonDown(MouseButton::Right);
+        if (m_input.isMouseCaptured() != m_editorFlyCapture) {
+            m_input.setMouseCaptured(m_editorFlyCapture);
+            if (m_editorFlyCapture) {
+                ENGINE_LOG_DEBUG("Mouse captured (viewport fly-look)");
+            } else {
+                ENGINE_LOG_DEBUG("Mouse released (fly-look ended)");
+            }
         }
         return;
+    }
+    // Entering Play mode: the fly-look capture never carries over.
+    if (m_editorFlyCapture) {
+        m_editorFlyCapture = false;
+        m_input.setMouseCaptured(false);
     }
     // Play mode: Esc always hands the mouse back to the UI first.
     // It never quits the application from here -- the window close

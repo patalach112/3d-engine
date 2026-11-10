@@ -16,7 +16,7 @@ namespace engine {
 // (Segoe UI on Windows, Liberation/Noto/DejaVu Sans on Linux and
 // macOS, with the bundled assets/fonts/DejaVuSans.ttf as the
 // always-available fallback) rasterized with stb_truetype directly
-// at the target pixel size (~20 px em) into a coverage (alpha)
+// at the target pixel size (~26 px em) into a coverage (alpha)
 // atlas. Text renders as plain textured quads whose sampled
 // coverage is the alpha -- no distance field anywhere.
 //
@@ -54,11 +54,12 @@ inline constexpr uint32_t kFontGlyphCount = kFontLastChar - kFontFirstChar + 1;
 inline constexpr float kUiFontUnitsPerEm = 10.0f; // font units per em
 
 // Bitmap bake size: glyphs are rasterized at this em pixel height,
-// close to the on-screen size of editor text (a ~14 px cap height),
-// so coverage stays crisp instead of being minified from a huge
-// bake. Larger scales (titles) magnify slightly, which large text
-// tolerates; labels -- the bulk of the UI -- stay pixel-true.
-inline constexpr float kBitmapFontBakePixels = 20.0f;
+// a step above the on-screen size of editor text (a ~19 px cap
+// height for the ~13 px caps the UI draws), so coverage stays
+// crisp instead of being minified from a huge bake. Larger scales
+// (titles) magnify slightly, which large text tolerates; labels --
+// the bulk of the UI -- stay pixel-true.
+inline constexpr float kBitmapFontBakePixels = 26.0f;
 
 // Legacy bitmap-fallback geometry, retained for the fallback path
 // and for save/load compatibility checks.

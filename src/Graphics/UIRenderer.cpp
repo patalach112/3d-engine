@@ -157,8 +157,8 @@ void UIBatch::drawText(std::string_view text, float x, float y, float scale, con
             // on a pixel boundary keeps its rasterized coverage; a
             // fractional origin would smear half of every thin
             // stroke into the neighbouring pixel and grey it out.
-            const float quadX = std::floor(penX + glyph.bearingX * scale + 0.5f);
-            const float quadY = std::floor(baselineY + glyph.bearingY * scale + 0.5f);
+            const float quadX = std::round(penX + glyph.bearingX * scale);
+            const float quadY = std::round(baselineY + glyph.bearingY * scale);
             addQuad(quadX, quadY, glyph.width * scale, glyph.height * scale, UIRectStyle{}, color,
                     kUITextPrimitive, kUIFontTexture, glm::vec4{glyph.u0, glyph.v0, glyph.u1, glyph.v1});
         }
@@ -433,8 +433,8 @@ void UIRenderer::createFontAtlasTexture() {
     std::memcpy(staging.mappedData(), m_fontAtlas.pixels.data(), m_fontAtlas.pixels.size());
     staging.unmap();
 
-    // Editor text is drawn close to (just under) the 20 px bake
-    // size. Coverage filters linearly -- each mip level is the
+    // Editor text is drawn close to (just under) the bake size.
+    // Coverage filters linearly -- each mip level is the
     // exact area coverage of the next -- so a full mip chain keeps
     // labels smooth when a small window shrinks them further,
     // without the threshold wash-out a distance field suffered.

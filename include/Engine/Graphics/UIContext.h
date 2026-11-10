@@ -118,7 +118,7 @@ public:
     static constexpr float kRowHeight = 26.0f;
     static constexpr float kRowSpacing = 4.0f;
     static constexpr float kPanelPadding = 8.0f;
-    static constexpr float kTextScale = 1.65f; // global UI text scale (+10% legibility)
+    static constexpr float kTextScale = 1.8f; // global UI text scale (comfortably legible)
     static constexpr float kSliderLabelFraction = 0.38f;
 
     // Frame lifecycle: beginFrame snapshots input (computing
