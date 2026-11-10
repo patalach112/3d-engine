@@ -2,6 +2,7 @@
 #include "Core/Export.h"
 
 #include "Graphics/RenderQueue.h" // DrawItem + RenderQueue
+#include "Graphics/Renderer.h"    // SceneViewportRect
 #include "Scene/Systems/LightingSystem.h"
 
 #include <glm/mat4x4.hpp>
@@ -65,6 +66,14 @@ public:
     // accounting does not mistake a skipped iteration for a real frame.
     bool render(Scene& scene);
 
+    // The editor's bounded viewport: projection aspect and the
+    // renderer's Vulkan viewport/scissor both follow this rect, so
+    // the world is framed for the panel it actually appears in
+    // (never stretched over the whole window). Empty = full
+    // framebuffer (standalone player).
+    void setSceneViewport(SceneViewportRect viewport) { m_sceneViewport = viewport; }
+    [[nodiscard]] SceneViewportRect sceneViewport() const { return m_sceneViewport; }
+
     // Scene -> frame data derivation (no GPU involvement).
     static PreparedFrame prepareFrame(Scene& scene, float aspectRatio,
                                       const FramePrepareOptions& options = {});
@@ -83,6 +92,7 @@ private:
     size_t m_parallelMinItems;
     bool m_sortDrawItems;
     const AssetManager* m_assets;
+    SceneViewportRect m_sceneViewport{}; // empty = full framebuffer
     bool m_warnedNoCamera = false;
     uint32_t m_lastDrawnCount = 0;
     uint32_t m_lastCulledCount = 0;

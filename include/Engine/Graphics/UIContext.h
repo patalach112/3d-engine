@@ -74,7 +74,11 @@ using UIWidgetId = uint32_t;
 inline constexpr UIWidgetId kUINoWidget = 0;
 
 struct UITheme {
-    glm::vec4 panelFill{0.05f, 0.06f, 0.09f, 0.92f};
+    // Docked editor panels are fully opaque: the 3D viewport is a
+    // bounded rectangle between them, so nothing of the world may
+    // bleed through the chrome (the old 0.92 alpha let scene colour
+    // wash over text whenever geometry passed behind a panel).
+    glm::vec4 panelFill{0.07f, 0.08f, 0.11f, 1.0f};
     glm::vec4 panelBorder{1.0f, 1.0f, 1.0f, 0.14f};
     glm::vec4 text{0.92f, 0.95f, 1.0f, 1.0f};
     glm::vec4 buttonFill{0.16f, 0.19f, 0.26f, 1.0f};

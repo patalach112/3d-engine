@@ -32,6 +32,23 @@ bool pickEntityAt(const Scene& scene, const Camera& camera, glm::vec2 mousePixel
     return scene.raycast(cameraRay(camera, screenToNdc(mousePixels, viewportSize), aspectRatio), outHit);
 }
 
+bool pickEntityAt(const Scene& scene, const Camera& camera, glm::vec2 mousePixels, const UIRect& viewport,
+                  RaycastHit& outHit) {
+    if (!viewport.contains(mousePixels.x, mousePixels.y)) {
+        return false;
+    }
+    return pickEntityAt(scene, camera, mousePixels - glm::vec2{viewport.x, viewport.y},
+                        glm::vec2{viewport.width, viewport.height}, outHit);
+}
+
+bool dropPointOnGround(const Camera& camera, glm::vec2 mousePixels, const UIRect& viewport, glm::vec3& outPoint) {
+    if (!viewport.contains(mousePixels.x, mousePixels.y)) {
+        return false;
+    }
+    return dropPointOnGround(camera, mousePixels - glm::vec2{viewport.x, viewport.y},
+                             glm::vec2{viewport.width, viewport.height}, outPoint);
+}
+
 bool dropPointOnGround(const Camera& camera, glm::vec2 mousePixels, glm::vec2 viewportSize, glm::vec3& outPoint) {
     if (viewportSize.x <= 0.0f || viewportSize.y <= 0.0f) {
         return false;

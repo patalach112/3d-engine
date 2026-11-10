@@ -166,11 +166,14 @@ std::vector<HudVertex> buildHudVertices(std::string_view text, float xPixels, fl
 std::string formatHudText(double framesPerSecond, double frameMilliseconds, uint32_t workerThreads,
                           uint64_t vramUsedMiB, uint64_t vramBudgetMiB, uint32_t drawnCount,
                           uint32_t culledCount) {
+    // Sentence-case, unit-spaced stats for the TrueType UI font (the
+    // old ALL-CAPS layout existed only because the 5x7 bitmap font
+    // had no lowercase). One line: it lives in the toolbar now.
     std::ostringstream stream;
-    stream << std::fixed << std::setprecision(1) << "FPS " << framesPerSecond << " FRAME " << std::setprecision(2)
-           << frameMilliseconds << " MS\n"
-           << "WORKERS " << workerThreads << "+1 VRAM " << vramUsedMiB << '/' << vramBudgetMiB << " MIB\n"
-           << "DRAWN " << drawnCount << " CULLED " << culledCount;
+    stream << std::fixed << std::setprecision(1) << "FPS " << framesPerSecond << "  |  Frame "
+           << std::setprecision(2) << frameMilliseconds << " ms  |  Workers " << workerThreads
+           << "+1  |  VRAM " << vramUsedMiB << '/' << vramBudgetMiB << " MiB  |  Drawn " << drawnCount
+           << "  Culled " << culledCount;
     return stream.str();
 }
 

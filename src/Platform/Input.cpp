@@ -290,6 +290,12 @@ float Input::axisValue(std::string_view name) const {
 void Input::onFocusChanged(bool focused) {
     if (!focused) {
         resetState();
+        // A captured cursor must never survive focus loss: the user
+        // Alt-Tabbed away precisely to get their mouse back, and a
+        // hidden locked cursor on return reads as "the app froze".
+        if (m_mouseCaptured) {
+            setMouseCaptured(false);
+        }
     }
 }
 

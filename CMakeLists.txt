@@ -179,6 +179,7 @@ engine_module(EngineGraphics ENGINE_BUILDING_GRAPHICS
     src/Graphics/HudFont.cpp
     src/Graphics/HudRenderer.cpp
     src/Graphics/SdfFont.cpp
+    src/Graphics/EditorLayout.cpp
     src/Graphics/UIContext.cpp
     src/Graphics/UIInspector.cpp
     src/Graphics/UIRenderer.cpp
@@ -337,9 +338,13 @@ add_dependencies(3d-engine engine_shaders)
 # The renderer locates compiled SPIR-V through this absolute path, so the
 # executable can be launched from any working directory.
 string(REPLACE "\\" "/" SHADER_OUTPUT_DIR_SLASHES ${SHADER_OUTPUT_DIR})
+string(REPLACE "\\" "/" ENGINE_FONT_DIR_SLASHES ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(EngineGraphics
     PRIVATE
         ENGINE_SHADER_DIR="${SHADER_OUTPUT_DIR_SLASHES}"
+        # Bundled fallback UI font (used when no system sans-serif --
+        # Segoe UI / Liberation / Noto / DejaVu -- can be found).
+        ENGINE_DEFAULT_FONT_PATH="${ENGINE_FONT_DIR_SLASHES}/assets/fonts/DejaVuSans.ttf"
 )
 
 # ---------------------------------------------------------------------------

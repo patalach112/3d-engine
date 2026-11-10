@@ -51,8 +51,13 @@ enum class MouseButton : uint8_t {
 // config/engine.ini).
 struct InputConfig {
     // Grab and hide the cursor at startup (first-person mouse look).
-    // Afterwards: click the window to capture, Esc to release.
-    bool captureMouseOnStart = true;
+    // Both default OFF: the editor must start with a free, visible
+    // cursor or its own UI is unusable. A game (the standalone
+    // player) may opt in via config; the editor host ignores
+    // captureMouseOnStart entirely and only captures after an
+    // explicit click inside the 3D viewport in Play mode, with Esc
+    // always releasing back to the UI.
+    bool captureMouseOnStart = false;
     bool captureMouseOnClick = true;
 };
 

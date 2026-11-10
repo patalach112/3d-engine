@@ -39,6 +39,7 @@
 #include "Graphics/PipelineState.h"
 #include "Core/Jobs/JobSystem.h"
 #include "Graphics/VramBudget.h"
+#include "Graphics/EditorLayout.h"
 #include "Graphics/HudFont.h"
 #include "Graphics/RenderQueue.h"
 #include "Graphics/SdfFont.h"
@@ -3731,11 +3732,12 @@ void testHudOverlay() {
           "multi-line HUD flows downward with glyph fallback");
 
     const std::string hud = engine::formatHudText(60.0, 16.67, 3, 12, 3072, 5, 2);
-    check(hud.find("FPS 60.0") != std::string::npos && hud.find("FRAME 16.67 MS") != std::string::npos,
-          "HUD text carries FPS and frame time");
-    check(hud.find("WORKERS 3+1") != std::string::npos && hud.find("VRAM 12/3072 MIB") != std::string::npos,
+    check(hud.find("FPS 60.0") != std::string::npos && hud.find("Frame 16.67 ms") != std::string::npos,
+          "HUD text carries FPS and frame time (readable mixed case)");
+    check(hud.find("Workers 3+1") != std::string::npos && hud.find("VRAM 12/3072 MiB") != std::string::npos,
           "HUD text carries worker count and VRAM usage");
-    check(hud.find("DRAWN 5 CULLED 2") != std::string::npos, "HUD text carries draw statistics");
+    check(hud.find("Drawn 5") != std::string::npos && hud.find("Culled 2") != std::string::npos,
+          "HUD text carries draw statistics");
 }
 
 void testWindowLoopIntegration() {
@@ -7926,38 +7928,46 @@ void testPhase26UIRenderer() {
     check(batch.empty() && !batch.truncated() && batch.textItemCount() == 0,
           "ui: begin resets geometry, text items and truncation");
 
-    // --- (g) SDF font atlas generation (Step 2) ------------------------------
+    // --- (g) TrueType font atlas generation ----------------------------------
     const engine::SdfFontAtlas atlas = engine::generateSdfFontAtlas();
-    check(!atlas.empty() && atlas.width == 384 && atlas.height == 192 &&
+    check(!atlas.empty() && atlas.trueType && !atlas.fontName.empty() &&
               atlas.pixels.size() == static_cast<size_t>(atlas.width) * atlas.height,
-          "ui sdf: atlas page bakes to 384x192 R8");
+          "ui font: a real TrueType font bakes the SDF page (system sans or bundled fallback)");
     const engine::SdfGlyph& glyphA = atlas.glyphFor('A');
     check(glyphA.u0 >= 0.0f && glyphA.v0 >= 0.0f && glyphA.u1 <= 1.0f && glyphA.v1 <= 1.0f &&
-              glyphA.u1 > glyphA.u0 && glyphA.advance == 6.0f,
-          "ui sdf: glyph rects sit inside the page with monospace advance");
-    check(atlas.glyphFor('a').u0 == glyphA.u0 && atlas.glyphFor('\x01').u0 == atlas.glyphFor('?').u0,
-          "ui sdf: lowercase folds to uppercase; unknown glyphs fall back to '?'");
+              glyphA.u1 > glyphA.u0 && glyphA.advance > 0.0f && glyphA.width > 0.0f && glyphA.height > 0.0f,
+          "ui font: glyph rects sit inside the page with per-glyph metrics");
+    check(atlas.glyphFor('a').u0 != glyphA.u0 && atlas.glyphFor('a').advance != glyphA.advance &&
+              atlas.glyphFor('\x01').u0 == atlas.glyphFor('?').u0,
+          "ui font: mixed case is distinct ('a' != 'A'); unknown glyphs fall back to '?'");
+    check(atlas.glyphFor('W').advance > atlas.glyphFor('i').advance && atlas.ascent > 0.0f &&
+              atlas.lineHeight > atlas.ascent && atlas.glyphFor(' ').advance > 0.0f &&
+              atlas.glyphFor(' ').width == 0.0f,
+          "ui font: proportional advances, baseline metrics, space advances without a quad");
     {
-        // Inspect the 'A' cell: deep-interior texels, a populated ramp
-        // band (a true distance field, not a binary mask), an outside
-        // corner; and the space cell: entirely outside.
-        const uint32_t cellX = static_cast<uint32_t>('A' - 32) % 16 * engine::kSdfCellWidth;
-        const uint32_t cellY = static_cast<uint32_t>('A' - 32) / 16 * engine::kSdfCellHeight;
+        // Inspect the 'A' glyph rect: deep-interior texels and a
+        // populated ramp band (a true distance field, not a mask).
+        const uint32_t x0 = static_cast<uint32_t>(glyphA.u0 * static_cast<float>(atlas.width));
+        const uint32_t y0 = static_cast<uint32_t>(glyphA.v0 * static_cast<float>(atlas.height));
+        const uint32_t x1 = static_cast<uint32_t>(glyphA.u1 * static_cast<float>(atlas.width));
+        const uint32_t y1 = static_cast<uint32_t>(glyphA.v1 * static_cast<float>(atlas.height));
         uint32_t mid = 0;
         uint8_t deepest = 0;
-        uint8_t spaceMax = 0;
-        for (uint32_t y = 0; y < engine::kSdfCellHeight; ++y) {
-            for (uint32_t x = 0; x < engine::kSdfCellWidth; ++x) {
-                const uint8_t value = atlas.pixels[(cellY + y) * atlas.width + (cellX + x)];
+        for (uint32_t y = y0; y < y1; ++y) {
+            for (uint32_t x = x0; x < x1; ++x) {
+                const uint8_t value = atlas.pixels[y * atlas.width + x];
                 deepest = std::max(deepest, value);
                 if (value > 64 && value < 192) {
                     ++mid;
                 }
-                spaceMax = std::max(spaceMax, atlas.pixels[y * atlas.width + x]); // space cell is (0,0)
             }
         }
-        check(deepest >= 160 && mid > 0 && atlas.pixels[cellY * atlas.width + cellX] < 128 && spaceMax == 0,
-              "ui sdf: field has interior, ramp and empty cells where expected");
+        check(deepest >= 160 && mid > 0, "ui font: field has interior and ramp where expected");
+        check(engine::generateTrueTypeFontAtlas(std::span<const uint8_t>{}).empty() &&
+                  engine::generateTrueTypeFontAtlas(
+                      std::span<const uint8_t>{std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}})
+                      .empty(),
+              "ui font: empty/garbage font bytes are rejected without crashing the rasterizer");
     }
 
     // --- (h) Atlas save/load round-trip ----------------------------------------
@@ -7977,31 +7987,40 @@ void testPhase26UIRenderer() {
               "ui sdf: truncated/corrupt blobs are rejected without touching the output");
     }
 
-    // --- (i) SDF text layout -----------------------------------------------------
+    // --- (i) TrueType text layout (proportional, kerned, baseline) ------------
     engine::UIBatch textBatch;
     textBatch.setFontAtlas(&atlas);
     textBatch.begin(1280, 720);
-    check(textBatch.measureText("AB", 1.0f) == 12.0f && textBatch.measureText("", 3.0f) == 0.0f &&
-              textBatch.measureText("ABC\nD", 2.0f) == 36.0f,
-          "ui text: measureText reports the widest line in screen pixels");
+    const engine::SdfGlyph& glyphB = atlas.glyphFor('B');
+    const float expectedAB = glyphA.advance + atlas.kernFor('A', 'B') + glyphB.advance;
+    check(textBatch.measureText("AB", 1.0f) == expectedAB && textBatch.measureText("", 3.0f) == 0.0f &&
+              textBatch.measureText("ABC\nD", 1.0f) >
+                  textBatch.measureText("ABC", 1.0f) - textBatch.measureText("D", 1.0f),
+          "ui text: measureText sums proportional advances + kerning, widest line wins");
+    check(textBatch.measureText("W", 1.0f) > textBatch.measureText("i", 1.0f),
+          "ui text: measurement is proportional, not monospace");
     textBatch.drawText("AB", 100.0f, 50.0f, 1.0f, fill);
     check(textBatch.vertices().size() == 8 && textBatch.indices().size() == 12 && textBatch.textItemCount() == 1,
           "ui text: two glyphs emit two quads");
     {
         const std::vector<engine::UIVertex>& v = textBatch.vertices();
-        const engine::SdfGlyph& glyphB = atlas.glyphFor('B');
         check(v[0].kind == engine::kUITextPrimitive &&
                   v[0].uvRect == glm::vec4{glyphA.u0, glyphA.v0, glyphA.u1, glyphA.v1},
-              "ui text: glyph quad samples its atlas cell as SDF text");
-        check(v[0].position == glm::vec2{99.5f, 49.5f}, "ui text: quad covers the cell halo (0.5 font px inset)");
-        check(v[4].position.x - v[0].position.x == 6.0f && v[4].uvRect.x == glyphB.u0,
-              "ui text: pen advances one monospace step per glyph");
+              "ui text: glyph quad samples its atlas rect as SDF text");
+        check(v[0].position == glm::vec2{100.0f + glyphA.bearingX, 50.0f + atlas.ascent + glyphA.bearingY},
+              "ui text: quad hangs off the baseline by the glyph's own bearing");
+        check(nearlyEqual(v[4].position.x - v[0].position.x,
+                          glyphA.advance + atlas.kernFor('A', 'B') + glyphB.bearingX - glyphA.bearingX, 1e-4) &&
+                  v[4].uvRect.x == glyphB.u0,
+              "ui text: pen advances by proportional advance + kerning");
         check(textBatch.segments().size() == 1 && textBatch.segments()[0].texture == engine::kUIFontTexture,
               "ui text: glyphs batch into one font-texture segment");
     }
     textBatch.drawText("A\nB", 0.0f, 0.0f, 2.0f, fill);
-    check(textBatch.vertices()[12].position == glm::vec2{-1.0f, 19.0f},
-          "ui text: newline resets the pen and steps one line height");
+    check(nearlyEqual(textBatch.vertices()[12].position.y - textBatch.vertices()[8].position.y,
+                      atlas.lineHeight * 2.0f + (glyphB.bearingY - glyphA.bearingY) * 2.0f, 1e-4) &&
+              nearlyEqual(textBatch.vertices()[12].position.x, glyphB.bearingX * 2.0f, 1e-4),
+          "ui text: newline resets the pen and steps one (font-metric) line height");
 
     // --- (j) Texture batching splits segments by texture id ----------------------
     engine::UIBatch texBatch;
@@ -9341,6 +9360,83 @@ void testSceneTeardown() {
     }
 }
 
+void testEditorViewportAndFont() {
+    std::cout << "Editor viewport layout, input defaults, picking bounds\n";
+
+    // The editor must boot with a free cursor: capturing at startup
+    // (the old default) hid the pointer and deadened every panel.
+    const engine::InputConfig inputDefaults;
+    check(!inputDefaults.captureMouseOnStart && inputDefaults.captureMouseOnClick,
+          "editor input: no mouse capture on start; capture stays an explicit click action");
+
+    // --- Docked layout at the reference size -------------------------
+    const engine::EditorLayout edit = engine::computeEditorLayout(1280.0f, 720.0f, false);
+    check(edit.toolbar.x == 0.0f && edit.toolbar.y == 0.0f && edit.toolbar.width == 1280.0f &&
+              edit.statusBar.y + edit.statusBar.height == 720.0f,
+          "layout: toolbar spans the top, status bar the bottom of the window");
+    check(edit.hierarchy.x < edit.viewport.x && edit.viewport.x + edit.viewport.width < edit.inspector.x &&
+              edit.viewport.y + edit.viewport.height < edit.assetBrowser.y,
+          "layout: Hierarchy | Viewport | Inspector with the Asset Browser below the viewport");
+    check(edit.viewportIsDockBounded() && edit.viewport.width > 400.0f && edit.viewport.height > 200.0f,
+          "layout: the 3D viewport is a bounded panel overlapped by no dock");
+    check(edit.containsViewport(edit.viewport.x + 4.0f, edit.viewport.y + 4.0f) &&
+              !edit.containsViewport(edit.hierarchy.x + 4.0f, edit.viewport.y + 4.0f) &&
+              !edit.containsViewport(edit.viewport.x + 4.0f, edit.assetBrowser.y + 4.0f),
+          "layout: viewport hit-testing accepts only viewport pixels (panels are not click-through)");
+
+    // --- Resize reflow ------------------------------------------------
+    const engine::EditorLayout big = engine::computeEditorLayout(1920.0f, 1080.0f, false);
+    check(big.viewport.width > edit.viewport.width && big.viewport.height > edit.viewport.height &&
+              big.viewportIsDockBounded(),
+          "layout: a larger window grows the viewport, docks stay docked");
+    const engine::EditorLayout small = engine::computeEditorLayout(800.0f, 500.0f, false);
+    check(small.viewport.width > 100.0f && small.viewport.height > 80.0f && small.viewportIsDockBounded() &&
+              small.inspector.x + small.inspector.width <= 800.0f &&
+              small.assetBrowser.y + small.assetBrowser.height <= 500.0f,
+          "layout: a small window shrinks docks, keeps a usable viewport, nothing leaves the window");
+    const engine::EditorLayout tiny = engine::computeEditorLayout(0.0f, 0.0f, false);
+    check(tiny.viewport.width == 0.0f && tiny.viewport.height == 0.0f,
+          "layout: a zero framebuffer (minimized) yields an empty viewport, never negative rects");
+
+    // --- Play mode collapses the docks --------------------------------
+    const engine::EditorLayout play = engine::computeEditorLayout(1280.0f, 720.0f, true);
+    check(play.hierarchy.width == 0.0f && play.inspector.width == 0.0f && play.assetBrowser.width == 0.0f &&
+              play.viewport.width > edit.viewport.width && play.viewport.height > edit.viewport.height &&
+              play.viewportIsDockBounded(),
+          "layout: Play mode hides authoring docks and expands the viewport between toolbar/status");
+
+    // --- Projection / picking follow the panel, not the window --------
+    check(nearlyEqual(edit.viewportAspect(),
+                      static_cast<double>(edit.viewport.width) / edit.viewport.height, 1e-6) &&
+              std::abs(edit.viewportAspect() - 1280.0f / 720.0f) > 0.01f,
+          "viewport: aspect comes from the panel (not the full window), so the scene never stretches");
+    {
+        engine::Scene scene;
+        engine::Camera camera{engine::CameraConfig{}};
+        engine::RaycastHit hit;
+        // Clicks over the Hierarchy dock must not pick, even before
+        // any scene query runs.
+        check(!engine::pickEntityAt(scene, camera,
+                                    glm::vec2{edit.hierarchy.x + 5.0f, edit.viewport.y + 5.0f},
+                                    edit.viewport, hit) &&
+                  hit.entity == entt::null,
+              "picking: a click over a dock never reaches the scene");
+        glm::vec3 ground;
+        check(!engine::dropPointOnGround(camera,
+                                         glm::vec2{edit.viewport.x + 5.0f, edit.assetBrowser.y + 5.0f},
+                                         edit.viewport, ground),
+              "picking: asset drops outside the viewport are refused by the panel bounds");
+    }
+
+    // SceneViewportRect: the renderer's GPU-side contract.
+    const engine::SceneViewportRect gpuRect{static_cast<int32_t>(edit.viewport.x),
+                                            static_cast<int32_t>(edit.viewport.y),
+                                            static_cast<uint32_t>(edit.viewport.width),
+                                            static_cast<uint32_t>(edit.viewport.height)};
+    check(!gpuRect.empty() && nearlyEqual(gpuRect.aspect(), edit.viewportAspect(), 1e-3),
+          "viewport: the renderer rect carries the same geometry the layout computed");
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -9365,6 +9461,7 @@ int main() {
     testPhase32Pbr();
     testPhase33Export();
     testSceneTeardown();
+    testEditorViewportAndFont();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();

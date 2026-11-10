@@ -75,6 +75,50 @@ void UIBatch::drawTexture(UITextureId texture, float x, float y, float width, fl
     addQuad(x, y, width, height, UIRectStyle{}, tint, kUIImagePrimitive, texture, uvRect);
 }
 
+namespace {
+
+// Decodes one UTF-8 codepoint at `index`, advancing it past the
+// sequence. Invalid bytes decode as a single '?' byte so layout can
+// never stall or run past the end of the string.
+uint32_t decodeUtf8(std::string_view text, size_t& index) {
+    const auto byteAt = [&text](size_t i) { return static_cast<unsigned char>(text[i]); };
+    const unsigned char lead = byteAt(index);
+    if (lead < 0x80) {
+        ++index;
+        return lead;
+    }
+    const size_t remaining = text.size() - index;
+    const auto continuation = [&](size_t i) { return (byteAt(i) & 0xC0) == 0x80; };
+    if ((lead & 0xE0) == 0xC0 && remaining >= 2 && continuation(index + 1)) {
+        const uint32_t cp = ((lead & 0x1Fu) << 6) | (byteAt(index + 1) & 0x3Fu);
+        index += 2;
+        return cp;
+    }
+    if ((lead & 0xF0) == 0xE0 && remaining >= 3 && continuation(index + 1) && continuation(index + 2)) {
+        const uint32_t cp =
+            ((lead & 0x0Fu) << 12) | ((byteAt(index + 1) & 0x3Fu) << 6) | (byteAt(index + 2) & 0x3Fu);
+        index += 3;
+        return cp;
+    }
+    if ((lead & 0xF8) == 0xF0 && remaining >= 4 && continuation(index + 1) && continuation(index + 2) &&
+        continuation(index + 3)) {
+        const uint32_t cp = ((lead & 0x07u) << 18) | ((byteAt(index + 1) & 0x3Fu) << 12) |
+                            ((byteAt(index + 2) & 0x3Fu) << 6) | (byteAt(index + 3) & 0x3Fu);
+        index += 4;
+        return cp;
+    }
+    ++index;
+    return static_cast<unsigned char>('?');
+}
+
+// Atlas characters are printable ASCII; everything else (including
+// decoded non-ASCII codepoints) draws as '?', matching glyphFor.
+char atlasChar(uint32_t codepoint) {
+    return codepoint >= kSdfFirstChar && codepoint <= kSdfLastChar ? static_cast<char>(codepoint) : '?';
+}
+
+} // namespace
+
 void UIBatch::drawText(std::string_view text, float x, float y, float scale, const glm::vec4& color) {
     if (text.empty()) {
         return;
@@ -84,29 +128,36 @@ void UIBatch::drawText(std::string_view text, float x, float y, float scale, con
         return; // accounting stub until a font atlas is set
     }
     const SdfFontAtlas& atlas = *m_fontAtlas;
-    const float advance = atlas.advance * scale;
-    const float cellWidth = atlas.cellWidth * scale;
-    const float cellHeight = atlas.cellHeight * scale;
-    const float inset = atlas.cellInset * scale;
     float penX = x;
-    float lineY = y;
-    for (const char character : text) {
-        if (character == '\n') {
+    // (x, y) is the first line's top; the baseline sits one ascent
+    // below it, and each glyph quad hangs off the baseline by its
+    // own bearing -- capitals rise to it, descenders fall below it.
+    float baselineY = y + atlas.ascent * scale;
+    char previous = '\0';
+    size_t index = 0;
+    while (index < text.size()) {
+        const uint32_t codepoint = decodeUtf8(text, index);
+        if (codepoint == '\n') {
             penX = x;
-            lineY += atlas.lineHeight * scale;
+            baselineY += atlas.lineHeight * scale;
+            previous = '\0';
             continue;
         }
-        if (character == '\r') {
+        if (codepoint == '\r') {
             continue;
         }
-        if (character != ' ') {
-            const SdfGlyph& glyph = atlas.glyphFor(character);
-            // The quad covers the whole atlas cell (glyph box plus the
-            // SDF padding halo), inset back from the pen position.
-            addQuad(penX - inset, lineY - inset, cellWidth, cellHeight, UIRectStyle{}, color,
-                    kUITextPrimitive, kUIFontTexture, glm::vec4{glyph.u0, glyph.v0, glyph.u1, glyph.v1});
+        const char character = atlasChar(codepoint);
+        if (previous != '\0') {
+            penX += atlas.kernFor(previous, character) * scale;
         }
-        penX += advance;
+        const SdfGlyph& glyph = atlas.glyphFor(character);
+        if (glyph.width > 0.0f && glyph.height > 0.0f) {
+            addQuad(penX + glyph.bearingX * scale, baselineY + glyph.bearingY * scale,
+                    glyph.width * scale, glyph.height * scale, UIRectStyle{}, color, kUITextPrimitive,
+                    kUIFontTexture, glm::vec4{glyph.u0, glyph.v0, glyph.u1, glyph.v1});
+        }
+        penX += glyph.advance * scale;
+        previous = character;
     }
 }
 
@@ -116,12 +167,21 @@ float UIBatch::measureText(std::string_view text, float scale) const {
     }
     float widest = 0.0f;
     float line = 0.0f;
-    for (const char character : text) {
-        if (character == '\n') {
+    char previous = '\0';
+    size_t index = 0;
+    while (index < text.size()) {
+        const uint32_t codepoint = decodeUtf8(text, index);
+        if (codepoint == '\n') {
             widest = std::max(widest, line);
             line = 0.0f;
-        } else if (character != '\r') {
-            line += m_fontAtlas->advance * scale;
+            previous = '\0';
+        } else if (codepoint != '\r') {
+            const char character = atlasChar(codepoint);
+            if (previous != '\0') {
+                line += m_fontAtlas->kernFor(previous, character) * scale;
+            }
+            line += m_fontAtlas->glyphFor(character).advance * scale;
+            previous = character;
         }
     }
     return std::max(widest, line);

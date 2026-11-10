@@ -63,11 +63,27 @@ public:
     void setInputHandler(Input* handler) { m_inputHandler = handler; }
 
     [[nodiscard]] GLFWwindow* handle() const { return m_window; }
+    // Logical window size (GLFW window coordinates: the units mouse
+    // positions arrive in). Updated by the window-size callback on
+    // every resize -- previously these stayed at the creation size
+    // forever, which froze the editor layout at its startup geometry.
     [[nodiscard]] int width() const { return m_width; }
     [[nodiscard]] int height() const { return m_height; }
+    // Physical framebuffer size in pixels (the render/UI surface).
+    // Differs from the logical size under DPI/content scaling.
+    [[nodiscard]] int framebufferWidth() const { return m_framebufferWidth; }
+    [[nodiscard]] int framebufferHeight() const { return m_framebufferHeight; }
+    // Framebuffer pixels per logical window pixel (>1 on HiDPI).
+    // Multiply GLFW mouse positions by this to address the
+    // framebuffer-sized UI batch; 1 when either size is unknown.
+    [[nodiscard]] float uiCoordinateScale() const {
+        return m_width > 0 ? static_cast<float>(m_framebufferWidth) / static_cast<float>(m_width)
+                           : 1.0f;
+    }
 
 private:
     static void framebufferResizeCallback(GLFWwindow* window, int width, int height);
+    static void windowSizeCallback(GLFWwindow* window, int width, int height);
     static void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods);
     static void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods);
     static void cursorPositionCallback(GLFWwindow* window, double xPosition, double yPosition);
@@ -81,6 +97,8 @@ private:
     Input* m_inputHandler = nullptr;
     int m_width = 0;
     int m_height = 0;
+    int m_framebufferWidth = 0;
+    int m_framebufferHeight = 0;
     bool m_framebufferResized = false;
     bool m_cursorCaptured = false;
 };

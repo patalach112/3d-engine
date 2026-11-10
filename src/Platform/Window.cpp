@@ -24,6 +24,15 @@ Window::Window(int width, int height, const char* title, bool resizable, bool ca
 
     glfwSetWindowUserPointer(m_window, this);
 
+    // Record both sizes up front: logical (mouse coordinates) and
+    // framebuffer pixels (render target). They only diverge under
+    // DPI scaling, but the editor layout keys off the framebuffer.
+    glfwGetWindowSize(m_window, &m_width, &m_height);
+    glfwGetFramebufferSize(m_window, &m_framebufferWidth, &m_framebufferHeight);
+    // Keep tiny/editor windows usable instead of letting panels be
+    // dragged to degenerate sizes the layout cannot honour.
+    glfwSetWindowSizeLimits(m_window, 640, 400, GLFW_DONT_CARE, GLFW_DONT_CARE);
+
     // Capture the cursor during window initialisation. In disabled-cursor
     // mode GLFW reports unbounded virtual mouse movement, which is what
     // permits unrestricted 360-degree free look without the pointer being
@@ -31,6 +40,7 @@ Window::Window(int width, int height, const char* title, bool resizable, bool ca
     setCursorCaptured(captureCursor);
 
     glfwSetFramebufferSizeCallback(m_window, &Window::framebufferResizeCallback);
+    glfwSetWindowSizeCallback(m_window, &Window::windowSizeCallback);
     glfwSetKeyCallback(m_window, &Window::keyCallback);
     glfwSetMouseButtonCallback(m_window, &Window::mouseButtonCallback);
     glfwSetCursorPosCallback(m_window, &Window::cursorPositionCallback);
@@ -94,9 +104,18 @@ Window* Window::fromGlfwWindow(GLFWwindow* window) {
     return static_cast<Window*>(glfwGetWindowUserPointer(window));
 }
 
-void Window::framebufferResizeCallback(GLFWwindow* window, int /*width*/, int /*height*/) {
+void Window::framebufferResizeCallback(GLFWwindow* window, int width, int height) {
     if (Window* self = fromGlfwWindow(window); self != nullptr) {
+        self->m_framebufferWidth = width;
+        self->m_framebufferHeight = height;
         self->m_framebufferResized = true;
+    }
+}
+
+void Window::windowSizeCallback(GLFWwindow* window, int width, int height) {
+    if (Window* self = fromGlfwWindow(window); self != nullptr) {
+        self->m_width = width;
+        self->m_height = height;
     }
 }
 

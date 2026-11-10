@@ -148,7 +148,8 @@ float handleHoverDistance(const HandleProjection& handle, GizmoMode mode, glm::v
     return best;
 }
 
-void drawHandle(UIBatch& batch, const HandleProjection& handle, GizmoMode mode, bool highlighted) {
+void drawHandle(UIBatch& batch, const HandleProjection& handle, GizmoMode mode, bool highlighted,
+                glm::vec2 origin) {
     const glm::vec4 color = axisColor(handle.axis, highlighted);
     const float lineRadius = highlighted ? 3.2f : 2.1f;
     if (mode == GizmoMode::Rotate) {
@@ -159,9 +160,9 @@ void drawHandle(UIBatch& batch, const HandleProjection& handle, GizmoMode mode, 
             if (!handle.ringValid[index]) {
                 continue;
             }
-            drawDot(batch, handle.ring[index], lineRadius, color);
+            drawDot(batch, handle.ring[index] + origin, lineRadius, color);
             if (!haveLabel) {
-                labelPoint = handle.ring[index];
+                labelPoint = handle.ring[index] + origin;
                 haveLabel = true;
             }
         }
@@ -173,15 +174,17 @@ void drawHandle(UIBatch& batch, const HandleProjection& handle, GizmoMode mode, 
     if (!handle.centerValid || !handle.tipValid) {
         return;
     }
-    drawDottedSegment(batch, handle.center, handle.tip, color, lineRadius);
+    drawDottedSegment(batch, handle.center + origin, handle.tip + origin, color, lineRadius);
     if (mode == GizmoMode::Scale) {
         const float half = highlighted ? 6.0f : 5.0f;
-        batch.drawRoundedRect(handle.tip.x - half, handle.tip.y - half, 2.0f * half, 2.0f * half,
+        const glm::vec2 tip = handle.tip + origin;
+        batch.drawRoundedRect(tip.x - half, tip.y - half, 2.0f * half, 2.0f * half,
                               UIRectStyle{2.0f, 0.0f, glm::vec4{0.0f}}, color);
     } else {
-        drawDot(batch, handle.tip, highlighted ? 6.5f : 5.5f, color);
+        drawDot(batch, handle.tip + origin, highlighted ? 6.5f : 5.5f, color);
     }
-    batch.drawText(axisLabel(handle.axis), handle.tip.x + 8.0f, handle.tip.y - 5.0f, 1.4f, color);
+    const glm::vec2 tip = handle.tip + origin;
+    batch.drawText(axisLabel(handle.axis), tip.x + 8.0f, tip.y - 5.0f, 1.4f, color);
 }
 
 } // namespace
@@ -239,8 +242,16 @@ void TransformGizmo::setMode(GizmoMode mode) {
 
 GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::entity selected, const Camera& camera,
                                          glm::vec2 viewportSize, bool inputBlocked) {
+    return update(ui, scene, selected, camera, UIRect{0.0f, 0.0f, viewportSize.x, viewportSize.y},
+                  inputBlocked);
+}
+
+GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::entity selected, const Camera& camera,
+                                         const UIRect& viewport, bool inputBlocked) {
     GizmoUpdateResult result;
     UIBatch* batch = ui.batch();
+    const glm::vec2 viewportSize{viewport.width, viewport.height};
+    const glm::vec2 viewportOrigin{viewport.x, viewport.y};
     if (batch == nullptr || viewportSize.x <= 0.0f || viewportSize.y <= 0.0f) {
         m_dragging = false;
         return result;
@@ -271,8 +282,11 @@ GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::enti
                                  : transform->position;
     const float length = handleLength(glm::distance(camera.position(), anchor));
 
-    const glm::vec2 mouse = ui.mousePosition();
-    const bool hasPointer = mouse.x > -9000.0f; // parked off-screen while captured
+    const glm::vec2 rawMouse = ui.mousePosition();
+    const bool hasPointer = rawMouse.x > -9000.0f; // parked off-screen while captured
+    // All gizmo math (projection, hover, rays) is viewport-local; only
+    // drawing translates back by the panel origin.
+    const glm::vec2 mouse = rawMouse - viewportOrigin;
     if (!hasPointer) {
         m_dragging = false;
     }
@@ -302,7 +316,7 @@ GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::enti
 
     // --- Drag start ----------------------------------------------------------
     if (!m_dragging && hover != GizmoAxis::None && hasPointer && !inputBlocked && !ui.popupOpen() &&
-        ui.activeId() == kUINoWidget && ui.pressedRect(UIRect{0.0f, 0.0f, viewportSize.x, viewportSize.y})) {
+        ui.activeId() == kUINoWidget && ui.pressedRect(viewport)) {
         bool started = true;
         if (m_mode == GizmoMode::Rotate) {
             glm::vec3 hitPoint;
@@ -377,12 +391,12 @@ GizmoUpdateResult TransformGizmo::update(UIContext& ui, Scene& scene, entt::enti
         for (const HandleProjection& handle : handles) {
             const bool highlighted = handle.axis == result.hoveredAxis;
             if ((pass == 1) == highlighted) {
-                drawHandle(*batch, handle, m_mode, highlighted);
+                drawHandle(*batch, handle, m_mode, highlighted, viewportOrigin);
             }
         }
     }
     if (handles[0].centerValid) {
-        const glm::vec2 center = handles[0].center;
+        const glm::vec2 center = handles[0].center + viewportOrigin;
         batch->drawRoundedRect(center.x - 3.5f, center.y - 3.5f, 7.0f, 7.0f,
                                UIRectStyle{1.5f, 0.0f, glm::vec4{0.0f}}, glm::vec4{0.95f, 0.97f, 1.0f, 0.95f});
     }

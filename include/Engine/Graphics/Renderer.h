@@ -23,6 +23,25 @@ class Window;
 class Swapchain;
 class GraphicsPipeline;
 
+// Pixel rectangle (framebuffer coordinates, top-left origin) the 3D
+// scene is confined to. The editor sets this to its docked viewport
+// panel; an empty rect (the default) means "the whole framebuffer",
+// which is what the standalone game player uses. The scene pass and
+// the composite both clip to it (viewport + scissor), so world pixels
+// can never appear under editor chrome.
+struct SceneViewportRect {
+    int32_t x = 0;
+    int32_t y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    bool operator==(const SceneViewportRect&) const = default;
+    [[nodiscard]] bool empty() const { return width == 0 || height == 0; }
+    [[nodiscard]] float aspect() const {
+        return height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+    }
+};
+
 // Per-frame data consumed by the cube shaders: camera matrices plus the
 // directional light's view-projection (shadow reprojection) and
 // direction. Per-entity model matrices travel through push constants
@@ -134,6 +153,13 @@ public:
 
     [[nodiscard]] uint32_t framesInFlight() const { return m_framesInFlight; }
 
+    // Confines the 3D scene (HDR pass + composite) to a framebuffer
+    // sub-rectangle; empty restores full-frame rendering. Cheap to
+    // call every frame: the rect is consumed at command-record time
+    // and clamped to the current swapchain extent.
+    void setSceneViewport(SceneViewportRect viewport) { m_sceneViewport = viewport; }
+    [[nodiscard]] SceneViewportRect sceneViewport() const { return m_sceneViewport; }
+
     // Mailbox/Immediate can replace or present work without waiting for
     // a refresh boundary; allowing the CPU to run a second frame ahead
     // would recreate much of FIFO's input queue. Keep those modes to a
@@ -153,6 +179,10 @@ public:
     // uploaded and flushed as one overlay draw call inside the
     // present pass, then cleared.
     [[nodiscard]] UIBatch& uiBatch() { return m_ui.batch(); }
+
+    // The UI font atlas in use (TrueType source name inside), for
+    // startup diagnostics.
+    [[nodiscard]] const SdfFontAtlas& uiFontAtlas() const { return m_ui.fontAtlas(); }
 
     void setPostSettings(const PostSettings& settings) { m_postSettings = settings; }
     [[nodiscard]] const PostSettings& postSettings() const { return m_postSettings; }
@@ -182,6 +212,9 @@ private:
                              std::span<const DrawItem> drawItems,
                              const std::array<glm::mat4, kMaxShadowCascades>& cascadeMatrices,
                              uint32_t cascadeCount, bool spotShadowEnabled);
+    // m_sceneViewport clamped to the swapchain extent (full extent
+    // when unset/degenerate).
+    [[nodiscard]] SceneViewportRect effectiveSceneViewport(VkExtent2D extent) const;
     void updateUniformBuffer(const glm::mat4& view, const glm::mat4& projection,
                              const FrameLighting& lighting);
     void recreateSwapchain();
@@ -216,6 +249,8 @@ private:
     Buffer m_vertexBuffer;
     Buffer m_indexBuffer;
     uint32_t m_indexCount = 0;
+
+    SceneViewportRect m_sceneViewport{}; // empty = full framebuffer
 
     std::vector<Buffer> m_uniformBuffers;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;

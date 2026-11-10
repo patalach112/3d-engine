@@ -10,6 +10,7 @@
 #include "Core/EventBus.h"
 #include "Core/GameLoop.h"
 #include "Core/Jobs/JobSystem.h"
+#include "Graphics/EditorLayout.h"
 #include "Graphics/GraphicsPipeline.h"
 #include "Core/ModuleManager.h"
 #include "Graphics/Renderer.h"
@@ -63,10 +64,20 @@ private:
     void registerAssets();
     void buildScene();
     void handleMouseCapture();
+    // Editor layout for the window's *current* framebuffer size,
+    // recomputed whenever needed (resize/DPI changes reflow the
+    // docks on the very next frame -- nothing caches window size).
+    [[nodiscard]] EditorLayout currentEditorLayout() const;
+    // GLFW mouse position converted into framebuffer/UI pixels.
+    [[nodiscard]] glm::vec2 uiMousePosition() const;
+    // Edit-mode viewport navigation: hold the right mouse button
+    // inside the viewport to look around. The cursor is never
+    // captured in Edit mode.
+    void updateEditorCamera(double deltaSeconds);
     // Phase 29 asset drag-and-drop: spawn a dropped mesh into the
     // scene, or apply a dropped asset to the selected entity.
     void spawnDroppedMesh(std::string_view relativePath, glm::vec2 mousePixels, const Camera& camera,
-                          glm::vec2 viewportSize);
+                          const UIRect& viewport);
     void applyDroppedAsset(entt::entity entity, const UIDragPayload& payload);
 
     // Phase 30 editor scene file commands (.gbq quicksave under
@@ -131,6 +142,13 @@ private:
     ModuleManager m_moduleManager;
     double m_moduleElapsedSeconds = 0.0;
     uint64_t m_moduleFrameIndex = 0;
+
+    // Last computed dock layout (refreshed at the top of every
+    // update/render from the live framebuffer size). Input handling
+    // (viewport capture, editor look) reads this; rendering
+    // recomputes and republishes it each frame.
+    EditorLayout m_editorLayout{};
+    std::string m_statsText; // toolbar stats line (TrueType UI text)
 
     double m_secondsSinceStatsLog = 0.0;
     double m_secondsSinceAssetPoll = 0.0;

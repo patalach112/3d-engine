@@ -3,6 +3,7 @@
 
 #include "Core/Camera.h"
 #include "Geometry/Ray.h"
+#include "Graphics/UIContext.h" // UIRect (editor viewport)
 
 #include <entt/entt.hpp>
 
@@ -45,6 +46,12 @@ struct RaycastHit {
 // untouched in that case.
 [[nodiscard]] ENGINE_SCENE_API bool pickEntityAt(const Scene& scene, const Camera& camera, glm::vec2 mousePixels,
                                                  glm::vec2 viewportSize, RaycastHit& outHit);
+// Viewport-rect form (editor): `mousePixels` are window/framebuffer
+// coordinates and the ray is built from the position *inside* the
+// bounded viewport panel, with the panel's own aspect. A click
+// outside the panel never picks -- panels cannot be clicked through.
+[[nodiscard]] ENGINE_SCENE_API bool pickEntityAt(const Scene& scene, const Camera& camera, glm::vec2 mousePixels,
+                                                 const UIRect& viewport, RaycastHit& outHit);
 
 // Drag-and-drop landing point (Phase 29): intersects the picking
 // ray through a viewport pixel with the ground plane y = 0, so
@@ -53,5 +60,9 @@ struct RaycastHit {
 // back to a point in front of the camera.
 [[nodiscard]] ENGINE_SCENE_API bool dropPointOnGround(const Camera& camera, glm::vec2 mousePixels,
                                                       glm::vec2 viewportSize, glm::vec3& outPoint);
+// Viewport-rect form: as pickEntityAt above, for asset drag-and-drop
+// into the bounded viewport panel.
+[[nodiscard]] ENGINE_SCENE_API bool dropPointOnGround(const Camera& camera, glm::vec2 mousePixels,
+                                                      const UIRect& viewport, glm::vec3& outPoint);
 
 } // namespace engine

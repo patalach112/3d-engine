@@ -173,7 +173,14 @@ bool UIContext::hitTest(const UIRect& rect) const {
 }
 
 float UIContext::textTop(const UIRect& rect) const {
-    return rect.y + 0.5f * (rect.height - kGlyphBoxHeight * kTextScale);
+    // Centre the font's real line box (ascent-to-descent from the
+    // TrueType metrics) in the row; the legacy constant is only the
+    // no-atlas fallback.
+    float lineHeight = kGlyphBoxHeight * kTextScale;
+    if (m_batch != nullptr && m_batch->fontAtlas() != nullptr) {
+        lineHeight = m_batch->fontAtlas()->lineHeight * kTextScale;
+    }
+    return rect.y + 0.5f * (rect.height - lineHeight);
 }
 
 bool UIContext::button(std::string_view label, const UIRectStyle& style) {

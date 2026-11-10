@@ -1028,6 +1028,22 @@ void Renderer::recordBloomChain(VkCommandBuffer commandBuffer) {
     }
 }
 
+SceneViewportRect Renderer::effectiveSceneViewport(VkExtent2D extent) const {
+    if (m_sceneViewport.empty() || extent.width == 0 || extent.height == 0) {
+        return SceneViewportRect{0, 0, extent.width, extent.height};
+    }
+    const int32_t maxX = static_cast<int32_t>(extent.width);
+    const int32_t maxY = static_cast<int32_t>(extent.height);
+    const int32_t x0 = std::clamp(m_sceneViewport.x, 0, maxX);
+    const int32_t y0 = std::clamp(m_sceneViewport.y, 0, maxY);
+    const int32_t x1 = std::clamp(m_sceneViewport.x + static_cast<int32_t>(m_sceneViewport.width), x0, maxX);
+    const int32_t y1 = std::clamp(m_sceneViewport.y + static_cast<int32_t>(m_sceneViewport.height), y0, maxY);
+    if (x1 <= x0 || y1 <= y0) {
+        return SceneViewportRect{0, 0, extent.width, extent.height};
+    }
+    return SceneViewportRect{x0, y0, static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)};
+}
+
 void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
     const VkExtent2D extent = m_swapchain.extent();
 
@@ -1045,13 +1061,25 @@ void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageInde
     renderPassInfo.pClearValues = clearValues.data();
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
+    // The composite (the only pass writing the swapchain image)
+    // presents the tone-mapped scene strictly inside the viewport
+    // rect. The render-pass clear above has already painted the
+    // whole image with the editor background colour, so the docks
+    // get a defined backdrop even before the UI overlay draws them.
+    // The fullscreen triangle's UVs still map 1:1 over the whole
+    // image, so the sub-rect samples exactly the texels the scene
+    // pass wrote there -- no rescaling, no offset math in shaders.
+    const SceneViewportRect sceneRect = effectiveSceneViewport(extent);
     VkViewport viewport{};
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
+    viewport.x = static_cast<float>(sceneRect.x);
+    viewport.y = static_cast<float>(sceneRect.y);
+    viewport.width = static_cast<float>(sceneRect.width);
+    viewport.height = static_cast<float>(sceneRect.height);
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
     VkRect2D scissor{};
-    scissor.extent = extent;
+    scissor.offset = {sceneRect.x, sceneRect.y};
+    scissor.extent = {sceneRect.width, sceneRect.height};
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_compositePipeline);
@@ -1069,6 +1097,18 @@ void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageInde
     vkCmdPushConstants(commandBuffer, m_postPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(CompositePush),
                        &push);
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+    // The UI overlay addresses the whole framebuffer in pixels, so
+    // restore the full viewport/scissor the composite just narrowed
+    // (UIRenderer additionally sets its own per-segment scissors).
+    VkViewport fullViewport{};
+    fullViewport.width = static_cast<float>(extent.width);
+    fullViewport.height = static_cast<float>(extent.height);
+    fullViewport.maxDepth = 1.0f;
+    vkCmdSetViewport(commandBuffer, 0, 1, &fullViewport);
+    VkRect2D fullScissor{};
+    fullScissor.extent = extent;
+    vkCmdSetScissor(commandBuffer, 0, 1, &fullScissor);
 
     // Phase 26 UI overlay (analytic rounded-rect panels/widgets),
     // drawn on the presented image after the composite, under the
@@ -1448,18 +1488,23 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
 
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
+    // The scene rasterizes only inside the editor's viewport rect
+    // (full extent for the standalone player): the render area above
+    // still spans the target so the clear defines every texel the
+    // bloom chain may sample, but viewport + scissor clip all draws.
+    const SceneViewportRect sceneRect = effectiveSceneViewport(extent);
     VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
+    viewport.x = static_cast<float>(sceneRect.x);
+    viewport.y = static_cast<float>(sceneRect.y);
+    viewport.width = static_cast<float>(sceneRect.width);
+    viewport.height = static_cast<float>(sceneRect.height);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
 
     VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = extent;
+    scissor.offset = {sceneRect.x, sceneRect.y};
+    scissor.extent = {sceneRect.width, sceneRect.height};
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
     const VkBuffer vertexBuffers[] = {m_vertexBuffer.handle()};

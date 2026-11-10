@@ -87,6 +87,11 @@ public:
     // while still rendering the handles.
     GizmoUpdateResult update(UIContext& ui, Scene& scene, entt::entity selected, const Camera& camera,
                              glm::vec2 viewportSize, bool inputBlocked = false);
+    // Viewport-rect form (editor): handles project into the bounded
+    // viewport panel and the cursor is read relative to it, so the
+    // gizmo can neither draw nor be grabbed over the docks.
+    GizmoUpdateResult update(UIContext& ui, Scene& scene, entt::entity selected, const Camera& camera,
+                             const UIRect& viewport, bool inputBlocked = false);
 
     // World-space unit direction of a gizmo axis (None -> +X fallback).
     [[nodiscard]] static glm::vec3 axisDirection(GizmoAxis axis);

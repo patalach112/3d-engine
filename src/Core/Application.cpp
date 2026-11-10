@@ -27,8 +27,14 @@ namespace engine {
 
 Application::Application(EngineConfig config)
     : m_config(std::move(config)),
+      // The editor ALWAYS starts with a free, visible cursor, even
+      // if a game-flavoured config asks for capture-on-start: its
+      // own panels are the primary surface, and a hidden locked
+      // cursor made the whole UI feel broken. Capture is a
+      // Play-mode action (click inside the viewport), never a
+      // startup state. The standalone player honours the config.
       m_window(m_config.window.width, m_config.window.height, m_config.window.title.c_str(),
-               m_config.window.resizable, m_config.input.captureMouseOnStart),
+               m_config.window.resizable, false),
       m_input(m_window),
       m_context(m_window),
       m_swapchain(m_context, m_window,
@@ -45,6 +51,12 @@ Application::Application(EngineConfig config)
       m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
                      m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems, &m_assets,
                      m_config.render.occlusionCulling) {
+    if (const SdfFontAtlas& font = m_renderer.uiFontAtlas(); font.trueType) {
+        ENGINE_LOG_INFO("Editor UI font: '" << font.fontName << "' (TrueType SDF, " << font.width << 'x'
+                                           << font.height << " atlas)");
+    } else {
+        ENGINE_LOG_WARNING("Editor UI font: no TrueType font found; using the bitmap fallback atlas");
+    }
     m_renderer.setPostSettings(PostSettings{static_cast<float>(m_config.render.exposure),
                                             m_config.render.bloomEnabled,
                                             static_cast<float>(m_config.render.bloomStrength),
@@ -133,9 +145,10 @@ Application::Application(EngineConfig config)
             }
         }
     }
-    // No late cursor-capture call is needed here: Window already applied
-    // GLFW_CURSOR_DISABLED during construction when captureMouseOnStart
-    // was enabled, and Input adopted that state.
+    // The editor never captures the cursor at startup (see the
+    // Window construction above): Input adopts the free-cursor
+    // state, and capture only ever happens in Play mode after an
+    // explicit click inside the 3D viewport.
 }
 
 Application::~Application() {
@@ -515,11 +528,12 @@ void Application::run() {
                     << " (vsync " << (m_config.render.vsync ? "on" : "off") << "), using "
                     << Swapchain::presentModeName(m_swapchain.presentMode()) << ", "
                     << m_renderer.framesInFlight() << " frame(s) in flight)");
-    ENGINE_LOG_INFO("Controls: WASD move, Q/E down/up, Shift boost, C resets physics cubes, mouse look "
-                    "(click window to capture mouse, Esc releases / quits), left-click selects the object "
-                    "under the cursor (crosshair when captured), F launches the selected body. The scene "
-                    "starts frozen in Edit mode: Play (toolbar or Ctrl+P) runs the simulation, Stop "
-                    "restores the pre-play snapshot");
+    ENGINE_LOG_INFO("Controls: the editor starts in Edit mode with a free cursor -- left-click "
+                    "selects in the viewport, hold right-mouse in the viewport to look around, "
+                    "1/2/3 switch gizmo tools, Ctrl+S/Ctrl+O save/load. Play (toolbar or Ctrl+P) "
+                    "runs the simulation; in Play, click inside the viewport to capture the mouse "
+                    "for player look and Esc releases it back to the UI. Stop restores the "
+                    "pre-play snapshot.");
 
     LoopCallbacks callbacks;
     callbacks.shouldContinue = [this] { return !m_window.shouldClose(); };
@@ -576,14 +590,21 @@ void Application::run() {
             m_secondsSinceAssetPoll = 0.0;
             m_assets.pollFileChanges();
         }
-        // Game module (Phase 23): variable update, then the
-        // half-second hot-reload poll (mtime on the source file).
+        // Game module + native scripts are *game* logic: they tick
+        // only in Play mode. (They used to run unconditionally,
+        // which let game-test behaviour leak into the editor's Edit
+        // mode and mutate the authored scene.) The hot-reload poll
+        // stays live in both modes so a rebuilt module is ready for
+        // the next Play press.
+        m_editorLayout = currentEditorLayout();
         m_moduleElapsedSeconds += deltaSeconds;
         ++m_moduleFrameIndex;
         {
             EngineContext context = buildModuleContext(static_cast<float>(deltaSeconds), 0.0f);
-            m_moduleManager.update(context, static_cast<float>(deltaSeconds));
-            NativeScriptSystem::update(context, static_cast<float>(deltaSeconds));
+            if (m_playSession.isPlaying()) {
+                m_moduleManager.update(context, static_cast<float>(deltaSeconds));
+                NativeScriptSystem::update(context, static_cast<float>(deltaSeconds));
+            }
             if (m_config.game.moduleHotReload) {
                 m_secondsSinceModulePoll += deltaSeconds;
                 if (m_secondsSinceModulePoll >= 0.5) {
@@ -597,9 +618,15 @@ void Application::run() {
         // mode only (Edit mode's frozen scene has nothing to reset).
         if (m_playSession.isPlaying()) {
             handlePhysicsReset();
+            handleEventImpulse();
+            // Player camera: mouse look only while captured; the
+            // physical player is driven by the fixed update.
+            CameraSystem::update(m_scene, m_input, deltaSeconds);
+        } else {
+            // Editor camera: free-cursor look while the right mouse
+            // button is held inside the viewport. No capture, ever.
+            updateEditorCamera(deltaSeconds);
         }
-        handleEventImpulse();
-        CameraSystem::update(m_scene, m_input, deltaSeconds);
 
         if (m_config.loop.statsLogIntervalSeconds > 0.0) {
             m_secondsSinceStatsLog += deltaSeconds;
@@ -609,44 +636,63 @@ void Application::run() {
             }
         }
 
-        // FPS HUD: refresh a few times per second (text re-layout is the
-        // only cost; per-frame recording is one bind + one draw).
+        // Toolbar stats line: refreshed a few times per second and
+        // drawn with the TrueType UI font in the render callback.
+        // (The legacy bitmap HudRenderer is no longer fed at all --
+        // its blocky all-caps glyphs were the unreadable overlay in
+        // the top-left corner.)
         if (m_config.render.hudEnabled) {
             m_secondsSinceHudUpdate += deltaSeconds;
             if (m_secondsSinceHudUpdate >= m_config.render.hudUpdateIntervalSeconds) {
                 m_secondsSinceHudUpdate = 0.0;
                 const auto& time = m_gameLoop.time();
-                m_renderer.setHudText(formatHudText(
+                m_statsText = formatHudText(
                     time.framesPerSecond(), time.deltaSeconds() * 1000.0, m_jobSystem.workerCount(),
                     m_vramBudget.usedBytes() / (1024 * 1024), m_config.render.vramBudgetMiB,
-                    m_renderSystem.lastDrawnCount(), m_renderSystem.lastCulledCount()));
+                    m_renderSystem.lastDrawnCount(), m_renderSystem.lastCulledCount());
             }
+        } else {
+            m_statsText.clear();
         }
     };
     // Rendering always runs last, over fully updated scene state. The
     // return value lets GameLoop count only presented frames for FPS.
     callbacks.render = [this](double /*interpolationAlpha*/) {
-        // Phase 26 UI overlay: a translucent rounded backdrop panel
-        // behind the FPS HUD text plus an accent rule under it. The
-        // batch is per-frame (flushed and cleared by the renderer's
-        // overlay record), so it is issued fresh on every frame.
-        if (m_config.render.hudEnabled) {
+        // Editor UI: one docked layout per frame, computed from the
+        // live framebuffer size (resize / DPI moves reflow it
+        // immediately). The 3D scene is confined to
+        // `layout.viewport` -- see EditorLayout and
+        // Renderer::setSceneViewport. The batch is per-frame
+        // (flushed and cleared by the renderer's overlay record).
+        {
             UIBatch& ui = m_renderer.uiBatch();
-            ui.begin(static_cast<uint32_t>(std::max(m_window.width(), 0)),
-                     static_cast<uint32_t>(std::max(m_window.height(), 0)));
+            const uint32_t framebufferWidth = static_cast<uint32_t>(std::max(m_window.framebufferWidth(), 0));
+            const uint32_t framebufferHeight = static_cast<uint32_t>(std::max(m_window.framebufferHeight(), 0));
+            ui.begin(framebufferWidth, framebufferHeight);
+            const bool playingNow = m_playSession.isPlaying();
+            const EditorLayout layout = computeEditorLayout(static_cast<float>(framebufferWidth),
+                                                            static_cast<float>(framebufferHeight), playingNow);
+            m_editorLayout = layout;
+            // Publish the viewport before RenderSystem runs (below,
+            // after this block): projection aspect and the Vulkan
+            // viewport/scissor both follow this same rectangle.
+            m_renderSystem.setSceneViewport(SceneViewportRect{
+                static_cast<int32_t>(layout.viewport.x), static_cast<int32_t>(layout.viewport.y),
+                static_cast<uint32_t>(std::max(layout.viewport.width, 0.0f)),
+                static_cast<uint32_t>(std::max(layout.viewport.height, 0.0f))});
 
-            // Phase 26 Step 3: interactive widgets. While the mouse
-            // is captured for flight the pointer is parked
-            // off-screen, so the UI stays visible but inert.
+            // Interactive widgets. While the mouse is captured for
+            // Play-mode look the pointer is parked off-screen, so
+            // the UI stays visible but inert (Esc releases first).
             UIInput uiInput;
             if (!m_input.isMouseCaptured()) {
-                const glm::vec2 mouse = m_input.mousePosition();
+                const glm::vec2 mouse = uiMousePosition();
                 uiInput.mouseX = mouse.x;
                 uiInput.mouseY = mouse.y;
                 uiInput.mouseDown = m_input.isMouseButtonDown(MouseButton::Left);
                 uiInput.keyStep = (m_input.wasKeyPressed(Key::Right) ? 1 : 0) -
                                   (m_input.wasKeyPressed(Key::Left) ? 1 : 0);
-                // Phase 27: right-click context menus + Esc dismissal.
+                // Right-click context menus + Esc dismissal.
                 uiInput.mouseRightDown = m_input.isMouseButtonDown(MouseButton::Right);
                 uiInput.escapePressed = m_input.wasKeyPressed(Key::Escape);
                 uiInput.scrollY = m_input.scrollDelta().y;
@@ -690,180 +736,199 @@ void Application::run() {
                 loadSceneFromGbq();
             }
 
-            ui.drawRoundedRect(6.0f, 6.0f, 372.0f, 118.0f,
-                               UIRectStyle{10.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.16f}},
-                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
-            ui.drawRect(6.0f, 126.0f, 372.0f, 3.0f, glm::vec4{0.35f, 0.75f, 1.0f, 0.9f});
-            // SDF text (Step 2): a control hint along the bottom edge,
-            // crisp at any window size from the baked distance atlas.
-            const float hintY = static_cast<float>(std::max(m_window.height() - 34, 0));
-            ui.drawText(playing ? "PLAY MODE - SIMULATION RUNNING - STOP (OR CTRL+P) RESTORES THE EDIT SCENE"
-                                : "WASD + MOUSE FLY - SPACE/CTRL RISE/SINK - Q/E ROLL - CTRL+P PLAYS THE SCENE",
-                        12.0f, hintY, 1.5f, glm::vec4{0.75f, 0.85f, 1.0f, 0.85f});
+            // --- Docked chrome --------------------------------------
+            // Solid toolbar and status bars spanning the window, and
+            // a framed viewport panel between the docks. These are
+            // opaque editor surfaces, not overlays floating on the
+            // world: the scene pass never rasterizes beneath them.
+            const float scale = layout.uiScale;
+            ui.drawRect(layout.toolbar.x, layout.toolbar.y, layout.toolbar.width, layout.toolbar.height,
+                        glm::vec4{0.07f, 0.08f, 0.11f, 1.0f});
+            ui.drawRect(layout.toolbar.x, layout.toolbar.y + layout.toolbar.height - 2.0f,
+                        layout.toolbar.width, 2.0f, glm::vec4{0.35f, 0.75f, 1.0f, 0.9f});
+            ui.drawRect(layout.statusBar.x, layout.statusBar.y, layout.statusBar.width,
+                        layout.statusBar.height, glm::vec4{0.07f, 0.08f, 0.11f, 1.0f});
+            ui.drawRect(layout.statusBar.x, layout.statusBar.y, layout.statusBar.width, 1.0f,
+                        glm::vec4{1.0f, 1.0f, 1.0f, 0.14f});
+            // Viewport panel frame + label chip (the scene itself is
+            // already clipped to this rectangle by the renderer).
+            ui.drawRoundedRect(layout.viewport.x - 1.0f, layout.viewport.y - 1.0f,
+                               layout.viewport.width + 2.0f, layout.viewport.height + 2.0f,
+                               UIRectStyle{4.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.18f}},
+                               glm::vec4{0.0f, 0.0f, 0.0f, 0.0f});
+            {
+                const std::string viewportLabel = playing ? "Viewport - Play" : "Viewport - Scene";
+                const float chipWidth = ui.measureText(viewportLabel, 1.2f) + 20.0f;
+                ui.drawRoundedRect(layout.viewport.x + 8.0f, layout.viewport.y + 8.0f, chipWidth, 24.0f,
+                                   UIRectStyle{5.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
+                                   glm::vec4{0.05f, 0.06f, 0.09f, 0.88f});
+                ui.drawText(viewportLabel, layout.viewport.x + 18.0f, layout.viewport.y + 14.0f, 1.2f,
+                            glm::vec4{0.85f, 0.90f, 0.99f, 1.0f});
+            }
+            const std::string statusText =
+                playing
+                    ? (m_input.isMouseCaptured()
+                           ? "Play mode - simulation running - Esc releases the mouse - Stop restores the edit scene"
+                           : "Play mode - click inside the viewport to capture the mouse - Stop (or Ctrl+P) restores the edit scene")
+                    : "Edit mode - click in the viewport to select - hold right-mouse in the viewport to look - Ctrl+P plays the scene";
+            ui.drawText(statusText, layout.statusBar.x + 10.0f,
+                        layout.statusBar.y + 0.5f * layout.statusBar.height - 6.0f * scale, 1.2f,
+                        glm::vec4{0.75f, 0.85f, 1.0f, 0.9f});
+            if (!m_statsText.empty()) {
+                const float statsWidth = ui.measureText(m_statsText, 1.2f);
+                const float statsX = std::max(layout.toolbar.x + 8.0f,
+                                              layout.toolbar.x + layout.toolbar.width - statsWidth - 12.0f);
+                // Stats sit at the toolbar's right edge; on narrow
+                // windows they yield (buttons keep their space).
+                if (statsX > layout.toolbar.x + layout.toolbar.width * 0.55f) {
+                    ui.drawText(m_statsText, statsX,
+                                layout.toolbar.y + 0.5f * layout.toolbar.height - 6.0f * scale, 1.2f,
+                                glm::vec4{0.92f, 0.95f, 1.0f, 1.0f});
+                }
+            }
 
-            // Phase 28 tool toolbar: gizmo mode switch (keys 1/2/3),
-            // its accent underline marking the active tool.
-            const UIRect toolbarRect{386.0f, 8.0f, 246.0f, 46.0f};
-            ui.drawRoundedRect(toolbarRect.x, toolbarRect.y, toolbarRect.width, toolbarRect.height,
-                               UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
-                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
-            const float kToolX[3] = {394.0f, 472.0f, 550.0f};
-            const int activeTool = m_gizmo.mode() == GizmoMode::Translate ? 0 : m_gizmo.mode() == GizmoMode::Rotate ? 1 : 2;
-            ui.drawRect(kToolX[activeTool], 45.0f, 74.0f, 3.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.95f});
-            // (Phase 31: in Play mode the authoring buttons still
-            // draw, but their actions are ignored.)
-            if (m_uiContext.button(UIRect{kToolX[0], 17.0f, 74.0f, 28.0f}, "Move") && !playing) {
+            // Toolbar buttons, laid out left-to-right inside the
+            // toolbar rect (never at absolute window coordinates, so
+            // they can never drift over the viewport or off-window
+            // when it shrinks). The tool switch keeps its accent
+            // underline; Play/Stop keep theirs per live mode. In
+            // Play mode the authoring buttons still draw but their
+            // actions are ignored -- Stop stays live.
+            const float buttonY = layout.toolbar.y + 0.5f * (layout.toolbar.height - 30.0f);
+            const float buttonH = 30.0f;
+            float buttonX = layout.toolbar.x + 10.0f;
+            const auto toolbarButton = [&](const char* label, float width) {
+                const UIRect rect{buttonX, buttonY, width, buttonH};
+                buttonX += width + 6.0f;
+                return m_uiContext.button(rect, label);
+            };
+            ui.drawText("3D Engine", buttonX, buttonY + 4.0f, 1.35f, glm::vec4{0.95f, 0.97f, 1.0f, 1.0f});
+            buttonX += ui.measureText("3D Engine", 1.35f) + 18.0f;
+            const float toolStartX = buttonX;
+            const int activeTool =
+                m_gizmo.mode() == GizmoMode::Translate ? 0 : m_gizmo.mode() == GizmoMode::Rotate ? 1 : 2;
+            if (toolbarButton("Move", 74.0f) && !playing) {
                 m_gizmo.setMode(GizmoMode::Translate);
             }
-            if (m_uiContext.button(UIRect{kToolX[1], 17.0f, 74.0f, 28.0f}, "Rotate") && !playing) {
+            if (toolbarButton("Rotate", 74.0f) && !playing) {
                 m_gizmo.setMode(GizmoMode::Rotate);
             }
-            if (m_uiContext.button(UIRect{kToolX[2], 17.0f, 74.0f, 28.0f}, "Scale") && !playing) {
+            if (toolbarButton("Scale", 74.0f) && !playing) {
                 m_gizmo.setMode(GizmoMode::Scale);
             }
-
-            // Phase 30: scene file commands beside the tool switch —
-            // Save serializes the active registry to the .gbq
-            // quicksave, Load clears and restores it wholesale.
-            const UIRect sceneFileRect{640.0f, 8.0f, 168.0f, 46.0f};
-            ui.drawRoundedRect(sceneFileRect.x, sceneFileRect.y, sceneFileRect.width, sceneFileRect.height,
-                               UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
-                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
-            if (m_uiContext.button(UIRect{648.0f, 17.0f, 74.0f, 28.0f}, "Save") && !playing) {
+            ui.drawRect(toolStartX + static_cast<float>(activeTool) * 80.0f,
+                        buttonY + buttonH + 3.0f, 74.0f, 3.0f, glm::vec4{1.0f, 0.82f, 0.25f, 0.95f});
+            buttonX += 10.0f;
+            // Scene file commands: Save serializes the registry to
+            // the .gbq quicksave, Load restores it wholesale.
+            if (toolbarButton("Save", 74.0f) && !playing) {
                 saveSceneToGbq();
             }
-            if (m_uiContext.button(UIRect{726.0f, 17.0f, 74.0f, 28.0f}, "Load") && !playing) {
+            if (toolbarButton("Load", 74.0f) && !playing) {
                 loadSceneFromGbq();
             }
-
-            // Phase 31: Play/Stop segment. Play snapshots the scene
-            // and starts the runtime simulation; Stop tears the
-            // runtime down and restores the pre-play snapshot.
-            // The accent underline marks the button matching the
-            // live mode (Stop stays reachable in Play mode, when
-            // every other authoring control is inert).
-            const UIRect playRect{816.0f, 8.0f, 168.0f, 46.0f};
-            ui.drawRoundedRect(playRect.x, playRect.y, playRect.width, playRect.height,
-                               UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
-                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
-            ui.drawRect(playing ? 902.0f : 824.0f, 45.0f, 74.0f, 3.0f,
-                        playing ? glm::vec4{1.0f, 0.35f, 0.25f, 0.95f} : glm::vec4{0.35f, 1.0f, 0.55f, 0.95f});
-            if (m_uiContext.button(UIRect{824.0f, 17.0f, 74.0f, 28.0f}, "Play")) {
-                if (!playing) {
-                    enterPlayMode();
-                }
+            buttonX += 10.0f;
+            // Play snapshots the scene and starts the simulation;
+            // Stop tears it down and restores the snapshot.
+            const float playStartX = buttonX;
+            if (toolbarButton("Play", 74.0f) && !playing) {
+                enterPlayMode();
             }
-            if (m_uiContext.button(UIRect{902.0f, 17.0f, 74.0f, 28.0f}, "Stop")) {
-                if (playing) {
-                    exitPlayMode();
-                }
+            if (toolbarButton("Stop", 74.0f) && playing) {
+                exitPlayMode();
             }
-
-            // Phase 33: "Export Game" segment. Packages the live
-            // (Edit-mode) scene plus every asset it references into
-            // the GBQB bundle the standalone game-player boots.
-            // Inert while playing: an export always ships the
-            // authored world, never mid-simulation state.
-            const UIRect exportRect{992.0f, 8.0f, 92.0f, 46.0f};
-            ui.drawRoundedRect(exportRect.x, exportRect.y, exportRect.width, exportRect.height,
-                               UIRectStyle{8.0f, 1.0f, glm::vec4{1.0f, 1.0f, 1.0f, 0.14f}},
-                               glm::vec4{0.02f, 0.03f, 0.05f, 0.55f});
-            if (m_uiContext.button(UIRect{1000.0f, 17.0f, 74.0f, 28.0f}, "Export") && !playing) {
+            ui.drawRect(playStartX + (playing ? 80.0f : 0.0f), buttonY + buttonH + 3.0f, 74.0f, 3.0f,
+                        playing ? glm::vec4{1.0f, 0.35f, 0.25f, 0.95f}
+                                : glm::vec4{0.35f, 1.0f, 0.55f, 0.95f});
+            buttonX += 10.0f;
+            // Export packages the Edit-mode scene into the GBQB
+            // bundle the standalone player boots. Inert in Play.
+            if (toolbarButton("Export", 74.0f) && !playing) {
                 exportGame();
             }
 
-            // Phase 27 editor layout: the Component Inspector dock
-            // (top-right) reflects the Outliner's selection over
-            // every reflected built-in component; the Scene
-            // Hierarchy panel (left, below the HUD backdrop) is
-            // built LAST so its context menu paints above the
-            // dock. With nothing selected the inspector falls back
-            // to the player ship's RigidBodyComponent (the Step 3
-            // behavior), present only when the flight module has
-            // spawned the ship.
+            // Docks: Inspector (right), Hierarchy (left), Asset
+            // Browser (bottom-centre) -- all solid panels from the
+            // one EditorLayout, all Edit-mode only. In Play mode
+            // none of them are built (their widgets edit component
+            // memory the runtime owns) and the viewport expands.
             auto& registry = m_scene.registry();
             UIInspectorOptions inspectorOptions;
             inspectorOptions.floatMin = 0.0f;
             inspectorOptions.floatMax = 5000.0f;
-            constexpr float kInspectorWidth = 322.0f;
-            const float inspectorX =
-                static_cast<float>(m_window.width()) - kInspectorWidth - 8.0f;
+            const UIRect& inspectorRect = layout.inspector;
+            const float inspectorX = inspectorRect.x + 6.0f;
+            const float inspectorWidth = std::max(0.0f, inspectorRect.width - 12.0f);
             const entt::entity selected = m_outliner.selected();
-            float inspectorBottom = 8.0f; // viewport picking occluder edge
-            // Phase 31: no inspector in Play mode — its widgets
-            // edit component memory, which the runtime owns.
-            if (!playing && selected != entt::null && registry.valid(selected)) {
-                float y = 8.0f;
-                y = inspectComponentAt<TransformComponent>(m_uiContext, registry, selected, inspectorX, y,
-                                                           kInspectorWidth, inspectorOptions);
-                y = inspectComponentAt<RigidBodyComponent>(m_uiContext, registry, selected, inspectorX, y,
-                                                           kInspectorWidth, inspectorOptions);
-                y = inspectComponentAt<SpinComponent>(m_uiContext, registry, selected, inspectorX, y,
-                                                      kInspectorWidth, inspectorOptions);
-                y = inspectComponentAt<PointLightComponent>(m_uiContext, registry, selected, inspectorX, y,
-                                                            kInspectorWidth, inspectorOptions);
-                y = inspectComponentAt<SpotLightComponent>(m_uiContext, registry, selected, inspectorX, y,
-                                                           kInspectorWidth, inspectorOptions);
-                y = inspectComponentAt<DirectionalLightComponent>(m_uiContext, registry, selected, inspectorX, y,
-                                                                  kInspectorWidth, inspectorOptions);
-                if (registry.all_of<MeshComponent>(selected)) {
-                    y = inspectMaterialAt(m_uiContext, m_assets, registry.get<MeshComponent>(selected),
-                                          inspectorX, y, kInspectorWidth);
-                }
-                inspectorBottom = y;
-            } else if (!playing) {
-                const auto tags = registry.view<TagComponent>();
-                for (const auto entity : tags) {
-                    if (tags.get<TagComponent>(entity).tag != "Spacecraft" ||
-                        !registry.all_of<RigidBodyComponent>(entity)) {
-                        continue;
+            if (!playing) {
+                // One opaque dock behind the per-component panels.
+                m_uiContext.beginPanel("InspectorDock", inspectorRect);
+                m_uiContext.endPanel();
+                if (selected != entt::null && registry.valid(selected)) {
+                    float y = inspectorRect.y + 6.0f;
+                    y = inspectComponentAt<TransformComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                               inspectorWidth, inspectorOptions);
+                    y = inspectComponentAt<RigidBodyComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                               inspectorWidth, inspectorOptions);
+                    y = inspectComponentAt<SpinComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                          inspectorWidth, inspectorOptions);
+                    y = inspectComponentAt<PointLightComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                                inspectorWidth, inspectorOptions);
+                    y = inspectComponentAt<SpotLightComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                               inspectorWidth, inspectorOptions);
+                    y = inspectComponentAt<DirectionalLightComponent>(m_uiContext, registry, selected,
+                                                                      inspectorX, y, inspectorWidth,
+                                                                      inspectorOptions);
+                    if (registry.all_of<MeshComponent>(selected)) {
+                        y = inspectMaterialAt(m_uiContext, m_assets, registry.get<MeshComponent>(selected),
+                                              inspectorX, y, inspectorWidth);
                     }
-                    auto& body = registry.get<RigidBodyComponent>(entity);
-                    inspectComponent(m_uiContext, UIRect{inspectorX, 8.0f, kInspectorWidth, 252.0f},
-                                     reflect<RigidBodyComponent>(), &body, inspectorOptions);
-                    inspectorBottom = 260.0f;
-                    break;
+                    (void)y; // panels are scissored by their own rects; the dock bounds the picking below
+                } else {
+                    bool drewFallback = false;
+                    const auto tags = registry.view<TagComponent>();
+                    for (const auto entity : tags) {
+                        if (tags.get<TagComponent>(entity).tag != "Spacecraft" ||
+                            !registry.all_of<RigidBodyComponent>(entity)) {
+                            continue;
+                        }
+                        auto& body = registry.get<RigidBodyComponent>(entity);
+                        inspectComponent(m_uiContext,
+                                         UIRect{inspectorX, inspectorRect.y + 6.0f, inspectorWidth, 252.0f},
+                                         reflect<RigidBodyComponent>(), &body, inspectorOptions);
+                        drewFallback = true;
+                        break;
+                    }
+                    if (!drewFallback) {
+                        ui.drawText("Inspector", inspectorX + 6.0f, inspectorRect.y + 12.0f, 1.35f,
+                                    glm::vec4{0.92f, 0.95f, 1.0f, 1.0f});
+                        ui.drawText("Select an entity in the Hierarchy", inspectorX + 6.0f,
+                                    inspectorRect.y + 40.0f, 1.2f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+                        ui.drawText("or click one in the viewport.", inspectorX + 6.0f,
+                                    inspectorRect.y + 58.0f, 1.2f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+                    }
                 }
+                m_outliner.build(m_uiContext, layout.hierarchy, m_scene);
             }
-            const float outlinerHeight =
-                std::max(static_cast<float>(m_window.height()) - 148.0f, 120.0f);
-            const UIRect outlinerRect{6.0f, 140.0f, 300.0f, outlinerHeight};
-            const glm::vec2 viewportSize{static_cast<float>(m_window.width()),
-                                         static_cast<float>(m_window.height())};
-            m_outliner.build(m_uiContext, outlinerRect, m_scene);
-            // Phase 29: Asset Browser dock along the bottom edge,
-            // between the hierarchy (left) and inspector (right).
-            const UIRect assetRect{312.0f, std::max(viewportSize.y - 196.0f, 150.0f),
-                                   std::max(viewportSize.x - 650.0f, 240.0f), 188.0f};
+            const UIRect assetRect = layout.assetBrowser;
 
-            // Phase 28: transform gizmo over the selection, then
-            // viewport picking. The gizmo runs first so a press that
-            // grabs a handle never re-picks; picking then fires only
-            // for presses the UI left unconsumed, outside every dock
-            // (HUD, toolbar, inspector, outliner), with no context
-            // menu open at frame start and no widget mid-drag.
+            // Transform gizmo over the selection, then viewport
+            // picking -- both strictly inside the viewport panel.
+            // The gizmo runs first so a press that grabs a handle
+            // never re-picks; picking then fires only for presses
+            // the UI left unconsumed, inside the viewport, with no
+            // context menu open at frame start and no widget drag.
             if (const CameraComponent* activeCamera = m_scene.findActiveCamera(); activeCamera != nullptr) {
-                // Phase 31: `playing` blocks both the gizmo (never
-                // updated — nothing draws or drags) and picking.
                 const bool gizmoBlocked = playing || popupOpenAtFrameStart || m_input.isMouseCaptured();
                 const GizmoUpdateResult gizmoResult =
                     playing ? GizmoUpdateResult{}
                             : m_gizmo.update(m_uiContext, m_scene, m_outliner.selected(), activeCamera->camera,
-                                             viewportSize, gizmoBlocked);
+                                             layout.viewport, gizmoBlocked);
                 const glm::vec2 mouse = m_uiContext.mousePosition();
-                const auto insideRect = [](const UIRect& rect, glm::vec2 point) {
-                    return point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y &&
-                           point.y < rect.y + rect.height;
-                };
-                const UIRect inspectorOccluder{inspectorX, 0.0f, std::max(0.0f, viewportSize.x - inspectorX),
-                                               inspectorBottom};
                 if (!gizmoResult.pressConsumed && !gizmoBlocked && m_uiContext.activeId() == kUINoWidget &&
-                    m_uiContext.pressedRect(UIRect{0.0f, 0.0f, viewportSize.x, viewportSize.y}) &&
-                    !insideRect(UIRect{6.0f, 6.0f, 372.0f, 124.0f}, mouse) && !insideRect(toolbarRect, mouse) &&
-                    !insideRect(outlinerRect, mouse) && !insideRect(inspectorOccluder, mouse) &&
-                    !insideRect(assetRect, mouse)) {
+                    m_uiContext.pressedRect(layout.viewport)) {
                     RaycastHit hit;
-                    if (pickEntityAt(m_scene, activeCamera->camera, mouse, viewportSize, hit)) {
+                    if (pickEntityAt(m_scene, activeCamera->camera, mouse, layout.viewport, hit)) {
                         m_outliner.setSelected(hit.entity);
                         ENGINE_LOG_DEBUG("Editor pick: entity #" << entt::to_integral(hit.entity) << " at "
                                                                  << hit.distance << " m");
@@ -886,14 +951,14 @@ void Application::run() {
                 playing ? UIAssetBrowser::Result{} : m_assetBrowser.build(m_uiContext, assetRect);
             const UIDragPayload dragPayload = m_uiContext.dragPayload();
             const glm::vec2 dragMouse = m_uiContext.mousePosition();
-            const auto overRect = [](const UIRect& rect, glm::vec2 point) {
-                return point.x >= rect.x && point.x < rect.x + rect.width && point.y >= rect.y &&
-                       point.y < rect.y + rect.height;
-            };
-            const UIRect inspectorDropRect{inspectorX, 0.0f, std::max(0.0f, viewportSize.x - inspectorX),
-                                           inspectorBottom};
+            // Drop targets are the actual docks: the inspector dock
+            // (checked first -- it wins) assigns, the bounded
+            // viewport spawns at the ground point under the cursor.
+            // Nothing outside those rects accepts a drop, so a drag
+            // released over a panel can never spawn through it.
+            const UIRect& inspectorDropRect = layout.inspector;
             const entt::entity dropSelection = m_outliner.selected();
-            if (dropSelection != entt::null && registry.valid(dropSelection)) {
+            if (!playing && dropSelection != entt::null && registry.valid(dropSelection)) {
                 const bool hot = m_uiContext.dropTargetHovered(inspectorDropRect, "AssetTexture") ||
                                  m_uiContext.dropTargetHovered(inspectorDropRect, "AssetMesh") ||
                                  m_uiContext.dropTargetHovered(inspectorDropRect, "AssetShader");
@@ -910,17 +975,14 @@ void Application::run() {
                 }
             }
             if (const CameraComponent* activeCamera = m_scene.findActiveCamera(); activeCamera != nullptr) {
-                const bool overDock = overRect(UIRect{6.0f, 6.0f, 372.0f, 124.0f}, dragMouse) ||
-                                      overRect(toolbarRect, dragMouse) || overRect(outlinerRect, dragMouse) ||
-                                      overRect(inspectorDropRect, dragMouse) || overRect(assetRect, dragMouse);
-                if (!overDock && m_uiContext.dropTarget(UIRect{0.0f, 0.0f, viewportSize.x, viewportSize.y},
-                                                        "AssetMesh")) {
-                    spawnDroppedMesh(dragPayload.data, dragMouse, activeCamera->camera, viewportSize);
+                if (!playing && m_uiContext.dropTarget(layout.viewport, "AssetMesh")) {
+                    spawnDroppedMesh(dragPayload.data, dragMouse, activeCamera->camera, layout.viewport);
                 }
                 if (browserResult.activated != nullptr && browserResult.activated->kind == AssetEntryKind::Mesh) {
                     spawnDroppedMesh(browserResult.activated->relativePath,
-                                     glm::vec2{viewportSize.x * 0.5f, viewportSize.y * 0.5f}, activeCamera->camera,
-                                     viewportSize);
+                                     glm::vec2{layout.viewport.x + 0.5f * layout.viewport.width,
+                                               layout.viewport.y + 0.5f * layout.viewport.height},
+                                     activeCamera->camera, layout.viewport);
                 }
             }
             m_uiContext.endFrame();
@@ -940,20 +1002,69 @@ void Application::run() {
     logLoopStats("Engine shutting down");
 }
 
+EditorLayout Application::currentEditorLayout() const {
+    return computeEditorLayout(static_cast<float>(std::max(m_window.framebufferWidth(), 0)),
+                               static_cast<float>(std::max(m_window.framebufferHeight(), 0)),
+                               m_playSession.isPlaying());
+}
+
+glm::vec2 Application::uiMousePosition() const {
+    // GLFW reports logical window coordinates; the UI batch and the
+    // dock layout live in framebuffer pixels. The two only diverge
+    // under DPI/content scaling, where this factor is > 1.
+    return m_input.mousePosition() * m_window.uiCoordinateScale();
+}
+
+void Application::updateEditorCamera(double deltaSeconds) {
+    CameraComponent* activeCamera = m_scene.findActiveCamera();
+    if (activeCamera == nullptr) {
+        return;
+    }
+    // Look only while the right mouse button is held inside the
+    // viewport panel. The cursor stays visible and free the whole
+    // time -- this is an editor navigation gesture, not a capture.
+    const glm::vec2 mouse = uiMousePosition();
+    if (m_input.isMouseButtonDown(MouseButton::Right) &&
+        m_editorLayout.containsViewport(mouse.x, mouse.y)) {
+        activeCamera->camera.processLook(m_input.mouseDelta());
+    }
+    activeCamera->camera.update(deltaSeconds);
+    // Deliberately no movement and no PlayerSystem::syncCamera here:
+    // in Edit mode the authored player transform is scene data, and
+    // the editor camera must not rewrite it (or be teleported by it).
+}
+
 void Application::handleMouseCapture() {
+    // Edit mode never captures: release any stale capture (e.g. a
+    // mode transition that raced a click) so the UI is always live.
+    if (!m_playSession.isPlaying()) {
+        if (m_input.isMouseCaptured()) {
+            m_input.setMouseCaptured(false);
+            ENGINE_LOG_DEBUG("Mouse released (Edit mode never captures)");
+        }
+        return;
+    }
+    // Play mode: Esc always hands the mouse back to the UI first.
+    // It never quits the application from here -- the window close
+    // button owns quitting, so a stray Esc can't nuke the session.
     if (m_input.wasKeyPressed(Key::Escape)) {
         if (m_input.isMouseCaptured()) {
             m_input.setMouseCaptured(false);
             ENGINE_LOG_DEBUG("Mouse released (Esc)");
-        } else {
-            m_window.requestClose();
         }
         return;
     }
+    // Capture only on an explicit click *inside the 3D viewport* --
+    // never on toolbar/panel clicks (the old any-click capture is
+    // what locked users out of the UI: the first click anywhere,
+    // including on a button, hid and locked the cursor).
     if (!m_input.isMouseCaptured() && m_config.input.captureMouseOnClick &&
         m_input.wasMouseButtonPressed(MouseButton::Left)) {
-        m_input.setMouseCaptured(true);
-        ENGINE_LOG_DEBUG("Mouse captured (click)");
+        const glm::vec2 mouse = uiMousePosition();
+        if (m_editorLayout.containsViewport(mouse.x, mouse.y)) {
+            m_input.setMouseCaptured(true);
+            ENGINE_LOG_DEBUG("Mouse captured (viewport click in Play mode)");
+        }
     }
 }
 
@@ -992,6 +1103,11 @@ void Application::enterPlayMode() {
     // drop it so no editor widget keeps a handle across the
     // snapshot boundary (Stop rebuilds every handle anyway).
     m_outliner.setSelected(entt::null);
+    // Play starts with a FREE cursor: the user clicks Stop with the
+    // mouse, or clicks inside the viewport to capture it for look.
+    if (m_input.isMouseCaptured()) {
+        m_input.setMouseCaptured(false);
+    }
     if (m_playSession.enterPlay(m_scene)) {
         // The C-key physics reset targets the pre-play state:
         // capture spawn states against the live handles now.
@@ -1000,6 +1116,10 @@ void Application::enterPlayMode() {
 }
 
 void Application::exitPlayMode() {
+    // Back to Edit: the cursor belongs to the UI again, always.
+    if (m_input.isMouseCaptured()) {
+        m_input.setMouseCaptured(false);
+    }
     if (m_playSession.exitPlay(m_scene)) {
         // The restore rebuilt every entity: keep the selection
         // cleared rather than pointing at a recycled handle.
@@ -1052,7 +1172,7 @@ void Application::exportGame() {
 }
 
 void Application::spawnDroppedMesh(std::string_view relativePath, glm::vec2 mousePixels, const Camera& camera,
-                                   glm::vec2 viewportSize) {
+                                   const UIRect& viewport) {
     std::filesystem::path absolute;
     if (!UIAssetBrowser::resolveWithinRoot(m_assetBrowser.rootPath(), relativePath, absolute)) {
         ENGINE_LOG_WARNING("Asset drop: '" << relativePath << "' escapes the asset root; refused");
@@ -1075,7 +1195,7 @@ void Application::spawnDroppedMesh(std::string_view relativePath, glm::vec2 mous
         return;
     }
     glm::vec3 position;
-    if (!dropPointOnGround(camera, mousePixels, viewportSize, position)) {
+    if (!dropPointOnGround(camera, mousePixels, viewport, position)) {
         position = camera.position() + camera.front() * 6.0f; // hover it in front of the camera
     }
     const Entity spawned = m_scene.spawnImportedModel(*asset, name, position, 1.0f, 1.0f);

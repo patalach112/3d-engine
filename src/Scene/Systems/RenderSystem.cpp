@@ -253,10 +253,15 @@ PreparedFrame RenderSystem::prepareFrame(Scene& scene, float aspectRatio,
 }
 
 bool RenderSystem::render(Scene& scene) {
+    // Keep the renderer's GPU viewport in lock-step with the aspect
+    // used for projection below: both come from the same rect.
+    m_renderer.setSceneViewport(m_sceneViewport);
     const VkExtent2D extent = m_swapchain.extent();
-    const float aspectRatio = extent.height > 0
-                                  ? static_cast<float>(extent.width) / static_cast<float>(extent.height)
-                                  : 1.0f;
+    const float aspectRatio = !m_sceneViewport.empty()
+                                  ? m_sceneViewport.aspect()
+                                  : (extent.height > 0
+                                         ? static_cast<float>(extent.width) / static_cast<float>(extent.height)
+                                         : 1.0f);
 
     FramePrepareOptions options;
     options.jobs = m_jobs;

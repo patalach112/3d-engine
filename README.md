@@ -2560,3 +2560,46 @@ a consumer reproduces the exact undefined-reference error;
 post-fix it exports and the consumer links and runs.
 1096 passed / 0 failed across all five build configs,
 CTest 1/1.
+
+## Maintenance — Bounded editor viewport, TrueType UI font, free-cursor editor ✅
+
+A user screenshot showed the editor rendering the 3D scene
+full-window underneath translucent floating panels, blocky
+all-caps bitmap text, and a cursor that booted straight into
+game-style mouse capture. All three are fixed:
+
+- **Docked layout, bounded viewport** (`Graphics/EditorLayout.*`):
+  one pure-CPU `EditorLayout` per frame, computed from the live
+  framebuffer size — Toolbar on top, Scene Hierarchy left,
+  Inspector right, Asset Browser bottom, and the 3D scene
+  strictly inside the central Viewport rect. The renderer takes
+  that rect (`Renderer::setSceneViewport`) and applies it as
+  the Vulkan viewport/scissor for the scene pass *and* the
+  HDR composite; camera aspect, mouse picking rays, gizmo
+  projection/dragging, and drag-and-drop targets all consume
+  the same rect. In Play mode the docks collapse and the
+  viewport takes their space. Layout is recomputed every
+  frame, so resizing reflows immediately (pinned by
+  `testEditorViewportAndFont` at 1280×720, 1920×1080, 800×500,
+  and 0×0).
+- **Real TrueType font** (`Graphics/SdfFont.*`, vendored
+  `stb_truetype` v1.26): the UI atlas is now baked from an
+  actual sans-serif — `ENGINE_UI_FONT` env override, then a
+  system font (Segoe UI / Helvetica / DejaVu Sans…), then the
+  bundled `assets/fonts/DejaVuSans.ttf` — as a 48 px SDF page
+  with per-glyph advances/bearings, a 95×95 kerning table, and
+  baseline-aligned, proportional, mixed-case text (the legacy
+  5×7 bake remains only as the last-resort fallback atlas).
+  Malformed font data is rejected before stb sees it (stb does
+  no bounds checking of its own), the ESDF cache format is
+  v2, and the negative-control/GCC-false-positive wrinkles are
+  covered by tests.
+- **The editor never captures the mouse**: `captureMouseOnStart`
+  now defaults to `false`; capture exists only as a deliberate
+  Play-mode click *inside the viewport rect* (RMB look,
+  WASD fly). Clicks on any dock never capture, Esc releases
+  instead of quitting, and focus loss hands the cursor back.
+  The standalone player is untouched.
+
+1112 passed / 0 failed across all five build configs, CTest 1/1,
+zero warnings.
