@@ -58,8 +58,8 @@ struct SceneViewportRect {
 // rasterizes into, so confinement to the requesting panel is
 // structural: geometry that would land in a neighbouring dock is
 // clipped by the GPU before it can be written.
-[[nodiscard]] SceneViewportRect resolveSceneViewport(const SceneViewportRect& requested,
-                                                     VkExtent2D framebufferExtent);
+[[nodiscard]] ENGINE_GRAPHICS_API SceneViewportRect resolveSceneViewport(const SceneViewportRect& requested,
+                                                                         VkExtent2D framebufferExtent);
 
 // Per-frame data consumed by the cube shaders: camera matrices plus the
 // directional light's view-projection (shadow reprojection) and
