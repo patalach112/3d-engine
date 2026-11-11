@@ -80,6 +80,22 @@ struct UIInput {
     std::string textInput{};
     bool backspacePressed = false; // one Backspace press this frame (textField)
     bool enterPressed = false;     // one Enter press this frame (commits a textField)
+    // Multi-line editor keys (one-frame edges): caret movement and
+    // deletion for the script TextEditor. `fineModifier` doubles as
+    // the Shift state (word jumps); ctrlModifier requests document
+    // actions (Ctrl+S = Save & Compile).
+    struct EditorKeys {
+        bool left = false, right = false, up = false, down = false;
+        bool home = false, end = false, del = false;
+        bool pageUp = false, pageDown = false;
+        bool tab = false;
+        bool saveCombo = false; // Ctrl+S edge
+    } editorKeys{};
+    // Level state of the repeating editor keys (held = repeat).
+    struct EditorHeld {
+        bool left = false, right = false, up = false, down = false, backspace = false;
+    } editorHeld{};
+    bool ctrlModifier = false;
 };
 
 using UIWidgetId = uint32_t;
@@ -226,6 +242,9 @@ public:
     [[nodiscard]] UIWidgetId hoveredId() const { return m_hovered; }
     [[nodiscard]] UIWidgetId activeId() const { return m_active; }
     [[nodiscard]] UIWidgetId focusedId() const { return m_focused; }
+    // The frame's full input snapshot (custom widgets such as the
+    // script TextEditor read caret keys / typed text from here).
+    [[nodiscard]] const UIInput& frameInput() const { return m_input; }
     [[nodiscard]] const UITheme& theme() const { return m_theme; }
     void setTheme(const UITheme& theme) { m_theme = theme; }
     [[nodiscard]] UIBatch* batch() const { return m_batch; }

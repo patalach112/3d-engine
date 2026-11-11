@@ -23,6 +23,7 @@
 #include "Platform/Window.h"
 #include "Scene/PlaySession.h"
 #include "Scripting/ScriptSystem.h"
+#include "Graphics/TextEditor.h"
 #include "Scene/Scene.h"
 #include "Scene/TransformGizmo.h"
 #include "Scene/UIAssetBrowser.h"
@@ -116,6 +117,16 @@ private:
     // Arms the inspector rename field for `entity` (tag copied into
     // the edit buffer, keyboard focus grabbed on its first frame).
     void beginRename(entt::entity entity);
+    // Script dock: binds the text editor to an entity's
+    // ScriptComponent, commits buffer -> component (+ .dsla file)
+    // with an immediate parse verdict, renders the inspector's
+    // script section and the bottom-dock script tab, and drives
+    // the dock splitters.
+    void bindScriptEditor(entt::entity entity);
+    void saveAndCompileScript();
+    float inspectScriptAt(float x, float y, float width, entt::entity entity);
+    void drawScriptDock(const UIRect& rect, double deltaSeconds);
+    void updateSplitters(const EditorLayout& layout);
     // Assembles the context handed to the game module (Phase 23).
     EngineContext buildModuleContext(float deltaSeconds, float fixedDeltaSeconds);
 
@@ -184,10 +195,22 @@ private:
     // camera), released with the button.
     bool m_editorFlyCapture = false;
     bool m_rightPressInViewport = false;
+    // Script editor + resizable docks: splitter drag state feeds
+    // computeEditorLayout every frame, so the scene viewport (and
+    // with it projection/picking) follows panel sizes immediately.
+    EditorDockSizes m_dockSizes;
+    int m_activeSplitter = 0;  // 0 none, 1 hierarchy, 2 inspector, 3 bottom dock
+    int m_hoveredSplitter = 0; // same encoding, for hover/cursor feedback
+    enum class BottomDockTab : uint8_t { Assets, Script };
+    BottomDockTab m_bottomDockTab = BottomDockTab::Assets;
+    TextEditor m_scriptEditor;
+    std::string m_scriptStatus; // last Save & Compile verdict for the bound script
+    UIRect m_scriptEditorRect{}; // last drawn script-dock rect (I-beam cursor)
     std::string m_statusMessage;           // transient status-bar notification
     float m_statusSecondsRemaining = 0.0f; // decays in the update callback
     std::filesystem::path m_activeScenePath; // scene file Save/Load last used
 
+    double m_lastUpdateDeltaSeconds = 0.0; // update() dt, reused by render-time widgets
     double m_secondsSinceStatsLog = 0.0;
     double m_secondsSinceAssetPoll = 0.0;
     double m_secondsSinceModulePoll = 0.0;

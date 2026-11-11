@@ -11,6 +11,8 @@
 #include <glm/geometric.hpp>
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <cmath>
 #include <utility>
 
@@ -426,6 +428,11 @@ void ScriptSystem::postEvent(ScriptSystemContext& context, DSLEvent event) {
     context.eventQueue.push_back(event);
 }
 
+const ScriptSystemContext::Runtime* ScriptSystem::findRuntime(const ScriptSystemContext& context, entt::entity script) {
+    const auto it = context.runtimes.find(script);
+    return it != context.runtimes.end() ? &it->second : nullptr;
+}
+
 std::optional<double> ScriptSystem::variable(ScriptSystemContext& context, entt::entity script, const std::string& name) {
     const auto it = context.runtimes.find(script);
     if (it == context.runtimes.end()) {
@@ -475,6 +482,30 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
         }
         auto& component = registry.get<ScriptComponent>(e);
         Runtime& rt = context.runtimes[e];
+        // Entity-linked script files: PreferFileSource loads the
+        // file before first compile; AutoReload keeps watching it
+        // and streams edits into `source` (the recompile detector
+        // below does the rest). Missing files are ignored quietly
+        // so inline-only scripts never spam the log.
+        if (!component.filePath.empty() &&
+            (hasFlag(component.compileFlags, ScriptCompileFlags::AutoReload) || !rt.setupDone)) {
+            std::error_code ec;
+            const auto stamp = std::filesystem::last_write_time(component.filePath, ec);
+            if (!ec) {
+                const int64_t ticks = static_cast<int64_t>(stamp.time_since_epoch().count());
+                int64_t& seen = context.fileStamps[e];
+                if (seen != ticks) {
+                    seen = ticks;
+                    std::ifstream file(component.filePath, std::ios::binary);
+                    if (file) {
+                        std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                        if (content != component.source) {
+                            component.source = std::move(content);
+                        }
+                    }
+                }
+            }
+        }
         if (component.source != rt.source) {
             DSLParseResult parsed = parseBackroomsScript(component.source);
             rt.source = component.source;

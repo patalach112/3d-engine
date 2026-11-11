@@ -51,6 +51,11 @@ Window::Window(int width, int height, const char* title, bool resizable, bool ca
 
 Window::~Window() {
     if (m_window != nullptr) {
+        for (void* cursor : m_cursors) {
+            if (cursor != nullptr) {
+                glfwDestroyCursor(static_cast<GLFWcursor*>(cursor));
+            }
+        }
         glfwDestroyWindow(m_window);
     }
     glfwTerminate();
@@ -72,7 +77,35 @@ void Window::setCursorCaptured(bool captured) {
     m_cursorCaptured = captured;
     if (m_window != nullptr) {
         glfwSetInputMode(m_window, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+        if (!captured) {
+            // Re-apply the editor cursor shape suppressed while captured.
+            const CursorShape shape = m_cursorShape;
+            m_cursorShape = CursorShape::Arrow;
+            setCursorShape(shape);
+        }
     }
+}
+
+void Window::setCursorShape(CursorShape shape) {
+    if (m_window == nullptr || shape == m_cursorShape) {
+        return;
+    }
+    m_cursorShape = shape;
+    if (m_cursorCaptured) {
+        return; // hidden cursor while captured; shape applies on release
+    }
+    const size_t index = static_cast<size_t>(shape);
+    if (m_cursors[index] == nullptr) {
+        GLFWcursor* cursor = nullptr;
+        switch (shape) {
+        case CursorShape::Arrow: break;
+        case CursorShape::IBeam: cursor = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR); break;
+        case CursorShape::ResizeEastWest: cursor = glfwCreateStandardCursor(GLFW_RESIZE_EW_CURSOR); break;
+        case CursorShape::ResizeNorthSouth: cursor = glfwCreateStandardCursor(GLFW_RESIZE_NS_CURSOR); break;
+        }
+        m_cursors[index] = cursor;
+    }
+    glfwSetCursor(m_window, static_cast<GLFWcursor*>(m_cursors[index]));
 }
 
 void Window::waitEvents() {

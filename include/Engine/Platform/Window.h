@@ -53,6 +53,12 @@ public:
     // until the rest of the application has finished constructing.
     void setCursorCaptured(bool captured);
     [[nodiscard]] bool isCursorCaptured() const { return m_cursorCaptured; }
+
+    // OS cursor glyphs for editor affordances (splitter drags,
+    // text editing). Shapes are created lazily from GLFW's standard
+    // cursors and owned by the window; Arrow restores the default.
+    enum class CursorShape : uint8_t { Arrow, IBeam, ResizeEastWest, ResizeNorthSouth };
+    void setCursorShape(CursorShape shape);
     [[nodiscard]] static constexpr int cursorModeForCapture(bool captured) {
         return captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL;
     }
@@ -95,6 +101,8 @@ private:
     static Window* fromGlfwWindow(GLFWwindow* window);
 
     GLFWwindow* m_window = nullptr;
+    void* m_cursors[4] = {nullptr, nullptr, nullptr, nullptr}; // GLFWcursor* per CursorShape
+    CursorShape m_cursorShape = CursorShape::Arrow;
     Input* m_inputHandler = nullptr;
     int m_width = 0;
     int m_height = 0;

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <glm/geometric.hpp>
 #include "Scene/Systems/TransformSystem.h"
 
@@ -21,6 +22,8 @@
 #include "Scene/NativeScript.h"
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scripting/StalkerAISystem.h"
+#include "Scripting/DSLParser.h"
+#include "Scripting/DSLComponents.h"
 #include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
@@ -593,6 +596,7 @@ void Application::run() {
     // Player control is frame-rate dependent by nature (mouse look), so
     // the camera system lives in the variable update.
     callbacks.update = [this](double deltaSeconds) {
+        m_lastUpdateDeltaSeconds = deltaSeconds;
         // Status-bar notifications are transient: they decay here
         // (real time) and the status bar falls back to its mode hint
         // once the timer runs out.
@@ -689,8 +693,18 @@ void Application::run() {
             ui.begin(framebufferWidth, framebufferHeight);
             const bool playingNow = m_playSession.isPlaying();
             const EditorLayout layout = computeEditorLayout(static_cast<float>(framebufferWidth),
-                                                            static_cast<float>(framebufferHeight), playingNow);
+                                                            static_cast<float>(framebufferHeight), playingNow,
+                                                            m_dockSizes);
             m_editorLayout = layout;
+            // Dock splitters read the same layout the panels are
+            // about to consume; dragging rewrites m_dockSizes, so
+            // next frame's layout (and scene viewport) follows.
+            if (!playingNow) {
+                updateSplitters(layout);
+            } else {
+                m_activeSplitter = 0;
+                m_hoveredSplitter = 0;
+            }
             // Publish the viewport before RenderSystem runs (below,
             // after this block): projection aspect and the Vulkan
             // viewport/scissor both follow this same rectangle.
@@ -721,6 +735,30 @@ void Application::run() {
                 uiInput.textInput = m_input.textInput();
                 uiInput.backspacePressed = m_input.wasKeyPressed(Key::Backspace);
                 uiInput.enterPressed = m_input.wasKeyPressed(Key::Enter);
+                // Script-editor caret keys: edges drive actions,
+                // levels drive key repeat. Ctrl+S is Save & Compile.
+                uiInput.ctrlModifier =
+                    m_input.isKeyDown(Key::LeftControl) || m_input.isKeyDown(Key::RightControl);
+                UIInput::EditorKeys& editorKeys = uiInput.editorKeys;
+                editorKeys.left = m_input.wasKeyPressed(Key::Left);
+                editorKeys.right = m_input.wasKeyPressed(Key::Right);
+                editorKeys.up = m_input.wasKeyPressed(Key::Up);
+                editorKeys.down = m_input.wasKeyPressed(Key::Down);
+                editorKeys.home = m_input.wasKeyPressed(Key::Home);
+                editorKeys.end = m_input.wasKeyPressed(Key::End);
+                editorKeys.del = m_input.wasKeyPressed(Key::Delete);
+                editorKeys.pageUp = m_input.wasKeyPressed(Key::PageUp);
+                editorKeys.pageDown = m_input.wasKeyPressed(Key::PageDown);
+                editorKeys.tab = m_input.wasKeyPressed(Key::Tab);
+                editorKeys.saveCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::S);
+                uiInput.editorHeld.left = m_input.isKeyDown(Key::Left);
+                uiInput.editorHeld.right = m_input.isKeyDown(Key::Right);
+                uiInput.editorHeld.up = m_input.isKeyDown(Key::Up);
+                uiInput.editorHeld.down = m_input.isKeyDown(Key::Down);
+                uiInput.editorHeld.backspace = m_input.isKeyDown(Key::Backspace);
+                if (m_scriptEditor.focused()) {
+                    uiInput.keyStep = 0; // arrows belong to the caret, not sliders
+                }
             }
             m_uiContext.beginFrame(uiInput, ui);
             // A menu open at frame start owns this frame's clicks:
@@ -981,6 +1019,7 @@ void Application::run() {
                     y = inspectComponentAt<DirectionalLightComponent>(m_uiContext, registry, selected,
                                                                       inspectorX, y, inspectorWidth,
                                                                       inspectorOptions);
+                    y = inspectScriptAt(inspectorX, y, inspectorWidth, selected);
                     if (registry.all_of<MeshComponent>(selected)) {
                         y = inspectMaterialAt(m_uiContext, m_assets, registry.get<MeshComponent>(selected),
                                               inspectorX, y, inspectorWidth);
@@ -1071,8 +1110,8 @@ void Application::run() {
                             : m_gizmo.update(m_uiContext, m_scene, m_outliner.selected(), activeCamera->camera,
                                              layout.viewport, gizmoBlocked);
                 const glm::vec2 mouse = m_uiContext.mousePosition();
-                if (!gizmoResult.pressConsumed && !gizmoBlocked && m_uiContext.activeId() == kUINoWidget &&
-                    m_uiContext.pressedRect(layout.viewport)) {
+                if (!gizmoResult.pressConsumed && !gizmoBlocked && m_activeSplitter == 0 &&
+                    m_uiContext.activeId() == kUINoWidget && m_uiContext.pressedRect(layout.viewport)) {
                     RaycastHit hit;
                     if (pickEntityAt(m_scene, activeCamera->camera, mouse, layout.viewport, hit)) {
                         m_outliner.setSelected(hit.entity);
@@ -1127,8 +1166,31 @@ void Application::run() {
             // Phase 31: the asset browser spawns into the scene,
             // so it is not built in Play mode (no drag sources, no
             // activation; the drop targets below then stay inert).
-            const UIAssetBrowser::Result browserResult =
-                playing ? UIAssetBrowser::Result{} : m_assetBrowser.build(m_uiContext, assetRect);
+            // Bottom dock tabs: Assets browser and the script
+            // editor share the dock; the tab strip is 26 px, the
+            // content below it. Play mode builds neither.
+            UIAssetBrowser::Result browserResult{};
+            if (!playing) {
+                const float tabHeight = 26.0f;
+                const UIRect tabAssets{assetRect.x + 4.0f, assetRect.y + 2.0f, 92.0f, tabHeight - 4.0f};
+                const UIRect tabScript{assetRect.x + 100.0f, assetRect.y + 2.0f, 92.0f, tabHeight - 4.0f};
+                if (m_uiContext.button(tabAssets, "Assets")) {
+                    m_bottomDockTab = BottomDockTab::Assets;
+                }
+                if (m_uiContext.button(tabScript, "Script")) {
+                    m_bottomDockTab = BottomDockTab::Script;
+                }
+                const UIRect activeTab = m_bottomDockTab == BottomDockTab::Assets ? tabAssets : tabScript;
+                ui.drawRect(activeTab.x, assetRect.y + tabHeight - 2.0f, activeTab.width, 2.0f,
+                            m_uiContext.theme().focusBorder);
+                const UIRect dockContent{assetRect.x, assetRect.y + tabHeight,
+                                         assetRect.width, std::max(0.0f, assetRect.height - tabHeight)};
+                if (m_bottomDockTab == BottomDockTab::Assets) {
+                    browserResult = m_assetBrowser.build(m_uiContext, dockContent);
+                } else {
+                    drawScriptDock(dockContent, m_lastUpdateDeltaSeconds);
+                }
+            }
             const UIDragPayload dragPayload = m_uiContext.dragPayload();
             const glm::vec2 dragMouse = m_uiContext.mousePosition();
             // Drop targets are the actual docks: the inspector dock
@@ -1202,6 +1264,32 @@ void Application::run() {
                 }
                 m_uiContext.endPopup();
             }
+            // Splitter affordance: accent line on the hovered /
+            // dragged dock boundary, and the matching OS cursor.
+            if (!playing) {
+                const int splitter = m_activeSplitter != 0 ? m_activeSplitter : m_hoveredSplitter;
+                const glm::vec4 accent = m_uiContext.theme().focusBorder;
+                if (splitter == 1) {
+                    ui.drawRect(layout.hierarchy.x + layout.hierarchy.width - 1.0f, layout.hierarchy.y, 2.0f,
+                                layout.hierarchy.height, accent);
+                } else if (splitter == 2) {
+                    ui.drawRect(layout.inspector.x - 1.0f, layout.inspector.y, 2.0f, layout.inspector.height, accent);
+                } else if (splitter == 3) {
+                    ui.drawRect(layout.assetBrowser.x, layout.assetBrowser.y - 1.0f, layout.assetBrowser.width,
+                                2.0f, accent);
+                }
+                Window::CursorShape desired = Window::CursorShape::Arrow;
+                if (splitter == 1 || splitter == 2) {
+                    desired = Window::CursorShape::ResizeEastWest;
+                } else if (splitter == 3) {
+                    desired = Window::CursorShape::ResizeNorthSouth;
+                } else if (m_bottomDockTab == BottomDockTab::Script &&
+                           m_scriptEditorRect.contains(m_uiContext.mousePosition().x,
+                                                       m_uiContext.mousePosition().y)) {
+                    desired = Window::CursorShape::IBeam;
+                }
+                m_window.setCursorShape(desired);
+            }
             m_uiContext.endFrame();
         }
         return m_renderSystem.render(m_scene);
@@ -1219,10 +1307,239 @@ void Application::run() {
     logLoopStats("Engine shutting down");
 }
 
+// ---------------------------------------------------------------------------
+// Script dock + dock splitters
+// ---------------------------------------------------------------------------
+
+void Application::bindScriptEditor(entt::entity entity) {
+    auto& registry = m_scene.registry();
+    if (entity == entt::null || !registry.valid(entity) || !registry.all_of<ScriptComponent>(entity)) {
+        return;
+    }
+    const ScriptComponent& script = registry.get<ScriptComponent>(entity);
+    std::string name = "Entity " + std::to_string(entt::to_integral(entity));
+    if (const TagComponent* tag = registry.try_get<TagComponent>(entity); tag != nullptr && !tag->tag.empty()) {
+        name = tag->tag;
+    }
+    m_scriptEditor.loadText(script.source);
+    m_scriptEditor.bind(entt::to_integral(entity), name, script.filePath);
+    m_scriptStatus.clear();
+    m_bottomDockTab = BottomDockTab::Script;
+}
+
+void Application::saveAndCompileScript() {
+    const entt::entity entity = static_cast<entt::entity>(m_scriptEditor.boundEntity());
+    auto& registry = m_scene.registry();
+    if (m_scriptEditor.boundEntity() == TextEditor::kNoEntity || !registry.valid(entity) ||
+        !registry.all_of<ScriptComponent>(entity)) {
+        setStatusMessage("Save & Compile: no script is bound in the editor");
+        return;
+    }
+    ScriptComponent& script = registry.get<ScriptComponent>(entity);
+    script.source = m_scriptEditor.text();
+    script.filePath = m_scriptEditor.filePath();
+    bool fileWritten = true;
+    if (!script.filePath.empty()) {
+        std::ofstream out(script.filePath, std::ios::binary | std::ios::trunc);
+        if (out) {
+            out << script.source;
+            m_scriptContext.fileStamps.erase(entity); // our own write is not an external edit
+        } else {
+            fileWritten = false;
+        }
+    }
+    // Force a fresh compile on the next ScriptSystem tick, and get
+    // the verdict synchronously for the dock/inspector status line.
+    ScriptSystem::clearRuntime(m_scriptContext, entity);
+    const DSLParseResult parsed = parseBackroomsScript(script.source);
+    if (parsed.ok()) {
+        m_scriptStatus = "Compiled OK";
+        setStatusMessage("Script compiled: " + m_scriptEditor.displayName() +
+                         (fileWritten ? "" : " (file write failed)"));
+    } else {
+        m_scriptStatus = parsed.errors.empty() ? std::string("Compile failed") : parsed.errors.front();
+        setStatusMessage("Script error: " + m_scriptStatus);
+    }
+    m_scriptEditor.markClean();
+}
+
+float Application::inspectScriptAt(float x, float y, float width, entt::entity entity) {
+    auto& registry = m_scene.registry();
+    const float rowStep = UIContext::kRowHeight + UIContext::kRowSpacing;
+    if (!registry.all_of<ScriptComponent>(entity)) {
+        const float height = 2.0f * UIContext::kPanelPadding + 2.0f * rowStep;
+        m_uiContext.beginPanel("ScriptComponent", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+        m_uiContext.label("Script (DSL)");
+        if (m_uiContext.button("Add Script Component")) {
+            ScriptComponent& script = registry.emplace<ScriptComponent>(entity);
+            script.source = "from start()\n"
+                            "    // Describe the behavior here.\n"
+                            "    on_interact(\"item\") {\n"
+                            "        print(\"Interacted\")\n"
+                            "    }\n"
+                            "script(end)\n";
+            bindScriptEditor(entity);
+            setStatusMessage("Script component added (Script tab, bottom dock)");
+        }
+        m_uiContext.endPanel();
+        return y + height + 6.0f;
+    }
+
+    ScriptComponent& script = registry.get<ScriptComponent>(entity);
+    const float height = 2.0f * UIContext::kPanelPadding + 8.0f * rowStep;
+    m_uiContext.beginPanel("ScriptComponent", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+    m_uiContext.label("Script (DSL)");
+    m_uiContext.label("File (.dsla, empty = inline)");
+    if (m_uiContext.textField("ScriptFilePath", &script.filePath) &&
+        static_cast<entt::entity>(m_scriptEditor.boundEntity()) == entity) {
+        m_scriptEditor.setFilePath(script.filePath);
+    }
+    m_uiContext.checkbox("Enabled", &script.enabled);
+    bool autoReload = hasFlag(script.compileFlags, ScriptCompileFlags::AutoReload);
+    if (m_uiContext.checkbox("Auto-reload file", &autoReload)) {
+        script.compileFlags = autoReload ? (script.compileFlags | ScriptCompileFlags::AutoReload)
+                                         : static_cast<ScriptCompileFlags>(static_cast<uint32_t>(script.compileFlags) &
+                                                                           ~static_cast<uint32_t>(ScriptCompileFlags::AutoReload));
+    }
+    const ScriptSystemContext::Runtime* runtime = ScriptSystem::findRuntime(m_scriptContext, entity);
+    if (!script.enabled) {
+        m_uiContext.label("Status: disabled");
+    } else if (runtime == nullptr) {
+        m_uiContext.label("Status: not compiled yet");
+    } else if (!runtime->errors.empty()) {
+        std::string status = "Error: " + runtime->errors.front();
+        if (status.size() > 52) {
+            status.resize(52);
+        }
+        m_uiContext.label(status);
+    } else {
+        size_t lines = 1;
+        for (const char ch : script.source) {
+            if (ch == '\n') {
+                ++lines;
+            }
+        }
+        m_uiContext.label("Status: compiled OK (" + std::to_string(lines) + " lines)");
+    }
+    if (m_uiContext.button("Open in Script Editor")) {
+        bindScriptEditor(entity);
+    }
+    if (m_uiContext.button("Save & Compile")) {
+        if (static_cast<entt::entity>(m_scriptEditor.boundEntity()) == entity) {
+            saveAndCompileScript();
+        } else {
+            ScriptSystem::clearRuntime(m_scriptContext, entity);
+            const DSLParseResult parsed = parseBackroomsScript(script.source);
+            setStatusMessage(parsed.ok() ? "Script compiled OK" : "Script error: " + parsed.errors.front());
+        }
+    }
+    m_uiContext.endPanel();
+    return y + height + 6.0f;
+}
+
+void Application::drawScriptDock(const UIRect& rect, double deltaSeconds) {
+    m_scriptEditorRect = rect;
+    auto& registry = m_scene.registry();
+    // Follow the selection while the buffer is clean: clicking a
+    // scripted entity in the Hierarchy loads its source here. A
+    // dirty buffer is never silently replaced.
+    const entt::entity selected = m_outliner.selected();
+    if (!m_scriptEditor.dirty() && selected != entt::null && registry.valid(selected) &&
+        registry.all_of<ScriptComponent>(selected) &&
+        static_cast<entt::entity>(m_scriptEditor.boundEntity()) != selected) {
+        bindScriptEditor(selected);
+    }
+    const float headerHeight = 30.0f;
+    std::string title = "Script Editor";
+    const entt::entity bound = static_cast<entt::entity>(m_scriptEditor.boundEntity());
+    const bool boundValid = m_scriptEditor.boundEntity() != TextEditor::kNoEntity && registry.valid(bound) &&
+                            registry.all_of<ScriptComponent>(bound);
+    if (boundValid) {
+        title += ": " + m_scriptEditor.displayName();
+        if (!m_scriptEditor.filePath().empty()) {
+            title += "  (" + m_scriptEditor.filePath() + ")";
+        }
+        if (m_scriptEditor.dirty()) {
+            title += " *";
+        }
+        if (!m_scriptStatus.empty()) {
+            title += "  -  " + m_scriptStatus;
+        }
+    }
+    m_renderer.uiBatch().drawText(title, rect.x + 8.0f, rect.y + 8.0f, 1.3f, m_uiContext.theme().text);
+    const UIRect saveButton{rect.x + rect.width - 150.0f, rect.y + 3.0f, 142.0f, 24.0f};
+    if (boundValid && m_uiContext.button(saveButton, "Save & Compile")) {
+        saveAndCompileScript();
+    }
+    const UIRect editorRect{rect.x + 4.0f, rect.y + headerHeight, std::max(0.0f, rect.width - 8.0f),
+                            std::max(0.0f, rect.height - headerHeight - 4.0f)};
+    m_scriptEditorRect = editorRect;
+    if (!boundValid) {
+        m_renderer.uiBatch().drawText("No script bound. Select an entity, then Inspector > Add Script Component",
+                                      rect.x + 8.0f, rect.y + headerHeight + 10.0f, 1.25f,
+                                      glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+        m_renderer.uiBatch().drawText("(or \"Open in Script Editor\" on an entity that already has one).",
+                                      rect.x + 8.0f, rect.y + headerHeight + 30.0f, 1.25f,
+                                      glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+        return;
+    }
+    const TextEditor::Result result =
+        m_scriptEditor.draw(m_uiContext, editorRect, static_cast<float>(deltaSeconds));
+    if (result.saveRequested) {
+        saveAndCompileScript();
+    }
+}
+
+void Application::updateSplitters(const EditorLayout& layout) {
+    if (m_input.isMouseCaptured()) {
+        m_hoveredSplitter = 0;
+        m_activeSplitter = 0;
+        return;
+    }
+    const glm::vec2 mouse = uiMousePosition();
+    const float halfBand = 3.5f;
+    const float middleTop = layout.hierarchy.y;
+    const float middleBottom = layout.hierarchy.y + layout.hierarchy.height;
+    int hovered = 0;
+    if (mouse.y >= middleTop && mouse.y < middleBottom) {
+        if (std::abs(mouse.x - (layout.hierarchy.x + layout.hierarchy.width)) <= halfBand) {
+            hovered = 1;
+        } else if (std::abs(mouse.x - layout.inspector.x) <= halfBand) {
+            hovered = 2;
+        }
+    }
+    if (hovered == 0 && std::abs(mouse.y - layout.assetBrowser.y) <= halfBand && mouse.x >= layout.assetBrowser.x &&
+        mouse.x < layout.assetBrowser.x + layout.assetBrowser.width) {
+        hovered = 3;
+    }
+    m_hoveredSplitter = hovered;
+    if (m_activeSplitter == 0 && hovered != 0 && m_input.wasMouseButtonPressed(MouseButton::Left)) {
+        m_activeSplitter = hovered;
+    }
+    if (m_activeSplitter == 0) {
+        return;
+    }
+    if (!m_input.isMouseButtonDown(MouseButton::Left)) {
+        m_activeSplitter = 0;
+        return;
+    }
+    // Sizes are recomputed by computeEditorLayout next frame (with
+    // its clamps + minimum-viewport guarantee); the scene viewport
+    // published from that layout follows the drag immediately.
+    const float framebufferRight = layout.inspector.x + layout.inspector.width;
+    const float dockBottom = layout.assetBrowser.y + layout.assetBrowser.height;
+    switch (m_activeSplitter) {
+    case 1: m_dockSizes.leftWidth = mouse.x - layout.hierarchy.x; break;
+    case 2: m_dockSizes.rightWidth = framebufferRight - mouse.x; break;
+    case 3: m_dockSizes.bottomHeight = dockBottom - mouse.y; break;
+    default: break;
+    }
+}
+
 EditorLayout Application::currentEditorLayout() const {
     return computeEditorLayout(static_cast<float>(std::max(m_window.framebufferWidth(), 0)),
                                static_cast<float>(std::max(m_window.framebufferHeight(), 0)),
-                               m_playSession.isPlaying());
+                               m_playSession.isPlaying(), m_dockSizes);
 }
 
 glm::vec2 Application::uiMousePosition() const {

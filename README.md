@@ -3015,3 +3015,53 @@ write the same EnTT scene.
   runs beside the native stalker in one loop. The demo exits
   nonzero on failure and is exercised by `engine-core-tests`
   (1267 passing checks) alongside the five-config matrix.
+
+## Editor upgrades — entity-linked scripts, native script editor, resizable docks ✅
+
+Three editor systems land together, all on the existing native
+Vulkan UI (no external UI library):
+
+- **Entity-linked scripts**: `ScriptComponent` now carries a
+  linked `.dsla` `filePath`, the inline `source` buffer, and
+  `ScriptCompileFlags` (`AutoReload`, `PreferFileSource`)
+  alongside `enabled`; the parsed AST, variables and timers stay
+  in the per-entity runtime (`ScriptSystemContext::Runtime`,
+  readable via `ScriptSystem::findRuntime`). Scene JSON
+  serializes path/source/flags/enabled. `PreferFileSource` loads
+  the file before first compile; `AutoReload` watches its mtime
+  and streams external edits into a recompile. The Inspector
+  grows a Script section (file field, Enabled / Auto-reload
+  toggles, live compile status with the first parse error,
+  Open in Script Editor, Save & Compile, and Add Script
+  Component with a starter template).
+- **Built-in text editor** (`Graphics/TextEditor`): a multi-line
+  code widget rendered through `UIBatch`/`DynamicFont` in the
+  bottom dock's new Script tab (Assets | Script). The buffer core
+  (lines, UTF-8-aware caret, insert/delete, word jumps,
+  Home/End/PageUp/PageDown, held-key repeat) is independent of
+  drawing and unit-tested; rendering adds a line-number gutter,
+  current-line wash, blinking caret, click-to-position, wheel
+  scroll, and DSL syntax highlighting (`highlightDslLine`:
+  keywords, `on_*` events, builtins, durations/numbers, strings,
+  comments in distinct theme colours). Ctrl+S or the dock button
+  runs Save & Compile: buffer -> component -> `.dsla` file ->
+  forced recompile with the verdict shown in the dock header and
+  status bar. A clean buffer auto-follows the Hierarchy
+  selection; a dirty one is never silently replaced.
+- **Resizable splitters**: `EditorDockSizes` feeds
+  `computeEditorLayout` (the old three-argument form keeps auto
+  fractions). Seven-pixel bands on the Hierarchy/Viewport,
+  Viewport/Inspector and centre/bottom-dock boundaries highlight
+  on hover, switch the OS cursor (`Window::setCursorShape`:
+  resize arrows, I-beam over the script editor), and drag with
+  LMB to resize docks live. Layout clamps plus the
+  minimum-viewport guarantee keep the world visible on any drag;
+  because the scene pass, projection, picking and gizmo all read
+  the same `layout.viewport` (through `resolveSceneViewport`),
+  rendering follows panel sizes the next frame with no
+  distortion. Splitter presses are consumed before viewport
+  picking, and Play mode collapses the docks as before.
+
+1300 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, standalone player headless run clean.

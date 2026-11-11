@@ -5,6 +5,11 @@
 namespace engine {
 
 EditorLayout computeEditorLayout(float framebufferWidth, float framebufferHeight, bool playing) {
+    return computeEditorLayout(framebufferWidth, framebufferHeight, playing, EditorDockSizes{});
+}
+
+EditorLayout computeEditorLayout(float framebufferWidth, float framebufferHeight, bool playing,
+                                 const EditorDockSizes& dockSizes) {
     EditorLayout layout;
     layout.playing = playing;
     if (framebufferWidth <= 0.0f || framebufferHeight <= 0.0f) {
@@ -43,9 +48,18 @@ EditorLayout computeEditorLayout(float framebufferWidth, float framebufferHeight
         return layout;
     }
 
-    float leftWidth = std::clamp(framebufferWidth * 0.19f, 168.0f * scale, 300.0f * scale);
-    float rightWidth = std::clamp(framebufferWidth * 0.21f, 184.0f * scale, 340.0f * scale);
-    float assetsHeight = std::clamp(framebufferHeight * 0.24f, 104.0f * scale, 208.0f * scale);
+    // Auto sizes are the classic fractions; explicit (splitter-
+    // dragged) sizes get wider, still-sane ranges. Either way the
+    // minimum-viewport guarantee below has the final word.
+    float leftWidth = dockSizes.leftWidth > 0.0f
+                          ? std::clamp(dockSizes.leftWidth, 120.0f * scale, 560.0f * scale)
+                          : std::clamp(framebufferWidth * 0.19f, 168.0f * scale, 300.0f * scale);
+    float rightWidth = dockSizes.rightWidth > 0.0f
+                           ? std::clamp(dockSizes.rightWidth, 140.0f * scale, 640.0f * scale)
+                           : std::clamp(framebufferWidth * 0.21f, 184.0f * scale, 340.0f * scale);
+    float assetsHeight = dockSizes.bottomHeight > 0.0f
+                             ? std::clamp(dockSizes.bottomHeight, 72.0f * scale, 520.0f * scale)
+                             : std::clamp(framebufferHeight * 0.24f, 104.0f * scale, 208.0f * scale);
 
     // Guarantee a usable viewport on cramped windows by shrinking the
     // docks (never the other way round): keep at least ~220x130 px of

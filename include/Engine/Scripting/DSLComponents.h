@@ -20,9 +20,30 @@ namespace engine {
 // serializable data.
 // ---------------------------------------------------------------------------
 
+// Compilation/linkage flags for an entity-linked script (bitmask,
+// serialized with the component). AutoReload watches filePath on
+// disk: when the file changes, ScriptSystem reloads it into
+// `source` and recompiles. PreferFileSource makes the file the
+// authority at setup time (the editor's Save & Compile writes both
+// the component buffer and the file, so the two never drift in the
+// other direction).
+enum class ScriptCompileFlags : uint32_t {
+    None = 0,
+    AutoReload = 1u << 0,
+    PreferFileSource = 1u << 1,
+};
+[[nodiscard]] constexpr ScriptCompileFlags operator|(ScriptCompileFlags a, ScriptCompileFlags b) {
+    return static_cast<ScriptCompileFlags>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+[[nodiscard]] constexpr bool hasFlag(ScriptCompileFlags flags, ScriptCompileFlags flag) {
+    return (static_cast<uint32_t>(flags) & static_cast<uint32_t>(flag)) != 0;
+}
+
 struct ScriptComponent {
-    std::string source;  // DSL program text (from start() .. script(end))
-    bool enabled = true; // disabled components are skipped by ScriptSystem
+    std::string filePath; // linked .dsla file ("" = inline-only script)
+    std::string source;   // DSL program text (from start() .. script(end))
+    ScriptCompileFlags compileFlags = ScriptCompileFlags::None;
+    bool enabled = true;  // disabled components are skipped by ScriptSystem
     bool started = false; // system-managed: setup statements have run
 };
 

@@ -7,6 +7,7 @@
 // remapped to fresh handles after every entity exists.
 
 #include "Scene/Scene.h"
+#include "Scripting/DSLComponents.h"
 
 #include "Core/Json.h"
 #include "Core/Logger.h"
@@ -274,6 +275,14 @@ std::string Scene::saveToString() const {
             object.set("degreesPerSecond", vec3Json(spin->degreesPerSecond));
             components.set("spin", std::move(object));
         }
+        if (const ScriptComponent* script = m_registry.try_get<ScriptComponent>(entity); script != nullptr) {
+            Value object = Value::object();
+            object.set("filePath", Value::string(script->filePath));
+            object.set("source", Value::string(script->source));
+            object.set("compileFlags", Value::number(static_cast<double>(static_cast<uint32_t>(script->compileFlags))));
+            object.set("enabled", Value::boolean(script->enabled));
+            components.set("script", std::move(object));
+        }
         if (const RigidBodyComponent* body = m_registry.try_get<RigidBodyComponent>(entity);
             body != nullptr) {
             Value object = Value::object();
@@ -471,6 +480,14 @@ bool Scene::loadFromString(std::string_view text) {
         if (const Value* object = components->find("spin"); object != nullptr) {
             SpinComponent& spin = entity.addComponent<SpinComponent>();
             spin.degreesPerSecond = getVec3(*object, "degreesPerSecond", spin.degreesPerSecond);
+        }
+        if (const Value* object = components->find("script"); object != nullptr) {
+            ScriptComponent& script = entity.addComponent<ScriptComponent>();
+            script.filePath = getString(*object, "filePath", script.filePath);
+            script.source = getString(*object, "source", script.source);
+            script.compileFlags =
+                static_cast<ScriptCompileFlags>(static_cast<uint32_t>(getFloat(*object, "compileFlags", 0.0f)));
+            script.enabled = getBool(*object, "enabled", script.enabled);
         }
         if (const Value* object = components->find("rigidBody"); object != nullptr) {
             RigidBodyComponent& body = entity.addComponent<RigidBodyComponent>();

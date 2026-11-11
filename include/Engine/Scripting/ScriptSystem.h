@@ -111,6 +111,7 @@ struct ScriptSystemContext {
     };
 
     std::unordered_map<entt::entity, Runtime> runtimes;
+    std::unordered_map<entt::entity, int64_t> fileStamps; // .dsla mtimes seen (AutoReload)
     std::unordered_map<entt::entity, glm::vec3> spawnPositions; // first-seen transforms (position = reset)
     std::deque<DSLEvent> eventQueue;
     std::vector<std::string> log;   // print()/sound echoes for tests/tools
@@ -135,6 +136,10 @@ public:
     static void update(Scene& scene, ScriptSystemContext& context, double deltaSeconds);
     static void update(Scene& scene, ScriptSystemContext& context, const Input& input, double deltaSeconds);
 
+    // Live runtime state for one script entity (null until its
+    // first update): the inspector reads compile errors / held
+    // items / timer counts from here.
+    [[nodiscard]] static const ScriptSystemContext::Runtime* findRuntime(const ScriptSystemContext& context, entt::entity script);
     [[nodiscard]] static std::optional<double> variable(ScriptSystemContext& context, entt::entity script, const std::string& name);
     [[nodiscard]] static std::optional<std::string> textVariable(ScriptSystemContext& context, entt::entity script, const std::string& name);
     [[nodiscard]] static bool holdsItem(ScriptSystemContext& context, entt::entity script, const std::string& item);

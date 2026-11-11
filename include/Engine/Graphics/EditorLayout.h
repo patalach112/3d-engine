@@ -54,11 +54,26 @@ struct EditorLayout {
     }
 };
 
+// User-resized dock sizes in framebuffer pixels (the editor's
+// splitter state). A value <= 0 means "auto": the classic
+// fraction-of-window default. Explicit sizes are clamped to sane
+// ranges and always yield to the minimum-viewport guarantee, so a
+// drag can shrink the world but never crush it out of existence.
+struct EditorDockSizes {
+    float leftWidth = -1.0f;   // Hierarchy dock
+    float rightWidth = -1.0f;  // Inspector dock
+    float bottomHeight = -1.0f; // bottom dock (Assets / Script tabs)
+};
+
 // Computes the dock layout for a framebuffer of the given size (pixels,
 // top-left origin). Degenerate sizes yield a zero viewport rather than
-// negative rectangles.
+// negative rectangles. The three-argument form uses auto dock sizes.
 [[nodiscard]] ENGINE_GRAPHICS_API EditorLayout computeEditorLayout(float framebufferWidth,
                                                                    float framebufferHeight,
                                                                    bool playing);
+[[nodiscard]] ENGINE_GRAPHICS_API EditorLayout computeEditorLayout(float framebufferWidth,
+                                                                   float framebufferHeight,
+                                                                   bool playing,
+                                                                   const EditorDockSizes& dockSizes);
 
 } // namespace engine

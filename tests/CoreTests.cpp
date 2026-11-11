@@ -64,6 +64,7 @@
 #include "Scripting/Scenario18.h"
 #include "Scripting/ScriptSystem.h"
 #include "Scripting/StalkerAISystem.h"
+#include "Graphics/TextEditor.h"
 #include "SpaceFlightModel.h"
 #include "Platform/DynamicLibrary.h"
 
@@ -10935,6 +10936,158 @@ void testBackroomsScripting() {
     }
 }
 
+void testEditorScriptingUpgrades() {
+    std::cout << "Editor upgrades: script binding, text editor, splitters\n";
+    using namespace engine;
+
+    // -- TextEditor buffer core --------------------------------------
+    {
+        TextEditor editor;
+        editor.loadText("from start()\n    sanity = 100\nscript(end)");
+        check(editor.lineCount() == 3 && !editor.dirty(), "editor: loadText splits lines, clean");
+        check(editor.text() == "from start()\n    sanity = 100\nscript(end)", "editor: text() round-trips");
+        editor.setCursor(1, 16); // end of "    sanity = 100"
+        editor.insertText(" + 5");
+        check(editor.line(1) == "    sanity = 100 + 5" && editor.dirty(), "editor: insert at caret");
+        editor.insertNewline();
+        check(editor.lineCount() == 4 && editor.cursorLine() == 2 && editor.cursorColumn() == 0, "editor: newline splits line");
+        editor.backspace(); // join back
+        check(editor.lineCount() == 3 && editor.line(1) == "    sanity = 100 + 5", "editor: backspace joins lines");
+        editor.setCursor(0, 0);
+        editor.deleteForward();
+        check(editor.line(0) == "rom start()", "editor: deleteForward removes a codepoint");
+        editor.moveEnd();
+        check(editor.cursorColumn() == editor.line(0).size(), "editor: moveEnd");
+        editor.moveHome();
+        check(editor.cursorColumn() == 0, "editor: moveHome");
+        editor.setCursor(1, 4);
+        editor.moveRight(true);
+        check(editor.cursorColumn() > 4, "editor: word jump moves past a word");
+        editor.setCursor(2, 0);
+        editor.moveUp();
+        check(editor.cursorLine() == 1, "editor: moveUp keeps goal column clamp");
+        editor.movePage(1, 10);
+        check(editor.cursorLine() == 2, "editor: page down clamps at last line");
+        editor.loadText("");
+        check(editor.lineCount() == 1 && editor.text().empty(), "editor: empty load = one empty line");
+    }
+
+    // -- DSL syntax highlighting ---------------------------------------
+    {
+        const auto spans = highlightDslLine("on_touch(\"safe_room\") { // zone");
+        check(!spans.empty() && spans[0].kind == DslHighlightKind::Event, "highlight: event keyword coloured");
+        bool sawString = false, sawComment = false;
+        for (const DslHighlightSpan& span : spans) {
+            sawString = sawString || span.kind == DslHighlightKind::String;
+            sawComment = sawComment || span.kind == DslHighlightKind::Comment;
+        }
+        check(sawString && sawComment, "highlight: string + comment spans");
+        const auto timed = highlightDslLine("every(10s) { sanity = sanity + 50 }");
+        bool numberCoversUnit = false, keywordSeen = false;
+        for (const DslHighlightSpan& span : timed) {
+            if (span.kind == DslHighlightKind::Number && span.offset == 6 && span.length == 3) numberCoversUnit = true;
+            if (span.kind == DslHighlightKind::Keyword) keywordSeen = true;
+        }
+        check(numberCoversUnit, "highlight: duration 10s is one number span");
+        check(keywordSeen, "highlight: every is a keyword");
+        const auto plain = highlightDslLine("health = health + 2");
+        check(!plain.empty() && plain[0].kind == DslHighlightKind::Plain, "highlight: identifiers stay plain");
+        check(dslHighlightColor(DslHighlightKind::Keyword) != dslHighlightColor(DslHighlightKind::String),
+              "highlight: kinds map to distinct colours");
+    }
+
+    // -- Resizable dock layout ------------------------------------------
+    {
+        const EditorLayout autoLayout = computeEditorLayout(1600.0f, 900.0f, false);
+        EditorDockSizes sizes;
+        sizes.leftWidth = 420.0f;
+        sizes.rightWidth = 480.0f;
+        sizes.bottomHeight = 300.0f;
+        const EditorLayout custom = computeEditorLayout(1600.0f, 900.0f, false, sizes);
+        check(std::abs(custom.hierarchy.width - 420.0f) < 0.5f, "layout: splitter left width honoured");
+        check(std::abs(custom.inspector.width - 480.0f) < 0.5f, "layout: splitter right width honoured");
+        check(std::abs(custom.assetBrowser.height - 300.0f) < 0.5f, "layout: splitter bottom height honoured");
+        check(custom.viewportIsDockBounded(), "layout: viewport stays dock-bounded after resize");
+        check(custom.viewport.width < autoLayout.viewport.width, "layout: wider docks shrink the viewport");
+        EditorDockSizes greedy;
+        greedy.leftWidth = 5000.0f;
+        greedy.rightWidth = 5000.0f;
+        greedy.bottomHeight = 5000.0f;
+        const EditorLayout clamped = computeEditorLayout(1600.0f, 900.0f, false, greedy);
+        check(clamped.viewport.width > 0.0f && clamped.viewport.height > 0.0f, "layout: greedy docks cannot crush the viewport");
+        check(clamped.viewportIsDockBounded(), "layout: clamped layout still dock-bounded");
+        const EditorLayout play = computeEditorLayout(1600.0f, 900.0f, true, sizes);
+        check(play.hierarchy.width == 0.0f && play.viewport.width == 1600.0f, "layout: play mode ignores dock sizes");
+    }
+
+    // -- ScriptComponent serialization ----------------------------------
+    {
+        Scene scene;
+        auto entity = scene.createEntity("ScriptedDoor");
+        entity.addComponent<TransformComponent>();
+        auto& script = entity.addComponent<ScriptComponent>();
+        script.filePath = "scripts/door.dsla";
+        script.source = "from start()\n    print(\"door\")\nscript(end)";
+        script.compileFlags = ScriptCompileFlags::AutoReload | ScriptCompileFlags::PreferFileSource;
+        script.enabled = false;
+        const std::string document = scene.saveToString();
+        Scene loaded;
+        check(loaded.loadFromString(document), "script serialization: scene loads");
+        const auto scripts = loaded.registry().view<ScriptComponent>();
+        check(scripts.size() == 1, "script serialization: component survives round-trip");
+        for (const entt::entity e : scripts) {
+            const ScriptComponent& back = scripts.get<ScriptComponent>(e);
+            check(back.filePath == "scripts/door.dsla" && back.source == script.source && !back.enabled &&
+                      hasFlag(back.compileFlags, ScriptCompileFlags::AutoReload) &&
+                      hasFlag(back.compileFlags, ScriptCompileFlags::PreferFileSource),
+                  "script serialization: path/source/flags/enabled round-trip");
+        }
+    }
+
+    // -- File-linked scripts: PreferFileSource + AutoReload --------------
+    {
+        const auto dir = makeTempDir("engine_test_dsla");
+        const std::filesystem::path file = dir / "watcher.dsla";
+        {
+            std::ofstream out(file);
+            out << "from start()\n    mood = 1\nscript(end)";
+        }
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        auto& script = brain.addComponent<ScriptComponent>();
+        script.filePath = file.string();
+        script.source = "from start()\n    mood = 99\nscript(end)";
+        script.compileFlags = ScriptCompileFlags::PreferFileSource | ScriptCompileFlags::AutoReload;
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "mood").value_or(-1.0) == 1.0,
+              "file scripts: PreferFileSource loads the file at setup");
+        {
+            std::ofstream out(file, std::ios::trunc);
+            out << "from start()\n    mood = 7\nscript(end)";
+        }
+        // Force a distinct mtime so the watcher cannot miss the edit.
+        std::filesystem::last_write_time(file, std::filesystem::file_time_type::clock::now() + std::chrono::seconds(5));
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "mood").value_or(-1.0) == 7.0,
+              "file scripts: AutoReload recompiles on external edit");
+        const ScriptSystemContext::Runtime* runtime = ScriptSystem::findRuntime(ctx, brain.handle());
+        check(runtime != nullptr && runtime->errors.empty() && runtime->setupDone,
+              "file scripts: runtime state readable (findRuntime)");
+    }
+
+    // -- Inspector-facing compile status on a broken file script ----------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source = "from start() every(broken { ";
+        ScriptSystem::update(scene, ctx, 0.1);
+        const ScriptSystemContext::Runtime* runtime = ScriptSystem::findRuntime(ctx, brain.handle());
+        check(runtime != nullptr && !runtime->errors.empty(), "script status: broken script exposes parse errors");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -10997,6 +11150,7 @@ int main() {
     testTime();
     testGameLoop();
     testBackroomsScripting();
+    testEditorScriptingUpgrades();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

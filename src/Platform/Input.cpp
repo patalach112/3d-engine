@@ -36,6 +36,11 @@ Key translateKey(int glfwKey) {
     case GLFW_KEY_DOWN: return Key::Down;
     case GLFW_KEY_LEFT: return Key::Left;
     case GLFW_KEY_RIGHT: return Key::Right;
+    case GLFW_KEY_DELETE: return Key::Delete;
+    case GLFW_KEY_HOME: return Key::Home;
+    case GLFW_KEY_END: return Key::End;
+    case GLFW_KEY_PAGE_UP: return Key::PageUp;
+    case GLFW_KEY_PAGE_DOWN: return Key::PageDown;
     default: return Key::Unknown;
     }
 }

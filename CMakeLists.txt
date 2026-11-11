@@ -184,6 +184,7 @@ engine_module(EngineGraphics ENGINE_BUILDING_GRAPHICS
     src/Graphics/UIInspector.cpp
     src/Graphics/UIRenderer.cpp
     src/Graphics/Renderer.cpp
+    src/Graphics/TextEditor.cpp
 )
 target_link_libraries(EngineGraphics
     PUBLIC EngineFoundation EnginePlatform EngineGeometry Vulkan::Vulkan glfw glm::glm)

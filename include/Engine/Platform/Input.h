@@ -37,6 +37,11 @@ enum class Key : uint8_t {
     Down,
     Left,
     Right,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
     Count
 };
 
