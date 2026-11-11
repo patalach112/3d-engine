@@ -3065,3 +3065,38 @@ Vulkan UI (no external UI library):
 1300 passed / 0 failed across all five build configs
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, standalone player headless run clean.
+
+## Console panel, persistent Play sessions, editor workflow polish ✅
+
+- **In-engine console** (`Graphics/ConsoleLog`): a `Logger`
+  listener API (`addListener`/`removeListener`, dispatched on the
+  caller's thread after the sinks) feeds a capped, mutex-guarded
+  ring buffer in the Application, so engine warnings, errors,
+  script compile errors and DSL `print()` output (logged as
+  `[script] ...`, rendered green) stream in real time. The panel
+  is a layout strip above the status bar — `EditorDockSizes.
+  consoleHeight`, present in Edit **and** Play — toggled from the
+  toolbar's Console button, resizable by its top-edge splitter,
+  with a level filter cycle, Clear, and auto/manual scrolling.
+- **Persistent script state across Play tests**: entering Play no
+  longer wipes `ScriptSystemContext`. Runtimes survive Stop ->
+  Play untouched when the script source is unchanged (the
+  recompile detector is the only automatic reset), handle
+  snapshot-restored components, and are pruned when their entity
+  is destroyed or loses its script. A dirty script buffer is
+  saved + compiled *before* the Play snapshot, so the session
+  always runs exactly the code on screen; the Script dock's
+  Reset button remains the explicit full reset.
+- **Readable script editor**: `TextEditor::kTextScale` rises
+  1.45 -> 1.95 (above the 1.8 UI chrome scale) with 1.22x line
+  spacing — glyphs bake at the matching exact pixel size through
+  the dynamic font cache, so code stays crisp.
+- **Seamless Ctrl+S workflow**: Ctrl+S commits the bound script
+  from any focus state in Edit mode (button, editor-local, and
+  global paths all funnel into `saveAndCompileScript`: buffer ->
+  component -> `.dsla` file -> forced recompile with the verdict
+  in the dock header, status bar and console).
+
+1317 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, standalone player headless run clean.

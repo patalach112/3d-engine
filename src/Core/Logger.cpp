@@ -462,6 +462,18 @@ std::string Logger::activeFilePath() const {
     return m_activeFilePath;
 }
 
+uint64_t Logger::addListener(LogListener listener) {
+    std::unique_lock lock(m_sinkMutex);
+    const uint64_t id = m_nextListenerId++;
+    m_listeners.emplace_back(id, std::move(listener));
+    return id;
+}
+
+void Logger::removeListener(uint64_t listenerId) {
+    std::unique_lock lock(m_sinkMutex);
+    std::erase_if(m_listeners, [listenerId](const auto& entry) { return entry.first == listenerId; });
+}
+
 void Logger::log(LogLevel level, const char* file, int line, std::string_view message) {
     if (!isEnabled(level)) {
         // Pre-initialization fallback: never swallow errors silently during
@@ -491,6 +503,17 @@ void Logger::log(LogLevel level, const char* file, int line, std::string_view me
         for (const auto& sink : m_sinks) {
             try {
                 sink->write(record);
+            } catch (...) {
+                // Logging must never throw into engine code.
+            }
+        }
+    }
+    {
+        std::shared_lock lock(m_sinkMutex);
+        for (const auto& [id, listener] : m_listeners) {
+            (void)id;
+            try {
+                listener(level, message);
             } catch (...) {
                 // Logging must never throw into engine code.
             }

@@ -65,6 +65,7 @@
 #include "Scripting/ScriptSystem.h"
 #include "Scripting/StalkerAISystem.h"
 #include "Graphics/TextEditor.h"
+#include "Graphics/ConsoleLog.h"
 #include "SpaceFlightModel.h"
 #include "Platform/DynamicLibrary.h"
 
@@ -11088,6 +11089,105 @@ void testEditorScriptingUpgrades() {
     }
 }
 
+void testConsoleAndPlayPersistence() {
+    std::cout << "Console panel, play persistence, editor font\n";
+    using namespace engine;
+
+    // -- ConsoleLog buffer -------------------------------------------------
+    {
+        ConsoleLog log;
+        log.push(LogLevel::Info, "hello");
+        log.push(LogLevel::Error, "[script] boom");
+        check(log.size() == 2 && log.totalReceived() == 2, "console: entries accumulate");
+        const auto entries = log.snapshot();
+        check(ConsoleLog::isScriptEntry(entries[1]) && !ConsoleLog::isScriptEntry(entries[0]),
+              "console: [script] entries detected");
+        check(ConsoleLog::levelVisible(LogLevel::Error, LogLevel::Warning) &&
+                  !ConsoleLog::levelVisible(LogLevel::Info, LogLevel::Warning),
+              "console: level filter predicate");
+        check(ConsoleLog::levelColor(entries[0]) != ConsoleLog::levelColor(entries[1]),
+              "console: script entries get their own colour");
+        for (size_t i = 0; i < ConsoleLog::kCapacity + 25; ++i) {
+            log.push(LogLevel::Info, "flood");
+        }
+        check(log.size() == ConsoleLog::kCapacity, "console: ring buffer caps at capacity");
+        log.clear();
+        check(log.size() == 0 && log.totalReceived() > 0, "console: clear empties but keeps the counter");
+    }
+
+    // -- Logger listeners (the console's capture path) ----------------------
+    {
+        // Earlier suites shut the logger down; revive it sink-less.
+        if (!Logger::instance().isInitialized()) {
+            LoggerConfig config;
+            config.minimumLevel = LogLevel::Warning;
+            config.consoleEnabled = false;
+            config.fileEnabled = false;
+            Logger::instance().initialize(config);
+        }
+        std::vector<std::string> heard;
+        const uint64_t id = Logger::instance().addListener(
+            [&heard](LogLevel, std::string_view message) { heard.emplace_back(message); });
+        ENGINE_LOG_WARNING("console-listener-probe"); // Warning: above every test minimum level
+        Logger::instance().removeListener(id);
+        ENGINE_LOG_WARNING("console-listener-after-remove");
+        check(heard.size() == 1 && heard[0] == "console-listener-probe", "logger: listener receives, removal stops delivery");
+    }
+
+    // -- Console in the dock layout (Edit and Play) --------------------------
+    {
+        EditorDockSizes sizes;
+        sizes.consoleHeight = 180.0f;
+        const EditorLayout edit = computeEditorLayout(1600.0f, 900.0f, false, sizes);
+        check(edit.console.height > 0.0f && edit.console.y + edit.console.height < 900.0f,
+              "layout: console strip sits above the status bar");
+        check(edit.viewportIsDockBounded(), "layout: viewport bounded with console open");
+        const EditorLayout play = computeEditorLayout(1600.0f, 900.0f, true, sizes);
+        check(play.console.height > 0.0f && play.viewport.height < edit.viewport.height + 400.0f &&
+                  play.viewport.y + play.viewport.height <= play.console.y + 0.5f,
+              "layout: console strip reserves space in Play too");
+        const EditorLayout closed = computeEditorLayout(1600.0f, 900.0f, false, EditorDockSizes{});
+        check(closed.console.height == 0.0f, "layout: console hidden by default");
+        const EditorLayout autoSized = computeEditorLayout(1600.0f, 900.0f, false);
+        check(autoSized.viewport.height > edit.viewport.height, "layout: open console shrinks the viewport");
+    }
+
+    // -- Play persistence semantics at the runtime level ---------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() visits = 0 on_input(\"LMB\") { visits = visits + 1 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "visits").value_or(-1.0) == 1.0, "persistence: event ran");
+
+        // A "new Play session" with an unchanged script and NO
+        // context reset: state must survive (enterPlayMode no
+        // longer wipes runtimes; only a source change may reset).
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "visits").value_or(-1.0) == 1.0,
+              "persistence: runtime variables survive across sessions when source is unchanged");
+
+        // Changing the source is the one legitimate reset.
+        scene.registry().get<ScriptComponent>(brain.handle()).source =
+            "from start() visits = 100 script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "visits").value_or(-1.0) == 100.0,
+              "persistence: changed source recompiles and resets");
+
+        // A destroyed entity's runtime is pruned, never resurrected.
+        scene.destroyEntity(brain);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::findRuntime(ctx, brain.handle()) == nullptr, "persistence: stale runtime pruned after destroy");
+    }
+
+    // -- Editor readability ---------------------------------------------------
+    check(TextEditor::kTextScale >= 1.8f, "editor: default font scale is comfortably large");
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -11151,6 +11251,7 @@ int main() {
     testGameLoop();
     testBackroomsScripting();
     testEditorScriptingUpgrades();
+    testConsoleAndPlayPersistence();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

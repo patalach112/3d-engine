@@ -90,6 +90,11 @@ Application::Application(EngineConfig config)
     m_physicsSystem.setEventBus(&m_eventBus);
     // DSL scripts consume the same physics events natively.
     ScriptSystem::attach(m_scriptContext, m_eventBus);
+    // Console capture: every enabled log call (engine warnings,
+    // compile errors, DSL print() output) lands in the console
+    // buffer in real time, whatever thread produced it.
+    m_consoleListenerId = Logger::instance().addListener(
+        [this](LogLevel level, std::string_view message) { m_consoleLog.push(level, std::string(message)); });
     m_input.bindAction("Impulse", Key::F);
     m_triggerLogSubscription = m_eventBus.subscribeScoped<TriggerEvent>([](const TriggerEvent& event) {
         ENGINE_LOG_INFO("Event: entity #" << entt::to_integral(event.otherEntity)
@@ -160,6 +165,8 @@ Application::Application(EngineConfig config)
 }
 
 Application::~Application() {
+    Logger::instance().removeListener(m_consoleListenerId);
+
     // Retire native script instances while every member (above all
     // the module manager and its still-loaded module) is alive:
     // deleting an instance calls module code through its vtable,
@@ -770,6 +777,14 @@ void Application::run() {
             // gizmo, picking, asset drops) is inert — only Stop and
             // the runtime itself are live.
             const bool playing = m_playSession.isPlaying();
+            // Global Save & Compile: Ctrl+S anywhere in Edit mode
+            // commits the bound script, focused editor or not (the
+            // editor's own Ctrl+S path is skipped to avoid a double
+            // save -- this one covers every focus state).
+            if (!playing && uiInput.ctrlModifier && m_input.wasKeyPressed(Key::S) && !m_scriptEditor.focused() &&
+                m_scriptEditor.boundEntity() != TextEditor::kNoEntity) {
+                saveAndCompileScript();
+            }
 
             // Rename session bookkeeping: the session dies with its
             // target, with Play mode, or on Esc (the textField also
@@ -932,6 +947,16 @@ void Application::run() {
             // bundle the standalone player boots. Inert in Play.
             if (toolbarButton("Export", 74.0f) && !playing) {
                 exportGame();
+            }
+            // Console strip toggle (live in both modes: the strip
+            // is part of the layout, not of the authoring docks).
+            const bool consoleOpen = m_dockSizes.consoleHeight > 0.0f;
+            if (toolbarButton("Console", 84.0f)) {
+                m_dockSizes.consoleHeight = consoleOpen ? -1.0f : m_consoleHeight;
+            }
+            if (consoleOpen) {
+                ui.drawRect(buttonX - 90.0f, buttonY + buttonH + 3.0f, 84.0f, 3.0f,
+                            glm::vec4{1.0f, 0.60f, 0.10f, 0.95f});
             }
 
             // Docks: Inspector (right), Hierarchy (left), Asset
@@ -1264,6 +1289,12 @@ void Application::run() {
                 }
                 m_uiContext.endPopup();
             }
+            // Console strip (Edit and Play alike): live log,
+            // warnings, compile errors and DSL print() output.
+            if (layout.console.height > 0.0f) {
+                drawConsolePanel(m_uiContext, layout.console, m_consoleLog, m_consoleState);
+            }
+
             // Splitter affordance: accent line on the hovered /
             // dragged dock boundary, and the matching OS cursor.
             if (!playing) {
@@ -1278,10 +1309,13 @@ void Application::run() {
                     ui.drawRect(layout.assetBrowser.x, layout.assetBrowser.y - 1.0f, layout.assetBrowser.width,
                                 2.0f, accent);
                 }
+                if (splitter == 4) {
+                    ui.drawRect(layout.console.x, layout.console.y - 1.0f, layout.console.width, 2.0f, accent);
+                }
                 Window::CursorShape desired = Window::CursorShape::Arrow;
                 if (splitter == 1 || splitter == 2) {
                     desired = Window::CursorShape::ResizeEastWest;
-                } else if (splitter == 3) {
+                } else if (splitter == 3 || splitter == 4) {
                     desired = Window::CursorShape::ResizeNorthSouth;
                 } else if (m_bottomDockTab == BottomDockTab::Script &&
                            m_scriptEditorRect.contains(m_uiContext.mousePosition().x,
@@ -1310,6 +1344,17 @@ void Application::run() {
 // ---------------------------------------------------------------------------
 // Script dock + dock splitters
 // ---------------------------------------------------------------------------
+
+void Application::resetScriptRuntimes() {
+    // The explicit full reset: every DSL runtime (variables,
+    // timers, held items, latched handlers) is dropped and each
+    // script re-runs its setup on the next tick. The bus
+    // subscriptions capture this member by reference, so resetting
+    // its contents is enough -- never re-attach.
+    m_scriptContext = ScriptSystemContext{};
+    m_scriptStatus = "Runtime reset";
+    setStatusMessage("Script runtimes reset");
+}
 
 void Application::bindScriptEditor(entt::entity entity) {
     auto& registry = m_scene.registry();
@@ -1467,6 +1512,10 @@ void Application::drawScriptDock(const UIRect& rect, double deltaSeconds) {
         }
     }
     m_renderer.uiBatch().drawText(title, rect.x + 8.0f, rect.y + 8.0f, 1.3f, m_uiContext.theme().text);
+    const UIRect resetButton{rect.x + rect.width - 238.0f, rect.y + 3.0f, 80.0f, 24.0f};
+    if (boundValid && m_uiContext.button(resetButton, "Reset")) {
+        resetScriptRuntimes();
+    }
     const UIRect saveButton{rect.x + rect.width - 150.0f, rect.y + 3.0f, 142.0f, 24.0f};
     if (boundValid && m_uiContext.button(saveButton, "Save & Compile")) {
         saveAndCompileScript();
@@ -1512,6 +1561,9 @@ void Application::updateSplitters(const EditorLayout& layout) {
         mouse.x < layout.assetBrowser.x + layout.assetBrowser.width) {
         hovered = 3;
     }
+    if (hovered == 0 && layout.console.height > 0.0f && std::abs(mouse.y - layout.console.y) <= halfBand) {
+        hovered = 4;
+    }
     m_hoveredSplitter = hovered;
     if (m_activeSplitter == 0 && hovered != 0 && m_input.wasMouseButtonPressed(MouseButton::Left)) {
         m_activeSplitter = hovered;
@@ -1532,6 +1584,10 @@ void Application::updateSplitters(const EditorLayout& layout) {
     case 1: m_dockSizes.leftWidth = mouse.x - layout.hierarchy.x; break;
     case 2: m_dockSizes.rightWidth = framebufferRight - mouse.x; break;
     case 3: m_dockSizes.bottomHeight = dockBottom - mouse.y; break;
+    case 4:
+        m_consoleHeight = (layout.console.y + layout.console.height) - mouse.y;
+        m_dockSizes.consoleHeight = m_consoleHeight;
+        break;
     default: break;
     }
 }
@@ -1683,14 +1739,23 @@ void Application::enterPlayMode() {
     if (m_input.isMouseCaptured()) {
         m_input.setMouseCaptured(false);
     }
+    // Ctrl+S workflow certainty: a dirty script buffer is saved
+    // and compiled BEFORE the snapshot, so Play always executes
+    // exactly what the editor shows.
+    if (m_scriptEditor.dirty() && m_scriptEditor.boundEntity() != TextEditor::kNoEntity) {
+        saveAndCompileScript();
+    }
     if (m_playSession.enterPlay(m_scene)) {
         // The C-key physics reset targets the pre-play state:
         // capture spawn states against the live handles now.
         m_physicsSystem.captureSpawnStates(m_scene);
-        // DSL scripts restart from their setup state each Play.
-        // (The bus subscriptions capture this member by reference,
-        // so resetting its contents is enough -- never re-attach.)
-        m_scriptContext = ScriptSystemContext{};
+        // Script runtimes PERSIST across Play sessions: variables,
+        // timers and held items survive Stop -> Play as long as the
+        // script source is unchanged (ScriptSystem's recompile
+        // detector resets a runtime only when its source actually
+        // changes, and stale runtimes are pruned when their entity
+        // disappears). Use "Reset Scripts" in the Script dock for
+        // an explicit full reset.
     }
 }
 

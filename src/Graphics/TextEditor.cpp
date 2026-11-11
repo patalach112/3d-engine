@@ -353,9 +353,9 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
     const UIInput& input = ui.frameInput();
     const UITheme& theme = ui.theme();
 
-    float rowHeight = 20.0f * kTextScale * 0.62f;
+    float rowHeight = 14.5f * kTextScale;
     if (batch->font() != nullptr) {
-        rowHeight = batch->font()->lineHeight(fontPixelSizeForScale(kTextScale)) * 1.12f;
+        rowHeight = batch->font()->lineHeight(fontPixelSizeForScale(kTextScale)) * 1.22f;
     }
     const float gutterWidth = 46.0f;
     const float textX = rect.x + gutterWidth + 10.0f;

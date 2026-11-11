@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -102,6 +103,14 @@ public:
     // Core logging entry point used by the macros and direct callers.
     void log(LogLevel level, const char* file, int line, std::string_view message);
 
+    // In-process listeners (the editor console): invoked with the
+    // raw (level, message) of every enabled log call, on the
+    // caller's thread, after the sinks. Listeners must be cheap and
+    // thread-safe; addListener returns an id for removeListener.
+    using LogListener = std::function<void(LogLevel level, std::string_view message)>;
+    uint64_t addListener(LogListener listener);
+    void removeListener(uint64_t listenerId);
+
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
 
@@ -110,6 +119,8 @@ private:
     ~Logger();
 
     std::vector<std::unique_ptr<detail::ILogSink>> m_sinks;
+    std::vector<std::pair<uint64_t, LogListener>> m_listeners;
+    uint64_t m_nextListenerId = 1;
     // Guards the sink list itself (reconfiguration is rare and takes it
     // exclusively); ordinary log dispatch only holds a shared lock, so
     // concurrent producers reach the sinks' lock-free ingestion queues

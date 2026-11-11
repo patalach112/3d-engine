@@ -29,6 +29,7 @@ struct EditorLayout {
     UIRect hierarchy{};
     UIRect inspector{};
     UIRect assetBrowser{};
+    UIRect console{}; // bottom strip above the status bar (empty = hidden)
     UIRect viewport{};
     UIRect statusBar{};
     float uiScale = 1.0f; // framebuffer pixels per reference UI pixel
@@ -50,7 +51,7 @@ struct EditorLayout {
         };
         return !overlaps(viewport, hierarchy) && !overlaps(viewport, inspector) &&
                !overlaps(viewport, assetBrowser) && !overlaps(viewport, toolbar) &&
-               !overlaps(viewport, statusBar);
+               !overlaps(viewport, console) && !overlaps(viewport, statusBar);
     }
 };
 
@@ -63,6 +64,7 @@ struct EditorDockSizes {
     float leftWidth = -1.0f;   // Hierarchy dock
     float rightWidth = -1.0f;  // Inspector dock
     float bottomHeight = -1.0f; // bottom dock (Assets / Script tabs)
+    float consoleHeight = -1.0f; // console strip (<= 0 = hidden, both modes)
 };
 
 // Computes the dock layout for a framebuffer of the given size (pixels,

@@ -36,8 +36,16 @@ EditorLayout computeEditorLayout(float framebufferWidth, float framebufferHeight
     layout.toolbar = UIRect{0.0f, 0.0f, framebufferWidth, toolbarHeight};
     layout.statusBar = UIRect{0.0f, framebufferHeight - statusHeight, framebufferWidth, statusHeight};
 
+    // Console strip: a full-width band above the status bar,
+    // present in Edit and Play alike when requested. Everything
+    // else (docks, viewport) ends where the console begins.
+    const float consoleHeight = dockSizes.consoleHeight > 0.0f
+                                    ? std::clamp(dockSizes.consoleHeight, 56.0f * scale, 480.0f * scale)
+                                    : 0.0f;
+    layout.console = UIRect{0.0f, framebufferHeight - statusHeight - consoleHeight, framebufferWidth, consoleHeight};
+
     const float middleTop = toolbarHeight;
-    const float middleBottom = framebufferHeight - statusHeight;
+    const float middleBottom = framebufferHeight - statusHeight - consoleHeight;
     const float middleHeight = std::max(0.0f, middleBottom - middleTop);
 
     if (playing) {

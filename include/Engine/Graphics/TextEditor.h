@@ -96,7 +96,7 @@ public:
     // Call between UIContext::beginFrame/endFrame.
     Result draw(UIContext& ui, const UIRect& rect, float deltaSeconds);
 
-    static constexpr float kTextScale = 1.45f; // editor font scale (vs UIContext::kTextScale chrome)
+    static constexpr float kTextScale = 1.95f; // editor font scale: comfortably larger than UI chrome (1.8)
 
 private:
     void clampCursor();

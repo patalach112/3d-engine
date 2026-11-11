@@ -24,6 +24,7 @@
 #include "Scene/PlaySession.h"
 #include "Scripting/ScriptSystem.h"
 #include "Graphics/TextEditor.h"
+#include "Graphics/ConsoleLog.h"
 #include "Scene/Scene.h"
 #include "Scene/TransformGizmo.h"
 #include "Scene/UIAssetBrowser.h"
@@ -124,6 +125,7 @@ private:
     // the dock splitters.
     void bindScriptEditor(entt::entity entity);
     void saveAndCompileScript();
+    void resetScriptRuntimes();
     float inspectScriptAt(float x, float y, float width, entt::entity entity);
     void drawScriptDock(const UIRect& rect, double deltaSeconds);
     void updateSplitters(const EditorLayout& layout);
@@ -206,6 +208,12 @@ private:
     TextEditor m_scriptEditor;
     std::string m_scriptStatus; // last Save & Compile verdict for the bound script
     UIRect m_scriptEditorRect{}; // last drawn script-dock rect (I-beam cursor)
+    // In-engine console: Logger listener -> ring buffer -> panel.
+    // Visible in Edit and Play (layout.console strip).
+    ConsoleLog m_consoleLog;
+    ConsolePanelState m_consoleState;
+    float m_consoleHeight = 170.0f; // remembered strip height when open
+    uint64_t m_consoleListenerId = 0;
     std::string m_statusMessage;           // transient status-bar notification
     float m_statusSecondsRemaining = 0.0f; // decays in the update callback
     std::filesystem::path m_activeScenePath; // scene file Save/Load last used

@@ -471,6 +471,21 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
         }
     });
 
+    // Prune runtimes whose entity vanished or lost its script:
+    // Play-session snapshot restores and editor deletes must not
+    // leak state into the next session (persistence is for live
+    // entities with unchanged scripts only).
+    for (auto it = context.runtimes.begin(); it != context.runtimes.end();) {
+        const entt::entity e = it->first;
+        if (!registry.valid(e) || !registry.all_of<ScriptComponent>(e)) {
+            context.fileStamps.erase(e);
+            context.spawnPositions.erase(e);
+            it = context.runtimes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     // Compile + set up scripts.
     std::vector<entt::entity> scripts;
     registry.view<ScriptComponent>().each([&](entt::entity e, ScriptComponent&) { scripts.push_back(e); });
@@ -534,6 +549,8 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
             execBlock(frame, rt.program.statements);
             rt.setupDone = true;
             component.started = true;
+        } else if (!component.started) {
+            component.started = true; // persisted runtime, fresh component (snapshot restore)
         }
         frame.armed = &armed;
         frame.dedupeTimers = true;
