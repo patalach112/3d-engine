@@ -59,6 +59,14 @@ Application::Application(EngineConfig config)
       m_renderSystem(m_renderer, m_swapchain, &m_jobSystem, m_config.render.frustumCulling,
                      m_config.performance.parallelMinDrawItems, m_config.render.sortDrawItems, &m_assets,
                      m_config.render.occlusionCulling) {
+    // Keep the OS window responsive through the heavy tail of
+    // startup (asset/pipeline creation below compiles shaders on
+    // this thread): without periodic glfwPollEvents the window sits
+    // white and "Not Responding" for the whole initialization. The
+    // graphics stack already pumped during its own construction
+    // (VulkanContext / Renderer); this covers everything after.
+    WindowStartupPump startupPump(&m_window);
+    startupPump.pumpNow();
     if (const DynamicFont& font = m_renderer.uiFont(); font.trueType()) {
         ENGINE_LOG_INFO("Editor UI font: '" << font.fontName()
                                            << "' (TrueType, dynamic exact-size glyph cache)");
@@ -256,8 +264,7 @@ float inspectComponentAt(UIContext& ui, Scene::Registry& registry, entt::entity 
     for (const PropertyInfo& property : type.properties) {
         rows += property.type == PropertyType::Vec3 ? 3.0f : 1.0f;
     }
-    const float height =
-        2.0f * UIContext::kPanelPadding + rows * (UIContext::kRowHeight + UIContext::kRowSpacing);
+    const float height = 2.0f * ui.panelPadding() + rows * (ui.rowHeight() + ui.rowSpacing());
     inspectComponent(ui, UIRect{x, y, width, height}, type, &registry.get<T>(entity), options);
     return y + height + 6.0f;
 }
@@ -275,7 +282,7 @@ float inspectMaterialAt(UIContext& ui, AssetManager& assets, const MeshComponent
     }
     MaterialDesc desc = material->desc;
     const float rows = 8.0f; // title, name, base color (3), metallic, roughness, occlusion
-    const float height = 2.0f * UIContext::kPanelPadding + rows * (UIContext::kRowHeight + UIContext::kRowSpacing);
+    const float height = 2.0f * ui.panelPadding() + rows * (ui.rowHeight() + ui.rowSpacing());
     ui.beginPanel("Material", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
     ui.label("Material");
     ui.label(mesh.materialName);
@@ -323,14 +330,18 @@ void Application::registerAssets() {
     // never visually merge the way the old single slate-blue material let
     // them. Geometry still carries one white tint; all per-object color
     // and lighting character lives in these materials.
-    const auto registerSandboxMaterial = [this](const MaterialDesc& desc) {
+    WindowStartupPump pump(&m_window);
+    const auto registerSandboxMaterial = [this, &pump](const MaterialDesc& desc) {
         const MaterialId id = m_assets.registerMaterial(desc);
         // Deterministic PSO creation per material (deduplicated by
         // pipeline state + shader pair, accelerated by the VkPipelineCache).
+        // Shader compilation is the slowest part of startup: pump OS
+        // events between materials so the window never looks hung.
         if (const MaterialAsset* material = m_assets.material(id)) {
             m_pipeline.getOrCreatePipeline(material->id, material->desc.pipeline, material->desc.vertexShader,
                                            material->desc.fragmentShader, m_swapchain);
         }
+        pump.maybePump();
         return id;
     };
 
@@ -770,7 +781,14 @@ void Application::run() {
     };
     // Rendering always runs last, over fully updated scene state. The
     // return value lets GameLoop count only presented frames for FPS.
-    callbacks.render = [this](double /*interpolationAlpha*/) {
+    callbacks.render = [this](double interpolationAlpha) {
+        // Render-rate camera: blend the player capsule between the
+        // last two fixed steps with the loop's fractional alpha,
+        // so Play stays smooth at render rates far above the fixed
+        // rate (the alpha was previously computed and discarded).
+        if (m_playSession.isPlaying()) {
+            PlayerSystem::syncCameraInterpolated(m_scene, static_cast<float>(interpolationAlpha));
+        }
         // Editor UI: one docked layout per frame, computed from the
         // live framebuffer size (resize / DPI moves reflow it
         // immediately). The 3D scene is confined to
@@ -787,6 +805,11 @@ void Application::run() {
                                                             static_cast<float>(framebufferHeight), playingNow,
                                                             m_dockSizes);
             m_editorLayout = layout;
+            // Dynamic resolution scaling: widget metrics consume the
+            // same uiScale the layout just applied to the panel
+            // rects, so contents can never overflow/overlap their
+            // panels after a resize or DPI change.
+            m_uiContext.setUiScale(layout.uiScale);
             // Dock splitters read the same layout the panels are
             // about to consume; dragging rewrites m_dockSizes, so
             // next frame's layout (and scene viewport) follows.
@@ -1083,7 +1106,7 @@ void Application::run() {
                 // measured content height (immediate-mode loop).
                 if (m_uiContext.hoveredRect(inspectorRect)) {
                     m_inspectorScroll -=
-                        m_uiContext.scrollDelta() * 3.0f * (UIContext::kRowHeight + UIContext::kRowSpacing);
+                        m_uiContext.scrollDelta() * 3.0f * (m_uiContext.rowHeight() + m_uiContext.rowSpacing());
                 }
                 m_inspectorScroll = UIContext::clampScrollOffset(m_inspectorScroll, m_inspectorContentHeight,
                                                                  inspectorRect.height - 12.0f);
@@ -1093,8 +1116,8 @@ void Application::run() {
                     if (renaming && m_renameTarget == selected) {
                         // Rename field, armed by either context menu:
                         // Enter writes the TagComponent, Esc abandons.
-                        const float renameHeight = 2.0f * UIContext::kPanelPadding +
-                                                   2.0f * (UIContext::kRowHeight + UIContext::kRowSpacing);
+                        const float renameHeight = 2.0f * m_uiContext.panelPadding() +
+                                                   2.0f * (m_uiContext.rowHeight() + m_uiContext.rowSpacing());
                         m_uiContext.beginPanel("RenameEntity", UIRect{inspectorX, y, inspectorWidth, renameHeight},
                                                UIRectStyle{8.0f, 1.0f, glm::vec4{}});
                         m_uiContext.label("Rename entity (Enter confirms, Esc cancels)");
@@ -1587,9 +1610,9 @@ void Application::saveAndCompileScript() {
 
 float Application::inspectScriptAt(float x, float y, float width, entt::entity entity) {
     auto& registry = m_scene.registry();
-    const float rowStep = UIContext::kRowHeight + UIContext::kRowSpacing;
+    const float rowStep = m_uiContext.rowHeight() + m_uiContext.rowSpacing();
     if (!registry.all_of<ScriptComponent>(entity)) {
-        const float height = 2.0f * UIContext::kPanelPadding + 2.0f * rowStep;
+        const float height = 2.0f * m_uiContext.panelPadding() + 2.0f * rowStep;
         m_uiContext.beginPanel("ScriptComponent", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
         m_uiContext.label("Script (DSL)");
         if (m_uiContext.button("Add Script Component")) {
@@ -1608,7 +1631,7 @@ float Application::inspectScriptAt(float x, float y, float width, entt::entity e
     }
 
     ScriptComponent& script = registry.get<ScriptComponent>(entity);
-    const float height = 2.0f * UIContext::kPanelPadding + 8.0f * rowStep;
+    const float height = 2.0f * m_uiContext.panelPadding() + 8.0f * rowStep;
     m_uiContext.beginPanel("ScriptComponent", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
     m_uiContext.label("Script (DSL)");
     m_uiContext.label("File (.dsla, empty = inline)");
@@ -2037,11 +2060,11 @@ entt::entity Application::resolveAnimRig() {
 
 float Application::inspectAnimationAt(float x, float y, float width, entt::entity entity) {
     auto& registry = m_scene.registry();
-    const float rowStep = UIContext::kRowHeight + UIContext::kRowSpacing;
+    const float rowStep = m_uiContext.rowHeight() + m_uiContext.rowSpacing();
     const bool hasRig = registry.all_of<RigComponent>(entity);
     const bool hasPlayer = registry.all_of<AnimationPlayerComponent>(entity);
     if (!hasRig && !hasPlayer) {
-        const float height = 2.0f * UIContext::kPanelPadding + 2.0f * rowStep;
+        const float height = 2.0f * m_uiContext.panelPadding() + 2.0f * rowStep;
         m_uiContext.beginPanel("AnimationComponent", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
         m_uiContext.label("Animation (VibeAnim)");
         if (m_uiContext.button("Auto-Rig This Hierarchy")) {
@@ -2061,7 +2084,7 @@ float Application::inspectAnimationAt(float x, float y, float width, entt::entit
     const RigComponent* rig = registry.try_get<RigComponent>(entity);
     const AnimationPlayerComponent* player = registry.try_get<AnimationPlayerComponent>(entity);
     RagdollComponent* ragdoll = registry.try_get<RagdollComponent>(entity);
-    const float height = 2.0f * UIContext::kPanelPadding + 5.0f * rowStep;
+    const float height = 2.0f * m_uiContext.panelPadding() + 5.0f * rowStep;
     m_uiContext.beginPanel("AnimationComponent", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
     m_uiContext.label("Animation (VibeAnim)");
     m_uiContext.label("Rig nodes: " + std::to_string(rig != nullptr ? rig->nodes.size() : size_t{0}) +
@@ -2145,7 +2168,7 @@ void Application::drawAnimStudio(const UIRect& rect, double /*deltaSeconds*/) {
 
     const float columnsY = rect.y + 32.0f;
     const float columnsHeight = std::max(60.0f, rect.height - 32.0f - 62.0f);
-    const float rowStep = UIContext::kRowHeight + UIContext::kRowSpacing;
+    const float rowStep = m_uiContext.rowHeight() + m_uiContext.rowSpacing();
 
     // -- Left: rig hierarchy (articulation points) --------------------
     {

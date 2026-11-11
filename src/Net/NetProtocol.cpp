@@ -65,6 +65,9 @@ std::vector<std::byte> ServerWelcome::serialize() const {
     detail::writeF32(out, move.gravity);
     detail::writeF32(out, move.jumpSpeed);
     detail::writeF32(out, move.groundY);
+    detail::writeF32(out, move.sprintSpeed);
+    detail::writeF32(out, move.staminaDrainPerSecond);
+    detail::writeF32(out, move.staminaRegenPerSecond);
     writeString(out, serverName, 64);
     return out;
 }
@@ -86,6 +89,9 @@ bool ServerWelcome::deserialize(const std::byte* data, std::size_t size, ServerW
     out.move.gravity = reader.f32();
     out.move.jumpSpeed = reader.f32();
     out.move.groundY = reader.f32();
+    out.move.sprintSpeed = reader.f32();
+    out.move.staminaDrainPerSecond = reader.f32();
+    out.move.staminaRegenPerSecond = reader.f32();
     out.serverName = reader.str(64);
     return reader.ok();
 }
@@ -94,7 +100,7 @@ bool ServerWelcome::deserialize(const std::byte* data, std::size_t size, ServerW
 
 std::vector<std::byte> InputCommand::serialize() const {
     std::vector<std::byte> out;
-    out.reserve(22);
+    out.reserve(23);
     writeHeader(out, NetPacketType::InputCommand);
     detail::writeU32(out, cmdNumber);
     detail::writeU32(out, lastAck);
@@ -102,6 +108,7 @@ std::vector<std::byte> InputCommand::serialize() const {
     detail::writeF32(out, cmd.strafe);
     out.push_back(static_cast<std::byte>(cmd.jump ? 1 : 0));
     detail::writeF32(out, cmd.yawDegrees);
+    out.push_back(static_cast<std::byte>(cmd.sprint ? 1 : 0));
     return out;
 }
 
@@ -115,6 +122,7 @@ bool InputCommand::deserialize(const std::byte* data, std::size_t size, InputCom
     out.cmd.strafe = reader.f32();
     out.cmd.jump = reader.u8() != 0;
     out.cmd.yawDegrees = reader.f32();
+    out.cmd.sprint = reader.u8() != 0;
     out.cmd.cmdNumber = out.cmdNumber;
     return reader.ok();
 }

@@ -13497,6 +13497,521 @@ void testCharacterController() {
     }
 }
 
+// Capsule sweep CCD (Physics/MovementSystem sweepCapsule)
+// ---------------------------------------------------------------------------
+
+void testCapsuleSweepCcd() {
+    using namespace engine;
+    std::cout << "Capsule sweep CCD\n";
+    const float radius = PlayerSystem::kCapsuleRadius;
+    const float segmentHalf = PlayerSystem::kCapsuleHalfHeight;
+    const auto seg = [](const glm::vec3& centre) {
+        return std::pair{centre - glm::vec3{0.0f, PlayerSystem::kCapsuleHalfHeight, 0.0f},
+                         centre + glm::vec3{0.0f, PlayerSystem::kCapsuleHalfHeight, 0.0f}};
+    };
+
+    // Distance oracle: capsule beside a box face; overlapping -> 0.
+    {
+        const TraceBox box{{0.0f, 0.0f, 0.0f}, {0.5f, 0.5f, 0.5f}, glm::mat3(1.0f)};
+        const auto [a1, b1] = seg({1.5f, 0.0f, 0.0f});
+        check(std::abs(capsuleBoxDistance(a1, b1, radius, box.center, box.axes, box.halfExtents) - 0.7f) < 1e-3f,
+              "capsule 1m from box face measures 0.7 of clearance");
+        const auto [a2, b2] = seg({0.2f, 0.0f, 0.0f});
+        check(capsuleBoxDistance(a2, b2, radius, box.center, box.axes, box.halfExtents) == -radius,
+              "capsule inside the box reports -radius signed clearance");
+    }
+
+    // High-speed head-on at a thin wall: 40 m/s over one 1/60 tick
+    // covers 0.67 m — 6x the wall's 0.1 m thickness. Discrete
+    // overlap testing tunnels straight through; the sweep must stop
+    // with its surface at the wall face (1.9 - radius, +1 mm skin).
+    {
+        const std::vector<TraceBox> boxes{TraceBox{{1.95f, 0.0f, 0.0f}, {0.05f, 2.0f, 2.0f}, glm::mat3(1.0f)}};
+        SweepHit hit;
+        const glm::vec3 start{1.2f, 0.75f, 0.0f};
+        const glm::vec3 displacement{40.0f / 60.0f, 0.0f, 0.0f};
+        check(sweepCapsule(start, displacement, radius, segmentHalf, boxes, hit), "sweep hits the thin wall");
+        check(hit.fraction > 0.0f && hit.fraction < 1.0f, "impact fraction is inside the tick");
+        const glm::vec3 stopped = start + displacement * hit.fraction;
+        check(stopped.x <= 1.9f - radius + 0.002f && stopped.x > 1.9f - radius - 0.02f,
+              "capsule stops at the wall face, never through it");
+        check(hit.normal.x < -0.99f, "impact normal faces the mover");
+    }
+
+    // Falling (in one differential) onto a floor box: lands ON the
+    // top with an up normal.
+    {
+        const std::vector<TraceBox> boxes{TraceBox{{0.0f, -0.5f, 0.0f}, {4.0f, 0.5f, 4.0f}, glm::mat3(1.0f)}};
+        SweepHit hit;
+        const glm::vec3 start{0.0f, 3.0f, 0.0f};
+        check(sweepCapsule(start, {0.0f, -3.4f, 0.0f}, radius, segmentHalf, boxes, hit) && hit.normal.y > 0.99f,
+              "falling sweep reaches the floor with an up normal");
+        const glm::vec3 stopped = start + glm::vec3{0.0f, -3.4f, 0.0f} * hit.fraction;
+        check(std::abs(stopped.y - (segmentHalf + radius)) < 0.005f, "capsule rests exactly ON the floor");
+    }
+
+    // Open space misses; sliding along a wall does not block.
+    {
+        const std::vector<TraceBox> boxes{TraceBox{{5.0f, 0.0f, 0.0f}, {0.5f, 0.5f, 0.5f}, glm::mat3(1.0f)}};
+        SweepHit hit;
+        check(!sweepCapsule({0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, radius, segmentHalf, boxes, hit),
+              "open space is a miss");
+        const std::vector<TraceBox> wall{TraceBox{{1.95f, 0.0f, 0.0f}, {0.05f, 2.0f, 2.0f}, glm::mat3(1.0f)}};
+        check(!sweepCapsule({1.6f, 0.75f, 0.0f}, {0.0f, 1.0f, 0.0f}, radius, segmentHalf, wall, hit),
+              "sliding along the wall does not block");
+    }
+
+    // Spawning inside a box: penetrated flag + shallowest exit.
+    {
+        const std::vector<TraceBox> boxes{TraceBox{{0.0f, 0.0f, 0.0f}, {0.5f, 0.5f, 0.5f}, glm::mat3(1.0f)}};
+        SweepHit hit;
+        check(sweepCapsule({0.2f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, radius, segmentHalf, boxes, hit) &&
+                  hit.startPenetrated,
+              "inside start flags penetration");
+        check(hit.penetrationNormal.x > 0.99f && std::abs(hit.penetrationDepth - 0.6f) < 1e-3f,
+              "shallowest exit is +x at depth 0.6 (expanded-box exits are 0.6 vs 1.0)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Source-style sprint + stamina on the shared movement core
+// ---------------------------------------------------------------------------
+void testSprintAndStamina() {
+    using namespace engine;
+    std::cout << "Sprint & stamina\n";
+    const MoveSettings s;
+    check(s.sprintSpeed > s.maxSpeed, "sprint speed exceeds walk speed");
+    const float dt = 1.0f / 60.0f;
+    const auto playerOnGround = [] {
+        PlayerState state;
+        state.position = {0.0f, PlayerSystem::kCapsuleHalfHeight + PlayerSystem::kCapsuleRadius, 0.0f};
+        state.grounded = true;
+        return state;
+    };
+
+    // Sprint engaged: the wish-speed cap rises to sprintSpeed, the
+    // friction/accelerate equilibrium settles ABOVE the walk cap,
+    // and stamina drains for those ticks.
+    {
+        PlayerState p = playerOnGround();
+        InputCmd cmd;
+        cmd.forward = 1.0f;
+        cmd.sprint = true;
+        const float before = p.stamina;
+        for (int i = 0; i < 120; ++i) {
+            playerMove(cmd, p, s, dt);
+        }
+        const float speed = glm::length(p.velocity);
+        check(speed > s.maxSpeed + 0.5f && speed <= s.sprintSpeed + 1e-3f,
+              "sprint equilibrium sits above walk speed, at or under sprintSpeed");
+        check(p.stamina < before - (s.staminaDrainPerSecond * dt) * 60.0f, "sprinting drains stamina");
+    }
+
+    // Standing still never drains (no movement, no sprint), even
+    // with the key held; moving in ANY direction (Source aux-power)
+    // does.
+    {
+        PlayerState p = playerOnGround();
+        InputCmd cmd;
+        cmd.sprint = true;
+        playerMove(cmd, p, s, dt);
+        check(p.stamina == 1.0f, "sprint key alone (no movement input) never drains");
+        InputCmd back = cmd;
+        back.forward = -1.0f;
+        playerMove(back, p, s, dt);
+        check(p.stamina < 1.0f, "sprint drains while moving (any direction, Source-style)");
+    }
+
+    // Exhaustion latches at zero and holds until 25% regenerates.
+    {
+        PlayerState p = playerOnGround();
+        p.velocity = {s.maxSpeed, 0.0f, 0.0f};
+        InputCmd cmd;
+        cmd.forward = 1.0f;
+        cmd.sprint = true;
+        for (int i = 0; i < 600 && p.stamina > 0.0f; ++i) {
+            playerMove(cmd, p, s, dt);
+        }
+        check(p.stamina == 0.0f && p.sprintExhausted, "empty stamina latches exhaustion");
+        for (int i = 0; i < 60; ++i) {
+            playerMove(cmd, p, s, dt);
+        }
+        check(glm::length(p.velocity) <= s.maxSpeed + 1e-3f && glm::length(p.velocity) > 2.0f,
+              "exhausted sprint falls back to walking (friction decays to the walk equilibrium)");
+        check(p.sprintExhausted || p.stamina < 0.25f, "exhaustion latch holds while below 25% stamina");
+        cmd.sprint = false;
+        for (int i = 0; i < 600; ++i) {
+            playerMove(cmd, p, s, dt);
+        }
+        check(p.stamina == 1.0f && !p.sprintExhausted, "rest regenerates stamina and clears the latch");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scene-level CCD: extreme speed cannot tunnel (even thin walls),
+// bounded depenetration cannot launch, and the rigid-body solver
+// cannot displace a character-driven body (the launch-path fix).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct CharacterWorld {
+    engine::Scene scene;
+    entt::entity player = entt::null;
+};
+
+void addFloorBox(engine::Scene& scene, float halfExtent) {
+    auto floor = scene.createEntity("Floor");
+    floor.addComponent<engine::TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+    auto& body = floor.addComponent<engine::RigidBodyComponent>();
+    body.setStatic(true);
+    floor.addComponent<engine::ColliderComponent>(
+        engine::ColliderComponent::box(glm::vec3{halfExtent, 0.5f, halfExtent}));
+}
+
+void addCharacterPlayer(engine::Scene& scene, const glm::vec3& centre) {
+    auto player = scene.createEntity("Player");
+    player.addComponent<engine::TransformComponent>(centre);
+    auto& camera = player.addComponent<engine::CameraComponent>(engine::CameraConfig{});
+    camera.camera.setOrientation(0.0f, 0.0f);
+    auto& body = player.addComponent<engine::RigidBodyComponent>(80.0f);
+    body.restitution = 0.0f;
+    body.friction = 0.25f;
+    body.setPrincipalInertia(glm::vec3{10000.0f});
+    player.addComponent<engine::ColliderComponent>(
+        engine::ColliderComponent::capsule(engine::PlayerSystem::kCapsuleRadius,
+                                           engine::PlayerSystem::kCapsuleHalfHeight));
+}
+
+void addStaticBox(engine::Scene& scene, const char* name, const glm::vec3& centre, const glm::vec3& halfExtents) {
+    auto box = scene.createEntity(name);
+    box.addComponent<engine::TransformComponent>(centre);
+    auto& body = box.addComponent<engine::RigidBodyComponent>();
+    body.setStatic(true);
+    box.addComponent<engine::ColliderComponent>(engine::ColliderComponent::box(halfExtents));
+}
+
+// Floor (top y=0) + wall facing -x at x in [1.9, 2.1], height 3.
+void makeWallWorld(CharacterWorld& world, float wallHalfThickness = 0.1f) {
+    addFloorBox(world.scene, 10.0f);
+    addStaticBox(world.scene, "Wall", {2.0f, 1.5f, 0.0f}, {wallHalfThickness, 1.5f, 2.0f});
+    addCharacterPlayer(world.scene, {0.0f, 0.75f, 0.0f});
+    world.player = world.scene.findActiveCameraEntity();
+    (void)engine::PlayerSystem::ensureCharacterController(world.scene);
+}
+
+void runPhysics(engine::Scene& scene, double dt) {
+    engine::PhysicsSettings settings;
+    engine::PhysicsSystem physics;
+    physics.update(scene, dt, settings);
+}
+
+} // namespace
+
+void testCharacterHighSpeedNoTunnel() {
+    using namespace engine;
+    std::cout << "Character high-speed CCD\n";
+    const float restY = PlayerSystem::kCapsuleHalfHeight + PlayerSystem::kCapsuleRadius; // 0.75
+
+    // Speed impact: 40 m/s re-injected each tick into a 0.2 m wall.
+    // The sweep must hold the capsule surface at x = 1.9 - radius
+    // for every tick, consuming into-wall velocity.
+    {
+        CharacterWorld world;
+        makeWallWorld(world);
+        auto& registry = world.scene.registry();
+        const float dt = 1.0f / 60.0f;
+        for (int tick = 0; tick < 90; ++tick) {
+            registry.get<CharacterControllerComponent>(world.player).state.velocity = {40.0f, 0.0f, 0.0f};
+            PlayerSystem::updateCharacter(world.scene, Input{}, dt);
+            runPhysics(world.scene, dt);
+            const auto& transform = registry.get<const TransformComponent>(world.player);
+            check(transform.position.x <= 1.9f - 0.3f + 0.0025f, "speed impact cannot tunnel through the 0.2m wall");
+            check(std::abs(transform.position.y - restY) < 0.01f, "impact never lifts the character");
+        }
+        const auto& transform = registry.get<const TransformComponent>(world.player);
+        check(std::abs(transform.position.x - (1.9f - 0.3f)) < 0.01f, "character rests against the wall face");
+    }
+
+    // One huge step (lag spike: 200 ms at 60 m/s = 12 m of travel)
+    // at a 1 cm wall: the sweep still stops at the face.
+    {
+        CharacterWorld world;
+        makeWallWorld(world, 0.005f);
+        auto& registry = world.scene.registry();
+        auto& controller = registry.get<CharacterControllerComponent>(world.player);
+        controller.settings.friction = 0.0f; // isolate the sweep: sv_friction would eat a 200 ms step whole
+        controller.state.velocity = {60.0f, 0.0f, 0.0f};
+        PlayerSystem::updateCharacter(world.scene, Input{}, 0.2);
+        const auto& transform = registry.get<const TransformComponent>(world.player);
+        check(transform.position.x <= (2.0f - 0.005f) - 0.3f + 0.0025f && transform.position.x > 1.0f,
+              "one 12 m lag-spike step stops at the 1 cm wall (no tunneling)");
+    }
+
+    // Corner: two walls at right angles; 40 m/s diagonal wedges in.
+    {
+        CharacterWorld world;
+        makeWallWorld(world);
+        addStaticBox(world.scene, "WallZ", {0.0f, 1.5f, 2.0f}, {2.0f, 1.5f, 0.1f});
+        auto& registry = world.scene.registry();
+        const float dt = 1.0f / 60.0f;
+        for (int tick = 0; tick < 90; ++tick) {
+            registry.get<CharacterControllerComponent>(world.player).state.velocity =
+                glm::vec3{28.284f, 0.0f, 28.284f};
+            PlayerSystem::updateCharacter(world.scene, Input{}, dt);
+            runPhysics(world.scene, dt);
+            const auto& transform = registry.get<const TransformComponent>(world.player);
+            check(transform.position.x <= 1.9f - 0.3f + 0.0025f && transform.position.z <= 1.9f - 0.3f + 0.0025f,
+                  "corner wedge: neither plane is crossed");
+        }
+    }
+
+    // Spawned overlapping the wall (map-edit overlap): bounded
+    // depenetration walks the character out; no launch.
+    {
+        CharacterWorld world;
+        makeWallWorld(world);
+        auto& registry = world.scene.registry();
+        auto& controller = registry.get<CharacterControllerComponent>(world.player);
+        controller.state.position = {1.75f, restY, 0.0f};
+        registry.get<TransformComponent>(world.player).position = controller.state.position;
+        const float dt = 1.0f / 60.0f;
+        glm::vec3 previous = controller.state.position;
+        for (int tick = 0; tick < 60; ++tick) {
+            PlayerSystem::updateCharacter(world.scene, Input{}, dt);
+            runPhysics(world.scene, dt);
+            const glm::vec3 pos = registry.get<const TransformComponent>(world.player).position;
+            check(std::abs(pos.y - restY) < 0.01f && pos.x > 0.0f && pos.x < 2.0f,
+                  "depenetration never launches the character");
+            check(glm::length(pos - previous) < 1.0f, "per-tick recovery travel stays bounded");
+            previous = pos;
+        }
+        const glm::vec3 pos = registry.get<const TransformComponent>(world.player).position;
+        check(pos.x <= 1.9f - 0.3f + 0.0025f, "depenetration ends resting at the wall face");
+    }
+
+    // Solver isolation: character overlapping a heavy dynamic cube,
+    // NO character update running — physics must push the CUBE and
+    // leave the character transform untouched (the old launch path).
+    {
+        CharacterWorld world;
+        makeWallWorld(world);
+        auto cube = world.scene.createEntity("Cube");
+        auto& cubeTransform = cube.addComponent<TransformComponent>(glm::vec3{0.45f, restY, 0.0f});
+        auto& cubeBody = cube.addComponent<RigidBodyComponent>(80.0f);
+        cubeBody.useGravity = false;
+        cube.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.25f}));
+        const glm::vec3 before = world.scene.registry().get<const TransformComponent>(world.player).position;
+        runPhysics(world.scene, 1.0 / 60.0);
+        runPhysics(world.scene, 1.0 / 60.0);
+        const glm::vec3 after = world.scene.registry().get<const TransformComponent>(world.player).position;
+        check(after == before, "solver cannot displace a character-driven body");
+        check(cubeTransform.position.x > 0.45f, "the cube takes the whole correction instead");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-timestep render interpolation
+// ---------------------------------------------------------------------------
+void testCameraInterpolation() {
+    using namespace engine;
+    std::cout << "Camera interpolation\n";
+    CharacterWorld world;
+    makeWallWorld(world);
+    auto& registry = world.scene.registry();
+    auto& controller = registry.get<CharacterControllerComponent>(world.player);
+    auto& transform = registry.get<TransformComponent>(world.player);
+    const auto& camera = registry.get<const CameraComponent>(world.player);
+    const float restY = PlayerSystem::kCapsuleHalfHeight + PlayerSystem::kCapsuleRadius;
+
+    controller.interpolationFrom = {0.0f, restY, 0.0f};
+    controller.interpolationValid = true;
+    transform.position = {1.2f, restY, 0.0f};
+
+    check(PlayerSystem::syncCameraInterpolated(world.scene, 0.0f), "interpolated sync runs");
+    check(std::abs(camera.camera.position().x - 0.0f) < 1e-5f, "alpha 0 shows the previous step");
+    check(PlayerSystem::syncCameraInterpolated(world.scene, 0.5f), "interpolated sync runs");
+    check(std::abs(camera.camera.position().x - 0.6f) < 1e-5f, "alpha 0.5 shows the midpoint");
+    check(std::abs(camera.camera.position().y - (restY + PlayerSystem::kEyeHeight)) < 1e-5f,
+          "eye offset rides the interpolation");
+    check(PlayerSystem::syncCameraInterpolated(world.scene, 3.0f), "interpolated sync runs");
+    check(std::abs(camera.camera.position().x - 1.2f) < 1e-5f, "alpha clamps to the live step");
+
+    PlayerSystem::updateCharacter(world.scene, Input{}, 1.0 / 60.0);
+    check(controller.interpolationValid, "a driven tick seeds interpolation");
+
+    LoopConfig cfg;
+    cfg.fixedDeltaSeconds = 1.0 / 128.0;
+    cfg.maxFixedStepsPerFrame = 64; // 1000 fps deltas never need catch-up
+    FixedTimestep loop(cfg);
+    float lastAlpha = -1.0f;
+    bool monotonic = true;
+    for (int i = 0; i < 32; ++i) {
+        const auto step = loop.advance(1.0 / 1000.0); // 1000 fps render vs 128 Hz sim
+        if (step.steps == 0 && static_cast<float>(step.interpolationAlpha) < lastAlpha) {
+            monotonic = false;
+        }
+        lastAlpha = static_cast<float>(step.interpolationAlpha);
+        check(step.interpolationAlpha >= 0.0 && step.interpolationAlpha < 1.0, "alpha stays in [0, 1)");
+    }
+    check(monotonic, "alpha grows monotonically between fixed steps");
+}
+
+// ---------------------------------------------------------------------------
+
+// [SYS] presence across server-hosted networks: sprint flows through
+// the InputCommand wire and the welcome move settings; server config
+// persists the sprint tuning; NetClient round-trips it.
+// ---------------------------------------------------------------------------
+void testSprintNetworking() {
+    std::cout << "Sprint networking\n";
+    using namespace engine;
+
+    InputCommand wire;
+    wire.cmd.forward = 0.5f;
+    wire.cmd.sprint = true;
+    const std::vector<std::byte> bytes = wire.serialize();
+    InputCommand decoded;
+    check(InputCommand::deserialize(bytes.data(), bytes.size(), decoded) && decoded.cmd.sprint, "net-sprint");
+
+    ServerWelcome welcome;
+    welcome.move.sprintSpeed = 7.3f;
+    welcome.move.staminaDrainPerSecond = 0.2f;
+    const std::vector<std::byte> welcomeBytes = welcome.serialize();
+    ServerWelcome readBack;
+    check(ServerWelcome::deserialize(welcomeBytes.data(), welcomeBytes.size(), readBack) &&
+                    std::abs(readBack.move.sprintSpeed - 7.3f) < 1e-6f &&
+                    std::abs(readBack.move.staminaDrainPerSecond - 0.2f) < 1e-6f,
+                "net-sprint");
+
+    const ServerConfigParseResult parsed =
+        parseServerConfig("move_sprint_speed = 7.3\nmove_stamina_drain = 0.2\nmove_stamina_regen = 0.05\n");
+    check(std::abs(parsed.settings.move.sprintSpeed - 7.3f) < 1e-6f &&
+                    std::abs(parsed.settings.move.staminaDrainPerSecond - 0.2f) < 1e-6f &&
+                    std::abs(parsed.settings.move.staminaRegenPerSecond - 0.05f) < 1e-6f,
+                "net-sprint");
+    const std::string roundTrip = generateServerConfig(parsed.settings);
+    check(generateServerConfig(parseServerConfig(roundTrip).settings) == roundTrip, "net-sprint");
+}
+
+// ---------------------------------------------------------------------------
+// UI resolution scaling: layout scale tracks the framebuffer and the
+// widget context consumes the SAME scale, so widgets agree with
+// their (scaled) panel rects at every size.
+// ---------------------------------------------------------------------------
+void testUiResolutionScaling() {
+    using namespace engine;
+    std::cout << "UI resolution scaling\n";
+
+    // The layout scale is a pure function of the framebuffer size:
+    // 1.0 at the 1280x720 reference, clamped to [0.75, 1.35].
+    const EditorLayout reference = computeEditorLayout(1280.0f, 720.0f, false);
+    const EditorLayout small = computeEditorLayout(800.0f, 600.0f, false);
+    const EditorLayout fullHd = computeEditorLayout(1920.0f, 1080.0f, false);
+    const EditorLayout huge = computeEditorLayout(3840.0f, 2160.0f, false);
+    check(reference.uiScale == 1.0f, "uiScale is 1 at the 1280x720 reference");
+    check(small.uiScale == 0.75f, "uiScale clamps to 0.75 for small windows");
+    check(fullHd.uiScale == 1.35f && huge.uiScale == 1.35f, "uiScale clamps to 1.35 for large framebuffers");
+    check(reference.viewportIsDockBounded() && small.viewportIsDockBounded() && huge.viewportIsDockBounded(),
+          "docks never overlap the viewport at any size");
+    check(huge.toolbar.height >= reference.toolbar.height && huge.statusBar.height >= reference.statusBar.height,
+          "chrome grows with the framebuffer");
+
+    // Widget metrics consume the same scale: at layout scale the
+    // context rows/padding/text grow by exactly that factor, so
+    // panel contents always fit the (scaled) panel rects.
+    UIContext context;
+    check(context.uiScale() == 1.0f && context.rowHeight() == UIContext::kRowHeight &&
+              context.textScale() == UIContext::kTextScale,
+          "unscaled context uses the reference metrics");
+    context.setUiScale(reference.uiScale);
+    check(context.rowHeight() == UIContext::kRowHeight, "reference scale leaves metrics untouched");
+    context.setUiScale(fullHd.uiScale);
+    check(std::abs(context.rowHeight() - UIContext::kRowHeight * 1.35f) < 1e-4f &&
+              std::abs(context.panelPadding() - UIContext::kPanelPadding * 1.35f) < 1e-4f &&
+              std::abs(context.textScale() - UIContext::kTextScale * 1.35f) < 1e-4f &&
+              std::abs(context.popupWidth() - UIContext::kPopupWidth * 1.35f) < 1e-4f,
+          "widget metrics scale by the layout uiScale");
+    context.setUiScale(small.uiScale);
+    check(std::abs(context.rowHeight() - UIContext::kRowHeight * 0.75f) < 1e-4f,
+          "small windows shrink widget metrics by the same factor");
+
+    // Degenerate input cannot collapse the UI.
+    context.setUiScale(0.0f);
+    check(context.uiScale() == 0.5f, "scale clamps at the lower bound");
+    context.setUiScale(100.0f);
+    check(context.uiScale() == 3.0f, "scale clamps at the upper bound");
+    context.setUiScale(std::numeric_limits<float>::quiet_NaN());
+    check(context.uiScale() == 1.0f, "non-finite scale resets to reference");
+
+    // Text actually renders bigger: measured width at the scaled
+    // text scale grows against reference (the widget drawText and
+    // measureText calls all route through textScale()).
+    DynamicFont atlas = createUiFont();
+    UIBatch batch;
+    batch.setFont(&atlas);
+    batch.begin(1920, 1080);
+    UIContext scaled;
+    UIContext plain;
+    plain.beginFrame(UIInput{}, batch);
+    const float widthAt1x = batch.measureText("Resolution", plain.textScale());
+    scaled.setUiScale(2.0f);
+    const float widthAt2x = batch.measureText("Resolution", scaled.textScale());
+    plain.endFrame();
+    check(widthAt2x > 1.9f * widthAt1x && widthAt1x > 0.0f, "text metrics follow the dynamic scale");
+
+    // End-to-end: a scaled context lays out panel rows with the
+    // scaled row height (row rects come from nextRow()).
+    {
+        DynamicFont font = createUiFont();
+        UIBatch uiBatch;
+        uiBatch.setFont(&font);
+        UIContext ctx;
+        ctx.setUiScale(2.0f);
+        // Panel padding is 16 and rows are 52+8 at 2x, so the
+        // second row spans y in [176, 228). At reference metrics the
+        // same pointer (y=200) would land below both rows entirely,
+        // so capturing the button here proves the rows were scaled.
+        const float pressY = 200.0f;
+        uiBatch.begin(3840, 2160);
+        ctx.beginFrame(UIInput{150.0f, pressY, true}, uiBatch);
+        ctx.beginPanel("ScalePanel", UIRect{100.0f, 100.0f, 400.0f, 400.0f});
+        ctx.label("first row"); // consumes one scaled row
+        const bool pressed = ctx.button("second row");
+        ctx.endPanel();
+        ctx.endFrame();
+        check(!pressed, "scaled rows: press alone does not fire the button");
+        check(ctx.activeId() != kUINoWidget, "scaled rows: the press captured the second-row button");
+        uiBatch.begin(3840, 2160);
+        ctx.beginFrame(UIInput{150.0f, pressY, false}, uiBatch);
+        ctx.beginPanel("ScalePanel", UIRect{100.0f, 100.0f, 400.0f, 400.0f});
+        ctx.label("first row");
+        const bool clicked = ctx.button("second row");
+        ctx.endPanel();
+        ctx.endFrame();
+        check(clicked, "scaled rows: release over the second scaled row fires its button");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup pumping: a null-window pump is a safe no-op (dedicated
+// servers, pre-window stages), and the pump object is usable before
+// any window exists -- the contract Application startup relies on.
+// ---------------------------------------------------------------------------
+void testStartupEventPumping() {
+    std::cout << "Startup event pumping\n";
+    engine::WindowStartupPump pump(nullptr);
+    pump.maybePump();
+    pump.pumpNow();
+    pump.setInterval(0.0f);
+    pump.maybePump();
+    pump.setInterval(-5.0f);
+    pump.maybePump();
+    check(pump.pumpCount() == 0 && pump.window() == nullptr, "null-window pump never pumps and never crashes");
+    check(pump.interval() == 0.0f, "negative intervals clamp to zero (pump every call)");
+    engine::WindowStartupPump defaulted(nullptr, 0.25f);
+    check(defaulted.interval() == 0.25f && defaulted.pumpCount() == 0, "pump stores its interval");
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -13570,6 +14085,13 @@ int main() {
     testTextEditorUpgrade();
     testNetworking();
     testMovementSystem();
+    testCapsuleSweepCcd();
+    testSprintAndStamina();
+    testCharacterHighSpeedNoTunnel();
+    testCameraInterpolation();
+    testSprintNetworking();
+    testUiResolutionScaling();
+    testStartupEventPumping();
     testCharacterController();
 
     if (g_failures == 0) {

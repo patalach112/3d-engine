@@ -3449,7 +3449,58 @@ runs clean.
   and rendering state never enters the server binary — client
   mirrors are built one-way via `NetClient::applyToScene`.
 
-1667 passed / 0 failed across all five build configs
+## Runtime fixes — startup pumping, capsule-sweep CCD, sprint, interpolation, UI scaling
+
+- **Startup freeze**: engine initialization used to block the main
+  thread from window creation until the first frame (seconds of
+  white "Not Responding" window). `WindowStartupPump`
+  (`Platform/Window.h`) now forwards to `glfwPollEvents()` between
+  init stages during heavy initialization: VulkanContext pumps
+  around device creation, the Renderer constructor pumps between
+  render-pass/environment/pipeline stages, and `Application`
+  pumps before `registerAssets()` and after every per-material
+  `getOrCreatePipeline` (the shader-compilation hotspot). A null
+  window is a safe no-op (dedicated-server startup).
+- **Character CCD (sweep, not solver)**: the character capsule no
+  longer relies on discrete overlap + solver correction. Each
+  tick `PlayerSystem::driveCharacter` traces the capsule with
+  `sweepCapsule` (conservative advancement over the exact
+  segment-to-box distance, `Physics/MovementSystem.h`), stops
+  exactly at `t_hit`, clips with `PM_ClipVelocity` (full clip on
+  floors/ceilings, purely horizontal on walls), and re-sweeps the
+  remainder (Source bump-and-slide, max 3 bumps). Starting
+  penetration is resolved ONCE via the shallowest exit, bounded
+  per tick. Crucially, `PhysicsSystem` now treats
+  character-driven bodies as immovable: it never integrates or
+  corrects them (`characterDriven`), while contacts still push
+  dynamic bodies — the penetration-feedback "launched out of the
+  map" path no longer exists. Verified at 40-60 m/s into 0.2 m
+  and 1 cm walls, corner wedges, and penetrating spawns.
+- **Source-style sprint + stamina**: `MoveSettings` gains
+  `sprintSpeed` (6.8), `staminaDrainPerSecond` (0.16) and
+  `staminaRegenPerSecond` (0.12); `InputCmd` carries a sprint
+  flag through local play, client prediction and the server
+  `InputCommand` wire format, and the values round-trip through
+  `server.cfg` (`move_sprint_speed`, `move_stamina_drain`,
+  `move_stamina_regen`). Sprint raises the wish-speed cap only
+  while moving with the key held; exhaustion latches at empty
+  until 25% regenerates. `sv_friction` 8, `sv_accelerate` 6 and
+  the air-accelerate 0 clamp are unchanged.
+- **Fixed-timestep interpolation**: `PlayerSystem::
+  syncCameraInterpolated` blends the capsule centre between the
+  previous and current fixed steps using the `GameLoop`'s
+  fractional alpha (previously computed and discarded by both
+  hosts), so the first-person view stays smooth at render rates
+  far above the 128 Hz physics rate (e.g. 1000 fps).
+- **UI resolution scaling**: `EditorLayout` always scaled panel
+  rects by `uiScale`, but `UIContext` widget metrics (row height,
+  padding, text, popups) were reference-size constants, so
+  contents overflowed panels on resize. `UIContext::setUiScale`
+  now feeds the same scale into every metric; `Application`
+  pushes `layout.uiScale` every frame and its hand-computed
+  panel heights use the scaled accessors too.
+
+2147 passed / 0 failed across all five build configs
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, `vibe_server --ticks` and
 `game-player --server` smoke runs clean, scripting-demo and

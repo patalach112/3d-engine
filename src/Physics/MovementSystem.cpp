@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <glm/geometric.hpp>
 #include <glm/vec2.hpp>
 #include <glm/trigonometric.hpp>
@@ -82,10 +83,29 @@ void playerMove(const InputCmd& rawCmd, PlayerState& state, const MoveSettings& 
     const glm::vec3 right(std::cos(yaw), 0.0f, -std::sin(yaw));
     glm::vec3 wishDir = forward * cmd.forward + right * cmd.strafe;
     const float wishLength = glm::length(wishDir);
+
+    // Sprint (Source aux-power model): the wish-speed cap rises to
+    // sprintSpeed only while the sprint input is held AND the
+    // player is actually moving, and the tank drains for exactly
+    // those ticks. Exhaustion latches until the tank recovers to
+    // 25%, so sprint can never be feathered at empty.
+    const bool sprinting = cmd.sprint && wishLength > 1e-6f && !state.sprintExhausted && state.stamina > 0.0f;
+    if (sprinting) {
+        state.stamina = std::max(0.0f, state.stamina - settings.staminaDrainPerSecond * dt);
+        if (state.stamina <= 0.0f) {
+            state.sprintExhausted = true;
+        }
+    } else {
+        state.stamina = std::min(1.0f, state.stamina + settings.staminaRegenPerSecond * dt);
+        if (state.sprintExhausted && state.stamina >= 0.25f) {
+            state.sprintExhausted = false;
+        }
+    }
+
     float wishSpeed = 0.0f;
     if (wishLength > 1e-6f) {
         wishDir /= wishLength;
-        wishSpeed = std::min(wishLength, 1.0f) * settings.maxSpeed;
+        wishSpeed = std::min(wishLength, 1.0f) * (sprinting ? settings.sprintSpeed : settings.maxSpeed);
     }
 
     if (state.grounded) {
@@ -186,6 +206,330 @@ InputCmd sanitizeInputCmd(const InputCmd& cmd) {
         out.strafe /= length;
     }
     return out;
+}
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Exact segment/box distance machinery (box-local space), the narrow
+// phase of the capsule trace. Distances are composed from the 12
+// face triangles of the box, which keeps every closest pair exact:
+// segment vs triangle = endpoint-to-triangle, vertex-to-segment,
+// and edge-to-edge segment pairs.
+// ---------------------------------------------------------------------------
+
+float pointSegmentDistance(const glm::vec3& point, const glm::vec3& a, const glm::vec3& b, glm::vec3& outOnSegment) {
+    const glm::vec3 ab = b - a;
+    const float lengthSq = glm::dot(ab, ab);
+    const float t = lengthSq > 1e-12f ? glm::clamp(glm::dot(point - a, ab) / lengthSq, 0.0f, 1.0f) : 0.0f;
+    outOnSegment = a + ab * t;
+    return glm::length(point - outOnSegment);
+}
+
+// Ericson's segment/segment closest points (Robustness: degenerate
+// segments degrade to point tests).
+float segmentSegmentDistance(const glm::vec3& p1, const glm::vec3& q1, const glm::vec3& p2, const glm::vec3& q2,
+                             glm::vec3& outOnFirst, glm::vec3& outOnSecond) {
+    const glm::vec3 d1 = q1 - p1;
+    const glm::vec3 d2 = q2 - p2;
+    const glm::vec3 r = p1 - p2;
+    const float a = glm::dot(d1, d1);
+    const float e = glm::dot(d2, d2);
+    const float f = glm::dot(d2, r);
+    float s = 0.0f;
+    float t = 0.0f;
+    if (a <= 1e-12f && e <= 1e-12f) {
+        outOnFirst = p1;
+        outOnSecond = p2;
+        return glm::length(r);
+    }
+    if (a <= 1e-12f) {
+        t = glm::clamp(f / e, 0.0f, 1.0f);
+    } else {
+        const float c = glm::dot(d1, r);
+        if (e <= 1e-12f) {
+            s = glm::clamp(-c / a, 0.0f, 1.0f);
+        } else {
+            const float b = glm::dot(d1, d2);
+            const float denom = a * e - b * b;
+            s = denom > 1e-12f ? glm::clamp((b * f - c * e) / denom, 0.0f, 1.0f) : 0.0f;
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = glm::clamp(-c / a, 0.0f, 1.0f);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = glm::clamp((b - c) / a, 0.0f, 1.0f);
+            }
+        }
+    }
+    outOnFirst = p1 + d1 * s;
+    outOnSecond = p2 + d2 * t;
+    return glm::length(outOnFirst - outOnSecond);
+}
+
+// Closest point on a triangle to a point (Ericson, RTCD 5.1.5).
+glm::vec3 closestPointOnTriangle(const glm::vec3& point, const glm::vec3& a, const glm::vec3& b, const glm::vec3& c) {
+    const glm::vec3 ab = b - a;
+    const glm::vec3 ac = c - a;
+    const glm::vec3 ap = point - a;
+    const float d1 = glm::dot(ab, ap);
+    const float d2 = glm::dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f)
+        return a;
+    const glm::vec3 bp = point - b;
+    const float d3 = glm::dot(ab, bp);
+    const float d4 = glm::dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3)
+        return b;
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
+        return a + ab * (d1 / (d1 - d3));
+    const glm::vec3 cp = point - c;
+    const float d5 = glm::dot(ab, cp);
+    const float d6 = glm::dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6)
+        return c;
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
+        return a + ac * (d2 / (d2 - d6));
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    const float denom = 1.0f / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+float segmentTriangleDistance(const glm::vec3& segA, const glm::vec3& segB, const glm::vec3& a, const glm::vec3& b,
+                              const glm::vec3& c, glm::vec3& outOnSegment, glm::vec3& outOnTriangle) {
+    float best = std::numeric_limits<float>::max();
+    glm::vec3 candidateSeg;
+    glm::vec3 candidateTri;
+    const auto consider = [&](float distance, const glm::vec3& onSeg, const glm::vec3& onTri) {
+        if (distance < best) {
+            best = distance;
+            candidateSeg = onSeg;
+            candidateTri = onTri;
+        }
+    };
+    glm::vec3 onTri = closestPointOnTriangle(segA, a, b, c);
+    consider(glm::length(segA - onTri), segA, onTri);
+    onTri = closestPointOnTriangle(segB, a, b, c);
+    consider(glm::length(segB - onTri), segB, onTri);
+    glm::vec3 onSeg;
+    float distance = pointSegmentDistance(a, segA, segB, onSeg);
+    consider(distance, onSeg, a);
+    distance = pointSegmentDistance(b, segA, segB, onSeg);
+    consider(distance, onSeg, b);
+    distance = pointSegmentDistance(c, segA, segB, onSeg);
+    consider(distance, onSeg, c);
+    glm::vec3 onFirst;
+    glm::vec3 onSecond;
+    distance = segmentSegmentDistance(segA, segB, a, b, onFirst, onSecond);
+    consider(distance, onFirst, onSecond);
+    distance = segmentSegmentDistance(segA, segB, b, c, onFirst, onSecond);
+    consider(distance, onFirst, onSecond);
+    distance = segmentSegmentDistance(segA, segB, c, a, onFirst, onSecond);
+    consider(distance, onFirst, onSecond);
+    outOnSegment = candidateSeg;
+    outOnTriangle = candidateTri;
+    return best;
+}
+
+// Segment vs AABB (half extents about the origin) in box-local
+// space. On intersection the distance is 0 and both closest points
+// are the segment's entry point (a defined, usable contact point).
+float segmentBoxDistanceLocal(const glm::vec3& segA, const glm::vec3& segB, const glm::vec3& half,
+                              glm::vec3& outOnSegment, glm::vec3& outOnBox) {
+    // Slab intersection test (also yields the entry point).
+    {
+        const glm::vec3 dir = segB - segA;
+        float tMin = 0.0f;
+        float tMax = 1.0f;
+        bool intersects = true;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (std::abs(dir[axis]) <= 1e-12f) {
+                if (std::abs(segA[axis]) > half[axis])
+                    intersects = false;
+                continue;
+            }
+            float t1 = (-half[axis] - segA[axis]) / dir[axis];
+            float t2 = (half[axis] - segA[axis]) / dir[axis];
+            if (t1 > t2)
+                std::swap(t1, t2);
+            tMin = std::max(tMin, t1);
+            tMax = std::min(tMax, t2);
+            if (tMin > tMax)
+                intersects = false;
+        }
+        if (intersects) {
+            outOnSegment = segA + dir * tMin;
+            outOnBox = outOnSegment;
+            return 0.0f;
+        }
+    }
+    // 12 face triangles (CCW winding is irrelevant for distance).
+    const glm::vec3 corners[8] = {
+        glm::vec3{-half.x, -half.y, -half.z}, glm::vec3{half.x, -half.y, -half.z},
+        glm::vec3{half.x, -half.y, half.z},   glm::vec3{-half.x, -half.y, half.z},
+        glm::vec3{-half.x, half.y, -half.z},  glm::vec3{half.x, half.y, -half.z},
+        glm::vec3{half.x, half.y, half.z},    glm::vec3{-half.x, half.y, half.z},
+    };
+    static constexpr int triangles[12][3] = {{0, 1, 2}, {0, 2, 3}, {4, 6, 5}, {4, 7, 6}, {0, 4, 1}, {1, 4, 5},
+                                             {1, 5, 2}, {2, 5, 6}, {2, 6, 3}, {3, 6, 7}, {3, 7, 0}, {0, 7, 4}};
+    float best = std::numeric_limits<float>::max();
+    for (const auto& tri : triangles) {
+        glm::vec3 onSeg;
+        glm::vec3 onTri;
+        const float distance = segmentTriangleDistance(segA, segB, corners[tri[0]], corners[tri[1]], corners[tri[2]],
+                                                       onSeg, onTri);
+        if (distance < best) {
+            best = distance;
+            outOnSegment = onSeg;
+            outOnBox = onTri;
+        }
+    }
+    return best;
+}
+
+} // namespace
+
+float capsuleBoxDistance(const glm::vec3& segmentA, const glm::vec3& segmentB, float radius,
+                         const glm::vec3& boxCenter, const glm::mat3& boxAxes, const glm::vec3& boxHalfExtents,
+                         glm::vec3* outSegmentPoint, glm::vec3* outBoxPoint) {
+    const glm::mat3 worldToLocal = glm::transpose(boxAxes);
+    const glm::vec3 localA = worldToLocal * (segmentA - boxCenter);
+    const glm::vec3 localB = worldToLocal * (segmentB - boxCenter);
+    glm::vec3 localSeg;
+    glm::vec3 localBox;
+    const float segmentDistance = segmentBoxDistanceLocal(localA, localB, glm::abs(boxHalfExtents), localSeg, localBox);
+    if (outSegmentPoint != nullptr)
+        *outSegmentPoint = boxCenter + boxAxes * localSeg;
+    if (outBoxPoint != nullptr)
+        *outBoxPoint = boxCenter + boxAxes * localBox;
+    return segmentDistance - radius;
+}
+
+bool sweepCapsule(const glm::vec3& startCenter, const glm::vec3& displacement, float radius, float halfHeight,
+                  std::span<const TraceBox> boxes, SweepHit& outHit) {
+    constexpr float kContactTolerance = 0.001f; // 1 mm: "touching"
+    const float displacementLength = glm::length(displacement);
+    const glm::vec3 segmentOffset{0.0f, halfHeight, 0.0f};
+
+    bool found = false;
+    SweepHit best;
+    for (size_t index = 0; index < boxes.size(); ++index) {
+        const TraceBox& box = boxes[index];
+        const auto distanceAt = [&](const glm::vec3& center, glm::vec3& onCapsule, glm::vec3& onBox) {
+            return capsuleBoxDistance(center - segmentOffset, center + segmentOffset, radius, box.center, box.axes,
+                                      box.halfExtents, &onCapsule, &onBox);
+        };
+
+        glm::vec3 onCapsule;
+        glm::vec3 onBox;
+        const float startDistance = distanceAt(startCenter, onCapsule, onBox);
+        if (startDistance < -1e-6f) {
+            // Penetrating: report the shallowest exit. When the
+            // segment itself has entered the box (distance pinned
+            // at -radius), exit along the least-penetrated axis.
+            SweepHit penetration;
+            penetration.fraction = 0.0f;
+            penetration.boxIndex = static_cast<int32_t>(index);
+            penetration.startPenetrated = true;
+            const glm::vec3 segA = startCenter - segmentOffset;
+            const glm::vec3 segB = startCenter + segmentOffset;
+            glm::vec3 segPoint;
+            glm::vec3 boxPoint;
+            const float segmentDistance =
+                capsuleBoxDistance(segA, segB, radius, box.center, box.axes, box.halfExtents, &segPoint, &boxPoint) +
+                radius;
+            if (segmentDistance > 1e-6f) {
+                penetration.penetrationNormal = glm::normalize(segPoint - boxPoint);
+                penetration.penetrationDepth = radius - segmentDistance;
+            } else {
+                const glm::mat3 worldToLocal = glm::transpose(box.axes);
+                const glm::vec3 local = worldToLocal * (startCenter - box.center);
+                const glm::vec3 half = glm::abs(box.halfExtents);
+                const glm::vec3 exit = half - glm::abs(local) + glm::vec3{radius};
+                int axis = 0;
+                if (exit.y < exit.x)
+                    axis = 1;
+                if (exit.z < exit[axis])
+                    axis = 2;
+                glm::vec3 localNormal{0.0f};
+                localNormal[axis] = local[axis] >= 0.0f ? 1.0f : -1.0f;
+                penetration.penetrationNormal = box.axes * localNormal;
+                penetration.penetrationDepth = exit[axis];
+            }
+            penetration.normal = penetration.penetrationNormal;
+            penetration.point = boxPoint;
+            if (!found || penetration.penetrationDepth > best.penetrationDepth) {
+                best = penetration;
+                found = true;
+            }
+            continue;
+        }
+        if (displacementLength <= 1e-8f) {
+            continue; // no motion: only penetration matters
+        }
+        if (startDistance <= kContactTolerance) {
+            // Resting/tangent contact: an impact only when the
+            // motion actually approaches along the surface normal.
+            glm::vec3 normal = onCapsule - onBox;
+            normal = glm::length(normal) > 1e-8f ? glm::normalize(normal) : -displacement / displacementLength;
+            if (glm::dot(displacement, normal) < -1e-6f) { // genuine approach only (see header note)
+                SweepHit hit;
+                hit.fraction = 0.0f;
+                hit.normal = normal;
+                hit.point = onBox;
+                hit.boxIndex = static_cast<int32_t>(index);
+                if (!found || (best.startPenetrated == false && hit.fraction < best.fraction)) {
+                    best = hit;
+                    found = true;
+                }
+            }
+            continue;
+        }
+        // Conservative advancement: the distance can shrink at most
+        // |displacement| per unit fraction, so stepping by the
+        // current distance can never overshoot the surface.
+        float fraction = 0.0f;
+        bool hitFound = false;
+        glm::vec3 hitNormal{0.0f, 1.0f, 0.0f};
+        glm::vec3 hitPoint{0.0f};
+        for (int iteration = 0; iteration < 8; ++iteration) {
+            const glm::vec3 center = startCenter + displacement * fraction;
+            glm::vec3 atCapsule;
+            glm::vec3 atBox;
+            const float distance = distanceAt(center, atCapsule, atBox);
+            if (distance <= kContactTolerance) {
+                glm::vec3 normal = atCapsule - atBox;
+                hitNormal = glm::length(normal) > 1e-8f ? glm::normalize(normal) : -displacement / displacementLength;
+                hitPoint = atBox;
+                hitFound = glm::dot(displacement, hitNormal) < -1e-6f || fraction > 0.0f;
+                break;
+            }
+            fraction += distance / displacementLength;
+            if (fraction >= 1.0f || (found && !best.startPenetrated && fraction >= best.fraction)) {
+                break;
+            }
+        }
+        if (hitFound && fraction < 1.0f) {
+            SweepHit hit;
+            hit.fraction = std::max(fraction, 0.0f);
+            hit.normal = hitNormal;
+            hit.point = hitPoint;
+            hit.boxIndex = static_cast<int32_t>(index);
+            if (!found || (!best.startPenetrated && hit.fraction < best.fraction)) {
+                best = hit;
+                found = true;
+            }
+        }
+    }
+    if (found) {
+        outHit = best;
+    }
+    return found;
 }
 
 } // namespace engine

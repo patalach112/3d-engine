@@ -1,5 +1,8 @@
 #pragma once
 #include "Core/Export.h"
+
+#include <chrono>
+#include <cstdint>
 #include <string>
 
 // GLFW_INCLUDE_VULKAN makes GLFW pull in <vulkan/vulkan.h> and expose the
@@ -115,6 +118,46 @@ private:
     int m_framebufferHeight = 0;
     bool m_framebufferResized = false;
     bool m_cursorCaptured = false;
+};
+
+// ---------------------------------------------------------------------------
+// WindowStartupPump
+//
+// Periodic event pumping for long, blocking initialization: heavy
+// engine startup (Vulkan device/swapchain setup, renderer resource
+// creation, per-material shader compilation) can keep the main
+// thread busy for seconds after the OS window appears; without
+// glfwPollEvents() calls the OS marks the window "Not Responding"
+// and paints it white. Hosts construct a pump over their window
+// (nullptr is a safe no-op, e.g. dedicated-server startup) and call
+// maybePump() between init stages: it forwards to Window::
+// pollEvents() at most once per interval, so the call sites can be
+// unconditional and effectively free. The first maybePump() after
+// construction always pumps, so the window becomes responsive
+// immediately after creation.
+// ---------------------------------------------------------------------------
+class ENGINE_PLATFORM_API WindowStartupPump {
+public:
+    explicit WindowStartupPump(Window* window, float intervalSeconds = 0.05f);
+
+    // Pumps when the interval has elapsed since the last pump (or
+    // on the first call). Safe with a null window.
+    void maybePump();
+    // Pumps immediately (still a no-op without a window) and
+    // restarts the interval.
+    void pumpNow();
+
+    void setInterval(float intervalSeconds);
+    [[nodiscard]] float interval() const { return m_intervalSeconds; }
+    [[nodiscard]] Window* window() const { return m_window; }
+    [[nodiscard]] uint32_t pumpCount() const { return m_pumpCount; }
+
+private:
+    Window* m_window = nullptr;
+    float m_intervalSeconds = 0.05f;
+    uint32_t m_pumpCount = 0;
+    bool m_hasPumped = false;
+    std::chrono::steady_clock::time_point m_lastPump{};
 };
 
 } // namespace engine

@@ -73,6 +73,41 @@ void Window::pollEvents() const {
     glfwPollEvents();
 }
 
+// ---------------------------------------------------------------------------
+// WindowStartupPump
+// ---------------------------------------------------------------------------
+WindowStartupPump::WindowStartupPump(Window* window, float intervalSeconds) : m_window(window) {
+    setInterval(intervalSeconds);
+}
+
+void WindowStartupPump::setInterval(float intervalSeconds) {
+    m_intervalSeconds = intervalSeconds > 0.0f ? intervalSeconds : 0.0f;
+}
+
+void WindowStartupPump::pumpNow() {
+    if (m_window == nullptr) {
+        return;
+    }
+    m_window->pollEvents();
+    m_lastPump = std::chrono::steady_clock::now();
+    m_hasPumped = true;
+    ++m_pumpCount;
+}
+
+void WindowStartupPump::maybePump() {
+    if (m_window == nullptr) {
+        return;
+    }
+    if (m_hasPumped && m_intervalSeconds > 0.0f) {
+        const auto elapsed = std::chrono::steady_clock::now() - m_lastPump;
+        if (elapsed < std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                           std::chrono::duration<float>(m_intervalSeconds))) {
+            return; // throttled: startup stages call this freely
+        }
+    }
+    pumpNow();
+}
+
 void Window::setCursorCaptured(bool captured) {
     m_cursorCaptured = captured;
     if (m_window != nullptr) {

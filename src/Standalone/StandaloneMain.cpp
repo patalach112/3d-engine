@@ -464,7 +464,14 @@ public:
             handleMouseCapture();
             engine::CameraSystem::update(m_scene, m_input, deltaSeconds);
         };
-        callbacks.render = [this](double) { return m_renderSystem.render(m_scene); };
+        callbacks.render = [this](double interpolationAlpha) {
+            // Fractional-alpha capsule interpolation (see
+            // PlayerSystem::syncCameraInterpolated): without it the
+            // first-person view judders at the fixed-step rate
+            // whenever the render rate outruns it.
+            engine::PlayerSystem::syncCameraInterpolated(m_scene, static_cast<float>(interpolationAlpha));
+            return m_renderSystem.render(m_scene);
+        };
 
         m_gameLoop.run(callbacks);
         m_context.waitIdle();

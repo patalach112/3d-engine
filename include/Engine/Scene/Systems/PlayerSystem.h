@@ -93,6 +93,15 @@ public:
     // Call after physics (and from the variable update so the camera tracks
     // the latest fixed-step result even between physics steps).
     static bool syncCamera(Scene& scene, float eyeHeight = kEyeHeight);
+
+    // Fixed-timestep render interpolation: like syncCamera, but the
+    // capsule centre is blended between the previous and current
+    // fixed steps by alpha in [0, 1] (the GameLoop's fractional
+    // leftover). Hosts call this from their render callback with
+    // the loop's interpolation alpha so the view stays smooth at
+    // render rates far above the fixed rate. Falls back to
+    // syncCamera for players without a character controller.
+    static bool syncCameraInterpolated(Scene& scene, float alpha, float eyeHeight = kEyeHeight);
 };
 
 } // namespace engine

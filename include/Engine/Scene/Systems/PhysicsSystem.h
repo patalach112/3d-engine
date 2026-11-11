@@ -89,6 +89,13 @@ private:
         TransformComponent* transform = nullptr;
         RigidBodyComponent* body = nullptr;
         ColliderComponent* collider = nullptr;
+        // Character-driven bodies (CharacterControllerComponent):
+        // PlayerSystem's capsule sweep authors their transform and
+        // velocity; the solver treats them as immovable (never
+        // integrates, never corrects) so no solver feedback loop
+        // can ever launch the character. Contacts still generate
+        // and still push OTHER bodies (cube pushback).
+        bool characterDriven = false;
     };
 
     struct BodyGeometry {

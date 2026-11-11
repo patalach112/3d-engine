@@ -2,6 +2,8 @@
 #define GLM_ENABLE_EXPERIMENTAL
 #endif
 #include "Scene/Systems/PhysicsSystem.h"
+
+#include "Physics/MovementSystem.h"
 #include "Scene/Systems/TransformSystem.h"
 
 #include "Core/Jobs/JobSystem.h"
@@ -429,6 +431,13 @@ void PhysicsSystem::snapshotBodies(Scene& scene) {
         ref.transform = &view.get<TransformComponent>(entity);
         ref.body = &view.get<RigidBodyComponent>(entity);
         ref.collider = &view.get<ColliderComponent>(entity);
+        // Character-driven bodies (CharacterControllerComponent):
+        // PlayerSystem's capsule sweep authors their transform and
+        // velocity; the solver treats them as immovable (never
+        // integrates, never corrects) so no solver feedback loop
+        // can ever launch the character. Contacts still generate
+        // and still push OTHER bodies (cube pushback).
+        ref.characterDriven = scene.registry().all_of<CharacterControllerComponent>(entity);
         initializeOrientationAndInertia(*ref.transform, *ref.body, *ref.collider);
         m_bodies.push_back(ref);
     }
@@ -604,6 +613,17 @@ void PhysicsSystem::integrate(double fixedDeltaSeconds, const PhysicsSettings& s
             if (!body.dynamic()) {
                 body.inverseMass = 0.0f;
                 body.acceleration = glm::vec3{0.0f};
+                consumeForces(body);
+                continue;
+            }
+            if (ref.characterDriven) {
+                // Controller-authored: the capsule sweep in
+                // PlayerSystem already produced this step's
+                // position and velocity. Never integrate it, never
+                // apply gravity/torque, never sleep it — and via
+                // solverInverseMass the solver cannot correct it
+                // either. Penetration feedback (the "launched out
+                // of the map" bug class) has no path to this body.
                 consumeForces(body);
                 continue;
             }
@@ -1876,6 +1896,14 @@ float PhysicsSystem::inverseMass(uint32_t bodyIndex) const {
 }
 
 float PhysicsSystem::solverInverseMass(uint32_t bodyIndex) const {
+    if (m_bodies[bodyIndex].characterDriven) {
+        // Character-driven bodies are kinematic to the solver:
+        // velocity and position corrections land entirely on the
+        // OTHER body (a pushed cube still gets pushed), and the
+        // character can never be displaced — let alone launched —
+        // by contact resolution.
+        return 0.0f;
+    }
     const RigidBodyComponent& body = *m_bodies[bodyIndex].body;
     if (body.sleeping) {
         return 0.0f; // asleep: immovable until the wake pass says otherwise

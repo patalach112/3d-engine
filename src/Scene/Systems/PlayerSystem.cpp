@@ -9,6 +9,7 @@
 #include <limits>
 #include <vector>
 #include <glm/geometric.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/trigonometric.hpp>
 
 namespace engine {
@@ -275,8 +276,12 @@ bool PlayerSystem::driveCharacter(Scene& scene, const InputCmd& cmd, double delt
 
     // Handshake, part 1: PhysicsSystem resolved the capsule last
     // step — its transform is the positional truth this tick
-    // resumes from. Groundedness is NOT read from it (below).
+    // resumes from. Groundedness is NOT read from it (below). The
+    // same position seeds render interpolation: hosts blend from
+    // here to the post-step transform with the frame's alpha.
     controller.state.position = transform.position;
+    controller.interpolationFrom = transform.position;
+    controller.interpolationValid = true;
 
     // ------------------------------------------------------------------
     // Ground probe: vertical shapecast (ray fan) from the capsule
@@ -328,49 +333,47 @@ bool PlayerSystem::driveCharacter(Scene& scene, const InputCmd& cmd, double delt
                                                   : -std::numeric_limits<float>::max();
     InputCmd sequenced = cmd;
     sequenced.cmdNumber = ++controller.cmdCounter;
+    // The sweep below owns this tick's integration: capture the
+    // pre-move position so the capsule trace starts from where the
+    // character actually is (playerMove's own position integration
+    // serves the network simulations, where no transform exists;
+    // here its velocity is what we consume).
+    glm::vec3 sweepOrigin = controller.state.position;
     playerMove(sequenced, controller.state, effective, dt);
 
     // ------------------------------------------------------------------
-    // Wall clipping & step-up. Two horizontal probes along the
-    // velocity — one just above the capsule bottom (low obstacles a
-    // centre-height ray would sail over) and one at capsule centre
-    // (full-height walls) — find the closest steep (non-walkable)
-    // plane in reach. The velocity is then clipped PURELY
-    // horizontally against it (PM_ClipVelocity in the XZ plane:
-    // vy is never touched), so when PhysicsSystem integrates, there
-    // is no wall penetration for its positional solver to resolve —
-    // and therefore no mechanism left that could displace the
-    // character vertically. What remains is exact wall sliding.
-    // The single exception: grounded movement into an obstacle no
-    // taller than maxStepHeight steps up onto it (probe straight
-    // down ahead, walkable surface within the step limit) instead
-    // of clipping. Step-up never applies while airborne.
+    // Step-up trigger. Two horizontal probes along the velocity —
+    // one just above the capsule bottom (low obstacles a centre-
+    // height ray would sail over) and one at capsule centre — look
+    // for a steep plane in reach. When grounded movement runs into
+    // an obstacle no taller than maxStepHeight, the character
+    // steps up onto it (probe straight down ahead, walkable
+    // surface within the step limit) instead of being stopped by
+    // the sweep below. Step-up never applies while airborne, and
+    // it is the ONLY vertical assistance: everything else that
+    // blocks the capsule is handled by the sweep's clipping.
     // ------------------------------------------------------------------
-    glm::vec3& velocity = controller.state.velocity;
-    const glm::vec3 horizontal{velocity.x, 0.0f, velocity.z};
-    const float horizontalSpeed = glm::length(horizontal);
-    if (horizontalSpeed > 1e-6f) {
-        const glm::vec3 dir = horizontal / horizontalSpeed;
-        const float reach = capsuleRadius + horizontalSpeed * dt + controller.skinWidth;
-        const glm::vec3 probeOrigins[2] = {
-            controller.state.position + glm::vec3{0.0f, -bottomOffset + 0.02f, 0.0f}, // feet
-            controller.state.position,                                                 // centre
-        };
-        RaycastHit wallHit;
-        bool wallFound = false;
-        for (const glm::vec3& origin : probeOrigins) {
-            RaycastHit candidate;
-            if (castFiltered(scene, Ray{origin, dir}, reach, layerMask, self, candidate) &&
-                candidate.distance > 1e-4f &&
-                !isWalkableNormal(candidate.normal, controller.maxSlopeAngleDegrees) &&
-                (!wallFound || candidate.distance < wallHit.distance)) {
-                wallHit = candidate;
-                wallFound = true;
+    {
+        const glm::vec3 horizontal{controller.state.velocity.x, 0.0f, controller.state.velocity.z};
+        const float horizontalSpeed = glm::length(horizontal);
+        if (horizontalSpeed > 1e-6f && controller.state.grounded) {
+            const glm::vec3 dir = horizontal / horizontalSpeed;
+            const float reach = capsuleRadius + horizontalSpeed * dt + controller.skinWidth;
+            const glm::vec3 probeOrigins[2] = {
+                controller.state.position + glm::vec3{0.0f, -bottomOffset + 0.02f, 0.0f}, // feet
+                controller.state.position,                                                 // centre
+            };
+            bool wallFound = false;
+            for (const glm::vec3& origin : probeOrigins) {
+                RaycastHit candidate;
+                if (castFiltered(scene, Ray{origin, dir}, reach, layerMask, self, candidate) &&
+                    candidate.distance > 1e-4f &&
+                    !isWalkableNormal(candidate.normal, controller.maxSlopeAngleDegrees)) {
+                    wallFound = true;
+                    break;
+                }
             }
-        }
-        if (wallFound) {
-            bool stepped = false;
-            if (controller.state.grounded) {
+            if (wallFound) {
                 const glm::vec3 ahead = controller.state.position + dir * reach;
                 RaycastHit stepHit;
                 const glm::vec3 stepOrigin{ahead.x, groundPoint.y + controller.maxStepHeight + controller.skinWidth,
@@ -394,19 +397,169 @@ bool PlayerSystem::driveCharacter(Scene& scene, const InputCmd& cmd, double delt
                     transform.position = controller.state.position;
                     controller.groundY = stepHit.position.y;
                     controller.groundNormal = stepHit.normal;
-                    stepped = true;
+                    // The step is part of this tick's path: the
+                    // sweep resumes from the stepped position (it
+                    // still collision-checks the remaining motion).
+                    sweepOrigin = controller.state.position;
                 }
-            }
-            if (!stepped) {
-                velocity = clipVelocityHorizontal(velocity, wallHit.normal, 1.0f);
             }
         }
     }
 
-    // Handshake, part 2: the (clipped) velocity is the rigid body's
-    // velocity; the controller keeps owning gravity and sleep so
-    // PhysicsSystem never double-integrates either, and its solver
-    // only integrates the capsule and resolves real contacts.
+    // ------------------------------------------------------------------
+    // Capsule-trace sweep (CCD): this tick's actual motion. Nearby
+    // box/plane colliders become trace geometry; any starting
+    // penetration is resolved ONCE along the shallowest exit
+    // (bounded, so a bad spawn can never accumulate solver energy);
+    // then the capsule bumps and slides: sweep along the velocity,
+    // stop exactly at t_hit, PM_ClipVelocity against the impact
+    // plane (full clip on floors/ceilings, purely horizontal on
+    // walls so sliding can never manufacture lift), re-sweep the
+    // remaining fraction. The rigid-body solver is out of this
+    // loop entirely (PhysicsSystem treats the body as immovable),
+    // so there is no penetration feedback left to launch anyone.
+    // ------------------------------------------------------------------
+    {
+        struct TracePlane {
+            glm::vec3 normal{0.0f, 1.0f, 0.0f};
+            float offset = 0.0f;
+        };
+        std::vector<TraceBox> boxes;
+        std::vector<TracePlane> planes;
+        // Gather around the path the sweep will actually travel:
+        // sweepOrigin -> sweepOrigin + velocity*dt. (controller.
+        // state.position has already been integrated forward by
+        // playerMove; centring the query there would reject the
+        // very walls the sweep is about to hit.)
+        const glm::vec3 sweepStart = sweepOrigin;
+        const glm::vec3 sweepEnd = sweepStart + controller.state.velocity * dt;
+        const float pathRadius = capsuleRadius + glm::length(controller.state.velocity) * dt + controller.skinWidth;
+        auto& registry = scene.registry();
+        for (const entt::entity entity : registry.view<TransformComponent, ColliderComponent>()) {
+            if (entity == self) {
+                continue;
+            }
+            const ColliderComponent& other = registry.get<ColliderComponent>(entity);
+            if (other.isTrigger || !shouldCollide(collider, other)) {
+                continue;
+            }
+            const TransformComponent& otherTransform = registry.get<TransformComponent>(entity);
+            if (other.type == ColliderComponent::Type::Plane) {
+                const glm::vec3 normal = glm::length(other.planeNormal) > 1e-8f
+                                             ? glm::normalize(other.planeNormal)
+                                             : glm::vec3{0.0f, 1.0f, 0.0f};
+                planes.push_back(TracePlane{normal, other.planeOffset});
+                continue;
+            }
+            if (other.type != ColliderComponent::Type::Box && other.type != ColliderComponent::Type::Obb) {
+                continue; // spheres/capsules/hulls: solver reports their contacts; the trace world is boxes+planes
+            }
+            // Cheap reject: candidate bounding sphere vs the swept path.
+            const float candidateRadius = glm::length(glm::abs(other.halfExtents * otherTransform.scale)) +
+                                          glm::length(other.centerOffset * otherTransform.scale);
+            const glm::vec3 pathMid = (sweepStart + sweepEnd) * 0.5f;
+            if (glm::length(otherTransform.position - pathMid) > candidateRadius + pathRadius) {
+                continue;
+            }
+            TransformComponent oriented = otherTransform;
+            if (!oriented.useQuaternionOrientation) {
+                oriented.syncOrientationFromEuler();
+            }
+            if (const RigidBodyComponent* otherBody = registry.try_get<RigidBodyComponent>(entity)) {
+                if (otherBody->orientationInitialized) {
+                    oriented.orientation = otherBody->orientation;
+                }
+            }
+            TraceBox box;
+            box.axes = glm::mat3_cast(oriented.orientation);
+            box.center = otherTransform.position + box.axes * (other.centerOffset * otherTransform.scale);
+            box.halfExtents = glm::abs(other.halfExtents * otherTransform.scale);
+            boxes.push_back(box);
+        }
+
+        glm::vec3 position = sweepOrigin;
+        glm::vec3 velocity = controller.state.velocity;
+
+        // Bounded depenetration: at most two shallowest-exit pushes
+        // per tick, each capped, so overlap from spawns or shoves
+        // resolves monotonically instead of feeding a solver.
+        for (int pass = 0; pass < 2; ++pass) {
+            SweepHit penetration;
+            if (!sweepCapsule(position, glm::vec3{0.0f}, capsuleRadius, segmentHalf, boxes, penetration) ||
+                !penetration.startPenetrated) {
+                break;
+            }
+            position += penetration.penetrationNormal * std::min(penetration.penetrationDepth, 0.5f);
+        }
+
+        // Bump-and-slide (Source TryPlayerMove shape, max 3 bumps).
+        float timeLeft = 1.0f;
+        for (int bump = 0; bump < 3 && timeLeft > 1e-6f; ++bump) {
+            const glm::vec3 displacement = velocity * (dt * timeLeft);
+            const float displacementLength = glm::length(displacement);
+            if (displacementLength <= 1e-8f) {
+                break;
+            }
+            SweepHit hit;
+            const bool boxHit = sweepCapsule(position, displacement, capsuleRadius, segmentHalf, boxes, hit);
+            // Analytic plane sweep, competing for earliest impact.
+            float bestFraction = boxHit ? hit.fraction : 1.0f;
+            glm::vec3 bestNormal = boxHit ? hit.normal : glm::vec3{0.0f, 1.0f, 0.0f};
+            bool haveHit = boxHit;
+            for (const TracePlane& plane : planes) {
+                const float approach = glm::dot(displacement, plane.normal);
+                if (approach >= 0.0f) {
+                    continue;
+                }
+                const glm::vec3 segA = position - glm::vec3{0.0f, segmentHalf, 0.0f};
+                const glm::vec3 segB = position + glm::vec3{0.0f, segmentHalf, 0.0f};
+                const float distance =
+                    std::min(glm::dot(plane.normal, segA), glm::dot(plane.normal, segB)) - plane.offset - capsuleRadius;
+                if (distance < -1e-4f) {
+                    continue; // already through: depenetration's problem, not the sweep's
+                }
+                const float fraction = distance <= 0.0f ? 0.0f : distance / -approach;
+                if (fraction < bestFraction) {
+                    bestFraction = fraction;
+                    bestNormal = plane.normal;
+                    haveHit = true;
+                }
+            }
+            if (!haveHit || bestFraction >= 1.0f) {
+                position += displacement;
+                timeLeft = 0.0f;
+                break;
+            }
+            // Stop exactly at the impact point (the trace's 1 mm
+            // tolerance leaves the capsule resting at the surface),
+            // clip, and re-sweep what is left of the tick.
+            position += displacement * bestFraction;
+            if (isWalkableNormal(bestNormal, controller.maxSlopeAngleDegrees) ||
+                isWalkableNormal(-bestNormal, controller.maxSlopeAngleDegrees)) {
+                velocity = clipVelocity(velocity, bestNormal, 1.0f); // floors & ceilings
+            } else {
+                velocity = clipVelocityHorizontal(velocity, bestNormal, 1.0f); // walls: slide, never lift
+            }
+            timeLeft *= 1.0f - bestFraction;
+            if (glm::length(velocity) <= 1e-6f) {
+                break; // the clip(s) consumed all motion (head-on stop / wedged corner)
+            }
+            // A fraction-0 (resting) hit does NOT end the bump
+            // loop: the clipped velocity no longer approaches, so
+            // the re-sweep applies the tangential remainder. The
+            // 3-bump bound keeps pathological stacks finite.
+        }
+
+        controller.state.position = position;
+        controller.state.velocity = velocity;
+        transform.position = position;
+    }
+
+    // Handshake, part 2: the swept velocity is the rigid body's
+    // velocity (contacts use it to push dynamic bodies); the
+    // controller keeps owning gravity and sleep, and PhysicsSystem
+    // treats the body as immovable — it never integrates or
+    // corrects a character-driven capsule.
     body.velocity = controller.state.velocity;
     body.useGravity = false;
     body.allowSleep = false;
@@ -434,10 +587,28 @@ bool PlayerSystem::updateCharacter(Scene& scene, const Input& input, double delt
         cmd.strafe -= 1.0f;
     }
     cmd.jump = input.isKeyDown(Key::Space);
+    cmd.sprint = input.isKeyDown(Key::LeftShift) || input.isKeyDown(Key::RightShift);
     // Movement yaw convention (0 = -Z) from the camera's facing.
     const glm::vec3 front = parts.player.camera->camera.front();
     cmd.yawDegrees = glm::degrees(std::atan2(-front.x, -front.z));
     return driveCharacter(scene, cmd, deltaSeconds);
+}
+
+bool PlayerSystem::syncCameraInterpolated(Scene& scene, float alpha, float eyeHeight) {
+    const CharacterParts parts = findCharacterPlayer(scene);
+    if (parts.controller == nullptr || parts.player.camera == nullptr || parts.player.transform == nullptr ||
+        !parts.controller->interpolationValid) {
+        return syncCamera(scene, eyeHeight);
+    }
+    // Blend the capsule centre between the last two fixed steps.
+    // alpha 0 = previous step's end, 1 = the live transform; the
+    // GameLoop produces alpha at render rate, so at 1000 fps the
+    // camera glides through ~16 distinct blends per physics step
+    // instead of snapping at 60 Hz.
+    const float t = std::clamp(alpha, 0.0f, 1.0f);
+    const glm::vec3 position = glm::mix(parts.controller->interpolationFrom, parts.player.transform->position, t);
+    parts.player.camera->camera.setPosition(position + glm::vec3{0.0f, eyeHeight, 0.0f});
+    return true;
 }
 
 bool PlayerSystem::syncCamera(Scene& scene, float eyeHeight) {

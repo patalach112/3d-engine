@@ -66,9 +66,16 @@ VulkanContext::VulkanContext(const Window& window) {
     createInstance();
     setupDebugMessenger();
     createSurface(window);
+    // First pump of the process: the window was just created and
+    // device enumeration/selection below can take a moment; keep
+    // the OS from flagging the window as unresponsive (see
+    // WindowStartupPump).
+    window.pollEvents();
     pickPhysicalDevice();
+    window.pollEvents();
     createLogicalDevice();
     createCommandPool();
+    window.pollEvents();
 }
 
 VulkanContext::~VulkanContext() {

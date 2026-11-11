@@ -2,6 +2,8 @@
 #include "Core/Export.h"
 
 #include <cstdint>
+#include <span>
+#include <glm/mat3x3.hpp>
 #include <glm/vec3.hpp>
 
 namespace engine {
@@ -56,6 +58,14 @@ struct MoveSettings {
     float gravity = 20.0f;      // m/s^2
     float jumpSpeed = 6.0f;     // m/s initial vertical velocity
     float groundY = 0.0f;       // ground plane height
+    // Source-style sprint (sv_sprintspeed + aux-power stamina):
+    // while the sprint input is held and the player is moving, the
+    // wish-speed cap rises to sprintSpeed and stamina drains;
+    // exhaustion locks sprint out until stamina recovers past the
+    // resume threshold (25%), so sprint can never be feathered.
+    float sprintSpeed = 6.8f;          // m/s wish cap while sprinting
+    float staminaDrainPerSecond = 0.16f; // ~6 s of sprint from full
+    float staminaRegenPerSecond = 0.12f; // full recharge in ~8 s
 };
 
 // One sequenced movement command. cmdNumber is the reconciliation
@@ -67,6 +77,7 @@ struct InputCmd {
     float forward = 0.0f;        // -1..1 (W/S)
     float strafe = 0.0f;         // -1..1 (D/A)
     bool jump = false;
+    bool sprint = false;         // sprint key held (Shift)
     float yawDegrees = 0.0f;     // facing; the wish direction derives from it
 };
 
@@ -77,6 +88,11 @@ struct PlayerState {
     glm::vec3 position{0.0f};
     glm::vec3 velocity{0.0f};
     bool grounded = true;
+    // Sprint stamina (1 = full). Drained by playerMove while a
+    // sprint is effective, regenerated otherwise; sprintExhausted
+    // is the lockout latch (set at 0, cleared at 25% charge).
+    float stamina = 1.0f;
+    bool sprintExhausted = false;
 };
 
 // The shared movement step (Source PM_Move equivalent for the
@@ -104,6 +120,66 @@ ENGINE_SCENE_API void playerMove(const InputCmd& cmd, PlayerState& state, const 
                                                       float overbounce = 1.0f);
 [[nodiscard]] ENGINE_SCENE_API glm::vec3 clipVelocityHorizontal(const glm::vec3& velocity, const glm::vec3& normal,
                                                                 float overbounce = 1.0f);
+
+// ---------------------------------------------------------------------------
+// Capsule-trace CCD (sweep) primitives: the collision half of the
+// character controller, kept as pure math so hosts and tests can
+// drive it without a scene. The capsule is always upright (its
+// segment runs along world Y through the centre). sweepCapsule
+// advances the capsule centre along `displacement` and reports
+// the EARLIEST impact against a set of world-space boxes: the
+// fraction of the displacement actually travelled, the surface
+// normal and point at impact. Movement stops exactly at the
+// impact point (t_hit) and the caller clips the velocity
+// (PM_ClipVelocity) and re-sweeps the remainder — the Source
+// bump-and-slide loop — so a capsule of any speed can neither
+// tunnel through nor be pushed out of geometry: penetration
+// never occurs, therefore no solver feedback can develop.
+// Conservative advancement over the exact capsule/box distance
+// keeps the trace honest to ~1 mm. A capsule already penetrating
+// a box reports startPenetrated with the shallowest exit (normal
+// + depth) so the caller can depenetrate ONCE, bounded — never
+// through an accumulating solver.
+// ---------------------------------------------------------------------------
+struct TraceBox {
+    glm::vec3 center{0.0f};
+    glm::vec3 halfExtents{0.5f};
+    glm::mat3 axes{1.0f}; // box local axes in world space (columns)
+};
+
+struct SweepHit {
+    float fraction = 1.0f;              // displacement fraction travelled before impact
+    glm::vec3 normal{0.0f, 1.0f, 0.0f}; // impact surface normal (world)
+    glm::vec3 point{0.0f};              // impact point on the box surface (world)
+    int32_t boxIndex = -1;              // index into the swept box span
+    bool startPenetrated = false;       // capsule already overlapped a box at t=0
+    float penetrationDepth = 0.0f;      // shallowest-exit depth when startPenetrated
+    glm::vec3 penetrationNormal{0.0f, 1.0f, 0.0f}; // shallowest-exit direction
+};
+
+// Signed clearance from a capsule (segment segmentA..segmentB
+// swept by radius) to an oriented box: positive when separated,
+// 0 when the capsule surface touches, negative (down to -radius)
+// when the capsule surface overlaps the box. Optionally reports
+// the closest points on the capsule segment and on the box.
+[[nodiscard]] ENGINE_SCENE_API float capsuleBoxDistance(const glm::vec3& segmentA, const glm::vec3& segmentB,
+                                                        float radius, const glm::vec3& boxCenter,
+                                                        const glm::mat3& boxAxes, const glm::vec3& boxHalfExtents,
+                                                        glm::vec3* outSegmentPoint = nullptr,
+                                                        glm::vec3* outBoxPoint = nullptr);
+
+// Sweeps an upright capsule (centre startCenter, segment
+// half-length halfHeight, radius) along displacement against
+// boxes. Returns true and fills outHit on the earliest impact
+// with fraction < 1 (a resting/tangent contact the velocity does
+// not approach is NOT an impact: sliding along a floor at exact
+// contact distance must not stop the sweep; "approach" is tested
+// with a 1e-6 m deadband because closest-point normals carry
+// float tilt of that order). Penetrating starts return true
+// immediately with fraction 0 + startPenetrated.
+[[nodiscard]] ENGINE_SCENE_API bool sweepCapsule(const glm::vec3& startCenter, const glm::vec3& displacement,
+                                                 float radius, float halfHeight, std::span<const TraceBox> boxes,
+                                                 SweepHit& outHit);
 
 // Walkable-ground test for a surface normal: true when the slope is
 // at most maxSlopeAngleDegrees from vertical (45 deg => normal.y
@@ -177,6 +253,14 @@ struct CharacterControllerComponent {
     // for tests/tools — groundedness itself lives in state.grounded).
     glm::vec3 groundNormal{0.0f, 1.0f, 0.0f};
     float groundY = 0.0f; // world Y of the last probed surface point
+    // Fixed-step render interpolation: the capsule centre at the
+    // START of the most recent driven tick (the end of the one
+    // before it). Hosts blend interpolationFrom -> live transform
+    // with the loop's fractional alpha, so rendering at any rate
+    // (incl. 1000 fps uncapped) glides between fixed steps instead
+    // of juddering at the step rate. See syncCameraInterpolated.
+    glm::vec3 interpolationFrom{0.0f};
+    bool interpolationValid = false;
     std::uint32_t cmdCounter = 0; // local cmd_number sequence
     bool enabled = true;
 };

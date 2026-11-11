@@ -139,6 +139,28 @@ public:
     static constexpr float kTextScale = 2.0f; // global UI text scale (matches the script editor's readability)
     static constexpr float kSliderLabelFraction = 0.38f;
 
+    // --- Dynamic resolution scaling --------------------------------------
+    // Hosts feed EditorLayout::uiScale (a pure function of the live
+    // framebuffer size) here every frame, so widget metrics track the
+    // SAME scale the layout applies to panel rectangles. Previously
+    // the rects scaled with the window while rows, padding, popups
+    // and text stayed at reference size, so panel contents overflowed
+    // or underfilled (visually: overlapping UI) on any resize or DPI
+    // change. All internal layout math consumes the scaled accessors
+    // below; the constexpr reference values above remain for
+    // scale-free predictions in tests. setUiScale clamps to a sane
+    // band so a degenerate framebuffer can never zero the UI out.
+    void setUiScale(float scale);
+    [[nodiscard]] float uiScale() const { return m_uiScale; }
+    [[nodiscard]] float rowHeight() const { return kRowHeight * m_uiScale; }
+    [[nodiscard]] float rowSpacing() const { return kRowSpacing * m_uiScale; }
+    [[nodiscard]] float panelPadding() const { return kPanelPadding * m_uiScale; }
+    [[nodiscard]] float textScale() const { return kTextScale * m_uiScale; }
+    [[nodiscard]] float popupWidth() const { return kPopupWidth * m_uiScale; }
+    [[nodiscard]] float popupItemHeight() const { return kPopupItemHeight * m_uiScale; }
+    [[nodiscard]] float popupPadding() const { return kPopupPadding * m_uiScale; }
+    [[nodiscard]] float dragThresholdPx() const { return kDragThresholdPx * m_uiScale; }
+
     // Frame lifecycle: beginFrame snapshots input (computing
     // press/release edges), endFrame finalizes focus (an unclaimed
     // press clears it). Widgets may only be called in between.
@@ -280,6 +302,7 @@ private:
 
     UIBatch* m_batch = nullptr;
     UITheme m_theme;
+    float m_uiScale = 1.0f; // dynamic resolution scale (see setUiScale)
     UIInput m_input{};
     float m_prevMouseX = -10000.0f; // last frame's pointer x (fine slider drags)
     UIWidgetId m_textEditId = kUINoWidget; // textField currently being edited

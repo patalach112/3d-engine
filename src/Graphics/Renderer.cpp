@@ -241,20 +241,32 @@ Renderer::Renderer(VulkanContext& context, Window& window, Swapchain& swapchain,
     : m_context(context), m_window(window), m_swapchain(swapchain), m_pipeline(pipeline),
       m_hud(context, swapchain), m_ui(context, swapchain),
       m_framesInFlight(std::clamp(maxFramesInFlight, 1u, static_cast<uint32_t>(kMaxFramesInFlight))) {
+    // Startup event pumping: this constructor (render passes,
+    // environment resources, pipeline creation with shader
+    // compilation) is the longest blocking stretch of engine
+    // initialization. Poll OS events between stages so the freshly
+    // created window never sits long enough to be painted white /
+    // marked "Not Responding" by the OS.
+    m_window.pollEvents();
     createVertexBuffer();
     createIndexBuffer();
     createShadowResources();
+    m_window.pollEvents();
     createSceneRenderPass();
     m_pipeline.setSceneRenderPass(m_sceneRenderPass);
     m_pipeline.createSkyboxPipeline(m_sceneRenderPass);
+    m_window.pollEvents();
     createHdrTargets();
     createEnvironmentResources();
+    m_window.pollEvents();
     createUniformBuffers();
     createDescriptorPool();
     createDescriptorSets();
     createPostResources();
+    m_window.pollEvents();
     createCommandBuffers();
     createSyncObjects();
+    m_window.pollEvents();
 }
 
 Renderer::~Renderer() {

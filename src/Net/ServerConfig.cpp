@@ -147,6 +147,13 @@ void ServerSettings::clampToValid() {
     move.airAccelerate = clampMove(move.airAccelerate, defaults.airAccelerate);
     move.gravity = clampMove(move.gravity, defaults.gravity);
     move.jumpSpeed = clampMove(move.jumpSpeed, defaults.jumpSpeed);
+    move.sprintSpeed = clampMove(move.sprintSpeed, defaults.sprintSpeed);
+    move.staminaDrainPerSecond = std::isfinite(move.staminaDrainPerSecond) && move.staminaDrainPerSecond >= 0.0f
+                                     ? move.staminaDrainPerSecond
+                                     : defaults.staminaDrainPerSecond;
+    move.staminaRegenPerSecond = std::isfinite(move.staminaRegenPerSecond) && move.staminaRegenPerSecond >= 0.0f
+                                     ? move.staminaRegenPerSecond
+                                     : defaults.staminaRegenPerSecond;
     if (!std::isfinite(move.groundY))
         move.groundY = defaults.groundY;
 }
@@ -175,7 +182,9 @@ bool ServerSettings::operator==(const ServerSettings& other) const {
            move.friction == other.move.friction && move.stopSpeed == other.move.stopSpeed &&
            move.accelerate == other.move.accelerate && move.airAccelerate == other.move.airAccelerate &&
            move.gravity == other.move.gravity && move.jumpSpeed == other.move.jumpSpeed &&
-           move.groundY == other.move.groundY;
+           move.groundY == other.move.groundY && move.sprintSpeed == other.move.sprintSpeed &&
+           move.staminaDrainPerSecond == other.move.staminaDrainPerSecond &&
+           move.staminaRegenPerSecond == other.move.staminaRegenPerSecond;
 }
 
 // --- server.cfg text ------------------------------------------------------------
@@ -238,6 +247,12 @@ ServerConfigParseResult parseServerConfig(std::string_view text) {
                 settings.port = static_cast<std::uint16_t>(intValue);
             else
                 result.warnings.push_back("line " + std::to_string(lineNumber) + ": bad port");
+        } else if (key == "move_sprint_speed" && parseFloat(value, floatValue)) {
+            settings.move.sprintSpeed = floatValue;
+        } else if (key == "move_stamina_drain" && parseFloat(value, floatValue)) {
+            settings.move.staminaDrainPerSecond = floatValue;
+        } else if (key == "move_stamina_regen" && parseFloat(value, floatValue)) {
+            settings.move.staminaRegenPerSecond = floatValue;
         } else if (key == "move_max_speed" && parseFloat(value, floatValue)) {
             settings.move.maxSpeed = floatValue;
         } else if (key == "move_friction" && parseFloat(value, floatValue)) {
@@ -284,6 +299,9 @@ std::string generateServerConfig(const ServerSettings& settingsIn) {
     out += "move_gravity " + formatFloat(settings.move.gravity) + "\n";
     out += "move_jump_speed " + formatFloat(settings.move.jumpSpeed) + "\n";
     out += "move_ground_y " + formatFloat(settings.move.groundY) + "\n";
+    out += "move_sprint_speed " + formatFloat(settings.move.sprintSpeed) + "\n";
+    out += "move_stamina_drain " + formatFloat(settings.move.staminaDrainPerSecond) + "\n";
+    out += "move_stamina_regen " + formatFloat(settings.move.staminaRegenPerSecond) + "\n";
     if (!settings.rules.empty()) {
         out += "\n// Custom server rules\n";
         for (const auto& [key, value] : settings.rules)
@@ -323,6 +341,9 @@ std::string ServerWorkspace::toJson() const {
     moveJson.set("gravity", json::Value::number(settings.move.gravity));
     moveJson.set("jumpSpeed", json::Value::number(settings.move.jumpSpeed));
     moveJson.set("groundY", json::Value::number(settings.move.groundY));
+    moveJson.set("sprintSpeed", json::Value::number(settings.move.sprintSpeed));
+    moveJson.set("staminaDrainPerSecond", json::Value::number(settings.move.staminaDrainPerSecond));
+    moveJson.set("staminaRegenPerSecond", json::Value::number(settings.move.staminaRegenPerSecond));
     settingsJson.set("move", std::move(moveJson));
     json::Value rulesJson = json::Value::array();
     for (const auto& [key, value] : settings.rules) {
@@ -379,6 +400,12 @@ bool ServerWorkspace::fromJson(std::string_view text, std::string* error) {
                 s.move.gravity = static_cast<float>(v->asNumber(s.move.gravity));
             if (const json::Value* v = moveJson->find("jumpSpeed"))
                 s.move.jumpSpeed = static_cast<float>(v->asNumber(s.move.jumpSpeed));
+            if (const json::Value* v = moveJson->find("sprintSpeed"))
+                s.move.sprintSpeed = static_cast<float>(v->asNumber(s.move.sprintSpeed));
+            if (const json::Value* v = moveJson->find("staminaDrainPerSecond"))
+                s.move.staminaDrainPerSecond = static_cast<float>(v->asNumber(s.move.staminaDrainPerSecond));
+            if (const json::Value* v = moveJson->find("staminaRegenPerSecond"))
+                s.move.staminaRegenPerSecond = static_cast<float>(v->asNumber(s.move.staminaRegenPerSecond));
             if (const json::Value* v = moveJson->find("groundY"))
                 s.move.groundY = static_cast<float>(v->asNumber(s.move.groundY));
         }

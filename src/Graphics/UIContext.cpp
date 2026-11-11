@@ -3,6 +3,7 @@
 #include <glm/geometric.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -34,6 +35,17 @@ float UIContext::clampScrollOffset(float offset, float contentHeight, float view
     return std::clamp(offset, 0.0f, std::max(0.0f, contentHeight - std::max(0.0f, viewHeight)));
 }
 
+void UIContext::setUiScale(float scale) {
+    // Hosts pass EditorLayout::uiScale (already clamped to
+    // [0.75, 1.35]); clamp again here so a degenerate or non-finite
+    // value from any caller can never collapse or explode the
+    // widgets: the UI degrades to reference size instead.
+    if (!std::isfinite(scale)) {
+        scale = 1.0f;
+    }
+    m_uiScale = std::clamp(scale, 0.5f, 3.0f);
+}
+
 void UIContext::beginFrame(const UIInput& input, UIBatch& batch) {
     m_batch = &batch;
     m_prevMouseX = m_input.mouseX; // yesterday's pointer, for relative (fine) drags
@@ -50,7 +62,7 @@ void UIContext::beginFrame(const UIInput& input, UIBatch& batch) {
     // a left press outside the popup closes it without the widgets
     // underneath ever claiming the click.
     if (m_popup.open) {
-        const UIRect popupRect{m_popup.x, m_popup.y, kPopupWidth, m_popup.height};
+        const UIRect popupRect{m_popup.x, m_popup.y, popupWidth(), m_popup.height};
         if (input.escapePressed) {
             m_popup.open = false;
         } else if (m_pressedEdge && !popupRect.contains(input.mouseX, input.mouseY)) {
@@ -63,7 +75,7 @@ void UIContext::beginFrame(const UIInput& input, UIBatch& batch) {
     // the pointer travels past the threshold while held; Esc
     // cancels a live drag (it will release into nothing).
     if (m_dragPhase == DragPhase::Pending && input.mouseDown &&
-        glm::distance(glm::vec2{input.mouseX, input.mouseY}, m_dragStart) >= kDragThresholdPx) {
+        glm::distance(glm::vec2{input.mouseX, input.mouseY}, m_dragStart) >= dragThresholdPx()) {
         m_dragPhase = DragPhase::Dragging;
     }
     if (m_dragPhase == DragPhase::Dragging && input.escapePressed) {
@@ -74,7 +86,7 @@ void UIContext::beginFrame(const UIInput& input, UIBatch& batch) {
     Panel root;
     root.rect = UIRect{0.0f, 0.0f, static_cast<float>(batch.viewportWidth()),
                        static_cast<float>(batch.viewportHeight())};
-    root.cursorY = kPanelPadding;
+    root.cursorY = panelPadding();
     root.seed = kRootSeed;
     m_panels.push_back(root);
 }
@@ -138,7 +150,7 @@ void UIContext::beginPanel(std::string_view id, const UIRect& rect, const UIRect
 
     Panel panel;
     panel.rect = rect;
-    panel.cursorY = rect.y + kPanelPadding;
+    panel.cursorY = rect.y + panelPadding();
     panel.seed = hashId(m_panels.empty() ? kRootSeed : m_panels.back().seed, id);
     m_panels.push_back(panel);
 }
@@ -160,7 +172,7 @@ void UIContext::label(const UIRect& rect, std::string_view text) {
     if (m_batch == nullptr) {
         return;
     }
-    m_batch->drawText(text, rect.x + 2.0f, textTop(rect), kTextScale, m_theme.text);
+    m_batch->drawText(text, rect.x + 2.0f, textTop(rect), textScale(), m_theme.text);
 }
 
 UIRect UIContext::nextRow() {
@@ -168,9 +180,9 @@ UIRect UIContext::nextRow() {
         return UIRect{};
     }
     Panel& panel = m_panels.back();
-    const UIRect row{panel.rect.x + kPanelPadding, panel.cursorY,
-                     std::max(0.0f, panel.rect.width - 2.0f * kPanelPadding), kRowHeight};
-    panel.cursorY += kRowHeight + kRowSpacing;
+    const UIRect row{panel.rect.x + panelPadding(), panel.cursorY,
+                     std::max(0.0f, panel.rect.width - 2.0f * panelPadding()), rowHeight()};
+    panel.cursorY += rowHeight() + rowSpacing();
     return row;
 }
 
@@ -189,9 +201,9 @@ float UIContext::textTop(const UIRect& rect) const {
     // Centre the font's real line box (ascent-to-descent from the
     // TrueType metrics) in the row; the legacy constant is only the
     // no-font fallback.
-    float lineHeight = kGlyphBoxHeight * kTextScale;
+    float lineHeight = kGlyphBoxHeight * textScale();
     if (m_batch != nullptr && m_batch->font() != nullptr) {
-        lineHeight = m_batch->font()->lineHeight(fontPixelSizeForScale(kTextScale));
+        lineHeight = m_batch->font()->lineHeight(fontPixelSizeForScale(textScale()));
     }
     return rect.y + 0.5f * (rect.height - lineHeight);
 }
@@ -235,9 +247,9 @@ bool UIContext::button(const UIRect& rect, std::string_view label, const UIRectS
         effective.borderColor = m_theme.panelBorder;
     }
     m_batch->drawRoundedRect(rect.x, rect.y, rect.width, rect.height, effective, fill);
-    const float textWidth = m_batch->measureText(label, kTextScale);
+    const float textWidth = m_batch->measureText(label, textScale());
     m_batch->drawText(label, rect.x + std::max(0.0f, 0.5f * (rect.width - textWidth)), textTop(rect),
-                      kTextScale, m_theme.text);
+                      textScale(), m_theme.text);
     return clicked;
 }
 
@@ -315,7 +327,7 @@ bool UIContext::sliderRow(const UIRect& rect, std::string_view label, UIWidgetId
     if (value != nullptr && min < max) {
         fraction = std::clamp((*value - min) / (max - min), 0.0f, 1.0f);
     }
-    m_batch->drawText(label, rect.x + 2.0f, textTop(rect), kTextScale, m_theme.text);
+    m_batch->drawText(label, rect.x + 2.0f, textTop(rect), textScale(), m_theme.text);
     m_batch->drawRoundedRect(track.x, track.y, track.width, track.height, UIRectStyle{3.0f, 0.0f, {}},
                              m_theme.trackFill);
     if (fraction > 0.0f) {
@@ -334,8 +346,8 @@ bool UIContext::sliderRow(const UIRect& rect, std::string_view label, UIWidgetId
     if (value != nullptr) {
         char valueText[32];
         std::snprintf(valueText, sizeof(valueText), "%.2f", static_cast<double>(*value));
-        const float valueWidth = m_batch->measureText(valueText, kTextScale);
-        m_batch->drawText(valueText, rect.x + rect.width - valueWidth - 6.0f, textTop(rect), kTextScale,
+        const float valueWidth = m_batch->measureText(valueText, textScale());
+        m_batch->drawText(valueText, rect.x + rect.width - valueWidth - 6.0f, textTop(rect), textScale(),
                           m_theme.text);
     }
     return changed;
@@ -380,7 +392,7 @@ bool UIContext::checkbox(const UIRect& rect, std::string_view label, bool* value
         m_batch->drawRoundedRect(box.x + inset, box.y + inset, box.width - 2.0f * inset,
                                  box.height - 2.0f * inset, UIRectStyle{2.0f, 0.0f, {}}, m_theme.checkFill);
     }
-    m_batch->drawText(label, rect.x + boxSize + 8.0f, textTop(rect), kTextScale, m_theme.text);
+    m_batch->drawText(label, rect.x + boxSize + 8.0f, textTop(rect), textScale(), m_theme.text);
     return toggled;
 }
 
@@ -465,9 +477,9 @@ bool UIContext::textField(const UIRect& rect, std::string_view label, std::strin
                                focused ? m_theme.focusBorder : glm::vec4{1.0f, 1.0f, 1.0f, 0.18f}};
     m_batch->drawRoundedRect(rect.x, rect.y, rect.width, rect.height, boxStyle, m_theme.trackFill);
     m_batch->pushScissor(rect.x, rect.y, rect.width, rect.height);
-    m_batch->drawText(*text, rect.x + 6.0f, textTop(rect), kTextScale, m_theme.text);
+    m_batch->drawText(*text, rect.x + 6.0f, textTop(rect), textScale(), m_theme.text);
     if (focused) { // steady caret just past the last character
-        const float caretX = rect.x + 6.0f + m_batch->measureText(*text, kTextScale) + 1.0f;
+        const float caretX = rect.x + 6.0f + m_batch->measureText(*text, textScale()) + 1.0f;
         m_batch->drawRect(caretX, rect.y + 5.0f, 1.5f, rect.height - 10.0f, m_theme.focusBorder);
     }
     m_batch->popScissor();
@@ -482,7 +494,7 @@ void UIContext::openPopup(std::string_view id, float x, float y) {
     m_popup.id = hashId(kRootSeed, id);
     m_popup.x = x;
     m_popup.y = y;
-    m_popup.height = 2.0f * kPopupPadding + kPopupItemHeight; // refined by endPopup each render
+    m_popup.height = 2.0f * popupPadding() + popupItemHeight(); // refined by endPopup each render
     m_popup.open = true;
 }
 
@@ -499,10 +511,10 @@ bool UIContext::beginPopup(std::string_view id) {
         return false;
     }
     m_popupRendering = true;
-    m_popup.cursorY = m_popup.y + kPopupPadding;
+    m_popup.cursorY = m_popup.y + popupPadding();
     const UIRectStyle style{6.0f, 1.0f, m_theme.panelBorder};
-    m_batch->drawRoundedRect(m_popup.x, m_popup.y, kPopupWidth, m_popup.height, style, m_theme.panelFill);
-    m_batch->pushScissor(m_popup.x, m_popup.y, kPopupWidth, m_popup.height);
+    m_batch->drawRoundedRect(m_popup.x, m_popup.y, popupWidth(), m_popup.height, style, m_theme.panelFill);
+    m_batch->pushScissor(m_popup.x, m_popup.y, popupWidth(), m_popup.height);
     return true;
 }
 
@@ -510,16 +522,16 @@ bool UIContext::menuItem(std::string_view label, bool enabled) {
     if (m_batch == nullptr || !m_popupRendering) {
         return false;
     }
-    const UIRect rect{m_popup.x + kPopupPadding, m_popup.cursorY, kPopupWidth - 2.0f * kPopupPadding,
-                      kPopupItemHeight};
-    m_popup.cursorY += kPopupItemHeight;
+    const UIRect rect{m_popup.x + popupPadding(), m_popup.cursorY, popupWidth() - 2.0f * popupPadding(),
+                      popupItemHeight()};
+    m_popup.cursorY += popupItemHeight();
     const bool hit = enabled && hitTest(rect);
     if (hit) {
         m_batch->drawRoundedRect(rect.x, rect.y, rect.width, rect.height, UIRectStyle{4.0f, 0.0f, {}},
                                  m_theme.buttonHovered);
     }
     const glm::vec4 textColor = enabled ? m_theme.text : glm::vec4{0.45f, 0.48f, 0.55f, 1.0f};
-    m_batch->drawText(label, rect.x + 6.0f, textTop(rect), kTextScale, textColor);
+    m_batch->drawText(label, rect.x + 6.0f, textTop(rect), textScale(), textColor);
     if (hit && m_pressedEdge && !m_pressConsumed) {
         closePopup(); // selecting an item always dismisses the menu
         return true;
@@ -531,7 +543,7 @@ void UIContext::menuSeparator() {
     if (m_batch == nullptr || !m_popupRendering) {
         return;
     }
-    m_batch->drawRect(m_popup.x + 8.0f, m_popup.cursorY + 4.0f, kPopupWidth - 16.0f, 1.0f,
+    m_batch->drawRect(m_popup.x + 8.0f, m_popup.cursorY + 4.0f, popupWidth() - 16.0f, 1.0f,
                       m_theme.panelBorder);
     m_popup.cursorY += 9.0f;
 }
@@ -540,7 +552,7 @@ void UIContext::endPopup() {
     if (!m_popupRendering) {
         return; // safe no-op when beginPopup returned false
     }
-    m_popup.height = m_popup.cursorY - m_popup.y + kPopupPadding;
+    m_popup.height = m_popup.cursorY - m_popup.y + popupPadding();
     if (m_batch != nullptr) {
         m_batch->popScissor();
     }
