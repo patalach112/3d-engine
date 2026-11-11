@@ -137,7 +137,8 @@ public:
         }
         // Multi-character operators first.
         const std::string two = m_pos + 1 < m_source.size() ? std::string(m_source.substr(m_pos, 2)) : "";
-        if (two == "==" || two == "!=" || two == ">=" || two == "<=" || two == "&&" || two == "||") {
+        if (two == "==" || two == "!=" || two == ">=" || two == "<=" || two == "&&" || two == "||" ||
+            two == "+=" || two == "-=" || two == "*=" || two == "/=") {
             m_pos += 2;
             token.kind = Token::Kind::Symbol;
             token.text = two;
@@ -421,7 +422,7 @@ private:
             node.extra = member;
             return node;
         }
-        if (!expectSymbol("=")) {
+        if (!parseAssignOperator(node)) {
             return std::nullopt;
         }
         node.kind = DSLNodeKind::PartAssign;
@@ -773,6 +774,22 @@ private:
         return node;
     }
 
+    // Consumes the '=' of a plain assignment or a compound
+    // operator token (+=, -=, *=, /=), recording the operator.
+    bool parseAssignOperator(DSLNode& node) {
+        if (atSymbol("=")) {
+            advance();
+            return true;
+        }
+        if (atSymbol("+=") || atSymbol("-=") || atSymbol("*=") || atSymbol("/=")) {
+            node.compoundOp = m_token.text.substr(0, 1);
+            advance();
+            return true;
+        }
+        fail("expected '=' (or '+=', '-=', '*=', '/=') in assignment");
+        return false;
+    }
+
     std::optional<DSLNode> parseAssignment(const std::string& word) {
         const int line = m_token.line;
         advance(); // variable name
@@ -809,7 +826,7 @@ private:
             }
             const std::string member = m_token.text;
             advance();
-            if (!expectSymbol("=")) {
+            if (!parseAssignOperator(node)) {
                 return std::nullopt;
             }
             if (member == "color" && m_token.kind == Token::Kind::HexColor) {
@@ -848,8 +865,7 @@ private:
             return node;
         }
         node.kind = DSLNodeKind::Assign;
-        if (!expectSymbol("=")) {
-            fail("expected '=' after '" + word + "'");
+        if (!parseAssignOperator(node)) {
             return std::nullopt;
         }
         auto value = parseExpression();

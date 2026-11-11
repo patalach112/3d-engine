@@ -3228,3 +3228,41 @@ standalone player headless runs clean.
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, scripting-demo and standalone
 player headless runs clean.
+
+## Maintenance — Event-handler variable mutations persist (compound writes, bounds on write) ✅
+
+- **Root cause**: handler bodies that used a compound assignment
+  (`health -= 25`, `+=`, `*=`, `/=`) never ran — the lexer/parser
+  had no compound-assignment form, so the script failed to
+  compile and the variable stayed locked at its `on_start()` /
+  setup value while `print` probes in the same body appeared to
+  work (they were reached by unrelated code paths). Plain writes
+  (`health = health - 25`) were unaffected; compound ones now
+  parse everywhere assignments do — plain variables, dotted
+  (`this.x *= 2`) and `part("...").intensity -= 1.5` property
+  targets, and `effect.chromatic_aberration += 0.1` — and read
+  the live current value (an unset variable reads as 0,
+  `/= 0` yields 0).
+- **One canonical write path**: variable assignment,
+  compound assignment, and `over Xs` lerp ticks all funnel
+  through a single clamped write, so the per-variable
+  `health(max) = ...` / `health(lowest) = ...` bounds re-check
+  and clamp on *every* write step — including writes inside
+  `on_touch`, `on_trigger`, and `on_input` handlers — and the
+  live `hudprint` `{variable}` interpolation picks the mutated
+  value up in the same frame's render data. Regression coverage
+  (`testEventHandlerMutation`) proves mutations persist across
+  frames and repeat events, accumulate, survive
+  Play → Stop → Play runtime migration, clamp at both bounds
+  from inside handlers, and surface in HUD prints immediately.
+- **Stale-AST hygiene**: replacing a script's source now also
+  drops latched handler records and completed-`for` markers,
+  which held pointers into the previous parse tree; a latched
+  nested handler from an edited-away script version can no
+  longer execute after recompile.
+
+1439 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, scripting-demo (including the new
+handler-mutation beat) and standalone player headless runs
+clean.

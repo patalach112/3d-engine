@@ -117,6 +117,41 @@ void applyBehavior(Frame& frame, entt::entity target, const std::string& behavio
     return value;
 }
 
+// THE canonical variable write path: every mutation of script
+// state -- setup assignments, event-handler writes, compound
+// assignments, timer bodies, lerp ticks -- lands here, so bounds
+// (health(max)/health(lowest)) are enforced on every single
+// write and the value always persists in the runtime's map.
+void writeVariable(Runtime& rt, const std::string& name, double value) {
+    rt.variables[name] = clampToBounds(rt, name, value);
+}
+
+[[nodiscard]] double applyCompoundOp(double current, const std::string& op, double rhs) {
+    if (op == "+") {
+        return current + rhs;
+    }
+    if (op == "-") {
+        return current - rhs;
+    }
+    if (op == "*") {
+        return current * rhs;
+    }
+    if (op == "/") {
+        return rhs != 0.0 ? current / rhs : 0.0;
+    }
+    return rhs;
+}
+
+// Resolves an assignment's final value: plain writes use the
+// expression directly; compound writes apply the operator to
+// the target's CURRENT value (unset variables read as 0).
+[[nodiscard]] double resolveAssignedValue(const DSLNode& node, double current, double rhs) {
+    if (node.compoundOp.empty()) {
+        return rhs;
+    }
+    return applyCompoundOp(current, node.compoundOp, rhs);
+}
+
 bool applyPartProperty(Scene::Registry& registry, entt::entity target, const std::string& property,
                        const std::string& axis, double value) {
     if (target == entt::null || !registry.valid(target)) {
@@ -211,7 +246,7 @@ bool applyPartProperty(Scene::Registry& registry, entt::entity target, const std
 void applyLerpTarget(Scene& scene, ScriptSystemContext& context, Runtime& rt, const Lerp& lerp, double value) {
     switch (lerp.target) {
     case Lerp::Target::Variable:
-        rt.variables[lerp.name] = clampToBounds(rt, lerp.name, value);
+        writeVariable(rt, lerp.name, value);
         return;
     case Lerp::Target::PartProperty:
         applyPartProperty(scene.registry(), findByName(scene.registry(), lerp.name), lerp.property, lerp.axis, value);
@@ -382,13 +417,15 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
             rt.textVariables[node.name] = *evaluateText(node.expr, rt);
             return;
         }
+        const auto currentIt = rt.variables.find(node.name);
+        const double current = currentIt != rt.variables.end() ? currentIt->second : 0.0;
+        const double value = resolveAssignedValue(node, current, evaluateExpr(node.expr, rt));
         if (node.hasLerp) {
-            startLerp(frame, Lerp::Target::Variable, node.name, "", "", evaluateExpr(node.expr, rt),
-                      node.lerpDuration);
+            startLerp(frame, Lerp::Target::Variable, node.name, "", "", value, node.lerpDuration);
             return;
         }
         cancelLerps(rt, Lerp::Target::Variable, node.name, "", "");
-        rt.variables[node.name] = clampToBounds(rt, node.name, evaluateExpr(node.expr, rt));
+        writeVariable(rt, node.name, value);
         return;
     }
     case DSLNodeKind::BoundDecl: {
@@ -427,7 +464,8 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
             return;
         }
         cancelLerps(rt, Lerp::Target::EffectProperty, node.name, node.property, "");
-        frame.context.effects.chromaticAberration = evaluateExpr(node.expr, rt);
+        frame.context.effects.chromaticAberration =
+            resolveAssignedValue(node, frame.context.effects.chromaticAberration, evaluateExpr(node.expr, rt));
         return;
     }
     case DSLNodeKind::HudPrint: {
@@ -493,9 +531,14 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
                       evaluateExpr(node.expr, rt), node.lerpDuration);
             return;
         }
+        double partValue = evaluateExpr(node.expr, rt);
+        if (!node.compoundOp.empty()) {
+            const double current =
+                readPartProperty(registry, resolvePartTarget(frame, node.name), node.property, node.extra).value_or(0.0);
+            partValue = applyCompoundOp(current, node.compoundOp, partValue);
+        }
         cancelLerps(rt, Lerp::Target::PartProperty, node.name, node.property, node.extra);
-        applyPartProperty(registry, resolvePartTarget(frame, node.name), node.property, node.extra,
-                          evaluateExpr(node.expr, rt));
+        applyPartProperty(registry, resolvePartTarget(frame, node.name), node.property, node.extra, partValue);
         return;
     }
     case DSLNodeKind::PartCall: {
@@ -1005,6 +1048,12 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
             rt.bounds.clear();
             rt.lerps.clear();
             rt.heldItems.clear();
+            // Latched handlers and finished-For records hold AST
+            // node pointers into the program being replaced:
+            // keeping them would execute stale handler bodies
+            // (or freed memory) instead of the new script.
+            rt.latched.clear();
+            rt.finishedFors.clear();
             if (!rt.errors.empty()) {
                 for (const std::string& error : rt.errors) {
                     ENGINE_LOG_ERROR("Script(" << nameOf(registry, e) << "): " << error);

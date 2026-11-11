@@ -104,6 +104,10 @@ struct DSLNode {
     // EffectAssign spawns a non-blocking lerp task in the runtime.
     bool hasLerp = false;
     double lerpDuration = 0.0; // seconds
+    // Compound assignment (health -= 25): empty means plain;
+    // otherwise one of "+","-","*","/" applied as
+    // target = target <op> expr through the clamped write path.
+    std::string compoundOp;
     // HudPrint settings (percent canvas anchors, #RRGGBB colour).
     // No duration (or `duration = infinite`) means persistent:
     // the print stays until hudclear closes it.

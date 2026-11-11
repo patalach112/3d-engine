@@ -7,7 +7,9 @@
 // (ScriptComponent); the SAME frame loop also runs the native
 // StalkerAISystem — the DSL assigns `behavior = stalker`, native
 // code does the tracking/steering/avoidance. A scripted timeline
-// (pickup -> LMB use -> enter safe room -> stalker collision)
+// (pickup -> LMB use -> enter safe room -> stalker collision,
+// then an event-handler mutation beat: on_touch compound damage
+// that must persist and reach the HUD on the next frame)
 // prints a trace and self-checks every beat, exiting nonzero on
 // any failure. Run: scripting-demo
 // ---------------------------------------------------------------------------
@@ -136,6 +138,33 @@ int main() {
     frame(0.1);
     const glm::vec3 resetPos = registry.get<TransformComponent>(stalker.handle()).position;
     expect(glm::distance(resetPos, stalkerSpawn) < 0.75f, "stalker touched the safe room: position = reset (back at spawn)");
+
+    // -- event-handler mutation: damage persists and reaches the HUD -----
+    auto arena = scene.createEntity("arena");
+    arena.addComponent<TransformComponent>();
+    arena.addComponent<ScriptComponent>().source =
+        "from start()\n"
+        "    health = 100\n"
+        "    health(max) = 100\n"
+        "    health(lowest) = 0\n"
+        "    hudprint(\"Arena HP {health}\") { duration = 30s }\n"
+        "    on_touch(\"stalker\") { health -= 30 }\n"
+        "script(end)";
+    frame(0.1);
+    expect(ScriptSystem::variable(scripts, arena.handle(), "health").value_or(-1.0) == 100.0,
+           "arena: setup health = 100");
+    ScriptSystem::postEvent(scripts, DSLEvent{DSLEventKind::Touch, "stalker", stalker.handle(), arena.handle(),
+                                              stalker.handle(), arena.handle()});
+    frame(0.1);
+    expect(ScriptSystem::variable(scripts, arena.handle(), "health").value_or(-1.0) == 70.0,
+           "arena: on_touch health -= 30 persists in the runtime (compound write)");
+    bool hudShowsDamage = false;
+    for (const auto& print : scripts.hudPrints) {
+        if (print.text == "Arena HP 70") {
+            hudShowsDamage = true;
+        }
+    }
+    expect(hudShowsDamage, "arena: HUD shows the mutated value on the next frame");
 
     std::cout << "script log lines: " << scripts.log.size() << ", sounds: " << scripts.sounds.size() << '\n';
     std::cout << (g_failures == 0 ? "scripting-demo: ALL CHECKS PASSED\n" : "scripting-demo: FAILURES\n");

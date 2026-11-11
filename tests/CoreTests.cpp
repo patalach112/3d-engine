@@ -11807,6 +11807,192 @@ void testDslScopingUniversalAndHudLive() {
     }
 }
 
+void testEventHandlerMutation() {
+    std::cout << "Event-handler mutation: persistence, compound writes, bounds, HUD sync\n";
+    using namespace engine;
+
+    // -- The reported scenario: player-hosted script, real bus events ---------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        EventBus bus;
+        ScriptSystem::attach(ctx, bus);
+        auto player = scene.createEntity("Player");
+        player.addComponent<TransformComponent>();
+        auto enemy = scene.createEntity("Enemy");
+        enemy.addComponent<TransformComponent>();
+        player.addComponent<ScriptComponent>().source =
+            "from start()\n"
+            "    health = 100\n"
+            "    hudprint(\"HP {health}\") { duration = 30s }\n"
+            "    on_touch(\"Enemy\") {\n"
+            "        print(\"hit\")\n"
+            "        health = health - 25\n"
+            "    }\n"
+            "script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, player.handle(), "health").value_or(-1.0) == 100.0,
+              "mutation: setup value present");
+        bus.publish(CollisionEvent{player.handle(), enemy.handle(), glm::vec3{}, glm::vec3{0, 1, 0}, 1.0f});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(!ctx.log.empty(), "mutation: handler print executed");
+        check(ScriptSystem::variable(ctx, player.handle(), "health").value_or(-1.0) == 75.0,
+              "mutation: on_touch write persists in the runtime (not a stack copy)");
+        check(ctx.hudPrints.size() == 1 && ctx.hudPrints[0].text == "HP 75",
+              "mutation: HUD reads the new value in the same frame's render data");
+        bus.publish(CollisionEvent{player.handle(), enemy.handle(), glm::vec3{}, glm::vec3{0, 1, 0}, 1.0f});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, player.handle(), "health").value_or(-1.0) == 50.0,
+              "mutation: repeated hits accumulate");
+        for (int i = 0; i < 30; ++i) {
+            ScriptSystem::update(scene, ctx, 0.1);
+        }
+        check(ScriptSystem::variable(ctx, player.handle(), "health").value_or(-1.0) == 50.0,
+              "mutation: value stays put across later frames (no reset to initial)");
+    }
+
+    // -- on_start definitions + bounds enforced inside handlers ----------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        EventBus bus;
+        ScriptSystem::attach(ctx, bus);
+        auto hero = scene.createEntity("Hero");
+        hero.addComponent<TransformComponent>();
+        auto zone = scene.createEntity("TrapZone");
+        zone.addComponent<TransformComponent>();
+        hero.addComponent<ScriptComponent>().source =
+            "from start()\n"
+            "    on_start() {\n"
+            "        health = 100\n"
+            "        health(max) = 100\n"
+            "        health(lowest) = 0\n"
+            "    }\n"
+            "    on_trigger(\"TrapZone\") { health = health - 25 }\n"
+            "    on_input(\"LMB\") { health = health + 50 }\n"
+            "    on_input(\"RMB\") { health = health - 500 }\n"
+            "script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        bus.publish(TriggerEvent{zone.handle(), hero.handle(), true});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, hero.handle(), "health").value_or(-1.0) == 75.0,
+              "mutation: on_trigger write persists with on_start-defined state");
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, hero.handle(), "health").value_or(-1.0) == 100.0,
+              "bounds: handler write clamps to max on re-assignment");
+        ScriptSystem::postInputEvent(ctx, "RMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, hero.handle(), "health").value_or(-1.0) == 0.0,
+              "bounds: handler write clamps to lowest on re-assignment");
+    }
+
+    // -- Compound assignments -----------------------------------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto wall = scene.createEntity("Wall");
+        wall.addComponent<TransformComponent>();
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() health(max) = 100 health(lowest) = 0 health = 100 mana = 10 "
+            "on_touch(\"Wall\") { health -= 25 } on_input(\"LMB\") { mana *= 3 } "
+            "on_input(\"RMB\") { mana /= 2 } on_input(\"E\") { health += 1000 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "health").value_or(-1.0) == 100.0,
+              "compound: script with -= compiles and sets up");
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, wall.handle(), brain.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "health").value_or(-1.0) == 75.0,
+              "compound: health -= 25 mutates the runtime value");
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "mana").value_or(-1.0) == 30.0, "compound: mana *= 3");
+        ScriptSystem::postInputEvent(ctx, "RMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "mana").value_or(-1.0) == 15.0, "compound: mana /= 2");
+        ScriptSystem::postInputEvent(ctx, "E", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "health").value_or(-1.0) == 100.0,
+              "compound: health += clamps through the bound on write");
+
+        // Compound writes on component properties read the live value.
+        Scene scene2;
+        ScriptSystemContext ctx2;
+        auto lamp = scene2.createEntity("lamp");
+        auto& point = lamp.addComponent<PointLightComponent>();
+        point.intensity = 4.0f;
+        auto brain2 = scene2.createEntity("brain");
+        brain2.addComponent<ScriptComponent>().source =
+            "from start() on_input(\"LMB\") { part(\"lamp\").intensity -= 1.5 } script(end)";
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        ScriptSystem::postInputEvent(ctx2, "LMB", false);
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        check(nearlyEqual(point.intensity, 2.5, 1e-6), "compound: part(...).intensity -= reads and writes the live property");
+    }
+
+    // -- Mutation continuity across Play -> Stop -> Play ---------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        PlaySession session;
+        auto player = scene.createEntity("Player");
+        player.addComponent<TransformComponent>();
+        auto enemy = scene.createEntity("Enemy");
+        enemy.addComponent<TransformComponent>();
+        player.addComponent<ScriptComponent>().source =
+            "from start() health = 100 on_touch(\"Enemy\") { health = health - 25 } script(end)";
+        const auto findByTag = [&scene](const char* tag) -> entt::entity {
+            for (const entt::entity e : scene.registry().view<TagComponent>()) {
+                if (scene.registry().get<TagComponent>(e).tag == tag) {
+                    return e;
+                }
+            }
+            return entt::null;
+        };
+        check(session.enterPlay(scene), "mutation continuity: enter Play");
+        ScriptSystem::update(scene, ctx, 0.1);
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, enemy.handle(), player.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, player.handle(), "health").value_or(-1.0) == 75.0,
+              "mutation continuity: hit lands in Play");
+        check(session.exitPlay(scene), "mutation continuity: Stop");
+        const entt::entity restoredPlayer = findByTag("Player");
+        const entt::entity restoredEnemy = findByTag("Enemy");
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, restoredPlayer, "health").value_or(-1.0) == 75.0,
+              "mutation continuity: damage survives Stop (runtime migration)");
+        check(session.enterPlay(scene), "mutation continuity: re-enter Play");
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, restoredEnemy, restoredPlayer});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, restoredPlayer, "health").value_or(-1.0) == 50.0,
+              "mutation continuity: next hit accumulates from the migrated value");
+        check(session.exitPlay(scene), "mutation continuity: final Stop");
+    }
+
+    // -- Recompile drops stale latched handlers --------------------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto wall = scene.createEntity("Wall");
+        wall.addComponent<TransformComponent>();
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() hits = 0 on_touch(\"Wall\") { on_input(\"LMB\") { hits = hits + 100 } } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, wall.handle(), brain.handle()});
+        ScriptSystem::update(scene, ctx, 0.1); // latches the nested on_input from v1
+        // The script is edited: the nested handler no longer exists.
+        scene.registry().get<ScriptComponent>(brain.handle()).source = "from start() hits = 0 script(end)";
+        ScriptSystem::update(scene, ctx, 0.1); // recompiles
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "hits").value_or(-1.0) == 0.0,
+              "mutation: stale latched handlers from the old AST never execute after recompile");
+    }
+}
+
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -11874,6 +12060,7 @@ int main() {
     testPlayRestoreClipboardAndRobustSaves();
     testDslExpansions();
     testDslScopingUniversalAndHudLive();
+    testEventHandlerMutation();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";
