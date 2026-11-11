@@ -3381,11 +3381,40 @@ runs clean.
   resolved transform is read back as the next tick's start
   position (the ground/collision handshake). The controller
   owns gravity and sleep while driven, so nothing
-  double-integrates; walls and landings come from the physics
-  solver, friction/acceleration from the movement core (with
-  `sv_friction 8` / `sv_accelerate 6`, released input stops the
-  capsule dead). Verified by the character-controller suite:
-  grounded travel, friction stop, jump/landing, wall clamp.
+  double-integrates; friction/acceleration come from the
+  movement core (`sv_friction 8` / `sv_accelerate 6`, released
+  input stops the capsule dead), while grounding, walls and
+  step-ups are resolved kinematically against real geometry:
+  * **Ground = raycast, never contacts**: every tick casts a
+    vertical shapecast (a small ray fan under the bottom
+    sphere, 0.05 m skin) straight down. Only a walkable normal
+    (within 45 deg of up) grounds the character, which then
+    snaps exactly onto the probed surface — landings end ON
+    the floor with no floating offset; a miss or a steep
+    normal (`n.y < cos 45 deg`) means airborne with full
+    gravity, so steep slopes are slid on, never stood on.
+    Inside hits never count.
+  * **PM_ClipVelocity wall sliding**: two horizontal probes
+    (feet and capsule centre) find the closest steep plane in
+    reach, and the velocity is clipped purely horizontally
+    (`clipVelocityHorizontal`: `v -= n_h * (v . n_h)`, `vy`
+    bit-untouched) BEFORE the physics step — the solver has
+    no wall penetration to convert into upward displacement,
+    so pressing into a wall slides exactly along it and can
+    never pop the character up. The classic 3D
+    `clipVelocity` (`v - n * (v . n) * overbounce`) ships
+    alongside in the movement core.
+  * **Step-up, strictly bounded**: the only way up beside
+    jumping — grounded horizontal movement into an obstacle
+    whose probed top is at most `max_step_height = 0.30 m`
+    above the current ground steps onto it (lift plus this
+    tick's advance, so the capsule clears the ledge corner);
+    anything taller is clipped like a wall.
+  Verified by the character-controller suite: grounded
+  travel, friction stop, jump/landing at exact rest height,
+  diagonal wall sliding without height gain, step-up vs.
+  refused climb, and raycast ground detection (skin window,
+  30 deg walkable, 55 deg airborne).
 - **Delta-compression snapshots**: per client, the server keeps
   the last acknowledged baseline (acks ride every input packet)
   and transmits only entities whose replicated state changed,
@@ -3420,7 +3449,7 @@ runs clean.
   and rendering state never enters the server binary — client
   mirrors are built one-way via `NetClient::applyToScene`.
 
-1639 passed / 0 failed across all five build configs
+1667 passed / 0 failed across all five build configs
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, `vibe_server --ticks` and
 `game-player --server` smoke runs clean, scripting-demo and

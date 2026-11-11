@@ -85,6 +85,32 @@ struct PlayerState {
 // input envelope is enforced by the same code on both sides.
 ENGINE_SCENE_API void playerMove(const InputCmd& cmd, PlayerState& state, const MoveSettings& settings, float dt);
 
+// ---------------------------------------------------------------------------
+// Velocity clipping against collision planes (Source PM_ClipVelocity).
+// clipVelocity removes the into-plane component of a velocity:
+//   backoff = dot(velocity, normal) * overbounce
+//   result  = velocity - normal * backoff
+// (overbounce 1 slides exactly along the plane; Source uses 1 for
+// characters, >1 only for bounce pads). A numerical guard then
+// removes any residual into-plane error. clipVelocityHorizontal
+// performs the same clip purely in the horizontal plane (the normal
+// is projected onto XZ first): for contacts steeper than the
+// climbable slope the character must NEVER gain or lose height from
+// the clip — wall pressure becomes wall sliding, never lift. That
+// is what stops a physics solver from resolving horizontal wall
+// penetration by displacing the character vertically.
+// ---------------------------------------------------------------------------
+[[nodiscard]] ENGINE_SCENE_API glm::vec3 clipVelocity(const glm::vec3& velocity, const glm::vec3& normal,
+                                                      float overbounce = 1.0f);
+[[nodiscard]] ENGINE_SCENE_API glm::vec3 clipVelocityHorizontal(const glm::vec3& velocity, const glm::vec3& normal,
+                                                                float overbounce = 1.0f);
+
+// Walkable-ground test for a surface normal: true when the slope is
+// at most maxSlopeAngleDegrees from vertical (45 deg => normal.y
+// >= 0.7071). Anything steeper is a wall, never ground: characters
+// on it are airborne, get full gravity, and never snap to it.
+[[nodiscard]] ENGINE_SCENE_API bool isWalkableNormal(const glm::vec3& normal, float maxSlopeAngleDegrees);
+
 // Clamps a raw command into the legal envelope: axes to -1..1,
 // wish vector length <= 1, non-finite values to 0, yaw normalised
 // to [0, 360). cmdNumber is always preserved. Clients may ask for
@@ -120,18 +146,37 @@ private:
 // resolves collisions, and the resolved transform is read back
 // as the next tick's state.position (the ground/collision
 // handshake). Authoring notes:
-//   * settings.groundY is the capsule CENTRE height when resting
-//     on the floor (0.75 m for the standard 1.50 m capsule), i.e.
-//     the ground plane the movement ground-check clamps to;
 //   * the controller owns gravity and sleep while driven: the
 //     rigid body's useGravity/allowSleep are forced off so
 //     PhysicsSystem never double-integrates them.
+// Groundedness is NEVER inferred from contacts or penetration
+// depth: every tick casts a vertical shapecast (a small ray fan
+// under the capsule's bottom sphere, skinWidth of slack); only a
+// walkable normal (within maxSlopeAngleDegrees of up) grounds the
+// character, and the capsule then snaps exactly onto the probed
+// surface — no floating offset, no vertical step-snapping while
+// airborne. A miss or a steep normal means AIRBORNE with full
+// gravity: steep slopes can be slid on, never stood on.
+// Wall contact is neutralised BEFORE the physics step by clipping
+// the velocity horizontally against probed wall planes
+// (clipVelocityHorizontal), so the solver never has horizontal
+// penetration to convert into upward displacement; the only way
+// up is the explicit step-up, offered solely for grounded
+// horizontal movement into obstacles at most maxStepHeight tall.
 // Runtime-authored (code/editor), intentionally not serialized:
 // networked players carry the same state in NetPlayerComponent.
 // ---------------------------------------------------------------------------
 struct CharacterControllerComponent {
     MoveSettings settings{}; // friction 8 / accelerate 6 / airAccelerate 0 defaults
     PlayerState state{};     // movement truth between ticks
+    // Collision tuning (physics layer only; never on the wire).
+    float skinWidth = 0.05f;            // ground-probe margin below the capsule (m)
+    float maxStepHeight = 0.30f;        // tallest ledge the step-up may claim (m)
+    float maxSlopeAngleDegrees = 45.0f; // steepest walkable ground normal
+    // Last ground probe result (rewritten every driven tick; state
+    // for tests/tools — groundedness itself lives in state.grounded).
+    glm::vec3 groundNormal{0.0f, 1.0f, 0.0f};
+    float groundY = 0.0f; // world Y of the last probed surface point
     std::uint32_t cmdCounter = 0; // local cmd_number sequence
     bool enabled = true;
 };

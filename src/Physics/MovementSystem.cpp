@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <glm/geometric.hpp>
+#include <glm/vec2.hpp>
 #include <glm/trigonometric.hpp>
 
 namespace engine {
@@ -123,6 +124,45 @@ void playerMove(const InputCmd& rawCmd, PlayerState& state, const MoveSettings& 
     } else {
         state.grounded = false;
     }
+}
+
+glm::vec3 clipVelocity(const glm::vec3& velocity, const glm::vec3& normal, float overbounce) {
+    // Source PM_ClipVelocity: subtract the into-plane component,
+    // scaled by overbounce, then clean up any residual into-plane
+    // error float rounding left behind.
+    const float backoff = glm::dot(velocity, normal) * overbounce;
+    glm::vec3 out = velocity - normal * backoff;
+    const float adjust = glm::dot(out, normal);
+    if (adjust < 0.0f) {
+        out -= normal * adjust;
+    }
+    return out;
+}
+
+glm::vec3 clipVelocityHorizontal(const glm::vec3& velocity, const glm::vec3& normal, float overbounce) {
+    // The wall clip: only the horizontal components participate, so
+    // a steep contact can redirect horizontal motion (sliding) but
+    // can never manufacture vertical velocity. A purely vertical
+    // normal (floor/ceiling) has no horizontal plane to clip against.
+    const glm::vec2 planeNormal{normal.x, normal.z};
+    const float planeLength = glm::length(planeNormal);
+    if (planeLength <= 1e-8f) {
+        return velocity;
+    }
+    const glm::vec2 unit = planeNormal / planeLength;
+    const glm::vec2 horizontal{velocity.x, velocity.z};
+    const float backoff = glm::dot(horizontal, unit) * overbounce;
+    glm::vec2 clipped = horizontal - unit * backoff;
+    const float adjust = glm::dot(clipped, unit);
+    if (adjust < 0.0f) {
+        clipped -= unit * adjust;
+    }
+    return glm::vec3{clipped.x, velocity.y, clipped.y};
+}
+
+bool isWalkableNormal(const glm::vec3& normal, float maxSlopeAngleDegrees) {
+    const float clampedDegrees = std::clamp(maxSlopeAngleDegrees, 0.0f, 90.0f);
+    return normal.y >= std::cos(glm::radians(clampedDegrees));
 }
 
 InputCmd sanitizeInputCmd(const InputCmd& cmd) {

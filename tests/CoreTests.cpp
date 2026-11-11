@@ -13240,8 +13240,9 @@ void testCharacterController() {
               "controller is grounded again after the landing (friction resumes)");
     }
 
-    // Wall: the capsule collider, not the movement core, stops the
-    // character — position clamps at the capsule offset.
+    // Wall: the controller clips velocity against the wall plane
+    // before the physics step (the capsule collider is only the
+    // backstop) — position clamps at the capsule offset.
     {
         Scene scene;
         addFloor(scene);
@@ -13264,6 +13265,222 @@ void testCharacterController() {
         const float z = player.getComponent<TransformComponent>().position.z;
         check(z > -0.5f - PlayerSystem::kCapsuleRadius - 0.05f && z < 0.2f,
               "capsule collider stops the character at the wall face");
+    }
+
+    // --- PM_ClipVelocity: the clipping math itself ------------------
+    {
+        const glm::vec3 headOn = clipVelocity(glm::vec3{0.0f, 0.0f, -4.0f}, glm::vec3{0.0f, 0.0f, 1.0f}, 1.0f);
+        check(nearlyEqual(headOn.x, 0.0, 1e-5) && nearlyEqual(headOn.y, 0.0, 1e-5) && nearlyEqual(headOn.z, 0.0, 1e-5),
+              "clipVelocity: head-on velocity into a plane is fully removed");
+        const glm::vec3 floorSlide = clipVelocity(glm::vec3{2.0f, -3.0f, 0.0f}, glm::vec3{0.0f, 1.0f, 0.0f}, 1.0f);
+        check(nearlyEqual(floorSlide.x, 2.0, 1e-5) && nearlyEqual(floorSlide.y, 0.0, 1e-5),
+              "clipVelocity: tangential component survives a floor clip exactly");
+        const glm::vec3 diagonal = clipVelocity(glm::vec3{-3.0f, 1.0f, -3.0f}, glm::normalize(glm::vec3{0.0f, 0.0f, 1.0f}), 1.0f);
+        check(std::abs(glm::dot(diagonal, glm::vec3{0.0f, 0.0f, 1.0f})) < 1e-5f && nearlyEqual(diagonal.x, -3.0, 1e-5),
+              "clipVelocity: result is exactly parallel to the plane (no residual penetration)");
+        const glm::vec3 wallClip = clipVelocityHorizontal(glm::vec3{3.0f, -5.0f, -4.0f}, glm::vec3{0.0f, 0.0f, 1.0f}, 1.0f);
+        check(wallClip.y == -5.0f && nearlyEqual(wallClip.z, 0.0, 1e-5) && nearlyEqual(wallClip.x, 3.0, 1e-5),
+              "clipVelocityHorizontal: vy is bit-untouched and into-wall z is removed (sliding, never lift)");
+        const glm::vec3 floorNormal = clipVelocityHorizontal(glm::vec3{1.0f, -2.0f, 3.0f}, glm::vec3{0.0f, 1.0f, 0.0f}, 1.0f);
+        check(floorNormal == glm::vec3{1.0f, -2.0f, 3.0f},
+              "clipVelocityHorizontal: a vertical normal has no horizontal plane (velocity unchanged)");
+        check(isWalkableNormal(glm::vec3{0.0f, 1.0f, 0.0f}, 45.0f), "flat up normal is walkable at 45 deg");
+        const glm::vec3 slope50{0.0f, std::cos(glm::radians(50.0f)), std::sin(glm::radians(50.0f))};
+        const glm::vec3 slope40{0.0f, std::cos(glm::radians(40.0f)), std::sin(glm::radians(40.0f))};
+        check(!isWalkableNormal(slope50, 45.0f), "50 deg slope normal is a wall at the 45 deg limit");
+        check(isWalkableNormal(slope40, 45.0f), "40 deg slope normal is ground at the 45 deg limit");
+    }
+
+    // --- Wall sliding WITHOUT height gain (diagonal press) ----------
+    {
+        Scene scene;
+        addFloor(scene);
+        auto player = addCharacter(scene, glm::vec3{0.0f, 0.75f, 2.0f});
+        (void)PlayerSystem::ensureCharacterController(scene);
+        auto wall = scene.createEntity("Wall");
+        wall.addComponent<TransformComponent>(glm::vec3{0.0f, 1.0f, -1.0f});
+        auto& wallBody = wall.addComponent<RigidBodyComponent>();
+        wallBody.setStatic(true);
+        wall.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{30.0f, 1.0f, 0.5f}));
+        PhysicsSettings physicsSettings;
+        PhysicsSystem physics;
+        InputCmd diagonal;
+        diagonal.forward = 1.0f;
+        diagonal.strafe = 1.0f; // 45-degree press into the wall
+        const double dt = 1.0 / 60.0;
+        float maxY = 0.0f;
+        for (int step = 0; step < 300; ++step) {
+            PlayerSystem::driveCharacter(scene, diagonal, dt);
+            physics.update(scene, dt, physicsSettings);
+            maxY = std::max(maxY, player.getComponent<TransformComponent>().position.y);
+        }
+        const glm::vec3 position = player.getComponent<TransformComponent>().position;
+        const glm::vec3 velocity = player.getComponent<RigidBodyComponent>().velocity;
+        check(position.x > 2.0f, "diagonal wall press slides along the wall (tangential motion preserved)");
+        check(position.z > -0.9f && position.z < 0.2f, "diagonal wall press is still blocked at the wall face");
+        check(maxY < 0.78f, "wall sliding NEVER gains height (no solver pop-up while pressed)");
+        check(nearlyEqual(position.y, 0.75, 0.03), "character rests at exact floor height after wall sliding");
+        check(std::abs(velocity.z) < 0.1f && velocity.x > 1.0f,
+              "clipped body velocity is purely tangential while pressed into the wall");
+    }
+
+    // --- Landing without float: dropped character settles exactly ---
+    {
+        Scene scene;
+        addFloor(scene);
+        auto player = addCharacter(scene, glm::vec3{0.0f, 3.0f, 0.0f});
+        (void)PlayerSystem::ensureCharacterController(scene);
+        PhysicsSettings physicsSettings;
+        PhysicsSystem physics;
+        const InputCmd none;
+        const double dt = 1.0 / 60.0;
+        for (int step = 0; step < 240; ++step) {
+            PlayerSystem::driveCharacter(scene, none, dt);
+            physics.update(scene, dt, physicsSettings);
+        }
+        const auto& controller = player.getComponent<CharacterControllerComponent>();
+        check(controller.state.grounded, "dropped character lands and reports raycast-grounded");
+        check(nearlyEqual(controller.groundY, 0.0, 1e-3), "ground probe reports the true floor height");
+        bool hoverFree = true;
+        for (int step = 0; step < 60; ++step) {
+            PlayerSystem::driveCharacter(scene, none, dt);
+            physics.update(scene, dt, physicsSettings);
+            hoverFree = hoverFree && nearlyEqual(player.getComponent<TransformComponent>().position.y, 0.75, 0.02);
+        }
+        check(hoverFree, "landed character rests at exact rest height (0.75) — no floating offset, ever");
+    }
+
+    // --- Raycast ground detection: skin window and slope verdicts ---
+    {
+        Scene scene;
+        addFloor(scene);
+        glm::vec3 point{0.0f};
+        glm::vec3 normal{0.0f};
+        check(PlayerSystem::probeGround(scene, glm::vec3{0.0f, 0.75f, 0.0f}, PlayerSystem::kCapsuleHalfHeight,
+                                        PlayerSystem::kCapsuleRadius, 0.05f, 45.0f, CollisionLayer::All, point,
+                                        normal) &&
+                  nearlyEqual(point.y, 0.0, 1e-4) && nearlyEqual(normal.y, 1.0, 1e-4),
+              "ground probe hits at rest with the floor point and up normal");
+        check(PlayerSystem::probeGround(scene, glm::vec3{0.0f, 0.78f, 0.0f}, PlayerSystem::kCapsuleHalfHeight,
+                                        PlayerSystem::kCapsuleRadius, 0.05f, 45.0f, CollisionLayer::All, point,
+                                        normal),
+              "ground probe still grounds within the 0.05 m skin window");
+        check(!PlayerSystem::probeGround(scene, glm::vec3{0.0f, 0.95f, 0.0f}, PlayerSystem::kCapsuleHalfHeight,
+                                         PlayerSystem::kCapsuleRadius, 0.05f, 45.0f, CollisionLayer::All, point,
+                                         normal),
+              "ground probe misses beyond the skin window (airborne)");
+
+        const auto addRamp = [](Scene& rampScene, float tiltDegrees) {
+            auto ramp = rampScene.createEntity("Ramp");
+            auto& rampTransform = ramp.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, 0.0f});
+            rampTransform.rotationDegrees.x = tiltDegrees;
+            auto& rampBody = ramp.addComponent<RigidBodyComponent>();
+            rampBody.setStatic(true);
+            ramp.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{3.0f, 0.25f, 3.0f}));
+            return ramp;
+        };
+        { // 30 deg ramp: walkable ground.
+            Scene rampScene;
+            addRamp(rampScene, 30.0f);
+            const float topY = 0.25f * std::cos(glm::radians(30.0f));
+            const float topZ = 0.25f * std::sin(glm::radians(30.0f));
+            check(PlayerSystem::probeGround(rampScene, glm::vec3{0.0f, topY + 0.78f, topZ},
+                                            PlayerSystem::kCapsuleHalfHeight, PlayerSystem::kCapsuleRadius, 0.05f,
+                                            45.0f, CollisionLayer::All, point, normal) &&
+                      normal.y > 0.7f,
+                  "30 deg ramp probe reports walkable ground");
+        }
+        { // 55 deg ramp: a wall, never ground.
+            Scene rampScene;
+            addRamp(rampScene, 55.0f);
+            const float topY = 0.25f * std::cos(glm::radians(55.0f));
+            const float topZ = 0.25f * std::sin(glm::radians(55.0f));
+            check(!PlayerSystem::probeGround(rampScene, glm::vec3{0.0f, topY + 0.78f, topZ},
+                                             PlayerSystem::kCapsuleHalfHeight, PlayerSystem::kCapsuleRadius, 0.05f,
+                                             45.0f, CollisionLayer::All, point, normal),
+                  "55 deg ramp probe is rejected as ground (steep normal)");
+
+            // Pressed against the steep ramp (capsule bottom
+            // within the skin window of the surface), the driven
+            // character is AIRBORNE with full gravity — never
+            // grounded, never snapped onto the slope.
+            auto player = addCharacter(rampScene, glm::vec3{0.0f, topY + 0.78f, topZ});
+            (void)PlayerSystem::ensureCharacterController(rampScene);
+            PhysicsSettings rampPhysicsSettings;
+            PhysicsSystem rampPhysics;
+            const InputCmd none;
+            const auto& rampController = player.getComponent<CharacterControllerComponent>();
+            PlayerSystem::driveCharacter(rampScene, none, 1.0 / 60.0);
+            check(rampController.groundNormal.y < 0.7071f,
+                  "ground probe records the steep slope normal (n.y < cos 45 deg)");
+            bool stayedAirborne = !rampController.state.grounded;
+            for (int step = 0; step < 20; ++step) {
+                PlayerSystem::driveCharacter(rampScene, none, 1.0 / 60.0);
+                rampPhysics.update(rampScene, 1.0 / 60.0, rampPhysicsSettings);
+                stayedAirborne = stayedAirborne && !rampController.state.grounded;
+            }
+            check(stayedAirborne, "character on a 55 deg slope stays AIRBORNE while it slides off (no snap, no friction)");
+        }
+    }
+
+    // --- Step-up: low obstacle climbed, tall obstacle clipped -------
+    {
+        const auto addBlock = [](Scene& blockScene, float topHeight, const char* name) {
+            auto block = blockScene.createEntity(name);
+            block.addComponent<TransformComponent>(glm::vec3{0.0f, topHeight * 0.5f, -1.75f});
+            auto& blockBody = block.addComponent<RigidBodyComponent>();
+            blockBody.setStatic(true);
+            block.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{1.5f, topHeight * 0.5f, 0.75f}));
+            return block;
+        };
+        { // 0.25 m ledge (<= maxStepHeight 0.30): stepped onto.
+            Scene scene;
+            addFloor(scene);
+            auto player = addCharacter(scene, glm::vec3{0.0f, 0.75f, 2.0f});
+            (void)PlayerSystem::ensureCharacterController(scene);
+            addBlock(scene, 0.25f, "Ledge");
+            PhysicsSettings physicsSettings;
+            PhysicsSystem physics;
+            InputCmd forward;
+            forward.forward = 1.0f;
+            const double dt = 1.0 / 60.0;
+            bool crossedOnTop = false;
+            for (int step = 0; step < 300; ++step) {
+                PlayerSystem::driveCharacter(scene, forward, dt);
+                physics.update(scene, dt, physicsSettings);
+                const glm::vec3 during = player.getComponent<TransformComponent>().position;
+                // Past the ledge face (-1.0) while at ledge-top rest
+                // height: the step carried the capsule onto the top.
+                crossedOnTop = crossedOnTop || (during.z < -1.4f && nearlyEqual(during.y, 1.0, 0.06));
+            }
+            const glm::vec3 position = player.getComponent<TransformComponent>().position;
+            check(crossedOnTop, "step-up climbs a 0.25 m ledge (rest height follows the step)");
+            check(position.z < -2.6f, "step-up carries the character onto and across the ledge");
+            check(player.getComponent<CharacterControllerComponent>().state.grounded,
+                  "character is grounded after crossing (on the floor past the ledge)");
+        }
+        { // 0.50 m block (> maxStepHeight): clipped, never climbed.
+            Scene scene;
+            addFloor(scene);
+            auto player = addCharacter(scene, glm::vec3{0.0f, 0.75f, 2.0f});
+            (void)PlayerSystem::ensureCharacterController(scene);
+            addBlock(scene, 0.50f, "Block");
+            PhysicsSettings physicsSettings;
+            PhysicsSystem physics;
+            InputCmd forward;
+            forward.forward = 1.0f;
+            const double dt = 1.0 / 60.0;
+            float maxY = 0.0f;
+            for (int step = 0; step < 300; ++step) {
+                PlayerSystem::driveCharacter(scene, forward, dt);
+                physics.update(scene, dt, physicsSettings);
+                maxY = std::max(maxY, player.getComponent<TransformComponent>().position.y);
+            }
+            const glm::vec3 position = player.getComponent<TransformComponent>().position;
+            check(maxY < 0.78f && nearlyEqual(position.y, 0.75, 0.03),
+                  "0.50 m block is never climbed (step-up refuses heights above maxStepHeight)");
+            check(position.z > -0.9f && position.z < 0.2f, "0.50 m block stops the character at its face");
+        }
     }
 
     // No component -> no character driving (legacy players are

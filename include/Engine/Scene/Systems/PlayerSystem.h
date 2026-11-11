@@ -56,12 +56,33 @@ public:
     // before Play). groundY is the capsule-centre rest height on the
     // floor — 0.75 m for the standard capsule. False: no physical player.
     static bool ensureCharacterController(Scene& scene, float groundY = kCapsuleHalfHeight + kCapsuleRadius);
+    // The ground probe at the heart of the character controller:
+    // a vertical shapecast straight down from the capsule bottom
+    // (a small ray fan under the bottom sphere, over skinWidth —
+    // see driveCharacter). Returns true — with the surface point
+    // and normal in the out parameters — only when a hit normal is
+    // walkable (within maxSlopeAngleDegrees of up); a miss or a
+    // steep (wall) normal means AIRBORNE. Self hits, inside hits
+    // and trigger volumes never count as ground. This verdict is
+    // the ONLY source of groundedness for character-driven players:
+    // contacts and penetration depth are never consulted.
+    [[nodiscard]] static bool probeGround(const Scene& scene, const glm::vec3& capsuleCenter, float capsuleHalfHeight,
+                                          float capsuleRadius, float skinWidth, float maxSlopeAngleDegrees,
+                                          uint32_t layerMask, glm::vec3& outPoint, glm::vec3& outNormal);
+
     // Integrates ONE InputCmd through MovementSystem::playerMove with
     // the caller's actual dt (sv_friction/sv_accelerate from the
     // component settings), then writes the resulting velocity into
-    // the rigid body. PhysicsSystem integrates the capsule and
-    // resolves collisions afterwards; the resolved transform is read
-    // back as the next call's state.position. The component owns the
+    // the rigid body. Per tick, in order: the resolved transform is
+    // read back; the ground probe above decides groundedness (and
+    // snaps the capsule exactly onto the surface across the skin
+    // gap — no floating offset, never while moving up); the movement
+    // core produces the velocity; horizontal wall probes clip that
+    // velocity horizontally (clipVelocityHorizontal) so the physics
+    // solver has no wall penetration to convert into lift, with the
+    // grounded-only step-up (maxStepHeight) as the single exception;
+    // finally the velocity is written to the rigid body and
+    // PhysicsSystem integrates the capsule. The component owns the
     // cmd_number sequence (the caller's cmdNumber is replaced).
     // False: no character-driven physical player.
     static bool driveCharacter(Scene& scene, const InputCmd& cmd, double deltaSeconds);
