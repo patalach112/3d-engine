@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core/Export.h"
+#include "Physics/MovementSystem.h"
 
 #include <glm/vec3.hpp>
 
@@ -43,7 +44,29 @@ public:
                               bool boost = false);
 
     // Input-driven form of driveMovement(): WASD + Space/E/Q + Shift.
+    // When the player carries a CharacterControllerComponent this
+    // dispatches to updateCharacter() (the MovementSystem path)
+    // instead — so every host input loop (editor Play, standalone
+    // player) ticks the decoupled movement core directly.
     static bool update(Scene& scene, const Input& input, double fixedDeltaSeconds);
+
+    // --- Character controller (decoupled MovementSystem) --------------
+    // Attaches a CharacterControllerComponent to the active physical
+    // player when it lacks one (hosts call this after scene load and
+    // before Play). groundY is the capsule-centre rest height on the
+    // floor — 0.75 m for the standard capsule. False: no physical player.
+    static bool ensureCharacterController(Scene& scene, float groundY = kCapsuleHalfHeight + kCapsuleRadius);
+    // Integrates ONE InputCmd through MovementSystem::playerMove with
+    // the caller's actual dt (sv_friction/sv_accelerate from the
+    // component settings), then writes the resulting velocity into
+    // the rigid body. PhysicsSystem integrates the capsule and
+    // resolves collisions afterwards; the resolved transform is read
+    // back as the next call's state.position. The component owns the
+    // cmd_number sequence (the caller's cmdNumber is replaced).
+    // False: no character-driven physical player.
+    static bool driveCharacter(Scene& scene, const InputCmd& cmd, double deltaSeconds);
+    // Input form of driveCharacter(): WASD + Space, yaw from the camera.
+    static bool updateCharacter(Scene& scene, const Input& input, double deltaSeconds);
 
     // Copies the simulated capsule center (+ eye offset) into the camera.
     // Call after physics (and from the variable update so the camera tracks

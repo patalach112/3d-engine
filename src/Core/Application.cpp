@@ -373,6 +373,10 @@ void Application::buildScene() {
     auto& playerCollider = player.addComponent<ColliderComponent>(
         ColliderComponent::capsule(PlayerSystem::kCapsuleRadius, PlayerSystem::kCapsuleHalfHeight));
     playerCollider.layer = CollisionLayer::Player; // mask stays All: the player still touches everything
+    // The editor player is character-driven: Play (and variable
+    // update) tick the decoupled MovementSystem through
+    // PlayerSystem's character path (friction 8 / accelerate 6).
+    (void)PlayerSystem::ensureCharacterController(m_scene);
 
     if (m_config.physics.demoMode == PhysicsDemoMode::Space) {
         // Zero-G sandbox: the uniform field is disabled for this scene and
@@ -2585,6 +2589,9 @@ void Application::enterPlayMode() {
         saveAndCompileScript();
     }
     if (m_playSession.enterPlay(m_scene)) {
+        // Stop restores a GBQ snapshot, which does not carry the
+        // runtime character controller: re-attach it for Play.
+        (void)PlayerSystem::ensureCharacterController(m_scene);
         // Zone subjects (position("zone") guards) focus the
         // player entity while playing; script hosts fall back to
         // themselves when no player exists.

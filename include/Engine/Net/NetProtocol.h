@@ -1,6 +1,6 @@
 #pragma once
 #include "Core/Export.h"
-#include "Net/MovementSystem.h"
+#include "Physics/MovementSystem.h"
 
 #include <array>
 #include <cstddef>

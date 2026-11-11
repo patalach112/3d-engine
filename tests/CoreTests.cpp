@@ -69,7 +69,7 @@
 #include "Scripting/StalkerAISystem.h"
 #include "Graphics/TextEditor.h"
 #include "Net/DedicatedServer.h"
-#include "Net/MovementSystem.h"
+#include "Physics/MovementSystem.h"
 #include "Net/NetClient.h"
 #include "Net/NetComponents.h"
 #include "Net/NetProtocol.h"
@@ -13132,6 +13132,154 @@ void testMovementSystem() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Character controller integration: the decoupled MovementSystem
+// (physics layer) ticking a local physical player directly —
+// rigid body + capsule collider resolved by PhysicsSystem, real
+// dt, sv_friction 8 / sv_accelerate 6 — with no network involved.
+// ---------------------------------------------------------------------------
+void testCharacterController() {
+    using namespace engine;
+    std::cout << "CharacterController (MovementSystem x PhysicsSystem)\n";
+
+    const auto addFloor = [](Scene& scene) {
+        auto floor = scene.createEntity("Floor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+        auto& body = floor.addComponent<RigidBodyComponent>();
+        body.setStatic(true);
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{30.0f, 0.5f, 30.0f}));
+        return floor;
+    };
+    const auto addCharacter = [](Scene& scene, const glm::vec3& center) {
+        auto player = scene.createEntity("Player");
+        player.addComponent<TransformComponent>(center);
+        auto& camera = player.addComponent<CameraComponent>(CameraConfig{});
+        camera.camera.setOrientation(0.0f, 0.0f);
+        auto& body = player.addComponent<RigidBodyComponent>(80.0f);
+        body.restitution = 0.0f;
+        body.friction = 0.25f;
+        body.setPrincipalInertia(glm::vec3{10000.0f});
+        player.addComponent<ColliderComponent>(
+            ColliderComponent::capsule(PlayerSystem::kCapsuleRadius, PlayerSystem::kCapsuleHalfHeight));
+        return player;
+    };
+
+    // Character at rest on the floor, driven forward at dt = 1/60
+    // (proof the core runs on the caller's actual dt, not 1/128).
+    {
+        Scene scene;
+        addFloor(scene);
+        auto player = addCharacter(scene, glm::vec3{0.0f, 0.75f, 0.0f});
+        check(PlayerSystem::ensureCharacterController(scene), "character controller attaches to the physical player");
+        auto& controller = player.getComponent<CharacterControllerComponent>();
+        check(controller.settings.friction == 8.0f && controller.settings.accelerate == 6.0f &&
+                  controller.settings.airAccelerate == 0.0f,
+              "character ships sv_friction 8 / sv_accelerate 6 / air clamp 0");
+        check(PlayerSystem::ensureCharacterController(scene), "ensure is idempotent");
+
+        PhysicsSettings physicsSettings;
+        PhysicsSystem physics;
+        InputCmd forward;
+        forward.forward = 1.0f; // yaw 0 -> -Z
+        const double dt = 1.0 / 60.0;
+        bool drove = true;
+        for (int step = 0; step < 120; ++step) {
+            drove = PlayerSystem::driveCharacter(scene, forward, dt) && drove;
+            physics.update(scene, dt, physicsSettings);
+        }
+        check(drove, "driveCharacter ticks the movement core in the local input loop");
+        const glm::vec3 position = player.getComponent<TransformComponent>().position;
+        const glm::vec3 bodyVelocity = player.getComponent<RigidBodyComponent>().velocity;
+        const float speed = std::sqrt(bodyVelocity.x * bodyVelocity.x + bodyVelocity.z * bodyVelocity.z);
+        check(position.z < -3.0f, "character travels forward through its capsule collider");
+        check(nearlyEqual(position.y, 0.75, 0.08), "capsule stays grounded at its rest height while driven");
+        check(speed > 2.5f && speed < 4.5f, "rigid body velocity is the movement core's velocity (friction equilibrium)");
+        check(nearlyEqual(controller.state.velocity.z, bodyVelocity.z, 1e-4),
+              "controller state and rigid body velocity agree");
+
+        // Release the input: the friction core (not the physics
+        // solver) bleeds the character to a stop.
+        const InputCmd none;
+        for (int step = 0; step < 120; ++step) {
+            PlayerSystem::driveCharacter(scene, none, dt);
+            physics.update(scene, dt, physicsSettings);
+        }
+        const glm::vec3 stoppedVelocity = player.getComponent<RigidBodyComponent>().velocity;
+        check(std::sqrt(stoppedVelocity.x * stoppedVelocity.x + stoppedVelocity.z * stoppedVelocity.z) < 0.1f,
+              "released input: sv_friction stops the character");
+    }
+
+    // Jump through the character path: leaves the floor, falls
+    // back, friction applies again after touchdown.
+    {
+        Scene scene;
+        addFloor(scene);
+        auto player = addCharacter(scene, glm::vec3{0.0f, 0.75f, 0.0f});
+        (void)PlayerSystem::ensureCharacterController(scene);
+        PhysicsSettings physicsSettings;
+        PhysicsSystem physics;
+        InputCmd jump;
+        jump.jump = true;
+        const double dt = 1.0 / 60.0;
+        float peak = 0.0f;
+        bool airborne = false;
+        for (int step = 0; step < 180; ++step) {
+            PlayerSystem::driveCharacter(scene, jump, dt);
+            jump.jump = false; // one press
+            physics.update(scene, dt, physicsSettings);
+            const float y = player.getComponent<TransformComponent>().position.y;
+            peak = std::max(peak, y);
+            if (y > 0.85f)
+                airborne = true;
+        }
+        check(airborne && peak > 1.1f, "character jump leaves the floor through the physics step");
+        check(nearlyEqual(player.getComponent<TransformComponent>().position.y, 0.75, 0.08),
+              "character lands back at rest height");
+        check(player.getComponent<CharacterControllerComponent>().state.grounded,
+              "controller is grounded again after the landing (friction resumes)");
+    }
+
+    // Wall: the capsule collider, not the movement core, stops the
+    // character — position clamps at the capsule offset.
+    {
+        Scene scene;
+        addFloor(scene);
+        auto player = addCharacter(scene, glm::vec3{0.0f, 0.75f, 2.0f});
+        (void)PlayerSystem::ensureCharacterController(scene);
+        auto wall = scene.createEntity("Wall");
+        wall.addComponent<TransformComponent>(glm::vec3{0.0f, 1.0f, -1.0f});
+        auto& wallBody = wall.addComponent<RigidBodyComponent>();
+        wallBody.setStatic(true);
+        wall.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{3.0f, 1.0f, 0.5f}));
+        PhysicsSettings physicsSettings;
+        PhysicsSystem physics;
+        InputCmd forward;
+        forward.forward = 1.0f;
+        const double dt = 1.0 / 60.0;
+        for (int step = 0; step < 240; ++step) {
+            PlayerSystem::driveCharacter(scene, forward, dt);
+            physics.update(scene, dt, physicsSettings);
+        }
+        const float z = player.getComponent<TransformComponent>().position.z;
+        check(z > -0.5f - PlayerSystem::kCapsuleRadius - 0.05f && z < 0.2f,
+              "capsule collider stops the character at the wall face");
+    }
+
+    // No component -> no character driving (legacy players are
+    // untouched by the new path).
+    {
+        Scene scene;
+        addFloor(scene);
+        auto player = addCharacter(scene, glm::vec3{0.0f, 0.75f, 0.0f});
+        (void)player;
+        InputCmd forward;
+        forward.forward = 1.0f;
+        check(!PlayerSystem::driveCharacter(scene, forward, 1.0 / 60.0),
+              "driveCharacter refuses a player without the controller component");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -13205,6 +13353,7 @@ int main() {
     testTextEditorUpgrade();
     testNetworking();
     testMovementSystem();
+    testCharacterController();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

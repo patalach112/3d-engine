@@ -401,6 +401,11 @@ public:
             reportScriptRequirements(result);
         }
         registerFallbackAssets(m_assets);
+        // Singleplayer movement is character-driven: the local
+        // player ticks the decoupled MovementSystem (friction 8 /
+        // accelerate 6) directly in the fixed input loop through
+        // PlayerSystem::update — no network wrappers involved.
+        (void)engine::PlayerSystem::ensureCharacterController(m_scene);
         m_physicsSystem.captureSpawnStates(m_scene);
         // Deterministic PSO creation per registered material
         // (deduplicated by pipeline state + shader pair).

@@ -3352,7 +3352,12 @@ runs clean.
 - **Shared movement simulation**: `MovementSystem::playerMove`
   is the ONE Source-style movement step (PM_Friction ->
   PM_Accelerate -> jump/gravity -> integrate) executed
-  bit-identically by client prediction and the 128 Hz server:
+  bit-identically by every movement consumer. It lives in the
+  physics layer (`EngineScene`, `Physics/MovementSystem.h`,
+  exported `ENGINE_SCENE_API`) next to `PhysicsSystem`;
+  `EngineNet` is transport/orchestration only and passes
+  `InputCmd`s to it for client prediction and the 128 Hz
+  server's authoritative validation — it owns no movement math:
   friction drops `max(speed, stopspeed) * sv_friction * dt`
   (heavy survival-horror tuning — slow accel ramp, direction
   reversals must cancel momentum through the projection-capped
@@ -3364,6 +3369,23 @@ runs clean.
   the last consumed number and clients replay the un-acked tail
   on top of the authoritative state. The envelope is sanitised
   inside the shared core: clients can ask, never exceed.
+- **Local character controller**: the same core drives the
+  singleplayer/editor player directly — no network wrappers.
+  A `CharacterControllerComponent` binds the movement state to
+  the physical player (camera entity + 80 kg rigid body +
+  capsule collider); `PlayerSystem::update` routes such players
+  through `driveCharacter`, which ticks `playerMove` with the
+  input loop's actual fixed `dt` and writes the resulting
+  velocity into the rigid body. `PhysicsSystem` integrates the
+  capsule and resolves floor/wall/ceiling collisions, and the
+  resolved transform is read back as the next tick's start
+  position (the ground/collision handshake). The controller
+  owns gravity and sleep while driven, so nothing
+  double-integrates; walls and landings come from the physics
+  solver, friction/acceleration from the movement core (with
+  `sv_friction 8` / `sv_accelerate 6`, released input stops the
+  capsule dead). Verified by the character-controller suite:
+  grounded travel, friction stop, jump/landing, wall clamp.
 - **Delta-compression snapshots**: per client, the server keeps
   the last acknowledged baseline (acks ride every input packet)
   and transmits only entities whose replicated state changed,
@@ -3398,7 +3420,7 @@ runs clean.
   and rendering state never enters the server binary — client
   mirrors are built one-way via `NetClient::applyToScene`.
 
-1625 passed / 0 failed across all five build configs
+1639 passed / 0 failed across all five build configs
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, `vibe_server --ticks` and
 `game-player --server` smoke runs clean, scripting-demo and

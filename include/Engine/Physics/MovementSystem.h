@@ -8,10 +8,16 @@ namespace engine {
 
 // ---------------------------------------------------------------------------
 // MovementSystem: the precise Source-engine movement core.
+// Lives in the physics layer (EngineScene, next to PhysicsSystem)
+// and is deliberately transport-agnostic: EngineNet merely passes
+// InputCmds to it, and the local PlayerSystem ticks it directly.
 //
 // ONE pure simulation function — playerMove() — is executed by
-// BOTH sides of the wire with bit-identical results:
-//   * the client calls it per local tick for instant prediction;
+// every movement consumer with bit-identical results:
+//   * the local player controller ticks it in the input loop
+//     (singleplayer / standalone / editor Play);
+//   * the multiplayer client calls it per local tick for instant
+//     prediction;
 //   * vibe_server calls it per consumed InputCmd in its 128 Hz
 //     authoritative loop.
 // Determinism contract: IEEE-754 float math in a fixed order, no
@@ -77,13 +83,13 @@ struct PlayerState {
 // ground/air controller): friction -> accelerate -> jump/gravity
 // -> integrate. The command is sanitised internally, so the legal
 // input envelope is enforced by the same code on both sides.
-ENGINE_NET_API void playerMove(const InputCmd& cmd, PlayerState& state, const MoveSettings& settings, float dt);
+ENGINE_SCENE_API void playerMove(const InputCmd& cmd, PlayerState& state, const MoveSettings& settings, float dt);
 
 // Clamps a raw command into the legal envelope: axes to -1..1,
 // wish vector length <= 1, non-finite values to 0, yaw normalised
 // to [0, 360). cmdNumber is always preserved. Clients may ask for
 // anything; the simulation only ever honours this envelope.
-[[nodiscard]] ENGINE_NET_API InputCmd sanitizeInputCmd(const InputCmd& cmd);
+[[nodiscard]] ENGINE_SCENE_API InputCmd sanitizeInputCmd(const InputCmd& cmd);
 
 // Settings-holding facade so hosts write exactly
 // `movement.playerMove(cmd, state, dt)` — the identical call on
@@ -102,6 +108,32 @@ public:
 
 private:
     MoveSettings m_settings;
+};
+
+// ---------------------------------------------------------------------------
+// CharacterControllerComponent: binds the movement core to a
+// physical player entity (Transform + RigidBody + capsule
+// Collider, the PlayerSystem player contract). PlayerSystem's
+// character path integrates `state` through playerMove() with the
+// caller's real dt and writes the resulting velocity into the
+// rigid body; PhysicsSystem then integrates the capsule and
+// resolves collisions, and the resolved transform is read back
+// as the next tick's state.position (the ground/collision
+// handshake). Authoring notes:
+//   * settings.groundY is the capsule CENTRE height when resting
+//     on the floor (0.75 m for the standard 1.50 m capsule), i.e.
+//     the ground plane the movement ground-check clamps to;
+//   * the controller owns gravity and sleep while driven: the
+//     rigid body's useGravity/allowSleep are forced off so
+//     PhysicsSystem never double-integrates them.
+// Runtime-authored (code/editor), intentionally not serialized:
+// networked players carry the same state in NetPlayerComponent.
+// ---------------------------------------------------------------------------
+struct CharacterControllerComponent {
+    MoveSettings settings{}; // friction 8 / accelerate 6 / airAccelerate 0 defaults
+    PlayerState state{};     // movement truth between ticks
+    std::uint32_t cmdCounter = 0; // local cmd_number sequence
+    bool enabled = true;
 };
 
 } // namespace engine

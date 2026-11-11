@@ -220,6 +220,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Systems/CameraSystem.cpp
     src/Scene/Systems/LightingSystem.cpp
     src/Scene/Systems/PhysicsSystem.cpp
+    src/Physics/MovementSystem.cpp
     src/Scene/Systems/PlayerSystem.cpp
     src/Scene/Systems/RotationSystem.cpp
     src/Scene/Systems/RenderSystem.cpp
@@ -266,7 +267,6 @@ endif()
 engine_module(EngineNet ENGINE_BUILDING_NET
     src/Net/NetProtocol.cpp
     src/Net/ServerConfig.cpp
-    src/Net/MovementSystem.cpp
     src/Net/NetTransport.cpp
     src/Net/NetServer.cpp
     src/Net/NetClient.cpp
