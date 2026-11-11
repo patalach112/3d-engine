@@ -3327,3 +3327,79 @@ clean.
 CTest 1/1, zero warnings, scripting-demo (including the new
 VibeAnim death-ragdoll beat) and standalone player headless
 runs clean.
+
+## Multiplayer — Source-style dedicated server, prediction & delta snapshots ✅
+
+- **Dedicated server runtime**: `vibe_server` (and
+  `game-player --server`) boots a Source-style `server.cfg` and
+  runs the server-authoritative simulation with **no window and
+  no Vulkan**: a deterministic fixed-timestep loop at
+  `FIXED_DT = 1/128` (configurable `tick_rate`, default 128),
+  the full physics solver (trigger/contact events included),
+  EnTT entity systems, and server-side `.dsla` scripts through
+  the same `ScriptSystem` the editor uses. An optional GBQ scene
+  supplies physics/trigger geometry; the editor-deployed
+  `server_scripts.json` set attaches as script components.
+- **ENet transport**: reliable channel 0 carries handshakes,
+  game events (triggers such as `on_touch`, health changes,
+  damage, death/respawn), status answers and action replies;
+  unreliable channel 1 carries input commands upstream and state
+  snapshots downstream. Peers are bound to registry entities at
+  handshake (`Hello` → `Welcome` with the assigned entity id,
+  tick rate and the shared movement rules); `max_players` is
+  enforced with a polite `server full` disconnect, and lifetimes
+  (join/leave/despawn) are fully lifecycle-managed.
+- **Shared movement simulation**: one pure ground-friction
+  controller (Source-style friction bleed + projected
+  accelerate, jump/gravity/ground clamp) runs identically on
+  server and client, so **client-side prediction** has zero
+  input lag and **server reconciliation** (rewind to the last
+  consumed input tick, replay un-acked commands) only cleans up
+  transport drift. Corrections surface as an exponentially
+  decaying visual offset — glides, not snaps; teleports snap.
+  Incoming commands are sanitised server-side (axis/wish-vector
+  clamps, NaN guards): clients can ask, never exceed.
+- **Delta-compression snapshots**: per client, the server keeps
+  the last acknowledged baseline (acks ride every input packet)
+  and transmits only entities whose replicated state changed,
+  plus removal lists — an idle world costs one packet header
+  per tick (verified: zero entities sent at steady state).
+  Stale or missing baselines fall back to full snapshots, which
+  is also the loss-recovery path.
+- **Server authority & remote queries**: health, damage, death,
+  respawn and trigger outcomes exist only on the server
+  (`applyDamage`/`applyHeal`/`teleportEntity`); clients receive
+  them as reliable events and snapshot fields. The only
+  client→server surface besides input is the remote-query API —
+  `requestStatus()` (alive/ping/player count/tick rate) and
+  `sendAction(name, payload)` — and the server executes **only**
+  handlers registered via `registerAction()`, rate-limited per
+  peer; everything else is denied by construction.
+- **Editor "Server" workspace**: a fourth bottom-dock tab,
+  isolated from the client scene/viewport, authors hostname,
+  tick rate, player cap, port, the shared movement rules, custom
+  `server.cfg` rules, and the server-side `.dsla` script set
+  (with the DSL text editor). **Compile Server** runs the server
+  target's own pipeline: every server script is validated with
+  the real DSL parser, and only on success are `server.cfg`
+  (classic `key value` format, round-trippable), the workspace
+  JSON and the deployable `server_scripts/` set regenerated —
+  a failed compile writes nothing and names the broken script.
+- **Zero-allocation hot loops**: per-tick server/client work
+  reuses reserved scratch buffers (transport events, world
+  state, snapshot baselines with bounded ack history); runtime
+  components (`NetPlayerComponent`, `HealthComponent`,
+  `ReplicatedComponent`) are plain data in dense EnTT storage,
+  and rendering state never enters the server binary — client
+  mirrors are built one-way via `NetClient::applyToScene`.
+
+1611 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, `vibe_server --ticks` and
+`game-player --server` smoke runs clean, scripting-demo and
+standalone player headless runs clean. The networking suite
+drives a real ENet loopback match end to end: handshake,
+prediction/reconciliation convergence, idle-world delta
+silence, authoritative damage/death/respawn, trigger
+republication, status/action queries, the player cap, and
+clean disconnects.

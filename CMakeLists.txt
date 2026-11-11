@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 project(3DEngine
     VERSION 0.1.0
     DESCRIPTION "Modern general-purpose 3D game engine (Vulkan)"
-    LANGUAGES CXX
+    LANGUAGES CXX C
 )
 
 # ---------------------------------------------------------------------------
@@ -44,6 +44,13 @@ FetchContent_Declare(
     glm
     GIT_REPOSITORY https://github.com/g-truc/glm.git
     GIT_TAG        1.0.1
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_Declare(
+    enet
+    GIT_REPOSITORY https://github.com/lsalzman/enet.git
+    GIT_TAG        v1.3.18
     GIT_SHALLOW    TRUE
 )
 
@@ -226,11 +233,58 @@ target_link_libraries(EngineScene
     PUBLIC EngineFoundation EngineCore EnginePlatform EngineGeometry EngineGraphics EngineAssets
            EnTT::EnTT glm::glm Threads::Threads)
 
+# ---------------------------------------------------------------------------
+# Networking (Source-style multiplayer): ENet transport, server/client
+# runtime, snapshot delta compression, prediction. ENet is vendored as
+# plain C sources (silenced: third-party code is not held to the
+# engine's warning bar) so its build quirks stay out of the module.
+# ---------------------------------------------------------------------------
+FetchContent_GetProperties(enet)
+if(NOT enet_POPULATED)
+    FetchContent_Populate(enet)
+endif()
+set(ENGINE_ENET_SOURCES
+    ${enet_SOURCE_DIR}/callbacks.c
+    ${enet_SOURCE_DIR}/compress.c
+    ${enet_SOURCE_DIR}/host.c
+    ${enet_SOURCE_DIR}/list.c
+    ${enet_SOURCE_DIR}/packet.c
+    ${enet_SOURCE_DIR}/peer.c
+    ${enet_SOURCE_DIR}/protocol.c
+)
+if(WIN32)
+    list(APPEND ENGINE_ENET_SOURCES ${enet_SOURCE_DIR}/win32.c)
+else()
+    list(APPEND ENGINE_ENET_SOURCES ${enet_SOURCE_DIR}/unix.c)
+endif()
+if(MSVC)
+    set_source_files_properties(${ENGINE_ENET_SOURCES} PROPERTIES COMPILE_OPTIONS "/w")
+else()
+    set_source_files_properties(${ENGINE_ENET_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+
+engine_module(EngineNet ENGINE_BUILDING_NET
+    src/Net/NetProtocol.cpp
+    src/Net/ServerConfig.cpp
+    src/Net/FrictionController.cpp
+    src/Net/NetTransport.cpp
+    src/Net/NetServer.cpp
+    src/Net/NetClient.cpp
+    src/Net/DedicatedServer.cpp
+    ${ENGINE_ENET_SOURCES}
+)
+target_include_directories(EngineNet PRIVATE ${enet_SOURCE_DIR}/include)
+target_link_libraries(EngineNet PUBLIC EngineScene)
+if(WIN32)
+    target_link_libraries(EngineNet PRIVATE ws2_32 winmm)
+endif()
+
 engine_module(EngineApp ENGINE_BUILDING_APP
     src/Core/Application.cpp
 )
 target_link_libraries(EngineApp
     PUBLIC EngineFoundation EngineCore EnginePlatform EngineGeometry EngineGraphics EngineAssets EngineScene
+           EngineNet
            Vulkan::Vulkan glfw glm::glm EnTT::EnTT Threads::Threads)
 
 # ---------------------------------------------------------------------------
@@ -365,7 +419,7 @@ target_compile_definitions(EngineGraphics
 add_executable(game-player src/Standalone/StandaloneMain.cpp)
 target_link_libraries(game-player
     PRIVATE EngineScene EngineAssets EngineGraphics EngineGeometry EngineCore
-            EnginePlatform EngineFoundation Threads::Threads Vulkan::Vulkan glfw
+            EnginePlatform EngineFoundation EngineNet Threads::Threads Vulkan::Vulkan glfw
             glm::glm EnTT::EnTT)
 engine_copy_runtime_dlls(game-player)
 add_dependencies(game-player engine_shaders)
@@ -377,6 +431,24 @@ if(MSVC)
     target_compile_options(game-player PRIVATE /W4 /permissive-)
 else()
     target_compile_options(game-player PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ---------------------------------------------------------------------------
+# Dedicated server (vibe_server): the headless, server-authoritative
+# runtime. No window, no Vulkan — just the fixed 128 Hz simulation,
+# physics, server .dsla scripts and the ENet transport. Boots from a
+# Source-style server.cfg (editor Server tab writes it) plus an
+# optional GBQ scene. `game-player --server` runs the same code.
+# ---------------------------------------------------------------------------
+add_executable(vibe_server src/Server/ServerMain.cpp)
+target_link_libraries(vibe_server
+    PRIVATE EngineNet EngineScene EngineCore EnginePlatform EngineFoundation
+            Threads::Threads glm::glm EnTT::EnTT)
+engine_copy_runtime_dlls(vibe_server)
+if(MSVC)
+    target_compile_options(vibe_server PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(vibe_server PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -438,7 +510,7 @@ if(BUILD_TESTING)
     # link, so the suite doubles as the dynamic-module export test.
     target_link_libraries(engine-core-tests
         PRIVATE EngineApp EngineScene EngineAssets EngineGraphics EngineGeometry EngineCore
-                EnginePlatform EngineFoundation Threads::Threads Vulkan::Vulkan glfw glm::glm EnTT::EnTT)
+                EnginePlatform EngineFoundation EngineNet Threads::Threads Vulkan::Vulkan glfw glm::glm EnTT::EnTT)
 
     # Phase 23/24: mock game modules for the hot-reload and branding
     # tests. They are standalone shared libraries (ABI header only, no

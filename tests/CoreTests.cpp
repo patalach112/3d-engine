@@ -68,6 +68,15 @@
 #include "Scripting/ScriptSystem.h"
 #include "Scripting/StalkerAISystem.h"
 #include "Graphics/TextEditor.h"
+#include "Net/DedicatedServer.h"
+#include "Net/FrictionController.h"
+#include "Net/NetClient.h"
+#include "Net/NetComponents.h"
+#include "Net/NetProtocol.h"
+#include "Net/NetServer.h"
+#include "Net/ServerConfig.h"
+#include "Net/SnapshotDelta.h"
+#include "Physics/PhysicsComponents.h"
 #include "Graphics/ConsoleLog.h"
 #include "SpaceFlightModel.h"
 #include "Platform/DynamicLibrary.h"
@@ -12424,6 +12433,534 @@ void testTextEditorUpgrade() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Multiplayer / dedicated server (Source-style): shared friction
+// controller, wire protocol, server.cfg, snapshot delta compression,
+// ENet loopback client/server with prediction + reconciliation,
+// server-authoritative damage, remote queries/actions, and the
+// headless vibe_server host.
+// ---------------------------------------------------------------------------
+void testNetworking() {
+    using namespace engine;
+    std::cout << "Networking / Dedicated Server\n";
+    const float kDt = 1.0f / 128.0f;
+
+    // --- Ground friction controller: identical math both sides ----
+    {
+        const MoveSettings move;
+        PlayerMoveInput forward;
+        forward.forward = 1.0f;
+        PlayerMoveState a;
+        PlayerMoveState b;
+        a.grounded = b.grounded = true;
+        for (int i = 0; i < 256; ++i) {
+            groundMove(a, forward, move, kDt);
+            groundMove(b, forward, move, kDt);
+        }
+        check(a.position == b.position && a.velocity == b.velocity,
+              "friction controller is deterministic (bit-identical states)");
+        check(nearlyEqual(glm::length(a.velocity), move.maxSpeed, 0.01),
+              "friction controller accelerates to max speed");
+        check(a.position.z < -5.0f, "forward input moves along facing (-Z at yaw 0)");
+        const PlayerMoveInput none;
+        for (int i = 0; i < 256; ++i)
+            groundMove(a, none, move, kDt);
+        check(glm::length(a.velocity) < 1e-3f, "ground friction bleeds speed to a full stop");
+        const float stoppedZ = a.position.z;
+        for (int i = 0; i < 32; ++i)
+            groundMove(a, none, move, kDt);
+        check(nearlyEqual(a.position.z, stoppedZ, 1e-6), "stopped player does not drift");
+
+        PlayerMoveState jumper;
+        jumper.grounded = true;
+        PlayerMoveInput jumpInput;
+        jumpInput.jump = true;
+        float peak = 0.0f;
+        for (int i = 0; i < 256; ++i) {
+            groundMove(jumper, jumpInput, move, kDt);
+            jumpInput.jump = false; // one press
+            peak = std::max(peak, jumper.position.y);
+        }
+        check(peak > 0.5f, "jump leaves the ground");
+        check(jumper.grounded && nearlyEqual(jumper.position.y, 0.0, 1e-6), "jump arc lands back on the ground plane");
+
+        PlayerMoveInput dirty;
+        dirty.forward = 5.0f;
+        dirty.strafe = 5.0f;
+        dirty.yawDegrees = std::numeric_limits<float>::quiet_NaN();
+        const PlayerMoveInput clean = sanitizeMoveInput(dirty);
+        check(clean.forward <= 1.0f && clean.yawDegrees == 0.0f, "sanitizeMoveInput clamps axes and NaN yaw");
+        check(std::sqrt(clean.forward * clean.forward + clean.strafe * clean.strafe) <= 1.001f,
+              "sanitizeMoveInput normalises the wish vector");
+    }
+
+    // --- Wire protocol round trips --------------------------------
+    {
+        ClientHello hello;
+        hello.playerName = "Alice";
+        const std::vector<std::byte> helloBytes = hello.serialize();
+        ClientHello helloBack;
+        check(ClientHello::deserialize(helloBytes.data(), helloBytes.size(), helloBack) &&
+                  helloBack.playerName == "Alice",
+              "ClientHello round-trips");
+        check(!ClientHello::deserialize(helloBytes.data(), 1, helloBack), "truncated packet rejected");
+
+        ServerWelcome welcome;
+        welcome.entityId = 42;
+        welcome.serverTick = 1000;
+        welcome.tickRate = 128;
+        welcome.maxPlayers = 16;
+        welcome.fixedDt = kDt;
+        welcome.serverName = "Round Trip";
+        const std::vector<std::byte> welcomeBytes = welcome.serialize();
+        ServerWelcome welcomeBack;
+        check(ServerWelcome::deserialize(welcomeBytes.data(), welcomeBytes.size(), welcomeBack) &&
+                  welcomeBack.entityId == 42 && welcomeBack.tickRate == 128 &&
+                  welcomeBack.serverName == "Round Trip",
+              "ServerWelcome round-trips");
+
+        InputCommand command;
+        command.tick = 77;
+        command.lastAck = 66;
+        command.input.forward = 0.5f;
+        command.input.jump = true;
+        command.input.yawDegrees = 90.0f;
+        const std::vector<std::byte> commandBytes = command.serialize();
+        InputCommand commandBack;
+        check(InputCommand::deserialize(commandBytes.data(), commandBytes.size(), commandBack) &&
+                  commandBack.tick == 77 && commandBack.input.jump && commandBack.input.yawDegrees == 90.0f,
+              "InputCommand round-trips");
+
+        Snapshot snapshot;
+        snapshot.tick = 500;
+        snapshot.full = true;
+        EntitySnapshot entity;
+        entity.entity = 7;
+        entity.position = glm::vec3{1.0f, 2.0f, 3.0f};
+        entity.health = 55;
+        entity.hasHealth = true;
+        snapshot.entities.push_back(entity);
+        snapshot.removed.push_back(9);
+        const std::vector<std::byte> snapshotBytes = snapshot.serialize();
+        Snapshot snapshotBack;
+        check(Snapshot::deserialize(snapshotBytes.data(), snapshotBytes.size(), snapshotBack) &&
+                  snapshotBack.entities.size() == 1 && snapshotBack.entities[0].health == 55 &&
+                  snapshotBack.removed.size() == 1,
+              "Snapshot round-trips");
+        std::vector<std::byte> corrupt = snapshotBytes;
+        corrupt[0] = static_cast<std::byte>(NetPacketType::Hello);
+        check(!Snapshot::deserialize(corrupt.data(), corrupt.size(), snapshotBack),
+              "packet with wrong type byte rejected");
+
+        NetGameEvent event;
+        event.kind = NetGameEventKind::Trigger;
+        event.entity = 3;
+        event.other = 4;
+        event.text = "SafeZone";
+        const std::vector<std::byte> eventBytes = event.serialize();
+        NetGameEvent eventBack;
+        check(NetGameEvent::deserialize(eventBytes.data(), eventBytes.size(), eventBack) &&
+                  eventBack.text == "SafeZone" && eventBack.kind == NetGameEventKind::Trigger,
+              "NetGameEvent round-trips");
+
+        check(channelOf(NetPacketType::InputCommand) == 1 && channelOf(NetPacketType::Snapshot) == 1 &&
+                  channelOf(NetPacketType::GameEvent) == 0 && channelOf(NetPacketType::Hello) == 0,
+              "movement/snapshots ride the unreliable channel, events the reliable one");
+        check(netTickNewer(5, 0xFFFFFFF0u) && !netTickNewer(0xFFFFFFF0u, 5), "tick comparison wraps correctly");
+    }
+
+    // --- server.cfg parse / generate -------------------------------
+    {
+        const ServerConfigParseResult parsed = parseServerConfig(
+            "// a comment\n"
+            "hostname \"My Server\"\n"
+            "tick_rate 64\n"
+            "max_players = 24\n"
+            "port 27016\n"
+            "sv_gravity 800\n"
+            "mp_timelimit 20 // minutes\n");
+        check(parsed.settings.serverName == "My Server" && parsed.settings.tickRate == 64 &&
+                  parsed.settings.maxPlayers == 24 && parsed.settings.port == 27016,
+              "server.cfg parses known keys");
+        check(parsed.settings.findRule("sv_gravity") != nullptr && *parsed.settings.findRule("sv_gravity") == "800",
+              "unknown keys are preserved as custom rules");
+
+        ServerSettings settings;
+        settings.serverName = "RT";
+        settings.tickRate = 128;
+        settings.setRule("sv_cheats", "0");
+        const ServerSettings roundTripped = parseServerConfig(generateServerConfig(settings)).settings;
+        check(roundTripped == settings, "generate -> parse round-trips the full settings");
+
+        ServerSettings wild;
+        wild.tickRate = 99999;
+        wild.maxPlayers = 0;
+        wild.clampToValid();
+        check(wild.tickRate == 1000 && wild.maxPlayers == 1, "settings clamp into legal envelopes");
+        const ServerSettings defaults = parseServerConfig("").settings;
+        check(defaults.tickRate == 128 && defaults.maxPlayers == 16 && defaults.port == 27015,
+              "empty config yields Source-style defaults (128 Hz)");
+    }
+
+    // --- Snapshot delta compression (pure) -------------------------
+    {
+        EntitySnapshot one;
+        one.entity = 1;
+        one.position = glm::vec3{0.0f};
+        EntitySnapshot two;
+        two.entity = 2;
+        two.position = glm::vec3{1.0f, 0.0f, 0.0f};
+        two.health = 80;
+        two.hasHealth = true;
+        const std::vector<EntitySnapshot> world{one, two};
+
+        SnapshotBaseline baseline;
+        const Snapshot first = buildSnapshot(world, baseline, 10, 0);
+        check(first.full && first.entities.size() == 2, "first snapshot is full");
+        baseline.recordSent(10, world);
+        baseline.onAck(10);
+        const Snapshot idle = buildSnapshot(world, baseline, 11, 0);
+        check(!idle.full && idle.entities.empty() && idle.removed.empty(),
+              "unchanged world produces an empty delta (static entities skipped)");
+
+        std::vector<EntitySnapshot> moved = world;
+        moved[1].position.x = 2.0f;
+        const Snapshot delta = buildSnapshot(moved, baseline, 12, 0);
+        check(delta.entities.size() == 1 && delta.entities[0].entity == 2,
+              "delta carries only the changed entity");
+        const Snapshot removed = buildSnapshot({one}, baseline, 13, 0);
+        check(removed.removed.size() == 1 && removed.removed[0] == 2, "vanished entities are reported removed");
+
+        std::unordered_map<std::uint32_t, EntitySnapshot> clientWorld;
+        applySnapshot(clientWorld, first);
+        applySnapshot(clientWorld, delta);
+        check(clientWorld.size() == 2 && clientWorld[2].position.x == 2.0f, "client merges deltas");
+        applySnapshot(clientWorld, removed);
+        check(clientWorld.size() == 1, "client honours removals");
+
+        SnapshotBaseline stale;
+        stale.ackTick = 1;
+        stale.acked[1] = one;
+        check(buildSnapshot(world, stale, 300, 0).full, "stale baseline forces a full snapshot");
+    }
+
+    // --- Server workspace compile pipeline --------------------------
+    {
+        const auto dir = makeTempDir("engine_test_server_workspace");
+        ServerWorkspace workspace;
+        workspace.settings.serverName = "Workspace Server";
+        workspace.scripts.push_back(
+            ServerScriptEntry{"server_rules",
+                              "from start()\n    health(max) = 100\n    on_start() {\n        print(\"up\")\n    }\nscript(end)",
+                              true});
+        const ServerWorkspace::CompileResult good = workspace.compile(dir);
+        check(good.ok, "workspace with a valid server script compiles");
+        const std::string cfg = readWholeFile(dir / "server.cfg");
+        check(cfg.find("hostname \"Workspace Server\"") != std::string::npos &&
+                  cfg.find("tick_rate 128") != std::string::npos,
+              "compile generates server.cfg from the settings");
+        check(std::filesystem::exists(dir / "server_scripts" / "server_rules.dsla") &&
+                  std::filesystem::exists(dir / "server_scripts.json"),
+              "compile deploys the server script set + manifest");
+        const ServerSettings fromCfg = parseServerConfig(cfg).settings;
+        check(fromCfg == workspace.settings, "generated server.cfg parses back to the workspace settings");
+        ServerWorkspace restored;
+        std::string error;
+        check(restored.loadFromFile(dir / "server_workspace.json", &error) &&
+                  restored.scripts.size() == 1 && restored.settings == workspace.settings,
+              "workspace JSON round-trips");
+
+        ServerWorkspace broken = workspace;
+        broken.scripts.push_back(
+            ServerScriptEntry{"broken_script", "from start()\n    on_start() {\n        print(\"x\")\nscript(end)", true});
+        const auto brokenDir = makeTempDir("engine_test_server_workspace_broken");
+        const ServerWorkspace::CompileResult bad = broken.compile(brokenDir);
+        check(!bad.ok && !bad.errors.empty() && bad.errors.front().find("broken_script") != std::string::npos,
+              "broken server script fails the compile and names the script");
+        check(!std::filesystem::exists(brokenDir / "server.cfg"), "failed compile writes nothing");
+    }
+
+    // --- ENet loopback: full client/server flow ----------------------
+    {
+        ServerSettings settings;
+        settings.serverName = "Loopback";
+        settings.port = 0; // OS-assigned
+        settings.maxPlayers = 2;
+        settings.tickRate = 128;
+
+        NetServer server;
+        // Server-side .dsla logic: runs only on the server.
+        {
+            Entity scriptEntity = server.scene().createEntity("ServerRules");
+            ScriptComponent script;
+            script.source = "from start() on_start() { print(\"hello from server script\") } script(end)";
+            scriptEntity.addComponent<ScriptComponent>(std::move(script));
+            // Physics trigger zone: entered events must reach clients.
+            Entity zone = server.scene().createEntity("SafeZone");
+            zone.addComponent<TransformComponent>(TransformComponent{glm::vec3{0.0f, 0.5f, 0.0f}});
+            ColliderComponent zoneCollider = ColliderComponent::box(glm::vec3{3.0f});
+            zoneCollider.isTrigger = true;
+            zone.addComponent<ColliderComponent>(zoneCollider);
+            RigidBodyComponent zoneBody;
+            zoneBody.setStatic(true);
+            zone.addComponent<RigidBodyComponent>(zoneBody);
+        }
+        check(server.start(settings), "dedicated server starts on an ephemeral port");
+        check(server.port() != 0, "ephemeral port is reported back");
+
+        std::vector<NetGameEvent> aliceEvents;
+        std::vector<std::pair<std::string, std::string>> aliceActions;
+        std::optional<NetStatus> aliceStatus;
+        NetClient alice;
+        NetClient::Callbacks aliceCallbacks;
+        aliceCallbacks.onGameEvent = [&aliceEvents](const NetGameEvent& e) { aliceEvents.push_back(e); };
+        aliceCallbacks.onClientAction = [&aliceActions](const std::string& n, const std::string& p) {
+            aliceActions.emplace_back(n, p);
+        };
+        aliceCallbacks.onStatus = [&aliceStatus](const NetStatus& s) { aliceStatus = s; };
+        alice.setCallbacks(aliceCallbacks);
+        check(alice.connect("127.0.0.1", server.port(), "Alice"), "client connects over UDP loopback");
+
+        const auto pump = [&](NetClient& client, const PlayerMoveInput& input, int iterations) {
+            for (int i = 0; i < iterations; ++i) {
+                server.step();
+                client.tickOnce(input);
+                if (i % 16 == 0)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        };
+        const PlayerMoveInput noInput;
+        pump(alice, noInput, 600);
+        check(alice.welcomed(), "handshake completes: Welcome assigns an entity");
+        check(server.players().size() == 1 && server.players()[0].name == "Alice",
+              "server maps the peer to a registry entity");
+
+        bool sawServerScriptLog = false;
+        for (const std::string& line : server.scriptContext().log) {
+            if (line.find("hello from server script") != std::string::npos)
+                sawServerScriptLog = true;
+        }
+        check(sawServerScriptLog, "server-side .dsla script executes on the server only");
+
+        // The probe enters the zone only now: trigger events are
+        // one-shot broadcasts, so it must arrive after Alice is in.
+        {
+            Entity probe = server.scene().createEntity("Probe");
+            probe.addComponent<TransformComponent>(TransformComponent{glm::vec3{0.0f, 0.5f, 0.0f}});
+            RigidBodyComponent probeBody;
+            probeBody.useGravity = false;
+            probe.addComponent<RigidBodyComponent>(probeBody);
+            probe.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f}));
+        }
+        pump(alice, noInput, 120);
+
+        bool sawTrigger = false;
+        for (const NetGameEvent& e : aliceEvents) {
+            if (e.kind == NetGameEventKind::Trigger && e.text == "SafeZone")
+                sawTrigger = true;
+        }
+        check(sawTrigger, "physics trigger is republished as a reliable game event");
+
+        // Client .dsla bridge: server events become presentation-
+        // only DSL events in the client's own script context.
+        {
+            Scene clientScene;
+            ScriptSystemContext clientScripts;
+            Entity hud = clientScene.createEntity("Hud");
+            ScriptComponent hudScript;
+            hudScript.source =
+                "from start() on_trigger(\"SafeZone\") { print(\"client saw zone\") } script(end)";
+            hud.addComponent<ScriptComponent>(std::move(hudScript));
+            check(alice.forwardEventsToScripts(clientScripts) >= 1,
+                  "server events are forwarded into the client script context");
+            ScriptSystem::update(clientScene, clientScripts, 0.05);
+            bool sawClientPrint = false;
+            for (const std::string& line : clientScripts.log) {
+                if (line.find("client saw zone") != std::string::npos)
+                    sawClientPrint = true;
+            }
+            check(sawClientPrint, "client .dsla reacts to the server trigger (presentation only)");
+        }
+
+        // Movement: predict locally, reconcile against the server.
+        const std::uint32_t aliceEntity = alice.localEntityId();
+        PlayerMoveInput forward;
+        forward.forward = 1.0f;
+        pump(alice, forward, 64);
+        const auto serverTransformOf = [&server](std::uint32_t entityId) {
+            auto& registry = server.scene().registry();
+            return registry.get<TransformComponent>(static_cast<entt::entity>(entityId)).position;
+        };
+        const glm::vec3 serverPos = serverTransformOf(aliceEntity);
+        check(serverPos.z < -0.5f, "server consumed input commands and moved the player");
+        check(glm::length(alice.predictedState().position - serverPos) < 0.25f,
+              "client prediction tracks the authoritative state");
+        pump(alice, noInput, 200);
+        const glm::vec3 settledServerPos = serverTransformOf(aliceEntity);
+        check(glm::length(alice.predictedState().position - settledServerPos) < 0.05f,
+              "prediction converges to the authoritative state at rest");
+        check(alice.stats().reconciliations > 0, "reconciliation ran on snapshots");
+
+        // Delta compression over the wire: an idle world sends nothing.
+        pump(alice, noInput, 64);
+        const std::uint64_t sentBefore = server.stats().snapshotEntitiesSent;
+        pump(alice, noInput, 64);
+        check(server.stats().snapshotEntitiesSent == sentBefore,
+              "idle world: delta snapshots skip every unchanged entity");
+        check(server.stats().snapshotEntitiesSkipped > 0, "delta compression reports skipped entities");
+
+        // Server-authoritative damage / death / respawn.
+        aliceEvents.clear();
+        check(server.applyDamage(aliceEntity, 30), "server applies damage");
+        pump(alice, noInput, 32);
+        bool sawHealth70 = false;
+        for (const NetGameEvent& e : aliceEvents) {
+            if (e.kind == NetGameEventKind::HealthChanged && e.value == 70)
+                sawHealth70 = true;
+        }
+        check(sawHealth70, "health change reaches the client as a reliable event");
+        check(alice.localAuthoritative().has_value() && alice.localAuthoritative()->health == 70,
+              "snapshot carries the authoritative health");
+        aliceEvents.clear();
+        check(server.applyDamage(aliceEntity, 1000), "server applies lethal damage");
+        pump(alice, noInput, 600); // death + 3 s respawn at 128 Hz
+        bool sawDeath = false;
+        bool sawRespawn = false;
+        for (const NetGameEvent& e : aliceEvents) {
+            if (e.kind == NetGameEventKind::Death)
+                sawDeath = true;
+            if (e.kind == NetGameEventKind::Respawn)
+                sawRespawn = true;
+        }
+        check(sawDeath && sawRespawn, "death and respawn are server-driven events");
+        check(alice.localAuthoritative().has_value() && alice.localAuthoritative()->alive &&
+                  alice.localAuthoritative()->health == 100,
+              "respawned player is alive at full health");
+
+        // Remote query: status.
+        aliceStatus.reset();
+        alice.requestStatus();
+        pump(alice, noInput, 300);
+        check(aliceStatus.has_value() && aliceStatus->alive && aliceStatus->playerCount == 1 &&
+                  aliceStatus->tickRate == 128,
+              "status query answers alive / player count / tick rate");
+
+        // Remote query: actions are allow-listed on the server.
+        server.registerAction("buy", [](std::uint32_t, const std::string& payload, std::string& reply) {
+            reply = "ok:" + payload;
+            return true;
+        });
+        aliceActions.clear();
+        aliceEvents.clear();
+        check(alice.sendAction("buy", "ammo"), "client sends a registered action request");
+        check(alice.sendAction("damage", "9999"), "client can ask for anything (server decides)");
+        pump(alice, noInput, 300);
+        bool sawBuy = false;
+        bool sawDenied = false;
+        for (const auto& [name, payload] : aliceActions) {
+            if (name == "buy" && payload == "ok:ammo")
+                sawBuy = true;
+        }
+        for (const NetGameEvent& e : aliceEvents) {
+            if (e.kind == NetGameEventKind::Message && e.text.find("action denied: damage") != std::string::npos)
+                sawDenied = true;
+        }
+        check(sawBuy, "registered action executes on the server and replies");
+        check(sawDenied, "unregistered action is denied by the server");
+        check(alice.localAuthoritative().has_value() && alice.localAuthoritative()->health == 100,
+              "clients cannot touch gameplay state (health untouched by action spam)");
+
+        // Reconciliation under divergence: server teleports the player.
+        const std::uint64_t mispredictsBefore = alice.stats().mispredictions;
+        check(server.teleportEntity(aliceEntity, glm::vec3{10.0f, 0.0f, 10.0f}), "server teleports the player");
+        pump(alice, noInput, 96);
+        check(alice.stats().mispredictions > mispredictsBefore, "divergence is detected as a misprediction");
+        check(glm::length(alice.predictedState().position - glm::vec3{10.0f, 0.0f, 10.0f}) < 0.1f,
+              "client reconciles onto the teleported authoritative state");
+
+        // Second player, mirrors, and the player cap.
+        NetClient bob;
+        check(bob.connect("127.0.0.1", server.port(), "Bob"), "second client connects");
+        for (int i = 0; i < 600 && !bob.welcomed(); ++i) {
+            server.step();
+            alice.tickOnce(noInput);
+            bob.tickOnce(noInput);
+            if (i % 16 == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(bob.welcomed() && server.players().size() == 2, "second player joins and is mapped to an entity");
+        pump(alice, noInput, 64);
+        Scene aliceScene;
+        alice.applyToScene(aliceScene);
+        check(aliceScene.registry().view<NetMirrorComponent>().size() == 1,
+              "client mirrors remote players into its scene (never itself)");
+
+        NetClient carol;
+        std::string carolReason;
+        NetClient::Callbacks carolCallbacks;
+        carolCallbacks.onDisconnected = [&carolReason](const std::string& reason) { carolReason = reason; };
+        carol.setCallbacks(carolCallbacks);
+        check(carol.connect("127.0.0.1", server.port(), "Carol"), "third client dials a full server");
+        for (int i = 0; i < 300; ++i) {
+            server.step();
+            alice.tickOnce(noInput);
+            carol.tickOnce(noInput);
+            if (i % 16 == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(!carol.welcomed() && carolReason == "server full", "max_players is enforced with a reason");
+        check(server.players().size() == 2, "rejected client never became a player");
+
+        bob.disconnect();
+        pump(alice, noInput, 300);
+        check(server.players().size() == 1, "disconnect destroys the server player entity");
+        alice.disconnect();
+        server.stop();
+        check(!server.status().alive, "server stops cleanly");
+    }
+
+    // --- vibe_server host: boot, serve, stop -------------------------
+    {
+        const auto dir = makeTempDir("engine_test_vibe_server");
+        const auto cfgPath = dir / "server.cfg";
+        {
+            std::ofstream file(cfgPath);
+            file << "hostname \"Test Dedicated\"\ntick_rate 128\nmax_players 4\nport 27987\n";
+        }
+        std::atomic<bool> stop{false};
+        int exitCode = -1;
+        std::thread serverThread([&] {
+            DedicatedServerOptions options;
+            options.configPath = cfgPath;
+            options.quiet = true;
+            exitCode = runDedicatedServer(options, &stop);
+        });
+        NetClient probe;
+        bool welcomed = false;
+        for (int i = 0; i < 800 && !welcomed; ++i) {
+            if (!probe.connected())
+                (void)probe.connect("127.0.0.1", 27987, "Probe");
+            probe.tickOnce(PlayerMoveInput{});
+            welcomed = probe.welcomed();
+            if (!welcomed)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        check(welcomed, "vibe_server host accepts a real client");
+        probe.requestStatus();
+        for (int i = 0; i < 400 && !probe.lastStatus().has_value(); ++i) {
+            probe.tickOnce(PlayerMoveInput{});
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(probe.lastStatus().has_value() && probe.lastStatus()->playerCount == 1,
+              "vibe_server answers remote status queries");
+        probe.disconnect();
+        stop.store(true);
+        serverThread.join();
+        check(exitCode == 0, "vibe_server shuts down cleanly on request");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -12495,6 +13032,7 @@ int main() {
     testAnimationStudio();
     testScriptAnimation();
     testTextEditorUpgrade();
+    testNetworking();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

@@ -101,6 +101,12 @@ Application::Application(EngineConfig config)
         [this](std::string_view text) { m_window.setClipboardText(std::string(text)); }});
     m_consoleListenerId = Logger::instance().addListener(
         [this](LogLevel level, std::string_view message) { m_consoleLog.push(level, std::string(message)); });
+    m_serverScriptEditor.setClipboardHooks(TextEditor::ClipboardHooks{
+        [this] { return m_window.clipboardText(); },
+        [this](std::string_view text) { m_window.setClipboardText(std::string(text)); }});
+    // Server workspace: restore the last authoring state (the
+    // Compile Server output directory doubles as its home).
+    loadServerWorkspace();
     m_input.bindAction("Impulse", Key::F);
     m_triggerLogSubscription = m_eventBus.subscribeScoped<TriggerEvent>([](const TriggerEvent& event) {
         ENGINE_LOG_INFO("Event: entity #" << entt::to_integral(event.otherEntity)
@@ -1280,9 +1286,15 @@ void Application::run() {
                 if (m_uiContext.button(tabAnim, "VibeAnim")) {
                     m_bottomDockTab = BottomDockTab::Anim;
                 }
+                const UIRect tabServer{assetRect.x + 292.0f, assetRect.y + 2.0f, 92.0f, tabHeight - 4.0f};
+                if (m_uiContext.button(tabServer, "Server")) {
+                    m_bottomDockTab = BottomDockTab::Server;
+                }
                 const UIRect activeTab = m_bottomDockTab == BottomDockTab::Assets
                                              ? tabAssets
-                                             : (m_bottomDockTab == BottomDockTab::Script ? tabScript : tabAnim);
+                                             : (m_bottomDockTab == BottomDockTab::Script
+                                                    ? tabScript
+                                                    : (m_bottomDockTab == BottomDockTab::Anim ? tabAnim : tabServer));
                 ui.drawRect(activeTab.x, assetRect.y + tabHeight - 2.0f, activeTab.width, 2.0f,
                             m_uiContext.theme().focusBorder);
                 const UIRect dockContent{assetRect.x, assetRect.y + tabHeight,
@@ -1291,8 +1303,10 @@ void Application::run() {
                     browserResult = m_assetBrowser.build(m_uiContext, dockContent);
                 } else if (m_bottomDockTab == BottomDockTab::Script) {
                     drawScriptDock(dockContent, m_lastUpdateDeltaSeconds);
-                } else {
+                } else if (m_bottomDockTab == BottomDockTab::Anim) {
                     drawAnimStudio(dockContent, m_lastUpdateDeltaSeconds);
+                } else {
+                    drawServerDock(dockContent, m_lastUpdateDeltaSeconds);
                 }
             }
             const UIDragPayload dragPayload = m_uiContext.dragPayload();
@@ -1707,6 +1721,230 @@ void Application::drawScriptDock(const UIRect& rect, double deltaSeconds) {
         if (!result.changed) {
             m_scriptEditor.closeCompletions();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server workspace (bottom-dock "Server" tab)
+//
+// Authoring surface for the dedicated server ONLY: settings that
+// become server.cfg, plus the server-side .dsla script set that
+// vibe_server executes. Nothing here touches the client scene,
+// the client script editor, or the Play session — the isolation
+// is the point (server scripts must never ship to clients).
+// ---------------------------------------------------------------------------
+
+void Application::syncServerFieldBuffers() {
+    const ServerSettings& settings = m_serverWorkspace.settings;
+    m_serverNameBuffer = settings.serverName;
+    m_serverTickRateBuffer = std::to_string(settings.tickRate);
+    m_serverMaxPlayersBuffer = std::to_string(settings.maxPlayers);
+    m_serverPortBuffer = std::to_string(settings.port);
+}
+
+void Application::commitServerScriptBuffer() {
+    if (m_serverScriptIndex < 0 ||
+        m_serverScriptIndex >= static_cast<int>(m_serverWorkspace.scripts.size()))
+        return;
+    if (m_serverScriptEditor.dirty()) {
+        m_serverWorkspace.scripts[static_cast<size_t>(m_serverScriptIndex)].source =
+            m_serverScriptEditor.text();
+        m_serverScriptEditor.markClean();
+    }
+}
+
+void Application::selectServerScript(int index) {
+    commitServerScriptBuffer();
+    m_serverScriptIndex = index;
+    if (index >= 0 && index < static_cast<int>(m_serverWorkspace.scripts.size())) {
+        m_serverScriptEditor.loadText(
+            m_serverWorkspace.scripts[static_cast<size_t>(index)].source);
+        m_serverScriptEditor.markClean();
+    }
+}
+
+void Application::loadServerWorkspace() {
+    const std::filesystem::path workspacePath = m_serverOutputDir / "server_workspace.json";
+    std::string error;
+    if (std::filesystem::exists(workspacePath)) {
+        if (m_serverWorkspace.loadFromFile(workspacePath, &error)) {
+            ENGINE_LOG_INFO("Server workspace loaded from " << workspacePath.string());
+        } else {
+            ENGINE_LOG_WARNING("Server workspace load failed: " << error);
+        }
+    }
+    if (m_serverWorkspace.scripts.empty()) {
+        // First run: scaffold one valid server-rules script so the
+        // tab (and Compile Server) has something real to show.
+        ServerScriptEntry starter;
+        starter.name = "server_rules";
+        starter.source = "// Server-side rules: executed ONLY by vibe_server.\n"
+                         "// Damage, health and triggers stay server-authoritative;\n"
+                         "// clients receive the outcomes as game events.\n"
+                         "from start()\n"
+                         "    health(max) = 100\n"
+                         "    health(lowest) = 0\n"
+                         "    on_start() {\n"
+                         "        print(\"server rules online\")\n"
+                         "    }\n"
+                         "script(end)\n";
+        m_serverWorkspace.scripts.push_back(std::move(starter));
+    }
+    syncServerFieldBuffers();
+    m_serverScriptIndex = -1;
+    selectServerScript(0);
+}
+
+void Application::compileServerWorkspace() {
+    commitServerScriptBuffer();
+    ServerSettings& settings = m_serverWorkspace.settings;
+    settings.serverName = m_serverNameBuffer;
+    const auto parseField = [](const std::string& text, int fallback) {
+        try {
+            return std::stoi(text);
+        } catch (...) {
+            return fallback;
+        }
+    };
+    settings.tickRate = parseField(m_serverTickRateBuffer, settings.tickRate);
+    settings.maxPlayers = parseField(m_serverMaxPlayersBuffer, settings.maxPlayers);
+    const int port = parseField(m_serverPortBuffer, settings.port);
+    settings.port = static_cast<std::uint16_t>(std::clamp(port, 0, 65535));
+    settings.clampToValid();
+    syncServerFieldBuffers(); // show the clamped values back
+
+    const ServerWorkspace::CompileResult result = m_serverWorkspace.compile(m_serverOutputDir);
+    if (result.ok) {
+        m_serverStatus = "Compiled OK -> " + m_serverOutputDir.string() + "/server.cfg (" +
+                         std::to_string(result.writtenFiles.size()) + " files)";
+        setStatusMessage("Server compiled: server.cfg updated");
+        ENGINE_LOG_INFO("Server workspace compiled: " << result.writtenFiles.size() << " files into "
+                                                      << m_serverOutputDir.string());
+    } else {
+        m_serverStatus = "Compile FAILED: " + (result.errors.empty() ? std::string("unknown error")
+                                                                      : result.errors.front());
+        setStatusMessage("Server compile failed (see Server tab)");
+        for (const std::string& compileError : result.errors)
+            ENGINE_LOG_ERROR("Server compile: " << compileError);
+    }
+}
+
+void Application::drawServerDock(const UIRect& rect, double deltaSeconds) {
+    UIBatch& batch = m_renderer.uiBatch();
+    const UITheme& theme = m_uiContext.theme();
+    ServerSettings& settings = m_serverWorkspace.settings;
+
+    batch.drawText("Server Workspace", rect.x + 8.0f, rect.y + 7.0f, 1.35f, theme.text);
+    batch.drawText("dedicated-server authoring - isolated from the client scene", rect.x + 185.0f,
+                   rect.y + 10.0f, 1.15f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+    const UIRect compileButton{rect.x + rect.width - 150.0f, rect.y + 3.0f, 142.0f, 24.0f};
+    if (m_uiContext.button(compileButton, "Compile Server")) {
+        compileServerWorkspace();
+    }
+    if (!m_serverStatus.empty()) {
+        const bool ok = m_serverStatus.rfind("Compiled OK", 0) == 0;
+        batch.drawText(m_serverStatus, rect.x + 8.0f, rect.y + rect.height - 18.0f, 1.15f,
+                       ok ? glm::vec4{0.45f, 0.85f, 0.5f, 1.0f} : glm::vec4{0.95f, 0.45f, 0.4f, 1.0f});
+    }
+
+    const float columnsY = rect.y + 32.0f;
+    const float columnsHeight = std::max(60.0f, rect.height - 58.0f);
+
+    // -- Left: server settings -> server.cfg -------------------------------
+    {
+        const UIRect panel{rect.x + 4.0f, columnsY, 300.0f, columnsHeight};
+        m_uiContext.beginPanel("ServerSettings", panel, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+        m_uiContext.label("Server Settings");
+        m_uiContext.label("Hostname");
+        m_uiContext.textField("ServerName", &m_serverNameBuffer);
+        m_uiContext.label("Tick rate (Hz, 10-1000)");
+        m_uiContext.textField("ServerTickRate", &m_serverTickRateBuffer);
+        m_uiContext.label("Max players (1-64)");
+        m_uiContext.textField("ServerMaxPlayers", &m_serverMaxPlayersBuffer);
+        m_uiContext.label("Port (0 = auto)");
+        m_uiContext.textField("ServerPort", &m_serverPortBuffer);
+        m_uiContext.label("Movement (client prediction uses these)");
+        m_uiContext.slider("max speed", &settings.move.maxSpeed, 0.5f, 20.0f);
+        m_uiContext.slider("friction", &settings.move.friction, 0.0f, 20.0f);
+        m_uiContext.slider("stop speed", &settings.move.stopSpeed, 0.1f, 10.0f);
+        m_uiContext.slider("accelerate", &settings.move.accelerate, 1.0f, 40.0f);
+        m_uiContext.slider("air accelerate", &settings.move.airAccelerate, 0.0f, 20.0f);
+        m_uiContext.slider("gravity", &settings.move.gravity, 1.0f, 60.0f);
+        m_uiContext.slider("jump speed", &settings.move.jumpSpeed, 0.5f, 20.0f);
+        m_uiContext.label("Custom rules (key = value in server.cfg)");
+        const size_t ruleRows = std::min<size_t>(settings.rules.size(), 6);
+        for (size_t i = 0; i < ruleRows; ++i) {
+            m_uiContext.textField("RuleKey" + std::to_string(i), &settings.rules[i].first);
+            m_uiContext.textField("RuleVal" + std::to_string(i), &settings.rules[i].second);
+        }
+        if (m_uiContext.button("Add Rule")) {
+            settings.rules.emplace_back("rule", "value");
+        }
+        if (!settings.rules.empty() && m_uiContext.button("Remove Last Rule")) {
+            settings.rules.pop_back();
+        }
+        m_uiContext.endPanel();
+    }
+
+    // -- Right: server script set + editor ----------------------------------
+    const float rightX = rect.x + 312.0f;
+    const float rightWidth = std::max(120.0f, rect.width - 316.0f);
+    const float listHeight = 168.0f;
+    {
+        const UIRect panel{rightX, columnsY, rightWidth, listHeight};
+        m_uiContext.beginPanel("ServerScripts", panel, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+        m_uiContext.label("Server Scripts (.dsla - executed by vibe_server only)");
+        const size_t shown = std::min<size_t>(m_serverWorkspace.scripts.size(), 3);
+        for (size_t i = 0; i < shown; ++i) {
+            const ServerScriptEntry& entry = m_serverWorkspace.scripts[i];
+            std::string labelText = entry.name.empty() ? ("script " + std::to_string(i)) : entry.name;
+            if (!entry.enabled)
+                labelText += " (disabled)";
+            if (static_cast<int>(i) == m_serverScriptIndex)
+                labelText += "  <";
+            if (m_uiContext.button(labelText)) {
+                selectServerScript(static_cast<int>(i));
+            }
+        }
+        if (m_serverWorkspace.scripts.size() > shown) {
+            m_uiContext.label("... " + std::to_string(m_serverWorkspace.scripts.size() - shown) + " more");
+        }
+        if (m_uiContext.button("New Script")) {
+            ServerScriptEntry entry;
+            entry.name = "server_script_" + std::to_string(m_serverWorkspace.scripts.size() + 1);
+            entry.source = "// Server-side script (vibe_server only)\n"
+                           "from start()\n"
+                           "    on_start() {\n"
+                           "    }\n"
+                           "script(end)\n";
+            m_serverWorkspace.scripts.push_back(std::move(entry));
+            selectServerScript(static_cast<int>(m_serverWorkspace.scripts.size()) - 1);
+        }
+        if (m_serverScriptIndex >= 0 &&
+            m_serverScriptIndex < static_cast<int>(m_serverWorkspace.scripts.size())) {
+            ServerScriptEntry& entry =
+                m_serverWorkspace.scripts[static_cast<size_t>(m_serverScriptIndex)];
+            m_uiContext.checkbox("Enabled", &entry.enabled);
+            if (m_uiContext.button("Delete Script")) {
+                m_serverWorkspace.scripts.erase(m_serverWorkspace.scripts.begin() + m_serverScriptIndex);
+                m_serverScriptIndex = -1;
+                if (!m_serverWorkspace.scripts.empty())
+                    selectServerScript(0);
+            }
+        }
+        m_uiContext.endPanel();
+    }
+
+    const UIRect editorRect{rightX, columnsY + listHeight + 6.0f, rightWidth,
+                            std::max(40.0f, columnsHeight - listHeight - 6.0f)};
+    if (m_serverScriptIndex >= 0 &&
+        m_serverScriptIndex < static_cast<int>(m_serverWorkspace.scripts.size())) {
+        m_serverScriptEditor.draw(m_uiContext, editorRect, static_cast<float>(deltaSeconds));
+        commitServerScriptBuffer();
+    } else {
+        batch.drawText("No server script selected. Use New Script to author server-side logic.",
+                       editorRect.x + 8.0f, editorRect.y + 10.0f, 1.25f,
+                       glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
     }
 }
 

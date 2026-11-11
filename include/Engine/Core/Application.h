@@ -23,6 +23,7 @@
 #include "Platform/Window.h"
 #include "Scene/PlaySession.h"
 #include "Scripting/ScriptSystem.h"
+#include "Net/ServerConfig.h"
 #include "Graphics/TextEditor.h"
 #include "Graphics/ConsoleLog.h"
 #include "Scene/Scene.h"
@@ -137,6 +138,16 @@ private:
     float inspectAnimationAt(float x, float y, float width, entt::entity entity);
     void drawAnimStudio(const UIRect& rect, double deltaSeconds);
     entt::entity resolveAnimRig();
+    // Server workspace (bottom-dock "Server" tab): dedicated-
+    // server settings + server-side .dsla authoring, isolated
+    // from the client scene. Compile runs the server target's
+    // own pipeline and writes server.cfg + server_scripts/.
+    void drawServerDock(const UIRect& rect, double deltaSeconds);
+    void compileServerWorkspace();
+    void loadServerWorkspace();
+    void syncServerFieldBuffers();
+    void selectServerScript(int index);
+    void commitServerScriptBuffer();
     // Script-editor live services: re-parse the buffer into gutter
     // diagnostics, and refresh the completion popup from the DSL
     // completion provider (clip/entity names read live).
@@ -217,7 +228,7 @@ private:
     EditorDockSizes m_dockSizes;
     int m_activeSplitter = 0;  // 0 none, 1 hierarchy, 2 inspector, 3 bottom dock
     int m_hoveredSplitter = 0; // same encoding, for hover/cursor feedback
-    enum class BottomDockTab : uint8_t { Assets, Script, Anim };
+    enum class BottomDockTab : uint8_t { Assets, Script, Anim, Server };
     BottomDockTab m_bottomDockTab = BottomDockTab::Assets;
     TextEditor m_scriptEditor;
     std::string m_scriptStatus; // last Save & Compile verdict for the bound script
@@ -240,6 +251,18 @@ private:
     std::string m_animNewClipName = "clip";
     double m_animSelectedKeyTime = -1.0; // < 0 = no key selected
     int m_animInterpChoice = 0;          // AnimInterpolation as int (new keys)
+    // Server workspace state (see drawServerDock). The workspace
+    // persists to <output dir>/server_workspace.json; Compile
+    // regenerates server.cfg + server_scripts/ beside it.
+    ServerWorkspace m_serverWorkspace;
+    std::filesystem::path m_serverOutputDir = "server";
+    TextEditor m_serverScriptEditor;
+    int m_serverScriptIndex = -1; // selected server script (-1 = none)
+    std::string m_serverStatus;   // last Compile Server verdict
+    std::string m_serverNameBuffer;
+    std::string m_serverPortBuffer;
+    std::string m_serverTickRateBuffer;
+    std::string m_serverMaxPlayersBuffer;
     UIRect m_scriptEditorRect{}; // last drawn script-dock rect (I-beam cursor)
     // In-engine console: Logger listener -> ring buffer -> panel.
     // Visible in Edit and Play (layout.console strip).

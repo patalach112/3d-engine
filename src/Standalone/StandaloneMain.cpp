@@ -37,11 +37,14 @@
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/AnimationSystem.h"
 #include "Scene/Systems/PlayerSystem.h"
+#include "Net/DedicatedServer.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 #include "Scene/Systems/TransformSystem.h"
 
+#include <atomic>
 #include <cmath>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -59,12 +62,22 @@
 
 namespace {
 
+std::atomic<bool> g_serverStop{false};
+void requestServerStop(int) {
+    g_serverStop.store(true, std::memory_order_relaxed);
+}
+
 struct Options {
     std::filesystem::path configPath; // game.ini / engine.ini
     std::filesystem::path bundlePath; // .gbq bundle (from Export Game)
     std::filesystem::path scenePath;  // raw scene .gbq (no bundle)
     long headlessFrames = -1;         // >= 0: headless simulation run
     bool help = false;
+    // Dedicated-server mode (--server): no window, no Vulkan; the
+    // same runtime as vibe_server, hosted by this binary.
+    bool server = false;
+    std::filesystem::path serverConfigPath = "server.cfg";
+    long serverTicks = 0; // 0 = run until SIGINT/SIGTERM
 };
 
 void printUsage(const char* program) {
@@ -75,6 +88,9 @@ void printUsage(const char* program) {
               << "  --bundle <path>     GBQB deployment bundle written by Export Game\n"
               << "  --scene <path>      Raw scene .gbq, booted with built-in fallback assets\n"
               << "  --headless <frames> No window/GPU: load, run N fixed steps, validate, exit\n"
+              << "  --server            Run as a headless dedicated server (server.cfg, no window/GPU)\n"
+              << "  --server-cfg <path> server.cfg for --server (default: server.cfg)\n"
+              << "  --server-ticks <n>  Stop the server after N fixed ticks (default: until signal)\n"
               << "  --help              Show this message\n";
 }
 
@@ -103,6 +119,23 @@ bool parseArguments(int argc, char* argv[], Options& options) {
             }
         } else if (argument == "--scene") {
             if (!takeValue("--scene", options.scenePath)) {
+                return false;
+            }
+        } else if (argument == "--server") {
+            options.server = true;
+        } else if (argument == "--server-cfg") {
+            if (!takeValue("--server-cfg", options.serverConfigPath)) {
+                return false;
+            }
+        } else if (argument == "--server-ticks") {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for --server-ticks\n";
+                return false;
+            }
+            char* end = nullptr;
+            options.serverTicks = std::strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || options.serverTicks < 0) {
+                std::cerr << "--server-ticks expects a non-negative tick count\n";
                 return false;
             }
         } else if (argument == "--headless") {
@@ -502,6 +535,20 @@ int main(int argc, char* argv[]) {
     // every engine system can log — same bootstrap as the editor.
     engine::EngineConfig config = engine::EngineConfig::load(options.configPath.string());
     engine::Logger::instance().initialize(config.logger);
+
+    if (options.server) {
+        // Dedicated-server mode: the authoritative fixed-step
+        // runtime only. No bundle resolution, no window, no GPU.
+        std::signal(SIGINT, requestServerStop);
+        std::signal(SIGTERM, requestServerStop);
+        engine::DedicatedServerOptions serverOptions;
+        serverOptions.configPath = options.serverConfigPath;
+        serverOptions.scenePath = options.scenePath;
+        serverOptions.maxTicks = options.serverTicks;
+        const int serverExit = engine::runDedicatedServer(serverOptions, &g_serverStop);
+        engine::Logger::instance().shutdown();
+        return serverExit == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     for (const std::string& warning : config.loadWarnings) {
         ENGINE_LOG_WARNING(warning);
     }
