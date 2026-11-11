@@ -118,6 +118,10 @@ private:
     // Arms the inspector rename field for `entity` (tag copied into
     // the edit buffer, keyboard focus grabbed on its first frame).
     void beginRename(entt::entity entity);
+    // Commits a rename: updates the tag, rewrites script
+    // references scene-wide, re-points runtime identities and
+    // the script-editor binding (Application::renameEntity).
+    void renameEntity(entt::entity entity, const std::string& newName);
     // Script dock: binds the text editor to an entity's
     // ScriptComponent, commits buffer -> component (+ .dsla file)
     // with an immediate parse verdict, renders the inspector's
@@ -207,6 +211,11 @@ private:
     BottomDockTab m_bottomDockTab = BottomDockTab::Assets;
     TextEditor m_scriptEditor;
     std::string m_scriptStatus; // last Save & Compile verdict for the bound script
+    // Compile-error modal: set by a failed Save & Compile, drawn
+    // over the editor until dismissed (OK / Enter / Escape).
+    bool m_scriptErrorOpen = false;
+    std::string m_scriptErrorTitle;
+    std::string m_scriptErrorBody;
     UIRect m_scriptEditorRect{}; // last drawn script-dock rect (I-beam cursor)
     // In-engine console: Logger listener -> ring buffer -> panel.
     // Visible in Edit and Play (layout.console strip).

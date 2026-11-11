@@ -280,6 +280,23 @@ private:
             if (word == "hudprint") {
                 return parseHudPrint();
             }
+            if (word == "hudclear") {
+                return parseHudClear();
+            }
+            if ((word == "destroy" || word == "freeze")) {
+                // Bare host calls: destroy() / freeze() target the
+                // script's own entity (universal local context).
+                const int line = m_token.line;
+                advance();
+                if (!expectSymbol("(") || !expectSymbol(")")) {
+                    return std::nullopt;
+                }
+                DSLNode node;
+                node.kind = DSLNodeKind::PartCall;
+                node.line = line;
+                node.extra = word; // node.name stays "" == self
+                return node;
+            }
             if (word == "every" || word == "for") {
                 return parseTemporal(word);
             }
@@ -343,7 +360,7 @@ private:
         if (!expectSymbol("(")) {
             return std::nullopt;
         }
-        auto name = parseStringArg("part(...)");
+        auto name = parseTargetArg("part(...)");
         if (!name.has_value() || !expectSymbol(")")) {
             return std::nullopt;
         }
@@ -409,6 +426,15 @@ private:
         }
         node.kind = DSLNodeKind::PartAssign;
         node.property = member;
+        if (member == "color" && m_token.kind == Token::Kind::HexColor) {
+            const std::string hex = m_token.text;
+            advance();
+            node.colorLiteral = true;
+            if (!parseHexColor(hex, node.colorRed, node.colorGreen, node.colorBlue)) {
+                return std::nullopt;
+            }
+            return node;
+        }
         auto value = parseExpression();
         if (!value.has_value()) {
             return std::nullopt;
@@ -609,21 +635,21 @@ private:
         return true;
     }
 
-    bool parseHexColor(const std::string& hex, DSLNode& node) {
+    bool parseHexColor(const std::string& hex, float& red, float& green, float& blue) {
         std::string digits = hex;
         if (digits.size() == 3) { // #RGB shorthand
             digits = std::string{digits[0], digits[0], digits[1], digits[1], digits[2], digits[2]};
         }
         if (digits.size() != 6) {
-            fail("hudprint color must be #RRGGBB");
+            fail("colour must be #RRGGBB");
             return false;
         }
         const auto channel = [&digits](size_t at) {
             return static_cast<float>(std::strtoul(digits.substr(at, 2).c_str(), nullptr, 16)) / 255.0f;
         };
-        node.hudRed = channel(0);
-        node.hudGreen = channel(2);
-        node.hudBlue = channel(4);
+        red = channel(0);
+        green = channel(2);
+        blue = channel(4);
         return true;
     }
 
@@ -636,12 +662,17 @@ private:
             return std::nullopt;
         }
         auto text = parseStringArg("hudprint(...)");
-        if (!text.has_value() || !expectSymbol(")") || !expectSymbol("{")) {
+        if (!text.has_value() || !expectSymbol(")")) {
             return std::nullopt;
         }
         DSLNode node;
         node.kind = DSLNodeKind::HudPrint;
         node.line = line;
+        if (!atSymbol("{")) {
+            node.name = *text; // block omitted: all defaults (persistent)
+            return node;
+        }
+        advance(); // {
         node.name = *text;
         while (!atSymbol("}")) {
             if (m_token.kind != Token::Kind::Identifier) {
@@ -673,23 +704,29 @@ private:
                     return std::nullopt;
                 }
             } else if (key == "duration") {
-                if (m_token.kind != Token::Kind::Duration && m_token.kind != Token::Kind::Number) {
-                    fail("hudprint duration expects a time (duration = 3s)");
+                if (atIdentifier("infinite")) {
+                    node.hudPersistent = true;
+                    node.hudDuration = 0.0;
+                    advance();
+                } else if (m_token.kind == Token::Kind::Duration || m_token.kind == Token::Kind::Number) {
+                    node.hudDuration = std::max(0.0, m_token.number);
+                    node.hudPersistent = false;
+                    advance();
+                } else {
+                    fail("hudprint duration expects a time (duration = 3s) or 'infinite'");
                     return std::nullopt;
                 }
-                node.hudDuration = std::max(0.0, m_token.number);
-                advance();
             } else if (key == "color") {
                 if (m_token.kind == Token::Kind::HexColor) {
                     const std::string hex = m_token.text;
                     advance();
-                    if (!parseHexColor(hex, node)) {
+                    if (!parseHexColor(hex, node.hudRed, node.hudGreen, node.hudBlue)) {
                         return std::nullopt;
                     }
                 } else if (m_token.kind == Token::Kind::String && !m_token.text.empty() && m_token.text.front() == '#') {
                     const std::string hex = m_token.text.substr(1);
                     advance();
-                    if (!parseHexColor(hex, node)) {
+                    if (!parseHexColor(hex, node.hudRed, node.hudGreen, node.hudBlue)) {
                         return std::nullopt;
                     }
                 } else {
@@ -713,6 +750,26 @@ private:
             }
         }
         advance(); // }
+        return node;
+    }
+
+    // hudclear("Text") / hudclear(): close this script's prints.
+    std::optional<DSLNode> parseHudClear() {
+        const int line = m_token.line;
+        advance(); // hudclear
+        if (!expectSymbol("(")) {
+            return std::nullopt;
+        }
+        DSLNode node;
+        node.kind = DSLNodeKind::HudClear;
+        node.line = line;
+        if (m_token.kind == Token::Kind::String) {
+            node.name = m_token.text;
+            advance();
+        }
+        if (!expectSymbol(")")) {
+            return std::nullopt;
+        }
         return node;
     }
 
@@ -755,6 +812,20 @@ private:
             if (!expectSymbol("=")) {
                 return std::nullopt;
             }
+            if (member == "color" && m_token.kind == Token::Kind::HexColor) {
+                const std::string hex = m_token.text;
+                advance();
+                node.kind = DSLNodeKind::PartAssign;
+                node.property = member;
+                if (word == "this" || word == "self") {
+                    node.name = "self";
+                }
+                node.colorLiteral = true;
+                if (!parseHexColor(hex, node.colorRed, node.colorGreen, node.colorBlue)) {
+                    return std::nullopt;
+                }
+                return node;
+            }
             auto dotted = parseExpression();
             if (!dotted.has_value()) {
                 return std::nullopt;
@@ -767,6 +838,9 @@ private:
             } else {
                 node.kind = DSLNodeKind::PartAssign;
                 node.property = member; // node.name keeps the entity name
+                if (word == "this" || word == "self") {
+                    node.name = "self"; // host-local property write
+                }
             }
             if (!parseOverSuffix(node)) {
                 return std::nullopt;

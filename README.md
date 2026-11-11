@@ -3185,3 +3185,46 @@ player headless runs clean.
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, scripting-demo (Scenario 18) and
 standalone player headless runs clean.
+
+## DSL/editor fixes — strict event scoping, rename propagation, compile modal, universal hosts, live HUD ✅
+
+- **Strict event target scoping**: the dispatcher matches a
+  handler only against the exact tag it named — physics pair
+  events must include that tag on one of the two actual
+  colliders, named events are authoritative on their target —
+  and a per-event arming snapshot means handlers armed or
+  latched by a handler body can never fire for the event that
+  armed them (landing on the floor no longer misfires
+  `on_touch("BrickWall")`; no same-event cascades).
+- **Entity renaming propagates**: the inspector rename now
+  funnels into `Application::renameEntity` — tag write plus
+  `ScriptSystem::rewriteReferences`, which rewrites quoted
+  `part("...")` / `on_touch("...")` / `on_trigger("...")` /
+  `position("...")` references in every script (string literals
+  and item names untouched), re-points runtime identity tags so
+  Play/Stop migration stays bound, updates the script-editor
+  binding, and rewrites references inside an open editor buffer
+  while preserving its dirty state.
+- **Compilation error modal**: a failed Save & Compile opens a
+  dedicated centred modal over a dimmed editor with the exact
+  parser errors (line numbers included), dismissed by OK /
+  Enter / Escape or by the next clean compile — console logging
+  remains as the permanent record.
+- **Universal entity scripting**: scripts execute in their
+  host's local context on ANY entity — `part(self)` /
+  `part("self")`, `this.intensity = ...`, `this.color = #FF0000`
+  (new hex colour property for lights), bare `destroy()` /
+  `freeze()` targeting the host — and `position("zone")`
+  measures the host itself when no player/focus entity exists
+  (the Application focuses the "Player" entity during Play).
+- **Live + persistent hudprint**: `{variable}` / `{text}`
+  placeholders interpolate at print time and re-render every
+  frame; omitted duration (or `duration = infinite`, or even
+  omitting the whole `{ }` block) makes a print persistent
+  until `hudclear("template")` / `hudclear()` closes it, and
+  runtime resets close their own prints.
+
+1416 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, scripting-demo and standalone
+player headless runs clean.

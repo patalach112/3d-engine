@@ -11624,6 +11624,189 @@ void testDslExpansions() {
     }
 }
 
+void testDslScopingUniversalAndHudLive() {
+    std::cout << "DSL scoping, universal hosts, live/persistent hudprint, rename rewrite\n";
+    using namespace engine;
+
+    // -- (1) Strict event target scoping --------------------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto wall = scene.createEntity("BrickWall");
+        wall.addComponent<TransformComponent>();
+        auto floor = scene.createEntity("Floor");
+        floor.addComponent<TransformComponent>();
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() hits = 0 interacted = 0 on_touch(\"BrickWall\") { hits = hits + 1 } "
+            "on_interact(\"Door\") { interacted = interacted + 1 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        // Landing on the floor (the "jumping" misfire): no BrickWall involved.
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, floor.handle(), brain.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "hits").value_or(-1.0) == 0.0,
+              "scoping: unrelated collider (floor landing) does not fire on_touch(\"BrickWall\")");
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, wall.handle(), brain.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "hits").value_or(-1.0) == 1.0,
+              "scoping: touching the exact tagged entity fires");
+        // A named event is authoritative even without a physics pair.
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "BrickWall", entt::null, entt::null, entt::null, entt::null});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "hits").value_or(-1.0) == 2.0,
+              "scoping: explicitly named target fires its handler");
+        ScriptSystem::postInteract(ctx, "Window", brain.handle());
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "interacted").value_or(-1.0) == 0.0,
+              "scoping: interacting with a different name does not fire");
+        ScriptSystem::postInteract(ctx, "Door", brain.handle());
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "interacted").value_or(-1.0) == 1.0,
+              "scoping: interacting with the exact name fires");
+    }
+    {
+        // A handler armed mid-dispatch must not fire for the event
+        // that armed it (no same-event cascades).
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto wall = scene.createEntity("wall");
+        wall.addComponent<TransformComponent>();
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() hits = 0 cascades = 0 on_touch(\"wall\") { hits = hits + 1 "
+            "on_touch(\"wall\") { cascades = cascades + 1 } } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, wall.handle(), brain.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "hits").value_or(-1.0) == 1.0 &&
+                  ScriptSystem::variable(ctx, brain.handle(), "cascades").value_or(-1.0) == 0.0,
+              "scoping: nested handler latched by an event does not cascade into the same event");
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, wall.handle(), brain.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "cascades").value_or(-1.0) == 1.0,
+              "scoping: latched handler fires from the next matching event on");
+    }
+
+    // -- (2) Rename reference rewriting (engine side of editor rename) ---------
+    {
+        check(ScriptSystem::rewriteSourceReferences(
+                  "from start() print(\"BrickWall\") on_touch(\"BrickWall\") { part(\"BrickWall\").freeze() } script(end)",
+                  "BrickWall", "StoneWall") ==
+                  "from start() print(\"BrickWall\") on_touch(\"StoneWall\") { part(\"StoneWall\").freeze() } script(end)",
+              "rename: only target references rewrite, string literals stay untouched");
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto wall = scene.createEntity("BrickWall");
+        wall.addComponent<ScriptComponent>().source = "from start() hp = 1 script(end)";
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() on_touch(\"BrickWall\") { part(\"BrickWall\").freeze() } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        scene.registry().get<TagComponent>(wall.handle()).tag = "StoneWall"; // the editor's tag write
+        const size_t changed = ScriptSystem::rewriteReferences(scene, ctx, "BrickWall", "StoneWall");
+        check(changed == 1, "rename: referencing scripts are counted and rewritten");
+        check(scene.registry().get<ScriptComponent>(brain.handle()).source.find("StoneWall") != std::string::npos &&
+                  scene.registry().get<ScriptComponent>(brain.handle()).source.find("BrickWall") == std::string::npos,
+              "rename: script references follow the new tag");
+        const ScriptSystemContext::Runtime* wallRuntime = ScriptSystem::findRuntime(ctx, wall.handle());
+        check(wallRuntime != nullptr && wallRuntime->identityTag == "StoneWall",
+              "rename: runtime identity follows the new tag (Play/Stop migration stays bound)");
+    }
+
+    // -- (4) Universal entity scripting ------------------------------------------
+    {
+        // A script living ON a lamp drives the lamp itself.
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto lamp = scene.createEntity("lamp");
+        auto& point = lamp.addComponent<PointLightComponent>();
+        point.intensity = 1.0f;
+        lamp.addComponent<ScriptComponent>().source =
+            "from start() part(self).intensity = 5 this.color = #FF0000 script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(nearlyEqual(point.intensity, 5.0, 1e-6), "universal: part(self).intensity writes the host light");
+        check(nearlyEqual(point.color.r, 1.0, 1e-6) && nearlyEqual(point.color.g, 0.0, 1e-9),
+              "universal: this.color = #FF0000 writes the host colour");
+
+        // A block whose script freezes and destroys ITSELF.
+        Scene scene2;
+        ScriptSystemContext ctx2;
+        auto crate = scene2.createEntity("crate");
+        crate.addComponent<TransformComponent>();
+        crate.addComponent<ScriptComponent>().source =
+            "from start() on_input(\"LMB\") { freeze() } on_input(\"RMB\") { destroy() } script(end)";
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        ScriptSystem::postInputEvent(ctx2, "LMB", false);
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        check(scene2.registry().valid(crate.handle()) && scene2.registry().all_of<FrozenComponent>(crate.handle()),
+              "universal: bare freeze() targets the host entity");
+        ScriptSystem::postInputEvent(ctx2, "RMB", false);
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        check(!scene2.registry().valid(crate.handle()), "universal: bare destroy() destroys the host entity");
+
+        // position("zone") measures the host itself when no
+        // player/focus exists (no Player entity in this scene).
+        Scene scene3;
+        ScriptSystemContext ctx3;
+        auto zone = scene3.createEntity("zone");
+        zone.addComponent<TransformComponent>(glm::vec3{0.0f, 0.0f, 0.0f});
+        auto door = scene3.createEntity("door");
+        door.addComponent<TransformComponent>(glm::vec3{0.5f, 0.0f, 0.0f});
+        door.addComponent<ScriptComponent>().source =
+            "from start() inside = 0 position(\"zone\") { inside = 1 } script(end)";
+        ScriptSystem::update(scene3, ctx3, 0.1);
+        check(ScriptSystem::variable(ctx3, door.handle(), "inside").value_or(-1.0) == 1.0,
+              "universal: position(zone) uses the script host as subject without a player");
+    }
+
+    // -- (5) hudprint interpolation + persistence ----------------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() health = 80 mode = \"calm\" hudprint(\"HP: {health} / {mode}\") { duration = 5s } "
+            "on_input(\"LMB\") { health = 35 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ctx.hudPrints.size() == 1 && ctx.hudPrints[0].text == "HP: 80 / calm",
+              "hudprint live: {variable} and {text} interpolate at print time");
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ctx.hudPrints.size() == 1 && ctx.hudPrints[0].text == "HP: 35 / calm",
+              "hudprint live: text re-renders every frame as variables change");
+
+        const DSLParseResult infinite = parseBackroomsScript(
+            "from start() hudprint(\"S\") { duration = infinite } script(end)");
+        check(infinite.ok() && infinite.program.statements[0].hudPersistent,
+              "hudprint persistent: duration = infinite parses as persistent");
+
+        Scene scene2;
+        ScriptSystemContext ctx2;
+        auto brain2 = scene2.createEntity("brain");
+        brain2.addComponent<ScriptComponent>().source =
+            "from start() score = 7 hudprint(\"STAT: {score}\") on_input(\"RMB\") { hudclear(\"STAT: {score}\") } script(end)";
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        check(ctx2.hudPrints.size() == 1 && ctx2.hudPrints[0].persistent && ctx2.hudPrints[0].text == "STAT: 7",
+              "hudprint persistent: omitted duration creates a permanent print");
+        ScriptSystem::update(scene2, ctx2, 60.0);
+        check(ctx2.hudPrints.size() == 1, "hudprint persistent: survives past any finite lifetime");
+        ScriptSystem::postInputEvent(ctx2, "RMB", false);
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        check(ctx2.hudPrints.empty(), "hudprint persistent: hudclear closes it explicitly");
+    }
+
+    // -- (3) Compile errors carry line numbers (the modal's payload) ---------------
+    {
+        const DSLParseResult broken = parseBackroomsScript("from start()\n    good = 1\n    bad = = 5\nscript(end)");
+        check(!broken.ok(), "compile popup: broken script fails to compile");
+        bool hasLine = false;
+        for (const std::string& error : broken.errors) {
+            hasLine = hasLine || error.find("line 3") != std::string::npos;
+        }
+        check(hasLine, "compile popup: error message carries the exact line number");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -11690,6 +11873,7 @@ int main() {
     testConsoleAndPlayPersistence();
     testPlayRestoreClipboardAndRobustSaves();
     testDslExpansions();
+    testDslScopingUniversalAndHudLive();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

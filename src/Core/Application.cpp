@@ -1081,16 +1081,7 @@ void Application::run() {
                         y += renameHeight + 6.0f;
                         if (committed) {
                             if (!m_renameBuffer.empty()) {
-                                // A viewport-picked entity may carry
-                                // no tag yet: give it one so the new
-                                // name has somewhere to live.
-                                if (TagComponent* tag = registry.try_get<TagComponent>(m_renameTarget);
-                                    tag != nullptr) {
-                                    tag->tag = m_renameBuffer;
-                                } else {
-                                    registry.emplace<TagComponent>(m_renameTarget, m_renameBuffer);
-                                }
-                                setStatusMessage("Renamed entity to '" + m_renameBuffer + "'");
+                                renameEntity(m_renameTarget, m_renameBuffer);
                             }
                             m_renameTarget = entt::null;
                             m_renameBuffer.clear();
@@ -1377,6 +1368,47 @@ void Application::run() {
                 }
             }
 
+            // Script compile-error modal: a dedicated centred
+            // window over a dimmed editor, drawn last so nothing
+            // covers it; OK / Enter / Escape dismiss it.
+            if (m_scriptErrorOpen) {
+                const float modalWidth = 580.0f;
+                size_t lineCount = 1;
+                for (const char ch : m_scriptErrorBody) {
+                    lineCount += ch == '\n' ? 1 : 0;
+                }
+                const float modalHeight = 118.0f + 22.0f * static_cast<float>(std::min<size_t>(lineCount, 8));
+                const float modalX = 0.5f * (static_cast<float>(framebufferWidth) - modalWidth);
+                const float modalY = 0.5f * (static_cast<float>(framebufferHeight) - modalHeight);
+                ui.drawRect(0.0f, 0.0f, static_cast<float>(framebufferWidth), static_cast<float>(framebufferHeight),
+                            glm::vec4{0.0f, 0.0f, 0.0f, 0.55f});
+                m_uiContext.beginPanel("ScriptErrorModal", UIRect{modalX, modalY, modalWidth, modalHeight},
+                                       UIRectStyle{8.0f, 1.0f, glm::vec4{0.85f, 0.30f, 0.25f, 1.0f}});
+                ui.drawText(m_scriptErrorTitle, modalX + 16.0f, modalY + 12.0f, 1.5f,
+                            glm::vec4{1.0f, 0.55f, 0.45f, 1.0f});
+                float errorY = modalY + 44.0f;
+                size_t start = 0;
+                size_t drawn = 0;
+                while (start <= m_scriptErrorBody.size() && drawn < 8) {
+                    const size_t newline = m_scriptErrorBody.find('\n', start);
+                    const std::string line = m_scriptErrorBody.substr(
+                        start, newline == std::string::npos ? std::string::npos : newline - start);
+                    ui.drawText(line, modalX + 16.0f, errorY, 1.35f, glm::vec4{0.92f, 0.90f, 0.88f, 1.0f});
+                    errorY += 22.0f;
+                    ++drawn;
+                    if (newline == std::string::npos) {
+                        break;
+                    }
+                    start = newline + 1;
+                }
+                m_uiContext.endPanel();
+                const UIRect okButton{modalX + modalWidth - 116.0f, modalY + modalHeight - 40.0f, 100.0f, 28.0f};
+                if (m_uiContext.button(okButton, "OK") || m_input.wasKeyPressed(Key::Enter) ||
+                    m_input.wasKeyPressed(Key::Escape)) {
+                    m_scriptErrorOpen = false;
+                }
+            }
+
             // Splitter affordance: accent line on the hovered /
             // dragged dock boundary, and the matching OS cursor.
             if (!playing) {
@@ -1478,11 +1510,26 @@ void Application::saveAndCompileScript() {
     const DSLParseResult parsed = parseBackroomsScript(script.source);
     if (parsed.ok()) {
         m_scriptStatus = "Compiled OK";
+        m_scriptErrorOpen = false; // a clean compile dismisses the modal
         setStatusMessage("Script compiled: " + m_scriptEditor.displayName() +
                          (fileWritten ? "" : " (file write failed)"));
     } else {
         m_scriptStatus = parsed.errors.empty() ? std::string("Compile failed") : parsed.errors.front();
         setStatusMessage("Script error: " + m_scriptStatus);
+        // Dedicated modal on top of the console log: the exact
+        // parser errors, line numbers included, until dismissed.
+        m_scriptErrorOpen = true;
+        m_scriptErrorTitle = "Script compilation failed - " + m_scriptEditor.displayName();
+        m_scriptErrorBody.clear();
+        for (const std::string& error : parsed.errors) {
+            if (!m_scriptErrorBody.empty()) {
+                m_scriptErrorBody += "\n";
+            }
+            m_scriptErrorBody += error;
+        }
+        if (m_scriptErrorBody.empty()) {
+            m_scriptErrorBody = "Compile failed (no details)";
+        }
     }
     m_scriptEditor.markClean();
 }
@@ -1825,6 +1872,16 @@ void Application::enterPlayMode() {
         saveAndCompileScript();
     }
     if (m_playSession.enterPlay(m_scene)) {
+        // Zone subjects (position("zone") guards) focus the
+        // player entity while playing; script hosts fall back to
+        // themselves when no player exists.
+        m_scriptContext.focusedEntity = entt::null;
+        for (const entt::entity e : m_scene.registry().view<TagComponent>()) {
+            if (m_scene.registry().get<TagComponent>(e).tag == "Player") {
+                m_scriptContext.focusedEntity = e;
+                break;
+            }
+        }
         // The C-key physics reset targets the pre-play state:
         // capture spawn states against the live handles now.
         m_physicsSystem.captureSpawnStates(m_scene);
@@ -1844,6 +1901,7 @@ void Application::exitPlayMode() {
         m_input.setMouseCaptured(false);
     }
     if (m_playSession.exitPlay(m_scene)) {
+        m_scriptContext.focusedEntity = entt::null; // rebuilt handle; re-focused on next Play
         // The restore rebuilt every entity: keep the selection
         // cleared rather than pointing at a recycled handle.
         m_outliner.setSelected(entt::null);
@@ -1943,6 +2001,50 @@ void Application::exportGame() {
 void Application::setStatusMessage(std::string message) {
     m_statusMessage = std::move(message);
     m_statusSecondsRemaining = 4.0f; // decayed in the update callback
+}
+
+void Application::renameEntity(entt::entity entity, const std::string& newName) {
+    auto& registry = m_scene.registry();
+    if (entity == entt::null || !registry.valid(entity) || newName.empty()) {
+        return;
+    }
+    std::string oldName;
+    if (TagComponent* tag = registry.try_get<TagComponent>(entity); tag != nullptr) {
+        oldName = tag->tag;
+        tag->tag = newName;
+    } else {
+        // A viewport-picked entity may carry no tag yet: give it
+        // one so the new name has somewhere to live.
+        registry.emplace<TagComponent>(entity, newName);
+    }
+    if (oldName.empty() || oldName == newName) {
+        setStatusMessage("Renamed entity to '" + newName + "'");
+        return;
+    }
+    // Propagate the rename so nothing dangles: every script that
+    // referenced the old name (part("..."), on_touch("..."), ...)
+    // is rewritten, live runtimes keep their identity under the
+    // new tag, and the script editor follows its bound entity.
+    const size_t rewritten = ScriptSystem::rewriteReferences(m_scene, m_scriptContext, oldName, newName);
+    if (const auto it = m_scriptContext.runtimes.find(entity); it != m_scriptContext.runtimes.end()) {
+        it->second.identityTag = newName;
+    }
+    if (m_scriptEditor.boundEntity() != TextEditor::kNoEntity) {
+        const std::string before = m_scriptEditor.text();
+        const std::string after = ScriptSystem::rewriteSourceReferences(before, oldName, newName);
+        if (after != before) {
+            const bool wasDirty = m_scriptEditor.dirty();
+            m_scriptEditor.loadText(after);
+            if (wasDirty) {
+                m_scriptEditor.markDirty();
+            }
+        }
+        if (m_scriptEditor.boundEntity() == entt::to_integral(entity)) {
+            m_scriptEditor.bind(entt::to_integral(entity), newName, m_scriptEditor.filePath());
+        }
+    }
+    setStatusMessage("Renamed '" + oldName + "' to '" + newName + "'" +
+                     (rewritten > 0 ? " (" + std::to_string(rewritten) + " script reference(s) updated)" : ""));
 }
 
 void Application::beginRename(entt::entity entity) {

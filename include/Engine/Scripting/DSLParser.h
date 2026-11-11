@@ -79,6 +79,7 @@ enum class DSLNodeKind : uint8_t {
     SoundCall,   // play_sound/emit_sound/print(name)  (call in `extra`)
     BoundDecl,   // name(max|lowest) = expr   (property = "max"/"lowest")
     HudPrint,    // hudprint("text") { position/duration/color/fade }
+    HudClear,    // hudclear("text")? -- removes this script's HUD prints
     EffectAssign, // effect.<property> = expr   (property name in `name`)
 };
 
@@ -104,11 +105,18 @@ struct DSLNode {
     bool hasLerp = false;
     double lerpDuration = 0.0; // seconds
     // HudPrint settings (percent canvas anchors, #RRGGBB colour).
+    // No duration (or `duration = infinite`) means persistent:
+    // the print stays until hudclear closes it.
     float hudXPercent = 50.0f;
     float hudYPercent = 50.0f;
-    double hudDuration = 3.0;
+    double hudDuration = 0.0;
+    bool hudPersistent = true;
     float hudRed = 1.0f, hudGreen = 1.0f, hudBlue = 1.0f;
     bool hudFade = false;
+    // Hex colour literal on a `color` property assignment
+    // (part("lamp").color = #FF8000, lights only).
+    bool colorLiteral = false;
+    float colorRed = 1.0f, colorGreen = 1.0f, colorBlue = 1.0f;
     DSLExpr expr;              // Assign/PartAssign value, If condition, Every/For duration
     std::vector<DSLNode> body; // nested statements
     int line = 0;              // source line for diagnostics

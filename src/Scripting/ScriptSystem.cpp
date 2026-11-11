@@ -275,6 +275,66 @@ void startLerp(Frame& frame, Lerp::Target target, const std::string& name, const
     rt.lerps.push_back(lerp);
 }
 
+// Universal local context: part("self") / part(self), bare
+// destroy()/freeze() (empty name) and this.<property> all resolve
+// to the script's host entity, so a script attached to a door,
+// lamp or block manipulates ITSELF naturally instead of hunting
+// for a player-centric target.
+[[nodiscard]] entt::entity resolvePartTarget(Frame& frame, const std::string& name) {
+    if (name.empty() || name == "self") {
+        return frame.self;
+    }
+    return findByName(frame.scene.registry(), name);
+}
+
+bool applyPartColor(Scene::Registry& registry, entt::entity target, float red, float green, float blue) {
+    if (target == entt::null || !registry.valid(target)) {
+        return false;
+    }
+    const glm::vec3 color{red, green, blue};
+    if (registry.all_of<PointLightComponent>(target)) {
+        registry.get<PointLightComponent>(target).color = color;
+        return true;
+    }
+    if (registry.all_of<SpotLightComponent>(target)) {
+        registry.get<SpotLightComponent>(target).color = color;
+        return true;
+    }
+    if (registry.all_of<DirectionalLightComponent>(target)) {
+        registry.get<DirectionalLightComponent>(target).color = color;
+        return true;
+    }
+    return false;
+}
+
+// Renders a hudprint template against live script state:
+// {name} substitutes the variable (%.6g) or text variable of
+// that name; an unknown name reads as 0, like every DSL read.
+[[nodiscard]] std::string renderHudText(const std::string& textTemplate, const Runtime& rt) {
+    std::string out;
+    for (size_t i = 0; i < textTemplate.size();) {
+        if (textTemplate[i] == '{') {
+            const size_t close = textTemplate.find('}', i + 1);
+            if (close != std::string::npos && close > i + 1) {
+                const std::string name = textTemplate.substr(i + 1, close - i - 1);
+                if (const auto it = rt.textVariables.find(name); it != rt.textVariables.end()) {
+                    out += it->second;
+                } else {
+                    const auto var = rt.variables.find(name);
+                    char buffer[32];
+                    std::snprintf(buffer, sizeof(buffer), "%.6g", var != rt.variables.end() ? var->second : 0.0);
+                    out += buffer;
+                }
+                i = close + 1;
+                continue;
+            }
+        }
+        out += textTemplate[i];
+        ++i;
+    }
+    return out;
+}
+
 void execBlock(Frame& frame, const std::vector<DSLNode>& body);
 void spawnTimer(Frame& frame, const DSLNode& node);
 [[nodiscard]] bool insideZone(Frame& frame, const std::string& zoneName, entt::entity& zoneOut);
@@ -375,11 +435,13 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
             return;
         }
         ActiveHudPrint print;
-        print.text = node.name;
+        print.textTemplate = node.name;
+        print.text = renderHudText(node.name, rt);
         print.xPercent = node.hudXPercent;
         print.yPercent = node.hudYPercent;
         print.color = glm::vec3{node.hudRed, node.hudGreen, node.hudBlue};
         print.duration = node.hudDuration;
+        print.persistent = node.hudPersistent;
         print.fade = node.hudFade;
         print.source = frame.self;
         print.alpha = print.fade ? 0.0f : 1.0f;
@@ -393,17 +455,46 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
         prints.push_back(print);
         return;
     }
+    case DSLNodeKind::HudClear: {
+        if (arming) {
+            return;
+        }
+        auto& prints = frame.context.hudPrints;
+        prints.erase(std::remove_if(prints.begin(), prints.end(),
+                                    [&](const ActiveHudPrint& other) {
+                                        return other.source == frame.self &&
+                                               (node.name.empty() || other.textTemplate == node.name ||
+                                                other.text == node.name);
+                                    }),
+                     prints.end());
+        return;
+    }
     case DSLNodeKind::PartAssign: {
         if (arming) {
             return;
         }
+        if (node.colorLiteral) {
+            applyPartColor(registry, resolvePartTarget(frame, node.name), node.colorRed, node.colorGreen,
+                           node.colorBlue);
+            return;
+        }
         if (node.hasLerp) {
-            startLerp(frame, Lerp::Target::PartProperty, node.name, node.property, node.extra,
+            // Lerp targets resolve by name each tick; "self"
+            // lerps resolve against the host by name lookup, so
+            // self-lerps go through the tag path instead.
+            const std::string selfName = node.name == "self" ? nameOf(registry, frame.self) : node.name;
+            if (node.name == "self" && selfName.empty()) {
+                // Untagged host: no name to re-resolve per tick,
+                // so a self-lerp lands instantly instead.
+                applyPartProperty(registry, frame.self, node.property, node.extra, evaluateExpr(node.expr, rt));
+                return;
+            }
+            startLerp(frame, Lerp::Target::PartProperty, selfName, node.property, node.extra,
                       evaluateExpr(node.expr, rt), node.lerpDuration);
             return;
         }
         cancelLerps(rt, Lerp::Target::PartProperty, node.name, node.property, node.extra);
-        applyPartProperty(registry, findByName(registry, node.name), node.property, node.extra,
+        applyPartProperty(registry, resolvePartTarget(frame, node.name), node.property, node.extra,
                           evaluateExpr(node.expr, rt));
         return;
     }
@@ -411,7 +502,7 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
         if (arming) {
             return;
         }
-        const entt::entity target = findByName(registry, node.name);
+        const entt::entity target = resolvePartTarget(frame, node.name);
         if (target == entt::null) {
             return;
         }
@@ -424,7 +515,7 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
     }
     case DSLNodeKind::PartBlock: {
         Frame inner = frame;
-        inner.contextEntity = findByName(registry, node.name);
+        inner.contextEntity = resolvePartTarget(frame, node.name);
         execBlock(inner, node.body);
         return;
     }
@@ -559,12 +650,16 @@ void spawnTimer(Frame& frame, const DSLNode& node) {
 [[nodiscard]] bool insideZone(Frame& frame, const std::string& zoneName, entt::entity& zoneOut) {
     auto& registry = frame.scene.registry();
     zoneOut = findByName(registry, zoneName);
+    // Subject priority: the host-focused entity (the Application
+    // focuses the Player in Play), then the script's own host
+    // entity (a door/light/block script measures ITSELF against
+    // the zone), then any entity tagged "Player".
     entt::entity subject = frame.context.focusedEntity;
-    if (subject == entt::null || !registry.valid(subject)) {
-        subject = findByName(registry, "Player");
-    }
-    if (subject == entt::null) {
+    if (subject == entt::null || !registry.valid(subject) || !registry.all_of<TransformComponent>(subject)) {
         subject = frame.self;
+    }
+    if (subject == entt::null || !registry.valid(subject) || !registry.all_of<TransformComponent>(subject)) {
+        subject = findByName(registry, "Player");
     }
     if (zoneOut == entt::null || subject == entt::null || !registry.valid(zoneOut) || !registry.valid(subject) ||
         !registry.all_of<TransformComponent>(zoneOut) || !registry.all_of<TransformComponent>(subject)) {
@@ -702,6 +797,79 @@ bool ScriptSystem::holdsItem(ScriptSystemContext& context, entt::entity script, 
 
 void ScriptSystem::clearRuntime(ScriptSystemContext& context, entt::entity script) {
     context.runtimes.erase(script);
+    auto& prints = context.hudPrints;
+    prints.erase(std::remove_if(prints.begin(), prints.end(),
+                                [script](const ActiveHudPrint& print) { return print.source == script; }),
+                 prints.end());
+}
+
+// ---------------------------------------------------------------------------
+// Editor rename support
+// ---------------------------------------------------------------------------
+
+std::string ScriptSystem::rewriteSourceReferences(const std::string& source, const std::string& oldName,
+                                                  const std::string& newName) {
+    if (oldName.empty() || oldName == newName) {
+        return source;
+    }
+    // Entity references appear as quoted arguments of the target
+    // constructs; rewrite only those, so string literals, items
+    // and comments that merely mention the name stay untouched.
+    static constexpr const char* kPrefixes[] = {"part(",   "on_touch(", "on_trigger(", "on_collide(",
+                                                "on_collision(", "on_interact(", "position("};
+    std::string out = source;
+    for (const char* prefixC : kPrefixes) {
+        const std::string prefix(prefixC);
+        size_t searchFrom = 0;
+        for (;;) {
+            const size_t at = out.find(prefix, searchFrom);
+            if (at == std::string::npos) {
+                break;
+            }
+            size_t cursor = at + prefix.size();
+            while (cursor < out.size() && (out[cursor] == ' ' || out[cursor] == '\t')) {
+                ++cursor;
+            }
+            if (cursor < out.size() && out[cursor] == '"') {
+                const size_t close = out.find('"', cursor + 1);
+                if (close != std::string::npos) {
+                    if (out.compare(cursor + 1, close - cursor - 1, oldName) == 0) {
+                        out.replace(cursor + 1, close - cursor - 1, newName);
+                        searchFrom = cursor + 1 + newName.size();
+                        continue;
+                    }
+                    searchFrom = close + 1;
+                    continue;
+                }
+            }
+            searchFrom = at + prefix.size();
+        }
+    }
+    return out;
+}
+
+size_t ScriptSystem::rewriteReferences(Scene& scene, ScriptSystemContext& context, const std::string& oldName,
+                                       const std::string& newName) {
+    if (oldName.empty() || oldName == newName) {
+        return 0;
+    }
+    size_t changed = 0;
+    auto& registry = scene.registry();
+    for (const entt::entity e : registry.view<ScriptComponent>()) {
+        ScriptComponent& script = registry.get<ScriptComponent>(e);
+        std::string rewritten = rewriteSourceReferences(script.source, oldName, newName);
+        if (rewritten != script.source) {
+            script.source = std::move(rewritten);
+            ++changed;
+        }
+    }
+    for (auto& [entity, rt] : context.runtimes) {
+        (void)entity;
+        if (rt.identityTag == oldName) {
+            rt.identityTag = newName;
+        }
+    }
+    return changed;
 }
 
 void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double deltaSeconds) {
@@ -944,9 +1112,15 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
     context.eventQueue.clear();
     for (DSLEvent& event : events) {
         // Resolve physics handle pairs into names.
-        std::string nameA = nameOf(registry, event.entityA);
-        std::string nameB = nameOf(registry, event.entityB);
-        for (size_t i = 0; i < armed.size(); ++i) {
+        const std::string nameA = nameOf(registry, event.entityA);
+        const std::string nameB = nameOf(registry, event.entityB);
+        // Scoping snapshot: only handlers armed BEFORE this event
+        // started dispatching may fire for it. Handlers armed or
+        // latched by a handler body mid-dispatch become eligible
+        // from the NEXT event, never for the one that armed them
+        // (no same-event cascades, no unrelated-collision misfires).
+        const size_t eligible = armed.size();
+        for (size_t i = 0; i < eligible; ++i) {
             const DSLNode* node = armed[i].first;
             Frame& frame = armed[i].second;
             if (node->event != event.kind) {
@@ -962,7 +1136,17 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
                 if (match && resolvedTarget == entt::null) {
                     resolvedTarget = findByName(registry, node->name);
                 }
+            } else if (!event.target.empty()) {
+                // Named events (posted with an explicit target
+                // name) are authoritative: the handler fires only
+                // for exactly the entity/tag it named.
+                match = node->name == event.target;
+                if (match && resolvedTarget == entt::null) {
+                    resolvedTarget = findByName(registry, node->name);
+                }
             } else {
+                // Physics pair events: the named entity must be
+                // one of the two actual colliders, by exact tag.
                 if (!nameA.empty() && node->name == nameA) {
                     match = true;
                     resolvedTarget = event.entityA;
@@ -1052,12 +1236,20 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
                        rt.lerps.end());
     }
 
-    // Tick HUD prints: age them, compute the fade alpha (equal
-    // fade-in/out windows capped at half the lifetime), expire.
+    // Tick HUD prints: re-render {variable} templates against
+    // live script state every frame, age them, compute the fade
+    // alpha (persistent prints fade in but never out/expire --
+    // they live until hudclear or a runtime reset closes them).
     for (ActiveHudPrint& print : context.hudPrints) {
+        if (const auto it = context.runtimes.find(print.source); it != context.runtimes.end()) {
+            print.text = renderHudText(print.textTemplate, it->second);
+        }
         print.elapsed += deltaSeconds;
         if (!print.fade) {
             print.alpha = 1.0f;
+        } else if (print.persistent) {
+            const double window = 0.5;
+            print.alpha = static_cast<float>(std::clamp(print.elapsed / window, 0.0, 1.0));
         } else {
             const double window = std::min(0.5, print.duration * 0.5);
             const double in = window > 0.0 ? print.elapsed / window : 1.0;
@@ -1067,7 +1259,8 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
     }
     context.hudPrints.erase(std::remove_if(context.hudPrints.begin(), context.hudPrints.end(),
                                            [](const ActiveHudPrint& print) {
-                                               return print.duration <= 0.0 || print.elapsed >= print.duration;
+                                               return !print.persistent &&
+                                                      (print.duration <= 0.0 || print.elapsed >= print.duration);
                                            }),
                             context.hudPrints.end());
 

@@ -143,7 +143,8 @@ struct ScriptSystemContext {
     // screen text with a lifetime; `alpha` is recomputed every
     // tick (fade in/out) for the host's HUD pass to draw with.
     struct ActiveHudPrint {
-        std::string text;
+        std::string text;         // rendered text (re-rendered per frame)
+        std::string textTemplate; // raw text with {variable} placeholders
         float xPercent = 50.0f;
         float yPercent = 50.0f;
         glm::vec3 color{1.0f};
@@ -151,6 +152,7 @@ struct ScriptSystemContext {
         double duration = 3.0;
         double elapsed = 0.0;
         bool fade = false;
+        bool persistent = false; // no duration: lives until hudclear
         entt::entity source = entt::null; // script entity that printed it
     };
     // Global post-processing state scripts drive through
@@ -198,6 +200,18 @@ public:
     [[nodiscard]] static std::optional<std::string> textVariable(ScriptSystemContext& context, entt::entity script, const std::string& name);
     [[nodiscard]] static bool holdsItem(ScriptSystemContext& context, entt::entity script, const std::string& item);
     static void clearRuntime(ScriptSystemContext& context, entt::entity script);
+
+    // Rewrites quoted entity references (part("x"), on_touch("x"),
+    // on_trigger("x"), position("x"), ...) from oldName to newName
+    // in one script source; returns the rewritten source (unchanged
+    // when nothing matched). Pure helper behind rewriteReferences.
+    [[nodiscard]] static std::string rewriteSourceReferences(const std::string& source, const std::string& oldName,
+                                                             const std::string& newName);
+    // Editor rename support: rewrites every script in the scene
+    // that referenced oldName, updates matching runtime identity
+    // tags, and returns how many script sources changed.
+    static size_t rewriteReferences(Scene& scene, ScriptSystemContext& context, const std::string& oldName,
+                                    const std::string& newName);
 };
 
 } // namespace engine

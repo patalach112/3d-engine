@@ -55,6 +55,7 @@ public:
     void loadText(std::string_view text);
     [[nodiscard]] std::string text() const;
     void markClean() { m_dirty = false; }
+    void markDirty() { m_dirty = true; }
     [[nodiscard]] bool dirty() const { return m_dirty; }
 
     [[nodiscard]] size_t lineCount() const { return m_lines.size(); }
