@@ -6,6 +6,7 @@
 #include <glm/vec4.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,17 +64,41 @@ public:
     void setCursor(size_t line, size_t columnBytes);
 
     // Buffer operations (all clamp the caret into validity).
+    // Insert/delete replace the current selection first, like
+    // every modern editor.
     void insertText(std::string_view text); // handles '\n'
     void insertNewline();
     void backspace();
     void deleteForward();
-    void moveLeft(bool word = false);
-    void moveRight(bool word = false);
-    void moveUp();
-    void moveDown();
-    void moveHome();
-    void moveEnd();
+    void moveLeft(bool word = false, bool extend = false);
+    void moveRight(bool word = false, bool extend = false);
+    void moveUp(bool extend = false);
+    void moveDown(bool extend = false);
+    void moveHome(bool extend = false);
+    void moveEnd(bool extend = false);
     void movePage(int direction, size_t visibleRows);
+
+    // Selection (anchor + caret): mouse drags and Shift+caret
+    // keys build it, typing replaces it.
+    void setSelection(size_t anchorLine, size_t anchorColumn);
+    void selectAll();
+    void clearSelection() { m_selectionActive = false; }
+    [[nodiscard]] bool hasSelection() const;
+    [[nodiscard]] std::string selectionText() const;
+    void deleteSelection();
+    void selectionRange(size_t& startLine, size_t& startCol, size_t& endLine, size_t& endCol) const;
+
+    // Clipboard: the host injects platform hooks (GLFW clipboard
+    // via Window); without hooks these are safe no-ops returning
+    // false, so headless tests exercise selection logic directly.
+    struct ClipboardHooks {
+        std::function<std::string()> getText;
+        std::function<void(std::string_view)> setText;
+    };
+    void setClipboardHooks(ClipboardHooks hooks) { m_clipboard = std::move(hooks); }
+    bool copySelection();
+    bool cutSelection();
+    bool pasteClipboard();
 
     // Dock binding: which entity/file this buffer belongs to.
     // (A raw entity id, not entt::entity: EngineGraphics does not
@@ -96,16 +121,22 @@ public:
     // Call between UIContext::beginFrame/endFrame.
     Result draw(UIContext& ui, const UIRect& rect, float deltaSeconds);
 
-    static constexpr float kTextScale = 1.95f; // editor font scale: comfortably larger than UI chrome (1.8)
+    static constexpr float kTextScale = 1.95f; // editor font scale (UI chrome is 2.0; code sits just under it)
 
 private:
     void clampCursor();
+    void beginSelection(); // anchor at caret when starting to extend
     void ensureCaretVisible(float rowHeight, float viewHeight);
     [[nodiscard]] size_t columnAtX(UIBatch& batch, const std::string& lineText, float localX) const;
 
     std::vector<std::string> m_lines{std::string{}};
     size_t m_cursorLine = 0;
     size_t m_cursorCol = 0;   // byte offset into the current line
+    size_t m_anchorLine = 0;  // selection anchor (other end from the caret)
+    size_t m_anchorCol = 0;
+    bool m_selectionActive = false;
+    bool m_dragging = false; // mouse drag-select in progress
+    ClipboardHooks m_clipboard;
     size_t m_goalColumn = 0;  // remembered column for vertical moves
     size_t m_scrollLine = 0;
     bool m_dirty = false;

@@ -1,5 +1,6 @@
 #pragma once
 #include "Core/Export.h"
+#include <string>
 
 // GLFW_INCLUDE_VULKAN makes GLFW pull in <vulkan/vulkan.h> and expose the
 // Vulkan surface helpers; GLFW_INCLUDE_NONE stops it from also including
@@ -59,6 +60,10 @@ public:
     // cursors and owned by the window; Arrow restores the default.
     enum class CursorShape : uint8_t { Arrow, IBeam, ResizeEastWest, ResizeNorthSouth };
     void setCursorShape(CursorShape shape);
+
+    // OS clipboard (GLFW): empty string when unset/unavailable.
+    void setClipboardText(const std::string& text);
+    [[nodiscard]] std::string clipboardText() const;
     [[nodiscard]] static constexpr int cursorModeForCapture(bool captured) {
         return captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL;
     }

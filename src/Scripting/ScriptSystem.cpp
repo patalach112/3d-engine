@@ -471,18 +471,74 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
         }
     });
 
-    // Prune runtimes whose entity vanished or lost its script:
-    // Play-session snapshot restores and editor deletes must not
-    // leak state into the next session (persistence is for live
-    // entities with unchanged scripts only).
-    for (auto it = context.runtimes.begin(); it != context.runtimes.end();) {
-        const entt::entity e = it->first;
-        if (!registry.valid(e) || !registry.all_of<ScriptComponent>(e)) {
-            context.fileStamps.erase(e);
-            context.spawnPositions.erase(e);
+    // Scene-restore migration: Play Stop (GBQ snapshot restore),
+    // scene loads and other registry rebuilds invalidate every
+    // handle, but the entities come back with the same tags. A
+    // runtime whose entity is gone is first offered to a restored
+    // script entity carrying its recorded tag -- variables, timers
+    // and inventory move across, so Stop -> Play never resets
+    // progress (the source-change detector below still applies).
+    // Only runtimes with no tag match are pruned.
+    {
+        std::vector<entt::entity> candidates;
+        for (const entt::entity e : registry.view<ScriptComponent>()) {
+            if (context.runtimes.find(e) == context.runtimes.end()) {
+                candidates.push_back(e);
+            }
+        }
+        for (auto it = context.runtimes.begin(); it != context.runtimes.end();) {
+            const entt::entity old = it->first;
+            if (registry.valid(old) && registry.all_of<ScriptComponent>(old)) {
+                ++it;
+                continue;
+            }
+            entt::entity target = entt::null;
+            if (!it->second.identityTag.empty()) {
+                // Prefer a tag match whose source also matches
+                // (duplicate tags cannot steal each other's state),
+                // then fall back to the first plain tag match.
+                for (int pass = 0; pass < 2 && target == entt::null; ++pass) {
+                    for (size_t i = 0; i < candidates.size(); ++i) {
+                        const TagComponent* tag = registry.try_get<TagComponent>(candidates[i]);
+                        if (tag == nullptr || tag->tag != it->second.identityTag) {
+                            continue;
+                        }
+                        if (pass == 0) {
+                            const ScriptComponent& candidate = registry.get<ScriptComponent>(candidates[i]);
+                            if (candidate.source != it->second.source) {
+                                continue;
+                            }
+                        }
+                        target = candidates[i];
+                        candidates.erase(candidates.begin() + static_cast<std::ptrdiff_t>(i));
+                        break;
+                    }
+                }
+            }
+            if (target == entt::null) {
+                context.fileStamps.erase(old);
+                context.spawnPositions.erase(old);
+                it = context.runtimes.erase(it);
+                continue;
+            }
+            Runtime moved = std::move(it->second);
             it = context.runtimes.erase(it);
-        } else {
-            ++it;
+            for (Timer& timer : moved.timers) {
+                if (timer.self == old) {
+                    timer.self = target;
+                }
+            }
+            for (auto& latched : moved.latched) {
+                if (latched.self == old) {
+                    latched.self = target;
+                }
+            }
+            if (const auto fit = context.fileStamps.find(old); fit != context.fileStamps.end()) {
+                context.fileStamps[target] = fit->second;
+                context.fileStamps.erase(fit);
+            }
+            context.spawnPositions.erase(old); // the restored entity re-records its own spawn above
+            context.runtimes.emplace(target, std::move(moved));
         }
     }
 
@@ -497,6 +553,9 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
         }
         auto& component = registry.get<ScriptComponent>(e);
         Runtime& rt = context.runtimes[e];
+        if (const TagComponent* tag = registry.try_get<TagComponent>(e); tag != nullptr && !tag->tag.empty()) {
+            rt.identityTag = tag->tag; // migration key for scene restores
+        }
         // Entity-linked script files: PreferFileSource loads the
         // file before first compile; AutoReload keeps watching it
         // and streams edits into `source` (the recompile detector

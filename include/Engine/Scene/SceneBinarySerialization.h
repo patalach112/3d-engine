@@ -79,6 +79,13 @@ struct GbqFileInfo {
 // the registry, hierarchy and joint links.
 ENGINE_SCENE_API bool deserializeScene(Scene& scene, const std::filesystem::path& path);
 
+// Verified atomic save: serializes to a temp sibling file, reads
+// it back and loads it into a scratch scene (entity + script
+// counts must match the source), and only then renames it over
+// `path`. A crash or bad write can therefore never leave a
+// truncated or silently-overwritten scene behind.
+[[nodiscard]] ENGINE_SCENE_API bool saveSceneAtomically(const Scene& scene, const std::filesystem::path& path);
+
 // In-memory twins of the two functions above (Phase 31):
 // serializeSceneToBytes returns the exact container bytes (an
 // editor play-mode snapshot is one of these); the byte-form

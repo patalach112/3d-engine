@@ -10533,8 +10533,8 @@ void testPhase36LayoutThemeFont() {
     // The raster size quantizes to the displayed em height, so at
     // any scale the glyphs are baked exactly as large as drawn.
     {
-        check(engine::UIContext::kTextScale == 1.8f, "font: global UI text scale is 1.8 (comfortably legible)");
-        check(engine::fontPixelSizeForScale(engine::UIContext::kTextScale) == 18 &&
+        check(engine::UIContext::kTextScale == 2.0f, "font: global UI text scale is 2.0 (matches script-editor readability)");
+        check(engine::fontPixelSizeForScale(engine::UIContext::kTextScale) == 20 &&
                   engine::fontPixelSizeForScale(1.0f) == 10 &&
                   engine::fontPixelSizeForScale(0.55f) == engine::kMinFontPixelSize &&
                   engine::fontPixelSizeForScale(100.0f) == engine::kMaxFontPixelSize,
@@ -11188,6 +11188,190 @@ void testConsoleAndPlayPersistence() {
     check(TextEditor::kTextScale >= 1.8f, "editor: default font scale is comfortably large");
 }
 
+void testPlayRestoreClipboardAndRobustSaves() {
+    std::cout << "Play/Stop runtime persistence, editor clipboard, robust saves\n";
+    using namespace engine;
+
+    const auto findByTag = [](Scene& scene, const std::string& tag) -> entt::entity {
+        auto& registry = scene.registry();
+        for (const entt::entity e : registry.view<TagComponent>()) {
+            if (registry.get<TagComponent>(e).tag == tag) {
+                return e;
+            }
+        }
+        return entt::null;
+    };
+
+    // -- GBQ binary round-trip keeps DSL script components -----------------
+    {
+        Scene scene;
+        auto door = scene.createEntity("ScriptedDoor");
+        door.addComponent<TransformComponent>(glm::vec3{1.0f, 2.0f, 3.0f});
+        auto& script = door.addComponent<ScriptComponent>();
+        script.filePath = "scripts/door.dsla";
+        script.source = "from start()\n    mood = 3\nscript(end)";
+        script.compileFlags = ScriptCompileFlags::AutoReload | ScriptCompileFlags::PreferFileSource;
+        script.enabled = false;
+
+        const std::vector<std::byte> bytes = scene.saveToGbqBytes();
+        check(!bytes.empty(), "gbq scripts: snapshot bytes produced");
+        Scene loaded;
+        check(loaded.loadFromGbqBytes(bytes), "gbq scripts: scene reloads");
+        const entt::entity back = findByTag(loaded, "ScriptedDoor");
+        check(back != entt::null && loaded.registry().all_of<ScriptComponent>(back),
+              "gbq scripts: DSL component survives the binary round-trip (DSCR)");
+        if (back != entt::null && loaded.registry().all_of<ScriptComponent>(back)) {
+            const ScriptComponent& restored = loaded.registry().get<ScriptComponent>(back);
+            check(restored.filePath == "scripts/door.dsla" && restored.source == script.source && !restored.enabled &&
+                      hasFlag(restored.compileFlags, ScriptCompileFlags::AutoReload) &&
+                      hasFlag(restored.compileFlags, ScriptCompileFlags::PreferFileSource),
+                  "gbq scripts: path/source/flags/enabled round-trip with zero loss");
+        }
+    }
+
+    // -- Play -> Stop -> Play keeps runtime progress -------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        PlaySession session;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<TransformComponent>();
+        auto& script = brain.addComponent<ScriptComponent>();
+        script.filePath = "scripts/brain.dsla";
+        script.source = "from start() visits = 0 on_input(\"LMB\") { visits = visits + 1 } script(end)";
+
+        check(session.enterPlay(scene), "play persistence: enter Play");
+        ScriptSystem::update(scene, ctx, 0.1);
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "visits").value_or(-1.0) == 1.0,
+              "play persistence: script ran during Play");
+
+        check(session.exitPlay(scene), "play persistence: Stop restores the snapshot");
+        const entt::entity restored = findByTag(scene, "brain");
+        check(restored != entt::null && scene.registry().all_of<ScriptComponent>(restored),
+              "play persistence: script component still bound after Stop");
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, restored, "visits").value_or(-1.0) == 1.0,
+              "play persistence: variables survive Stop (no reset to initial state)");
+
+        check(session.enterPlay(scene), "play persistence: re-enter Play");
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, restored, "visits").value_or(-1.0) == 2.0,
+              "play persistence: progress continues across Stop -> Play");
+        check(session.exitPlay(scene), "play persistence: second Stop");
+        const entt::entity restoredAgain = findByTag(scene, "brain");
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(restoredAgain != entt::null &&
+                  ScriptSystem::variable(ctx, restoredAgain, "visits").value_or(-1.0) == 2.0,
+              "play persistence: variables survive the second Stop too");
+
+        ScriptSystem::clearRuntime(ctx, restoredAgain);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, restoredAgain, "visits").value_or(-1.0) == 0.0,
+              "play persistence: explicit reset re-runs setup from scratch");
+    }
+
+    // -- TextEditor selection + clipboard ------------------------------------
+    {
+        TextEditor editor;
+        editor.loadText("hello world\nsecond line");
+        std::string clipboard;
+        editor.setClipboardHooks(TextEditor::ClipboardHooks{
+            [&clipboard] { return clipboard; },
+            [&clipboard](std::string_view text) { clipboard = std::string(text); }});
+
+        editor.setCursor(0, 0);
+        for (int i = 0; i < 5; ++i) {
+            editor.moveRight(false, true);
+        }
+        check(editor.hasSelection() && editor.selectionText() == "hello",
+              "editor selection: Shift+caret builds a selection");
+        check(editor.copySelection() && clipboard == "hello", "editor clipboard: Ctrl+C copies the selection");
+        check(editor.text() == "hello world\nsecond line", "editor clipboard: copy leaves the buffer untouched");
+
+        editor.moveLeft(false, false);
+        check(!editor.hasSelection() && editor.cursorColumn() == 0,
+              "editor selection: plain Left collapses to the selection start");
+
+        editor.selectAll();
+        check(editor.selectionText() == "hello world\nsecond line", "editor selection: Ctrl+A selects everything");
+        check(editor.cutSelection() && clipboard == "hello world\nsecond line" && editor.text().empty(),
+              "editor clipboard: Ctrl+X cuts the selection to the clipboard");
+
+        clipboard = "alpha\nbeta";
+        editor.setCursor(0, 0);
+        check(editor.pasteClipboard() && editor.text() == "alpha\nbeta" && editor.lineCount() == 2,
+              "editor clipboard: Ctrl+V pastes multi-line text");
+
+        editor.setSelection(0, 0);
+        for (int i = 0; i < 5; ++i) {
+            editor.moveRight(false, true);
+        }
+        clipboard = "omega";
+        check(editor.pasteClipboard() && editor.line(0) == "omega",
+              "editor clipboard: paste replaces the current selection");
+
+        editor.selectAll();
+        editor.insertText("typed");
+        check(editor.text() == "typed" && !editor.hasSelection(),
+              "editor selection: typing replaces the selection");
+
+        TextEditor hookless;
+        hookless.loadText("abc");
+        hookless.selectAll();
+        check(!hookless.copySelection() && !hookless.cutSelection() && hookless.text() == "abc",
+              "editor clipboard: without hooks copy/cut are safe no-ops");
+    }
+
+    // -- Verified atomic scene saves ------------------------------------------
+    {
+        const auto dir = makeTempDir("engine_test_atomic_save");
+        const std::filesystem::path path = dir / "scene.gbq";
+        Scene scene;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<TransformComponent>(glm::vec3{4.0f, 5.0f, 6.0f});
+        auto& script = brain.addComponent<ScriptComponent>();
+        script.filePath = "scripts/brain.dsla";
+        script.source = "from start()\n    saved = 42\nscript(end)";
+
+        check(saveSceneAtomically(scene, path), "atomic save: verified scene save succeeds");
+        check(std::filesystem::exists(path) && !std::filesystem::exists(path.string() + ".tmp"),
+              "atomic save: target exists and no temp file is left behind");
+        Scene loaded;
+        check(deserializeScene(loaded, path), "atomic save: saved scene loads back");
+        const entt::entity back = findByTag(loaded, "brain");
+        check(back != entt::null && loaded.registry().all_of<ScriptComponent>(back) &&
+                  loaded.registry().get<ScriptComponent>(back).source == script.source,
+              "atomic save: script source survives save-to-disk with zero loss");
+
+        scene.registry().get<ScriptComponent>(brain.handle()).source =
+            "from start()\n    saved = 99\nscript(end)";
+        check(saveSceneAtomically(scene, path), "atomic save: overwrite succeeds");
+        Scene reloaded;
+        check(deserializeScene(reloaded, path), "atomic save: overwritten scene loads back");
+        const entt::entity back2 = findByTag(reloaded, "brain");
+        check(back2 != entt::null && reloaded.registry().all_of<ScriptComponent>(back2) &&
+                  reloaded.registry().get<ScriptComponent>(back2).source.find("saved = 99") != std::string::npos,
+              "atomic save: overwrite lands the new script, not the stale one");
+
+        const std::filesystem::path badPath = dir / "missing" / "scene.gbq";
+        check(!saveSceneAtomically(scene, badPath) && !std::filesystem::exists(badPath),
+              "atomic save: unwritable target fails without creating a partial file");
+
+        const std::filesystem::path jsonPath = dir / "scene.json";
+        check(scene.saveToFile(jsonPath.string()), "atomic save: JSON scene save succeeds");
+        Scene jsonLoaded;
+        check(jsonLoaded.loadFromFile(jsonPath.string()) && findByTag(jsonLoaded, "brain") != entt::null,
+              "atomic save: JSON scene loads back after atomic write");
+    }
+
+    // -- Readability scales -----------------------------------------------------
+    check(UIContext::kTextScale == 2.0f, "font: general UI scale raised to 2.0 for readability");
+    check(TextEditor::kTextScale >= 1.9f, "font: script editor scale stays comfortably large");
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -11252,6 +11436,7 @@ int main() {
     testBackroomsScripting();
     testEditorScriptingUpgrades();
     testConsoleAndPlayPersistence();
+    testPlayRestoreClipboardAndRobustSaves();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

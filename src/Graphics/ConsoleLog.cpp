@@ -52,7 +52,7 @@ void drawConsolePanel(UIContext& ui, const UIRect& rect, ConsoleLog& log, Consol
         return;
     }
     const UITheme& theme = ui.theme();
-    const float textScale = 1.3f;
+    const float textScale = 1.9f; // console matches the script editor's scale
     float lineHeight = 15.0f * textScale;
     if (batch->font() != nullptr) {
         lineHeight = batch->font()->lineHeight(fontPixelSizeForScale(textScale)) * 1.15f;
@@ -62,9 +62,9 @@ void drawConsolePanel(UIContext& ui, const UIRect& rect, ConsoleLog& log, Consol
     ui.beginPanel("ConsolePanel", rect, UIRectStyle{-1.0f, -1.0f, glm::vec4{}});
 
     // Header: title + entry count, filter cycle, autoscroll, clear.
-    batch->drawText("Console", rect.x + 8.0f, rect.y + 5.0f, 1.3f, theme.text);
+    batch->drawText("Console", rect.x + 8.0f, rect.y + 4.0f, 1.55f, theme.text);
     const std::string count = std::to_string(log.size()) + " entries";
-    batch->drawText(count, rect.x + 96.0f, rect.y + 5.0f, 1.3f, glm::vec4{0.6f, 0.65f, 0.75f, 1.0f});
+    batch->drawText(count, rect.x + 118.0f, rect.y + 4.0f, 1.5f, glm::vec4{0.6f, 0.65f, 0.75f, 1.0f});
     const UIRect clearButton{rect.x + rect.width - 76.0f, rect.y + 3.0f, 68.0f, 20.0f};
     if (ui.button(clearButton, "Clear")) {
         log.clear();

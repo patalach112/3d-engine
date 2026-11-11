@@ -103,6 +103,7 @@ struct ScriptSystemContext {
         std::vector<std::string> heldItems;
         std::vector<Timer> timers;
         std::vector<LatchedHandler> latched;
+        std::string identityTag; // TagComponent name (scene-restore migration key)
         std::string source; // last source text compiled (recompile detector)
         bool setupDone = false;
         bool deadReported = false;

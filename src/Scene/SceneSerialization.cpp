@@ -12,6 +12,7 @@
 #include "Core/Json.h"
 #include "Core/Logger.h"
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -598,13 +599,37 @@ bool Scene::loadFromString(std::string_view text) {
 }
 
 bool Scene::saveToFile(const std::string& filepath) const {
-    std::ofstream file{filepath, std::ios::trunc};
-    if (!file) {
-        ENGINE_LOG_WARNING("Scene: could not open '" << filepath << "' for writing");
-        return false;
+    // Atomic write: temp sibling + rename, so an interrupted save
+    // can never truncate the previous good scene file.
+    const std::string tempPath = filepath + ".tmp";
+    {
+        std::ofstream file{tempPath, std::ios::trunc};
+        if (!file) {
+            ENGINE_LOG_WARNING("Scene: could not open '" << tempPath << "' for writing");
+            return false;
+        }
+        file << saveToString();
+        file.flush();
+        if (!file) {
+            std::error_code ec;
+            std::filesystem::remove(tempPath, ec);
+            return false;
+        }
     }
-    file << saveToString();
-    return static_cast<bool>(file);
+    std::error_code ec;
+    std::filesystem::rename(tempPath, filepath, ec);
+    if (ec) {
+        std::error_code ignored;
+        std::filesystem::remove(filepath, ignored);
+        ec.clear();
+        std::filesystem::rename(tempPath, filepath, ec);
+        if (ec) {
+            std::filesystem::remove(tempPath, ignored);
+            ENGINE_LOG_WARNING("Scene: could not replace '" << filepath << "'");
+            return false;
+        }
+    }
+    return true;
 }
 
 bool Scene::loadFromFile(const std::string& filepath) {

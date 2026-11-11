@@ -86,6 +86,20 @@ void Window::setCursorCaptured(bool captured) {
     }
 }
 
+void Window::setClipboardText(const std::string& text) {
+    if (m_window != nullptr) {
+        glfwSetClipboardString(m_window, text.c_str());
+    }
+}
+
+std::string Window::clipboardText() const {
+    if (m_window == nullptr) {
+        return {};
+    }
+    const char* text = glfwGetClipboardString(m_window);
+    return text != nullptr ? std::string(text) : std::string{};
+}
+
 void Window::setCursorShape(CursorShape shape) {
     if (m_window == nullptr || shape == m_cursorShape) {
         return;

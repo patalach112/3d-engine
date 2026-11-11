@@ -152,6 +152,7 @@ void TextEditor::loadText(std::string_view text) {
     m_cursorCol = 0;
     m_goalColumn = 0;
     m_scrollLine = 0;
+    m_selectionActive = false;
     m_dirty = false;
 }
 
@@ -176,9 +177,125 @@ void TextEditor::setCursor(size_t line, size_t columnBytes) {
     m_cursorCol = columnBytes;
     clampCursor();
     m_goalColumn = m_cursorCol;
+    m_selectionActive = false;
+}
+
+// ---------------------------------------------------------------------------
+// Selection
+// ---------------------------------------------------------------------------
+
+void TextEditor::beginSelection() {
+    if (!m_selectionActive) {
+        m_anchorLine = m_cursorLine;
+        m_anchorCol = m_cursorCol;
+        m_selectionActive = true;
+    }
+}
+
+void TextEditor::setSelection(size_t anchorLine, size_t anchorColumn) {
+    m_anchorLine = std::min(anchorLine, m_lines.size() - 1);
+    m_anchorCol = std::min(anchorColumn, m_lines[m_anchorLine].size());
+    m_cursorLine = m_anchorLine;
+    m_cursorCol = m_anchorCol;
+    m_selectionActive = true;
+}
+
+void TextEditor::selectAll() {
+    m_anchorLine = 0;
+    m_anchorCol = 0;
+    m_cursorLine = m_lines.size() - 1;
+    m_cursorCol = m_lines.back().size();
+    m_goalColumn = m_cursorCol;
+    m_selectionActive = true;
+}
+
+void TextEditor::selectionRange(size_t& startLine, size_t& startCol, size_t& endLine, size_t& endCol) const {
+    startLine = m_anchorLine;
+    startCol = m_anchorCol;
+    endLine = m_cursorLine;
+    endCol = m_cursorCol;
+    if (startLine > endLine || (startLine == endLine && startCol > endCol)) {
+        std::swap(startLine, endLine);
+        std::swap(startCol, endCol);
+    }
+}
+
+bool TextEditor::hasSelection() const {
+    return m_selectionActive && (m_anchorLine != m_cursorLine || m_anchorCol != m_cursorCol);
+}
+
+std::string TextEditor::selectionText() const {
+    if (!hasSelection()) {
+        return {};
+    }
+    size_t sl, sc, el, ec;
+    selectionRange(sl, sc, el, ec);
+    if (sl == el) {
+        return m_lines[sl].substr(sc, ec - sc);
+    }
+    std::string out = m_lines[sl].substr(sc);
+    for (size_t line = sl + 1; line < el; ++line) {
+        out.push_back('\n');
+        out += m_lines[line];
+    }
+    out.push_back('\n');
+    out += m_lines[el].substr(0, ec);
+    return out;
+}
+
+void TextEditor::deleteSelection() {
+    if (!hasSelection()) {
+        m_selectionActive = false;
+        return;
+    }
+    size_t sl, sc, el, ec;
+    selectionRange(sl, sc, el, ec);
+    if (sl == el) {
+        m_lines[sl].erase(sc, ec - sc);
+    } else {
+        m_lines[sl] = m_lines[sl].substr(0, sc) + m_lines[el].substr(ec);
+        m_lines.erase(m_lines.begin() + static_cast<std::ptrdiff_t>(sl + 1),
+                      m_lines.begin() + static_cast<std::ptrdiff_t>(el + 1));
+    }
+    m_cursorLine = sl;
+    m_cursorCol = sc;
+    m_goalColumn = sc;
+    m_selectionActive = false;
+    m_dirty = true;
+}
+
+bool TextEditor::copySelection() {
+    if (!hasSelection() || !m_clipboard.setText) {
+        return false;
+    }
+    m_clipboard.setText(selectionText());
+    return true;
+}
+
+bool TextEditor::cutSelection() {
+    if (!copySelection()) {
+        return false;
+    }
+    deleteSelection();
+    return true;
+}
+
+bool TextEditor::pasteClipboard() {
+    if (!m_clipboard.getText) {
+        return false;
+    }
+    const std::string text = m_clipboard.getText();
+    if (text.empty()) {
+        return false;
+    }
+    insertText(text);
+    return true;
 }
 
 void TextEditor::insertText(std::string_view textToInsert) {
+    if (hasSelection()) {
+        deleteSelection();
+    }
     for (const char c : textToInsert) {
         if (c == '\n') {
             insertNewline();
@@ -197,6 +314,9 @@ void TextEditor::insertText(std::string_view textToInsert) {
 }
 
 void TextEditor::insertNewline() {
+    if (hasSelection()) {
+        deleteSelection();
+    }
     std::string& line = m_lines[m_cursorLine];
     std::string rest = line.substr(m_cursorCol);
     line.erase(m_cursorCol);
@@ -208,6 +328,10 @@ void TextEditor::insertNewline() {
 }
 
 void TextEditor::backspace() {
+    if (hasSelection()) {
+        deleteSelection();
+        return;
+    }
     if (m_cursorCol > 0) {
         const size_t prev = prevCodepoint(m_lines[m_cursorLine], m_cursorCol);
         m_lines[m_cursorLine].erase(prev, m_cursorCol - prev);
@@ -225,6 +349,10 @@ void TextEditor::backspace() {
 }
 
 void TextEditor::deleteForward() {
+    if (hasSelection()) {
+        deleteSelection();
+        return;
+    }
     std::string& line = m_lines[m_cursorLine];
     if (m_cursorCol < line.size()) {
         const size_t next = nextCodepoint(line, m_cursorCol);
@@ -238,7 +366,20 @@ void TextEditor::deleteForward() {
     m_goalColumn = m_cursorCol;
 }
 
-void TextEditor::moveLeft(bool word) {
+void TextEditor::moveLeft(bool word, bool extend) {
+    if (extend) {
+        beginSelection();
+    } else if (hasSelection()) {
+        size_t sl, sc, el, ec;
+        selectionRange(sl, sc, el, ec);
+        m_cursorLine = sl;
+        m_cursorCol = sc;
+        m_goalColumn = sc;
+        m_selectionActive = false;
+        return; // collapse to the selection start, no step
+    } else {
+        m_selectionActive = false;
+    }
     if (word) {
         const std::string& line = m_lines[m_cursorLine];
         size_t col = m_cursorCol;
@@ -258,7 +399,20 @@ void TextEditor::moveLeft(bool word) {
     m_goalColumn = m_cursorCol;
 }
 
-void TextEditor::moveRight(bool word) {
+void TextEditor::moveRight(bool word, bool extend) {
+    if (extend) {
+        beginSelection();
+    } else if (hasSelection()) {
+        size_t sl, sc, el, ec;
+        selectionRange(sl, sc, el, ec);
+        m_cursorLine = el;
+        m_cursorCol = ec;
+        m_goalColumn = ec;
+        m_selectionActive = false;
+        return; // collapse to the selection end, no step
+    } else {
+        m_selectionActive = false;
+    }
     const std::string& line = m_lines[m_cursorLine];
     if (word) {
         size_t col = m_cursorCol;
@@ -278,26 +432,46 @@ void TextEditor::moveRight(bool word) {
     m_goalColumn = m_cursorCol;
 }
 
-void TextEditor::moveUp() {
+void TextEditor::moveUp(bool extend) {
+    if (extend) {
+        beginSelection();
+    } else {
+        m_selectionActive = false;
+    }
     if (m_cursorLine > 0) {
         --m_cursorLine;
         m_cursorCol = std::min(m_goalColumn, m_lines[m_cursorLine].size());
     }
 }
 
-void TextEditor::moveDown() {
+void TextEditor::moveDown(bool extend) {
+    if (extend) {
+        beginSelection();
+    } else {
+        m_selectionActive = false;
+    }
     if (m_cursorLine + 1 < m_lines.size()) {
         ++m_cursorLine;
         m_cursorCol = std::min(m_goalColumn, m_lines[m_cursorLine].size());
     }
 }
 
-void TextEditor::moveHome() {
+void TextEditor::moveHome(bool extend) {
+    if (extend) {
+        beginSelection();
+    } else {
+        m_selectionActive = false;
+    }
     m_cursorCol = 0;
     m_goalColumn = 0;
 }
 
-void TextEditor::moveEnd() {
+void TextEditor::moveEnd(bool extend) {
+    if (extend) {
+        beginSelection();
+    } else {
+        m_selectionActive = false;
+    }
     m_cursorCol = m_lines[m_cursorLine].size();
     m_goalColumn = m_cursorCol;
 }
@@ -362,20 +536,37 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
     const float textY = rect.y + 6.0f;
     const float viewHeight = rect.height - 12.0f;
 
-    // Focus + caret placement from the mouse.
+    // Focus + caret placement + drag selection from the mouse:
+    // press plants both anchor and caret, dragging sweeps the
+    // caret while the anchor stays, release ends the drag.
     const bool pressEdge = input.mouseDown && !m_prevMouseDown;
     m_prevMouseDown = input.mouseDown;
+    const auto caretFromMouse = [&]() {
+        const float localY = input.mouseY - textY;
+        const size_t clicked = m_scrollLine + static_cast<size_t>(std::max(0.0f, localY) / rowHeight);
+        m_cursorLine = std::min(clicked, m_lines.size() - 1);
+        m_cursorCol = columnAtX(*batch, m_lines[m_cursorLine], input.mouseX - textX);
+        m_goalColumn = m_cursorCol;
+        m_blinkSeconds = 0.0f;
+    };
     if (pressEdge) {
         if (rect.contains(input.mouseX, input.mouseY)) {
             m_focused = true;
-            const float localY = input.mouseY - textY;
-            const size_t clicked = m_scrollLine + static_cast<size_t>(std::max(0.0f, localY) / rowHeight);
-            m_cursorLine = std::min(clicked, m_lines.size() - 1);
-            m_cursorCol = columnAtX(*batch, m_lines[m_cursorLine], input.mouseX - textX);
-            m_goalColumn = m_cursorCol;
-            m_blinkSeconds = 0.0f;
+            caretFromMouse();
+            m_anchorLine = m_cursorLine;
+            m_anchorCol = m_cursorCol;
+            m_selectionActive = true;
+            m_dragging = true;
         } else {
             m_focused = false;
+            m_dragging = false;
+        }
+    }
+    if (m_dragging) {
+        if (input.mouseDown) {
+            caretFromMouse();
+        } else {
+            m_dragging = false;
         }
     }
     if (ui.hoveredRect(rect) && input.scrollY != 0.0f) {
@@ -387,6 +578,7 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
     if (m_focused) {
         m_blinkSeconds += deltaSeconds;
         const bool word = input.ctrlModifier;
+        const bool extend = input.fineModifier; // Shift builds the selection
         // Key repeat: an action starts on its edge, repeats after
         // 0.38 s at ~24/s. Repeat state is per-editor, frame-driven.
         enum Action : int {
@@ -403,14 +595,14 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
         bool fired = false;
         const auto fire = [&](int action) {
             switch (action) {
-            case Left: moveLeft(word); break;
-            case Right: moveRight(word); break;
-            case Up: moveUp(); break;
-            case Down: moveDown(); break;
+            case Left: moveLeft(word, extend); break;
+            case Right: moveRight(word, extend); break;
+            case Up: moveUp(extend); break;
+            case Down: moveDown(extend); break;
             case Back: backspace(); result.changed = true; break;
             case Del: deleteForward(); result.changed = true; break;
-            case Home: moveHome(); break;
-            case End: moveEnd(); break;
+            case Home: moveHome(extend); break;
+            case End: moveEnd(extend); break;
             default: break;
             }
             fired = true;
@@ -439,6 +631,23 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
         if (keys.tab) {
             insertText("  ");
             result.changed = true;
+            m_blinkSeconds = 0.0f;
+        }
+        // Standard clipboard combos (host hooks provide the OS
+        // clipboard; without hooks they are safe no-ops).
+        if (keys.copyCombo) {
+            copySelection();
+        }
+        if (keys.cutCombo && cutSelection()) {
+            result.changed = true;
+            m_blinkSeconds = 0.0f;
+        }
+        if (keys.pasteCombo && pasteClipboard()) {
+            result.changed = true;
+            m_blinkSeconds = 0.0f;
+        }
+        if (keys.selectAllCombo) {
+            selectAll();
             m_blinkSeconds = 0.0f;
         }
         if (!fired && m_repeatAction != None) {
@@ -491,6 +700,20 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
         if (lineIndex == m_cursorLine && m_focused) {
             batch->drawRect(textX - 4.0f, y - 1.0f, rect.x + rect.width - textX + 4.0f, rowHeight,
                             glm::vec4{1.0f, 1.0f, 1.0f, 0.045f});
+        }
+        // Selection background under this line's covered range.
+        if (hasSelection()) {
+            size_t selStartLine, selStartCol, selEndLine, selEndCol;
+            selectionRange(selStartLine, selStartCol, selEndLine, selEndCol);
+            if (lineIndex >= selStartLine && lineIndex <= selEndLine) {
+                const size_t from = lineIndex == selStartLine ? selStartCol : 0;
+                const size_t to = lineIndex == selEndLine ? selEndCol : m_lines[lineIndex].size();
+                const std::string& text = m_lines[lineIndex];
+                const float x0 = textX + batch->measureText(std::string_view(text).substr(0, from), kTextScale);
+                const float x1 = textX + batch->measureText(std::string_view(text).substr(0, to), kTextScale);
+                batch->drawRect(x0, y - 1.0f, std::max(3.0f, x1 - x0), rowHeight,
+                                glm::vec4{0.0f, 0.478f, 0.800f, 0.38f});
+            }
         }
         const std::string number = std::to_string(lineIndex + 1);
         const float numberWidth = batch->measureText(number, kTextScale);

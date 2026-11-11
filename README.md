@@ -3100,3 +3100,48 @@ CTest 1/1, zero warnings, standalone player headless run clean.
 1317 passed / 0 failed across all five build configs
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, standalone player headless run clean.
+
+## Play/Stop runtime persistence, editor clipboard, larger fonts, zero-loss saves ✅
+
+- **Script runtimes survive Play -> Stop -> Play**: the root cause
+  of the old wipe was the Play snapshot restore — `exitPlay`
+  rebuilds every entity from GBQ bytes, orphaning runtimes keyed
+  by dead EnTT handles. `ScriptSystem` now records each runtime's
+  `TagComponent` identity and, on the first tick after a restore,
+  migrates runtimes (variables, text variables, held items,
+  timers, latched handlers) to the restored entity carrying the
+  same tag — preferring a tag+source match so duplicate tags
+  cannot steal state. Only runtimes with no restored counterpart
+  are pruned, and only a source change or the Script dock's
+  explicit Reset button starts a script from scratch. The script
+  editor also rebinds to the restored entity by tag on Stop, so
+  tweaking continues exactly where testing left off.
+- **TextEditor selection + OS clipboard**: mouse-drag selection
+  with a highlighted range, Shift+caret extension (arrows, Home/
+  End, word jumps), selection-collapse arrow semantics, and
+  typing/paste replacing the selection. Ctrl+C / Ctrl+V / Ctrl+X /
+  Ctrl+A ride injected clipboard hooks backed by the real OS
+  clipboard — `Window::setClipboardText` / `clipboardText`
+  wrapping GLFW in the platform layer; without hooks (headless,
+  tests) the operations are safe no-ops.
+- **Larger, still-crisp fonts**: general UI text scale rises
+  1.8 -> 2.0 (`UIContext::kTextScale`, 20px raster via the dynamic
+  font cache) and the console body goes 1.3 -> 1.9, matching the
+  script editor's 1.95 readability at exact-pixel glyph sizes.
+- **Zero-loss serialization**: the GBQ binary format gains a
+  `DSCR` section carrying the full DSL `ScriptComponent`
+  (filePath/source/compileFlags/enabled) — previously only native
+  script names were stored, so Play snapshots, GBQ scene saves and
+  exported bundles silently dropped DSL scripts. Older loaders
+  skip the unknown section; older files load without it. Scene
+  saves are verified-atomic (`saveSceneAtomically`: temp file,
+  read-back reload into a scratch scene with entity + script
+  count checks, then rename-over), JSON scene saves and `.dsla`
+  writes use the same temp+rename discipline, and every scene
+  save/export first commits a dirty script-editor buffer so the
+  file on disk always contains exactly what the editor shows.
+
+1353 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, scripting-demo and standalone
+player headless runs clean.

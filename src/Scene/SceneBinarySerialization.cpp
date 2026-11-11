@@ -7,6 +7,7 @@
 // raw IEEE bits, so a round trip is bit-for-bit.
 
 #include "Scene/SceneBinarySerialization.h"
+#include "Scripting/DSLComponents.h"
 
 #include "Core/Logger.h"
 #include "Scene/Scene.h"
@@ -294,6 +295,7 @@ struct StagedEntity {
     std::optional<SpotLightComponent> spotLight;
     std::optional<DirectionalLightComponent> directionalLight;
     std::optional<std::string> script;
+    std::optional<ScriptComponent> dslScript;
 };
 
 struct StagedScene {
@@ -331,7 +333,7 @@ bool readComponentSection(const std::vector<std::byte>& bytes, const std::vector
 // record (Phase 32); version 1 files keep loading.
 bool sectionVersionsAcceptable(const std::vector<TocEntry>& toc) {
     static constexpr const char* kKnown[] = {"META", "ENTY", "TAGC", "TRNF", "CAMR", "MESH", "SPIN", "RGBD",
-                                             "CLDR", "GRVF", "JONT", "THRS", "PLGT", "SLGT", "NSCR", "DIRL"};
+                                             "CLDR", "GRVF", "JONT", "THRS", "PLGT", "SLGT", "NSCR", "DIRL", "DSCR"};
     for (const TocEntry& entry : toc) {
         for (const char* known : kKnown) {
             if (std::memcmp(entry.type.data(), known, 4) != 0) {
@@ -622,6 +624,20 @@ bool parseGbq(const std::vector<std::byte>& bytes, StagedScene& staged) {
                               })) {
         return false;
     }
+    if (!readComponentSection(bytes, toc, "DSCR", entityCount,
+                              [&staged](ByteReader& reader, uint32_t index) {
+                                  ScriptComponent value;
+                                  uint32_t flags = 0;
+                                  const bool ok = reader.str(value.filePath) && reader.str(value.source) &&
+                                                  reader.u32(flags) && reader.boolean(value.enabled);
+                                  if (ok) {
+                                      value.compileFlags = static_cast<ScriptCompileFlags>(flags);
+                                      staged.entities[index].dslScript = value;
+                                  }
+                                  return ok;
+                              })) {
+        return false;
+    }
     return true;
 }
 
@@ -666,6 +682,7 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
     collect(m_registry.view<SpotLightComponent>());
     collect(m_registry.view<DirectionalLightComponent>());
     collect(m_registry.view<NativeScriptComponent>());
+    collect(m_registry.view<ScriptComponent>());
     collect(m_registry.view<RigidBodyComponent>());
     collect(m_registry.view<ColliderComponent>());
     collect(m_registry.view<GravityFieldComponent>());
@@ -939,6 +956,22 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
         out.str(value->scriptName);
         return true;
     });
+    // DSL scripts (Phase: entity-linked scripts): full component
+    // so Play snapshots and GBQ scene saves keep .dsla bindings.
+    // Unknown to older loaders, which skip the section; older
+    // files simply have no DSCR section and load without scripts.
+    writeSection("DSCR", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
+        const ScriptComponent* value = m_registry.try_get<ScriptComponent>(entity);
+        if (value == nullptr) {
+            return false;
+        }
+        out.u32(index);
+        out.str(value->filePath);
+        out.str(value->source);
+        out.u32(static_cast<uint32_t>(value->compileFlags));
+        out.boolean(value->enabled);
+        return true;
+    });
 
     // Assemble: header, TOC, then 8-byte-aligned section payloads.
     ByteWriter file;
@@ -1068,6 +1101,9 @@ bool Scene::loadFromGbqBytes(const std::vector<std::byte>& bytes) {
         if (stagedEntity.script.has_value()) {
             m_registry.emplace<NativeScriptComponent>(handle, *stagedEntity.script);
         }
+        if (stagedEntity.dslScript.has_value()) {
+            m_registry.emplace<ScriptComponent>(handle, *stagedEntity.dslScript);
+        }
     }
     // Joint links point at entities that may be created later in
     // the file order: remap them now that every handle exists.
@@ -1123,6 +1159,67 @@ bool serializeScene(const Scene& scene, const std::filesystem::path& path) {
 
 bool deserializeScene(Scene& scene, const std::filesystem::path& path) {
     return scene.loadFromGbqFile(path.string());
+}
+
+bool saveSceneAtomically(const Scene& scene, const std::filesystem::path& path) {
+    const std::vector<std::byte> bytes = scene.saveToGbqBytes();
+    if (bytes.empty()) {
+        return false;
+    }
+    std::filesystem::path temp = path;
+    temp += ".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return false;
+        }
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        out.flush();
+        if (!out) {
+            std::error_code ec;
+            std::filesystem::remove(temp, ec);
+            return false;
+        }
+    }
+    // Verify before touching the target: the temp file must load
+    // cleanly and reproduce the source's entity + script counts.
+    bool verified = false;
+    {
+        std::ifstream in(temp, std::ios::binary);
+        if (in) {
+            const std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            std::vector<std::byte> back(raw.size());
+            std::transform(raw.begin(), raw.end(), back.begin(),
+                           [](char ch) { return static_cast<std::byte>(ch); });
+            if (back.size() == bytes.size()) {
+                Scene scratch;
+                if (deserializeSceneFromBytes(scratch, back)) {
+                    const size_t wantScripts = scene.registry().view<ScriptComponent>().size();
+                    const size_t gotScripts = scratch.registry().view<ScriptComponent>().size();
+                    verified = scratch.entityCount() == scene.entityCount() && gotScripts == wantScripts;
+                }
+            }
+        }
+    }
+    if (!verified) {
+        std::error_code ec;
+        std::filesystem::remove(temp, ec);
+        ENGINE_LOG_ERROR("Scene save verification FAILED for '" << path.string() << "' -- original file untouched");
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, path, ec);
+    if (ec) { // some platforms refuse to rename over an existing file
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        ec.clear();
+        std::filesystem::rename(temp, path, ec);
+        if (ec) {
+            std::filesystem::remove(temp, ignored);
+            return false;
+        }
+    }
+    return true;
 }
 
 std::vector<std::byte> serializeSceneToBytes(const Scene& scene) {

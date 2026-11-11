@@ -90,6 +90,7 @@ struct UIInput {
         bool pageUp = false, pageDown = false;
         bool tab = false;
         bool saveCombo = false; // Ctrl+S edge
+        bool copyCombo = false, pasteCombo = false, cutCombo = false, selectAllCombo = false; // Ctrl+C/V/X/A
     } editorKeys{};
     // Level state of the repeating editor keys (held = repeat).
     struct EditorHeld {
@@ -134,7 +135,7 @@ public:
     static constexpr float kRowHeight = 26.0f;
     static constexpr float kRowSpacing = 4.0f;
     static constexpr float kPanelPadding = 8.0f;
-    static constexpr float kTextScale = 1.8f; // global UI text scale (comfortably legible)
+    static constexpr float kTextScale = 2.0f; // global UI text scale (matches the script editor's readability)
     static constexpr float kSliderLabelFraction = 0.38f;
 
     // Frame lifecycle: beginFrame snapshots input (computing

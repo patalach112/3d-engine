@@ -93,6 +93,10 @@ Application::Application(EngineConfig config)
     // Console capture: every enabled log call (engine warnings,
     // compile errors, DSL print() output) lands in the console
     // buffer in real time, whatever thread produced it.
+    // Script editor clipboard rides the OS clipboard (GLFW).
+    m_scriptEditor.setClipboardHooks(TextEditor::ClipboardHooks{
+        [this] { return m_window.clipboardText(); },
+        [this](std::string_view text) { m_window.setClipboardText(std::string(text)); }});
     m_consoleListenerId = Logger::instance().addListener(
         [this](LogLevel level, std::string_view message) { m_consoleLog.push(level, std::string(message)); });
     m_input.bindAction("Impulse", Key::F);
@@ -181,6 +185,54 @@ Application::~Application() {
 }
 
 namespace {
+
+// Verified atomic text write: temp sibling, read-back compare,
+// then rename over the target (with a remove+retry for platforms
+// that refuse rename-over). A failed write never truncates the
+// existing file -- zero silent data loss for .dsla scripts.
+bool writeTextFileAtomically(const std::filesystem::path& path, std::string_view contents) {
+    std::filesystem::path temp = path;
+    temp += ".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return false;
+        }
+        out << contents;
+        out.flush();
+        if (!out) {
+            std::error_code ec;
+            std::filesystem::remove(temp, ec);
+            return false;
+        }
+    }
+    bool verified = false;
+    {
+        std::ifstream in(temp, std::ios::binary);
+        if (in) {
+            const std::string back((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            verified = back == contents;
+        }
+    }
+    if (!verified) {
+        std::error_code ec;
+        std::filesystem::remove(temp, ec);
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, path, ec);
+    if (ec) {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+        ec.clear();
+        std::filesystem::rename(temp, path, ec);
+        if (ec) {
+            std::filesystem::remove(temp, ignored);
+            return false;
+        }
+    }
+    return true;
+}
 
 // Phase 27 editor: inspects one reflected component of `entity`
 // (when present) in a panel stacked at (x, y); returns the y just
@@ -758,6 +810,10 @@ void Application::run() {
                 editorKeys.pageDown = m_input.wasKeyPressed(Key::PageDown);
                 editorKeys.tab = m_input.wasKeyPressed(Key::Tab);
                 editorKeys.saveCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::S);
+                editorKeys.copyCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::C);
+                editorKeys.cutCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::X);
+                editorKeys.pasteCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::V);
+                editorKeys.selectAllCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::A);
                 uiInput.editorHeld.left = m_input.isKeyDown(Key::Left);
                 uiInput.editorHeld.right = m_input.isKeyDown(Key::Right);
                 uiInput.editorHeld.up = m_input.isKeyDown(Key::Up);
@@ -1385,12 +1441,9 @@ void Application::saveAndCompileScript() {
     script.filePath = m_scriptEditor.filePath();
     bool fileWritten = true;
     if (!script.filePath.empty()) {
-        std::ofstream out(script.filePath, std::ios::binary | std::ios::trunc);
-        if (out) {
-            out << script.source;
+        fileWritten = writeTextFileAtomically(script.filePath, script.source);
+        if (fileWritten) {
             m_scriptContext.fileStamps.erase(entity); // our own write is not an external edit
-        } else {
-            fileWritten = false;
         }
     }
     // Force a fresh compile on the next ScriptSystem tick, and get
@@ -1768,10 +1821,34 @@ void Application::exitPlayMode() {
         // The restore rebuilt every entity: keep the selection
         // cleared rather than pointing at a recycled handle.
         m_outliner.setSelected(entt::null);
+        // The script editor's binding is a raw handle too: rebind
+        // it to the restored script entity carrying the same tag
+        // (the buffer text is untouched -- Play cannot edit it,
+        // and enterPlay flushed any dirty buffer pre-snapshot).
+        if (m_scriptEditor.boundEntity() != TextEditor::kNoEntity) {
+            auto& registry = m_scene.registry();
+            const std::string name = m_scriptEditor.displayName();
+            for (const entt::entity e : registry.view<ScriptComponent>()) {
+                const TagComponent* tag = registry.try_get<TagComponent>(e);
+                if (tag != nullptr && tag->tag == name) {
+                    m_scriptEditor.bind(entt::to_integral(e), name,
+                                        registry.get<ScriptComponent>(e).filePath);
+                    break;
+                }
+            }
+        }
     }
 }
 
 void Application::saveSceneToGbq() {
+    // Zero-loss ordering: a dirty script-editor buffer is
+    // committed (component + .dsla file) BEFORE the scene is
+    // serialized, whichever focus state triggered the save --
+    // otherwise Ctrl+S with the editor focused would write the
+    // scene with the pre-edit script source.
+    if (m_scriptEditor.dirty() && m_scriptEditor.boundEntity() != TextEditor::kNoEntity) {
+        saveAndCompileScript();
+    }
     // Save always lands on the active scene path (the editor's
     // .gbq quicksave under the asset root today); the status bar
     // confirms it so the button never feels dead.
@@ -1781,13 +1858,14 @@ void Application::saveSceneToGbq() {
         std::filesystem::create_directories(parent, ec);
     }
     m_activeScenePath = path;
-    if (serializeScene(m_scene, path)) {
-        ENGINE_LOG_INFO("Editor: scene saved to '" << path.string() << "' (" << m_scene.entityCount() << " entities)");
+    if (saveSceneAtomically(m_scene, path)) {
+        ENGINE_LOG_INFO("Editor: scene saved + verified '" << path.string() << "' (" << m_scene.entityCount()
+                                                            << " entities)");
         setStatusMessage("Saved scene to '" + path.filename().string() + "' (" +
-                         std::to_string(m_scene.entityCount()) + " entities)");
+                         std::to_string(m_scene.entityCount()) + " entities, verified)");
     } else {
         ENGINE_LOG_WARNING("Editor: scene save failed ('" << path.string() << "')");
-        setStatusMessage("Save failed: could not write '" + path.filename().string() + "'");
+        setStatusMessage("Save failed: '" + path.filename().string() + "' was NOT overwritten");
     }
 }
 
@@ -1808,6 +1886,11 @@ void Application::loadSceneFromGbq() {
 }
 
 void Application::exportGame() {
+    // Same zero-loss rule as scene save: commit a dirty script
+    // buffer before the bundle serializes the scene.
+    if (m_scriptEditor.dirty() && m_scriptEditor.boundEntity() != TextEditor::kNoEntity) {
+        saveAndCompileScript();
+    }
     const std::filesystem::path bundlePath = m_assetBrowser.rootPath() / "export" / "game.gbq";
     // Export the authored in-memory scene (the live registry while
     // editing; the button is inert in Play mode, so the exported
