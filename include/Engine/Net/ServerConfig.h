@@ -43,7 +43,11 @@ struct ServerSettings {
     [[nodiscard]] ENGINE_NET_API const std::string* findRule(std::string_view key) const;
     ENGINE_NET_API void setRule(std::string key, std::string value);
 
-    [[nodiscard]] bool operator==(const ServerSettings& other) const;
+    // Exported like every other member: the definition lives in
+    // ServerConfig.cpp, so without ENGINE_NET_API the symbol is
+    // invisible across the DLL boundary (MinGW/Windows linkers
+    // then report an undefined reference from consumer objects).
+    [[nodiscard]] ENGINE_NET_API bool operator==(const ServerSettings& other) const;
     [[nodiscard]] bool operator!=(const ServerSettings& other) const { return !(*this == other); }
 };
 
