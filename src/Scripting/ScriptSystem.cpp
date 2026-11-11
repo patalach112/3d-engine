@@ -7,6 +7,7 @@
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
 #include "Scripting/DSLComponents.h"
+#include "Scene/Systems/AnimationSystem.h"
 
 #include <glm/geometric.hpp>
 
@@ -40,6 +41,22 @@ namespace {
         return registry.get<TagComponent>(e).tag;
     }
     return {};
+}
+
+// The entity carrying the animation rig for a script: the host
+// itself when it has a RigComponent, else the nearest ancestor
+// that does (scripts commonly sit on the rig root or a child
+// "brain" node). entt::null when the host is not inside any rig.
+[[nodiscard]] entt::entity resolveRigEntity(Scene::Registry& registry, entt::entity self) {
+    entt::entity current = self;
+    for (int depth = 0; depth < 64 && current != entt::null && registry.valid(current); ++depth) {
+        if (registry.try_get<RigComponent>(current) != nullptr) {
+            return current;
+        }
+        const ParentComponent* parent = registry.try_get<ParentComponent>(current);
+        current = parent != nullptr ? parent->parent : entt::null;
+    }
+    return entt::null;
 }
 
 struct Frame {
@@ -644,6 +661,40 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
             ++audio.playCount;
         }
         frame.context.sounds.push_back(node.name);
+        return;
+    }
+    case DSLNodeKind::PlayAnimation: {
+        if (arming) {
+            return;
+        }
+        // Host-local playback: the script's own rig (or its nearest
+        // rig ancestor) starts the named clip; `over Xs`/`blend Xs`
+        // crossfade from the running one. Unknown clips log like a
+        // failed print so designers see the typo in the console.
+        const entt::entity rig = resolveRigEntity(registry, frame.self);
+        const double blend = node.hasLerp ? node.lerpDuration : 0.0;
+        if (rig == entt::null || !AnimationSystem::playClip(frame.scene, rig, node.name, blend)) {
+            frame.context.log.push_back("play.animation: no clip '" + node.name + "' on this rig");
+            ENGINE_LOG_WARN("Script(" << nameOf(registry, frame.self) << "): play.animation(\"" << node.name
+                                      << "\") found no matching clip/player");
+        }
+        return;
+    }
+    case DSLNodeKind::RagdollToggle: {
+        if (arming) {
+            return;
+        }
+        // Sets the desired state; AnimationSystem::update (which
+        // runs right after scripts in the host loop) spawns or
+        // restores the physics bodies. With no rig ancestor the
+        // flag lands on the host itself, ready for a rig to appear.
+        entt::entity target = resolveRigEntity(registry, frame.self);
+        if (target == entt::null) {
+            target = frame.self;
+        }
+        if (target != entt::null && registry.valid(target)) {
+            registry.get_or_emplace<RagdollComponent>(target).enabled = node.ragdollEnable;
+        }
         return;
     }
     case DSLNodeKind::Program:

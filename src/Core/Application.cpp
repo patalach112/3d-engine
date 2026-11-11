@@ -24,6 +24,8 @@
 #include "Scripting/StalkerAISystem.h"
 #include "Scripting/DSLParser.h"
 #include "Scripting/DSLComponents.h"
+#include "Graphics/DslCompletion.h"
+#include "Scene/AnimationComponents.h"
 #include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
@@ -646,6 +648,11 @@ void Application::run() {
                 post.chromaticAberration = static_cast<float>(m_scriptContext.effects.chromaticAberration);
                 m_renderer.setPostSettings(post);
             }
+            // Animation playback + ragdoll reconciliation: right
+            // after the scripts (play.animation / enable.ragdoll
+            // take effect this same step), before physics (fresh
+            // ragdoll bodies must exist for the solver).
+            AnimationSystem::update(m_scene, fixedDeltaSeconds);
             StalkerAISystem::update(m_scene, static_cast<float>(fixedDeltaSeconds));
             // Rigid-body physics is deterministic simulation, so it lives in
             // the fixed step (never the variable/render-rate update). Its
@@ -656,6 +663,12 @@ void Application::run() {
             m_physicsSystem.update(m_scene, fixedDeltaSeconds, m_config.physics, m_jobSystem);
             PlayerSystem::syncCamera(m_scene);
             RotationSystem::update(m_scene, fixedDeltaSeconds, m_jobSystem);
+        }
+        // VibeAnim Anim Preview (Edit mode): evaluate previewing
+        // rigs into the viewport without entering Play. Preview
+        // snapshots guarantee the authored scene is restored.
+        if (!m_playSession.isPlaying()) {
+            AnimationSystem::updatePreview(m_scene, m_animationContext, fixedDeltaSeconds);
         }
         // Re-propagate after every writer of local transforms so
         // picking and rendering consume this step's world matrices.
@@ -819,6 +832,7 @@ void Application::run() {
                 editorKeys.pageDown = m_input.wasKeyPressed(Key::PageDown);
                 editorKeys.tab = m_input.wasKeyPressed(Key::Tab);
                 editorKeys.saveCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::S);
+                editorKeys.completionCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::Space);
                 editorKeys.copyCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::C);
                 editorKeys.cutCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::X);
                 editorKeys.pasteCombo = uiInput.ctrlModifier && m_input.wasKeyPressed(Key::V);
@@ -1101,6 +1115,7 @@ void Application::run() {
                                                                       inspectorX, y, inspectorWidth,
                                                                       inspectorOptions);
                     y = inspectScriptAt(inspectorX, y, inspectorWidth, selected);
+                    y = inspectAnimationAt(inspectorX, y, inspectorWidth, selected);
                     if (registry.all_of<MeshComponent>(selected)) {
                         y = inspectMaterialAt(m_uiContext, m_assets, registry.get<MeshComponent>(selected),
                                               inspectorX, y, inspectorWidth);
@@ -1261,15 +1276,23 @@ void Application::run() {
                 if (m_uiContext.button(tabScript, "Script")) {
                     m_bottomDockTab = BottomDockTab::Script;
                 }
-                const UIRect activeTab = m_bottomDockTab == BottomDockTab::Assets ? tabAssets : tabScript;
+                const UIRect tabAnim{assetRect.x + 196.0f, assetRect.y + 2.0f, 92.0f, tabHeight - 4.0f};
+                if (m_uiContext.button(tabAnim, "VibeAnim")) {
+                    m_bottomDockTab = BottomDockTab::Anim;
+                }
+                const UIRect activeTab = m_bottomDockTab == BottomDockTab::Assets
+                                             ? tabAssets
+                                             : (m_bottomDockTab == BottomDockTab::Script ? tabScript : tabAnim);
                 ui.drawRect(activeTab.x, assetRect.y + tabHeight - 2.0f, activeTab.width, 2.0f,
                             m_uiContext.theme().focusBorder);
                 const UIRect dockContent{assetRect.x, assetRect.y + tabHeight,
                                          assetRect.width, std::max(0.0f, assetRect.height - tabHeight)};
                 if (m_bottomDockTab == BottomDockTab::Assets) {
                     browserResult = m_assetBrowser.build(m_uiContext, dockContent);
-                } else {
+                } else if (m_bottomDockTab == BottomDockTab::Script) {
                     drawScriptDock(dockContent, m_lastUpdateDeltaSeconds);
+                } else {
+                    drawAnimStudio(dockContent, m_lastUpdateDeltaSeconds);
                 }
             }
             const UIDragPayload dragPayload = m_uiContext.dragPayload();
@@ -1372,12 +1395,9 @@ void Application::run() {
             // window over a dimmed editor, drawn last so nothing
             // covers it; OK / Enter / Escape dismiss it.
             if (m_scriptErrorOpen) {
-                const float modalWidth = 580.0f;
-                size_t lineCount = 1;
-                for (const char ch : m_scriptErrorBody) {
-                    lineCount += ch == '\n' ? 1 : 0;
-                }
-                const float modalHeight = 118.0f + 22.0f * static_cast<float>(std::min<size_t>(lineCount, 8));
+                const float modalWidth = 620.0f;
+                const size_t shown = std::min<size_t>(m_scriptErrorLines.size(), 8);
+                const float modalHeight = 118.0f + 24.0f * static_cast<float>(shown);
                 const float modalX = 0.5f * (static_cast<float>(framebufferWidth) - modalWidth);
                 const float modalY = 0.5f * (static_cast<float>(framebufferHeight) - modalHeight);
                 ui.drawRect(0.0f, 0.0f, static_cast<float>(framebufferWidth), static_cast<float>(framebufferHeight),
@@ -1386,20 +1406,26 @@ void Application::run() {
                                        UIRectStyle{8.0f, 1.0f, glm::vec4{0.85f, 0.30f, 0.25f, 1.0f}});
                 ui.drawText(m_scriptErrorTitle, modalX + 16.0f, modalY + 12.0f, 1.5f,
                             glm::vec4{1.0f, 0.55f, 0.45f, 1.0f});
-                float errorY = modalY + 44.0f;
-                size_t start = 0;
-                size_t drawn = 0;
-                while (start <= m_scriptErrorBody.size() && drawn < 8) {
-                    const size_t newline = m_scriptErrorBody.find('\n', start);
-                    const std::string line = m_scriptErrorBody.substr(
-                        start, newline == std::string::npos ? std::string::npos : newline - start);
-                    ui.drawText(line, modalX + 16.0f, errorY, 1.35f, glm::vec4{0.92f, 0.90f, 0.88f, 1.0f});
-                    errorY += 22.0f;
-                    ++drawn;
-                    if (newline == std::string::npos) {
-                        break;
+                ui.drawText("Click an error to jump to its line:", modalX + 16.0f, modalY + 34.0f, 1.2f,
+                            glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+                float errorY = modalY + 56.0f;
+                for (size_t i = 0; i < shown; ++i) {
+                    const auto& [text, line] = m_scriptErrorLines[i];
+                    const UIRect row{modalX + 10.0f, errorY - 3.0f, modalWidth - 20.0f, 22.0f};
+                    if (m_uiContext.button(row, text) && line > 0) {
+                        // Jump: close, surface the script dock, put
+                        // the caret on the offending line.
+                        m_scriptErrorOpen = false;
+                        m_bottomDockTab = BottomDockTab::Script;
+                        m_scriptEditor.setCursor(static_cast<size_t>(line - 1), 0);
+                        m_scriptEditor.setFocused(true);
                     }
-                    start = newline + 1;
+                    errorY += 24.0f;
+                }
+                if (m_scriptErrorLines.size() > shown) {
+                    ui.drawText("+ " + std::to_string(m_scriptErrorLines.size() - shown) +
+                                    " more (console keeps the full list)",
+                                modalX + 16.0f, errorY, 1.2f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
                 }
                 m_uiContext.endPanel();
                 const UIRect okButton{modalX + modalWidth - 116.0f, modalY + modalHeight - 40.0f, 100.0f, 28.0f};
@@ -1520,15 +1546,22 @@ void Application::saveAndCompileScript() {
         // parser errors, line numbers included, until dismissed.
         m_scriptErrorOpen = true;
         m_scriptErrorTitle = "Script compilation failed - " + m_scriptEditor.displayName();
-        m_scriptErrorBody.clear();
+        m_scriptErrorLines.clear();
         for (const std::string& error : parsed.errors) {
-            if (!m_scriptErrorBody.empty()) {
-                m_scriptErrorBody += "\n";
+            int line = 0;
+            if (error.starts_with("line ")) {
+                size_t digitEnd = 5;
+                while (digitEnd < error.size() && std::isdigit(static_cast<unsigned char>(error[digitEnd]))) {
+                    ++digitEnd;
+                }
+                if (digitEnd > 5) {
+                    line = std::stoi(error.substr(5, digitEnd - 5));
+                }
             }
-            m_scriptErrorBody += error;
+            m_scriptErrorLines.emplace_back(error, line);
         }
-        if (m_scriptErrorBody.empty()) {
-            m_scriptErrorBody = "Compile failed (no details)";
+        if (m_scriptErrorLines.empty()) {
+            m_scriptErrorLines.emplace_back("Compile failed (no details)", 0);
         }
     }
     m_scriptEditor.markClean();
@@ -1662,6 +1695,445 @@ void Application::drawScriptDock(const UIRect& rect, double deltaSeconds) {
         m_scriptEditor.draw(m_uiContext, editorRect, static_cast<float>(deltaSeconds));
     if (result.saveRequested) {
         saveAndCompileScript();
+    }
+    // Real-time services: re-parse on edit (gutter diagnostics) and
+    // refresh completions; moving to another line closes the popup.
+    updateScriptLiveDiagnostics();
+    if (result.changed) {
+        refreshScriptCompletions();
+    }
+    if (m_scriptEditor.cursorLine() != m_scriptEditorLastLine) {
+        m_scriptEditorLastLine = m_scriptEditor.cursorLine();
+        if (!result.changed) {
+            m_scriptEditor.closeCompletions();
+        }
+    }
+}
+
+void Application::updateScriptLiveDiagnostics() {
+    const std::string source = m_scriptEditor.text();
+    if (source == m_scriptLiveSource) {
+        return;
+    }
+    m_scriptLiveSource = source;
+    const DSLParseResult parsed = parseBackroomsScript(source);
+    std::vector<TextEditor::Diagnostic> diagnostics;
+    for (const std::string& error : parsed.errors) {
+        if (!error.starts_with("line ")) {
+            continue;
+        }
+        size_t digitEnd = 5;
+        while (digitEnd < error.size() && std::isdigit(static_cast<unsigned char>(error[digitEnd]))) {
+            ++digitEnd;
+        }
+        if (digitEnd > 5) {
+            const int line = std::stoi(error.substr(5, digitEnd - 5));
+            if (line > 0) {
+                diagnostics.push_back(TextEditor::Diagnostic{static_cast<size_t>(line - 1), error});
+            }
+        }
+    }
+    m_scriptEditor.setDiagnostics(std::move(diagnostics));
+    if (!m_scriptStatus.starts_with("Compiled")) {
+        m_scriptStatus = parsed.ok() ? std::string{} : parsed.errors.front();
+    }
+}
+
+void Application::refreshScriptCompletions() {
+    if (!m_scriptEditor.focused()) {
+        m_scriptEditor.closeCompletions();
+        return;
+    }
+    auto& registry = m_scene.registry();
+    std::vector<std::string> clipNames;
+    for (const entt::entity entity : registry.view<AnimationPlayerComponent>()) {
+        for (const AnimationClip& clip : registry.get<AnimationPlayerComponent>(entity).clips) {
+            if (std::find(clipNames.begin(), clipNames.end(), clip.name) == clipNames.end()) {
+                clipNames.push_back(clip.name);
+            }
+        }
+    }
+    std::vector<std::string> entityNames;
+    for (const entt::entity entity : registry.view<TagComponent>()) {
+        const std::string& tag = registry.get<TagComponent>(entity).tag;
+        if (!tag.empty()) {
+            entityNames.push_back(tag);
+        }
+    }
+    const DslCompletionResult result =
+        dslCompletions(m_scriptEditor.text(), m_scriptEditor.cursorTextOffset(), clipNames, entityNames);
+    if (result.active) {
+        std::vector<TextEditor::CompletionItem> items;
+        items.reserve(result.items.size());
+        for (const DslCompletionItem& item : result.items) {
+            items.push_back(TextEditor::CompletionItem{item.text, item.detail});
+        }
+        m_scriptEditor.showCompletions(std::move(items), result.replaceStart);
+    } else {
+        m_scriptEditor.closeCompletions();
+    }
+}
+
+
+entt::entity Application::resolveAnimRig() {
+    auto& registry = m_scene.registry();
+    if (m_animRig != entt::null && registry.valid(m_animRig) && registry.all_of<RigComponent>(m_animRig)) {
+        return m_animRig;
+    }
+    entt::entity current = m_outliner.selected();
+    for (int depth = 0; depth < 64 && current != entt::null && registry.valid(current); ++depth) {
+        if (registry.all_of<RigComponent>(current)) {
+            m_animRig = current;
+            return current;
+        }
+        const ParentComponent* parent = registry.try_get<ParentComponent>(current);
+        current = parent != nullptr ? parent->parent : entt::null;
+    }
+    m_animRig = entt::null;
+    return entt::null;
+}
+
+float Application::inspectAnimationAt(float x, float y, float width, entt::entity entity) {
+    auto& registry = m_scene.registry();
+    const float rowStep = UIContext::kRowHeight + UIContext::kRowSpacing;
+    const bool hasRig = registry.all_of<RigComponent>(entity);
+    const bool hasPlayer = registry.all_of<AnimationPlayerComponent>(entity);
+    if (!hasRig && !hasPlayer) {
+        const float height = 2.0f * UIContext::kPanelPadding + 2.0f * rowStep;
+        m_uiContext.beginPanel("AnimationComponent", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+        m_uiContext.label("Animation (VibeAnim)");
+        if (m_uiContext.button("Auto-Rig This Hierarchy")) {
+            RigComponent rig = AnimationRigging::buildFromHierarchy(m_scene, entity);
+            const size_t nodeCount = rig.nodes.size();
+            registry.emplace_or_replace<RigComponent>(entity, std::move(rig));
+            if (!hasPlayer) {
+                registry.emplace<AnimationPlayerComponent>(entity);
+            }
+            m_animRig = entity;
+            m_bottomDockTab = BottomDockTab::Anim;
+            setStatusMessage("Rig built: " + std::to_string(nodeCount) + " nodes (VibeAnim tab)");
+        }
+        m_uiContext.endPanel();
+        return y + height + 6.0f;
+    }
+    const RigComponent* rig = registry.try_get<RigComponent>(entity);
+    const AnimationPlayerComponent* player = registry.try_get<AnimationPlayerComponent>(entity);
+    RagdollComponent* ragdoll = registry.try_get<RagdollComponent>(entity);
+    const float height = 2.0f * UIContext::kPanelPadding + 5.0f * rowStep;
+    m_uiContext.beginPanel("AnimationComponent", UIRect{x, y, width, height}, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+    m_uiContext.label("Animation (VibeAnim)");
+    m_uiContext.label("Rig nodes: " + std::to_string(rig != nullptr ? rig->nodes.size() : size_t{0}) +
+                      "   Clips: " + std::to_string(player != nullptr ? player->clips.size() : size_t{0}));
+    m_uiContext.label("Playing: " +
+                      std::string(player != nullptr && player->playing && !player->currentClip.empty()
+                                      ? player->currentClip
+                                      : "(none)"));
+    if (ragdoll != nullptr) {
+        bool enabled = ragdoll->enabled;
+        if (m_uiContext.checkbox("Ragdoll mode", &enabled)) {
+            AnimationSystem::setRagdollEnabled(m_scene, entity, enabled);
+        }
+    }
+    if (m_uiContext.button("Open in VibeAnim Studio")) {
+        m_animRig = entity;
+        m_bottomDockTab = BottomDockTab::Anim;
+    }
+    m_uiContext.endPanel();
+    return y + height + 6.0f;
+}
+
+// ---------------------------------------------------------------------------
+// VibeAnim studio: rig hierarchy + joint properties | clip library |
+// timeline. Everything edits the same components the runtime plays,
+// and Anim Preview evaluates them in Edit mode (snapshot-safe).
+// ---------------------------------------------------------------------------
+void Application::drawAnimStudio(const UIRect& rect, double /*deltaSeconds*/) {
+    auto& registry = m_scene.registry();
+    UIBatch& batch = m_renderer.uiBatch();
+    const UITheme& theme = m_uiContext.theme();
+    batch.drawText("VibeAnim Studio", rect.x + 8.0f, rect.y + 7.0f, 1.35f, theme.text);
+
+    const entt::entity rigEntity = resolveAnimRig();
+    if (rigEntity == entt::null) {
+        batch.drawText("No rig in scope. Select an entity (a mesh or a primitive stack root),",
+                       rect.x + 8.0f, rect.y + 34.0f, 1.25f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+        batch.drawText("then use Inspector > Animation > Auto-Rig This Hierarchy to map its joints.",
+                       rect.x + 8.0f, rect.y + 54.0f, 1.25f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+        const entt::entity selected = m_outliner.selected();
+        if (selected != entt::null && registry.valid(selected)) {
+            const UIRect autoRigButton{rect.x + 8.0f, rect.y + 78.0f, 230.0f, 24.0f};
+            if (m_uiContext.button(autoRigButton, "Auto-Rig Selected Hierarchy")) {
+                RigComponent rig = AnimationRigging::buildFromHierarchy(m_scene, selected);
+                const size_t nodeCount = rig.nodes.size();
+                registry.emplace_or_replace<RigComponent>(selected, std::move(rig));
+                if (registry.try_get<AnimationPlayerComponent>(selected) == nullptr) {
+                    registry.emplace<AnimationPlayerComponent>(selected);
+                }
+                m_animRig = selected;
+                setStatusMessage("Rig built: " + std::to_string(nodeCount) + " nodes");
+            }
+        }
+        return;
+    }
+
+    RigComponent& rig = registry.get<RigComponent>(rigEntity);
+    AnimationPlayerComponent* player = registry.try_get<AnimationPlayerComponent>(rigEntity);
+    RagdollComponent* ragdoll = registry.try_get<RagdollComponent>(rigEntity);
+    std::string rigName = "Entity " + std::to_string(entt::to_integral(rigEntity));
+    if (const TagComponent* tag = registry.try_get<TagComponent>(rigEntity); tag != nullptr && !tag->tag.empty()) {
+        rigName = tag->tag;
+    }
+    batch.drawText("Rig: " + rigName, rect.x + 170.0f, rect.y + 7.0f, 1.25f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+
+    // Header toggles: Anim Preview + Ragdoll Mode.
+    const bool previewing = AnimationSystem::previewActive(m_animationContext, rigEntity);
+    const UIRect previewButton{rect.x + rect.width - 268.0f, rect.y + 3.0f, 128.0f, 24.0f};
+    if (m_uiContext.button(previewButton, previewing ? "Preview: ON" : "Preview: OFF")) {
+        if (previewing) {
+            AnimationSystem::stopPreview(m_scene, m_animationContext, rigEntity);
+        } else if (player != nullptr) {
+            AnimationSystem::startPreview(m_scene, m_animationContext, rigEntity);
+        }
+    }
+    const bool ragdollOn = ragdoll != nullptr && ragdoll->enabled;
+    const UIRect ragdollButton{rect.x + rect.width - 132.0f, rect.y + 3.0f, 124.0f, 24.0f};
+    if (m_uiContext.button(ragdollButton, ragdollOn ? "Ragdoll: ON" : "Ragdoll: OFF")) {
+        AnimationSystem::setRagdollEnabled(m_scene, rigEntity, !ragdollOn);
+    }
+
+    const float columnsY = rect.y + 32.0f;
+    const float columnsHeight = std::max(60.0f, rect.height - 32.0f - 62.0f);
+    const float rowStep = UIContext::kRowHeight + UIContext::kRowSpacing;
+
+    // -- Left: rig hierarchy (articulation points) --------------------
+    {
+        const UIRect panel{rect.x + 4.0f, columnsY, 208.0f, columnsHeight};
+        m_uiContext.beginPanel("VibeAnimRigNodes", panel, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+        m_uiContext.label("Rig Hierarchy");
+        const size_t maxRows = static_cast<size_t>(std::max(1.0f, (columnsHeight - 30.0f) / rowStep)) - 1;
+        size_t shown = 0;
+        for (const RigNode& node : rig.nodes) {
+            if (shown++ >= maxRows) {
+                break;
+            }
+            std::string indent;
+            // Depth from the parent chain (rigs are small; a linear walk is fine).
+            int depth = 0;
+            for (int32_t p = node.parent; p >= 0 && depth < 12; p = rig.nodes[static_cast<size_t>(p)].parent) {
+                ++depth;
+            }
+            for (int i = 0; i < depth; ++i) {
+                indent += "  ";
+            }
+            const bool selectedNode = node.name == m_animSelectedNode;
+            if (m_uiContext.button((selectedNode ? "> " : "  ") + indent + node.name)) {
+                m_animSelectedNode = node.name;
+                m_animSelectedKeyTime = -1.0;
+                if (node.entity != entt::null && registry.valid(node.entity)) {
+                    m_outliner.setSelected(node.entity);
+                }
+            }
+        }
+        m_uiContext.endPanel();
+    }
+
+    RigNode* selectedNode = nullptr;
+    for (RigNode& node : rig.nodes) {
+        if (node.name == m_animSelectedNode) {
+            selectedNode = &node;
+        }
+    }
+    if (selectedNode == nullptr && !rig.nodes.empty()) {
+        selectedNode = &rig.nodes.front();
+        m_animSelectedNode = selectedNode->name;
+    }
+    if (player != nullptr && player->findClip(m_animSelectedClip) == nullptr && !player->clips.empty()) {
+        m_animSelectedClip = player->clips.front().name;
+    }
+    AnimationClip* selectedClip =
+        player != nullptr ? player->findClip(m_animSelectedClip) : nullptr;
+
+    // -- Middle: joint properties + keyframing -------------------------
+    {
+        const UIRect panel{rect.x + 216.0f, columnsY, 252.0f, columnsHeight};
+        m_uiContext.beginPanel("VibeAnimNodeProps", panel, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+        m_uiContext.label("Joint / Node");
+        if (selectedNode != nullptr) {
+            m_uiContext.label("Node: " + selectedNode->name);
+            m_uiContext.vec3Sliders("joint axis", &selectedNode->jointAxis, -1.0f, 1.0f);
+            m_uiContext.slider("min angle", &selectedNode->minAngleDegrees, -180.0f, 180.0f);
+            m_uiContext.slider("max angle", &selectedNode->maxAngleDegrees, -180.0f, 180.0f);
+        }
+        m_uiContext.label("Keyframes (selected node)");
+        static const char* kInterpNames[] = {"Linear", "EaseInOut", "Step"};
+        AnimKeyframe* selectedKey = nullptr;
+        if (selectedClip != nullptr && selectedNode != nullptr && m_animSelectedKeyTime >= 0.0) {
+            for (AnimTrack& track : selectedClip->tracks) {
+                if (track.node != selectedNode->name) {
+                    continue;
+                }
+                for (AnimKeyframe& key : track.keys) {
+                    if (std::abs(key.time - m_animSelectedKeyTime) < 1e-9) {
+                        selectedKey = &key;
+                    }
+                }
+            }
+        }
+        const int shownInterp = selectedKey != nullptr ? static_cast<int>(selectedKey->interpolation)
+                                                        : m_animInterpChoice;
+        if (m_uiContext.button(std::string("Interp: ") + kInterpNames[shownInterp % 3])) {
+            const int next = (shownInterp + 1) % 3;
+            if (selectedKey != nullptr) {
+                selectedKey->interpolation = static_cast<AnimInterpolation>(next);
+            } else {
+                m_animInterpChoice = next;
+            }
+        }
+        if (m_uiContext.button("Add Key at Playhead")) {
+            if (selectedClip != nullptr && selectedNode != nullptr && selectedNode->entity != entt::null &&
+                player != nullptr) {
+                if (const TransformComponent* transform =
+                        registry.try_get<TransformComponent>(selectedNode->entity);
+                    transform != nullptr) {
+                    AnimKeyframe key;
+                    key.time = player->time;
+                    key.position = transform->position;
+                    key.rotationDegrees = transform->rotationDegrees;
+                    key.scale = transform->scale;
+                    key.interpolation = static_cast<AnimInterpolation>(m_animInterpChoice % 3);
+                    addKeyframe(*selectedClip, selectedNode->name, key);
+                    m_animSelectedKeyTime = key.time;
+                }
+            }
+        }
+        if (m_uiContext.button("Delete Selected Key")) {
+            if (selectedClip != nullptr && selectedNode != nullptr && m_animSelectedKeyTime >= 0.0 &&
+                removeKeyframe(*selectedClip, selectedNode->name, m_animSelectedKeyTime)) {
+                m_animSelectedKeyTime = -1.0;
+            }
+        }
+        m_uiContext.endPanel();
+    }
+
+    // -- Right: clip library ---------------------------------------------
+    {
+        const UIRect panel{rect.x + 472.0f, columnsY, std::max(180.0f, rect.width - 476.0f), columnsHeight};
+        m_uiContext.beginPanel("VibeAnimClips", panel, UIRectStyle{8.0f, 1.0f, glm::vec4{}});
+        m_uiContext.label("Animation Clips");
+        if (player == nullptr) {
+            if (m_uiContext.button("Add Animation Player")) {
+                registry.emplace<AnimationPlayerComponent>(rigEntity);
+            }
+        } else {
+            for (const AnimationClip& clip : player->clips) {
+                const bool selectedClipRow = clip.name == m_animSelectedClip;
+                if (m_uiContext.button((selectedClipRow ? "> " : "  ") + clip.name)) {
+                    m_animSelectedClip = clip.name;
+                    m_animSelectedKeyTime = -1.0;
+                    if (previewing) {
+                        AnimationSystem::playClip(m_scene, rigEntity, clip.name, 0.25);
+                    }
+                }
+            }
+            m_uiContext.textField("New clip name", &m_animNewClipName);
+            if (m_uiContext.button("Create Clip")) {
+                std::string name = m_animNewClipName.empty() ? "clip" : m_animNewClipName;
+                if (player->findClip(name) == nullptr) {
+                    AnimationClip clip;
+                    clip.name = name;
+                    clip.duration = 2.0;
+                    clip.loop = true;
+                    player->clips.push_back(std::move(clip));
+                    m_animSelectedClip = name;
+                }
+            }
+            if (selectedClip != nullptr) {
+                float duration = static_cast<float>(selectedClip->duration);
+                if (m_uiContext.slider("Duration (s)", &duration, 0.1f, 60.0f)) {
+                    selectedClip->duration = std::max(0.05, static_cast<double>(duration));
+                }
+                m_uiContext.checkbox("Loop", &selectedClip->loop);
+                if (m_uiContext.button("Delete Clip")) {
+                    auto& clips = player->clips;
+                    clips.erase(std::remove_if(clips.begin(), clips.end(),
+                                               [&](const AnimationClip& clip) { return clip.name == m_animSelectedClip; }),
+                                clips.end());
+                    m_animSelectedClip.clear();
+                    selectedClip = nullptr;
+                }
+            }
+        }
+        m_uiContext.endPanel();
+    }
+
+    // -- Bottom: timeline ---------------------------------------------------
+    {
+        const float timelineY = rect.y + rect.height - 56.0f;
+        const UIRect track{rect.x + 170.0f, timelineY + 18.0f, std::max(60.0f, rect.width - 180.0f), 14.0f};
+        batch.drawRect(rect.x + 4.0f, timelineY, rect.width - 8.0f, 52.0f, theme.panelFill);
+        const bool playingNow = player != nullptr && player->playing;
+        if (m_uiContext.button(UIRect{rect.x + 10.0f, timelineY + 14.0f, 62.0f, 24.0f},
+                               playingNow ? "Pause" : "Play")) {
+            if (player != nullptr && selectedClip != nullptr) {
+                if (!previewing) {
+                    AnimationSystem::startPreview(m_scene, m_animationContext, rigEntity);
+                }
+                if (player->currentClip != selectedClip->name) {
+                    AnimationSystem::playClip(m_scene, rigEntity, selectedClip->name, 0.0);
+                }
+                player->playing = !playingNow;
+            }
+        }
+        if (m_uiContext.button(UIRect{rect.x + 78.0f, timelineY + 14.0f, 34.0f, 24.0f}, "|<")) {
+            if (player != nullptr) {
+                player->time = 0.0;
+            }
+        }
+        const double playhead = player != nullptr ? player->time : 0.0;
+        const double duration = selectedClip != nullptr ? std::max(0.05, selectedClip->duration) : 1.0;
+        char timeText[64];
+        std::snprintf(timeText, sizeof(timeText), "%.2fs / %.2fs", playhead, duration);
+        batch.drawText(timeText, rect.x + 118.0f, timelineY + 18.0f, 1.2f, theme.text);
+        batch.drawRect(track.x, track.y, track.width, track.height, theme.trackFill);
+        // Key ticks for the selected node's lane.
+        if (selectedClip != nullptr && selectedNode != nullptr) {
+            if (const AnimTrack* lane = selectedClip->findTrack(selectedNode->name); lane != nullptr) {
+                for (const AnimKeyframe& key : lane->keys) {
+                    const float keyX = track.x + static_cast<float>(key.time / duration) * track.width;
+                    const bool selected = std::abs(key.time - m_animSelectedKeyTime) < 1e-9;
+                    batch.drawRect(keyX - 3.0f, track.y - 3.0f, 6.0f, track.height + 6.0f,
+                                   selected ? glm::vec4{1.0f, 0.65f, 0.2f, 1.0f}
+                                            : glm::vec4{0.45f, 0.75f, 1.0f, 1.0f});
+                    if (m_uiContext.pressedRect(UIRect{keyX - 5.0f, track.y - 4.0f, 10.0f, track.height + 8.0f})) {
+                        m_animSelectedKeyTime = key.time;
+                        if (player != nullptr) {
+                            player->time = key.time;
+                        }
+                    }
+                }
+            }
+        }
+        // Playhead + scrub (press or drag inside the track).
+        const float playheadX = track.x + static_cast<float>(std::clamp(playhead / duration, 0.0, 1.0)) * track.width;
+        batch.drawRect(playheadX - 1.0f, track.y - 5.0f, 2.0f, track.height + 10.0f,
+                       glm::vec4{1.0f, 0.35f, 0.30f, 1.0f});
+        const UIInput& frameInput = m_uiContext.frameInput();
+        const glm::vec2 mouse = m_uiContext.mousePosition();
+        if (player != nullptr && selectedClip != nullptr && frameInput.mouseDown &&
+            track.contains(mouse.x, mouse.y)) {
+            if (!previewing) {
+                AnimationSystem::startPreview(m_scene, m_animationContext, rigEntity);
+                if (player->currentClip != selectedClip->name) {
+                    AnimationSystem::playClip(m_scene, rigEntity, selectedClip->name, 0.0);
+                }
+            }
+            player->time = std::clamp(static_cast<double>(mouse.x - track.x) / track.width, 0.0, 1.0) * duration;
+        }
+        if (selectedClip == nullptr) {
+            batch.drawText(player == nullptr || player->clips.empty() ? "Create a clip to start keyframing"
+                                                                      : "Select a clip",
+                           track.x + 8.0f, track.y + 1.0f, 1.2f, glm::vec4{0.62f, 0.68f, 0.78f, 1.0f});
+        }
     }
 }
 
@@ -1856,6 +2328,9 @@ void Application::handleEventImpulse() {
 }
 
 void Application::enterPlayMode() {
+    // Anim Preview must not leak into Play: restore every
+    // previewed rig to its authored pose before the snapshot.
+    AnimationSystem::stopAllPreviews(m_scene, m_animationContext);
     // The selection names an entity the runtime is about to own;
     // drop it so no editor widget keeps a handle across the
     // snapshot boundary (Stop rebuilds every handle anyway).
@@ -1905,6 +2380,10 @@ void Application::exitPlayMode() {
         // The restore rebuilt every entity: keep the selection
         // cleared rather than pointing at a recycled handle.
         m_outliner.setSelected(entt::null);
+        m_animRig = entt::null; // rig handles were rebuilt too
+        m_animSelectedClip.clear();
+        m_animSelectedNode.clear();
+        m_animSelectedKeyTime = -1.0;
         // The script editor's binding is a raw handle too: rebind
         // it to the restored script entity carrying the same tag
         // (the buffer text is untouched -- Play cannot edit it,

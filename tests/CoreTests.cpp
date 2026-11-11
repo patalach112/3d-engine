@@ -28,6 +28,9 @@
 #include "Scene/TransformGizmo.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
+#include "Scene/AnimationComponents.h"
+#include "Scene/Systems/AnimationSystem.h"
+#include "Graphics/DslCompletion.h"
 #include "Scene/Systems/TransformSystem.h"
 #include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RotationSystem.h"
@@ -10992,7 +10995,7 @@ void testEditorScriptingUpgrades() {
         check(numberCoversUnit, "highlight: duration 10s is one number span");
         check(keywordSeen, "highlight: every is a keyword");
         const auto plain = highlightDslLine("health = health + 2");
-        check(!plain.empty() && plain[0].kind == DslHighlightKind::Plain, "highlight: identifiers stay plain");
+        check(!plain.empty() && plain[0].kind == DslHighlightKind::Variable, "highlight: identifiers read as variables");
         check(dslHighlightColor(DslHighlightKind::Keyword) != dslHighlightColor(DslHighlightKind::String),
               "highlight: kinds map to distinct colours");
     }
@@ -11993,6 +11996,434 @@ void testEventHandlerMutation() {
 }
 
 
+void testAnimationStudio() {
+    std::cout << "VibeAnim: keyframe sampling, rigging, blending, ragdoll\n";
+    using namespace engine;
+
+    // -- Keyframe sampling: interpolation modes --------------------------------
+    {
+        AnimTrack track;
+        track.node = "arm";
+        track.keys.push_back(AnimKeyframe{0.0, glm::vec3{0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                          AnimInterpolation::Linear});
+        track.keys.push_back(AnimKeyframe{2.0, glm::vec3{2.0f, 0.0f, 0.0f}, glm::vec3{0.0f, 90.0f, 0.0f},
+                                          glm::vec3{2.0f}, AnimInterpolation::Linear});
+        AnimPose pose;
+        check(sampleTrack(track, 1.0, pose) && nearlyEqual(pose.position.x, 1.0, 1e-6),
+              "anim: linear midpoint position");
+        const glm::vec3 euler = glm::degrees(glm::eulerAngles(pose.rotation));
+        check(nearlyEqual(euler.y, 45.0, 1e-2), "anim: rotation slerps (45 deg at midpoint)");
+        check(nearlyEqual(pose.scale.x, 1.5, 1e-6), "anim: scale lerps");
+
+        track.keys[0].interpolation = AnimInterpolation::EaseInOut;
+        check(sampleTrack(track, 0.5, pose) && nearlyEqual(pose.position.x, 0.3125, 1e-5),
+              "anim: ease-in-out is slow at the segment start (smoothstep 0.25 -> 0.15625)");
+        check(sampleTrack(track, 1.0, pose) && nearlyEqual(pose.position.x, 1.0, 1e-6),
+              "anim: ease-in-out passes the midpoint");
+
+        track.keys[0].interpolation = AnimInterpolation::Step;
+        check(sampleTrack(track, 1.9, pose) && nearlyEqual(pose.position.x, 0.0, 1e-9),
+              "anim: step holds the start key");
+        check(sampleTrack(track, 2.0, pose) && nearlyEqual(pose.position.x, 2.0, 1e-9),
+              "anim: step lands on the next key at its time");
+        check(!sampleTrack(AnimTrack{}, 0.0, pose), "anim: empty track samples nothing");
+    }
+
+    // -- Clip time policy: loop wrap vs clamp ------------------------------------
+    {
+        AnimationClip clip;
+        clip.name = "loop";
+        clip.duration = 2.0;
+        clip.loop = true;
+        AnimTrack& track = clip.trackFor("arm");
+        track.keys.push_back(AnimKeyframe{0.0, glm::vec3{0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                          AnimInterpolation::Linear});
+        track.keys.push_back(AnimKeyframe{2.0, glm::vec3{2.0f, 0.0f, 0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                          AnimInterpolation::Linear});
+        AnimPose pose;
+        check(sampleClip(clip, "arm", 3.0, pose) && nearlyEqual(pose.position.x, 1.0, 1e-6),
+              "anim: looping clip wraps time");
+        clip.loop = false;
+        check(sampleClip(clip, "arm", 99.0, pose) && nearlyEqual(pose.position.x, 2.0, 1e-6),
+              "anim: non-looping clip clamps at the end pose");
+        check(!sampleClip(clip, "missing", 0.0, pose), "anim: unknown node has no pose");
+    }
+
+    // -- Keyframe editing ----------------------------------------------------------
+    {
+        AnimationClip clip;
+        clip.name = "edit";
+        clip.duration = 0.5;
+        addKeyframe(clip, "arm", AnimKeyframe{1.5, glm::vec3{1.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                              AnimInterpolation::Linear});
+        addKeyframe(clip, "arm", AnimKeyframe{0.5, glm::vec3{0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                              AnimInterpolation::Linear});
+        const AnimTrack* track = clip.findTrack("arm");
+        check(track != nullptr && track->keys.size() == 2 && track->keys[0].time == 0.5,
+              "anim edit: keys stay time-sorted");
+        check(nearlyEqual(clip.duration, 1.5, 1e-12), "anim edit: duration extends to the last key");
+        addKeyframe(clip, "arm", AnimKeyframe{0.5, glm::vec3{7.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                              AnimInterpolation::Step});
+        check(track->keys.size() == 2 && nearlyEqual(track->keys[0].position.x, 7.0, 1e-9),
+              "anim edit: same-time key replaces instead of duplicating");
+        check(removeKeyframe(clip, "arm", 0.5) && clip.findTrack("arm")->keys.size() == 1,
+              "anim edit: key removal");
+        check(!removeKeyframe(clip, "arm", 0.5), "anim edit: removing a missing key reports false");
+    }
+
+    // -- Auto-rigging from a hierarchy ----------------------------------------------
+    Scene scene;
+    auto root = scene.createEntity("puppet");
+    root.addComponent<TransformComponent>(glm::vec3{0.0f, 3.0f, 0.0f});
+    auto arm = scene.createEntity("armUpper");
+    arm.addComponent<TransformComponent>(glm::vec3{0.4f, 0.2f, 0.0f});
+    auto hand = scene.createEntity("armLower");
+    hand.addComponent<TransformComponent>(glm::vec3{0.3f, 0.0f, 0.0f});
+    scene.setParent(arm, root);
+    scene.setParent(hand, arm);
+    RigComponent rig = AnimationRigging::buildFromHierarchy(scene, root.handle());
+    check(rig.nodes.size() == 3, "rig: root + descendants mapped");
+    check(rig.nodes[0].name == "puppet" && rig.nodes[0].parent == -1, "rig: node 0 is the root");
+    check(rig.nodes[1].name == "armUpper" && rig.nodes[1].parent == 0, "rig: child parent index");
+    check(rig.nodes[2].name == "armLower" && rig.nodes[2].parent == 1, "rig: grandchild parent index");
+    check(rig.findNode("armLower") != nullptr && rig.findNode("armLower")->entity == hand.handle(),
+          "rig: nodes resolve to their entities");
+
+    // -- Playback + crossfade blending ------------------------------------------------
+    root.addComponent<RigComponent>(rig);
+    AnimationPlayerComponent& player = root.addComponent<AnimationPlayerComponent>();
+    {
+        AnimationClip idle;
+        idle.name = "idle";
+        idle.duration = 1.0;
+        AnimTrack& t = idle.trackFor("armUpper");
+        t.keys.push_back(AnimKeyframe{0.0, glm::vec3{0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                      AnimInterpolation::Linear});
+        t.keys.push_back(AnimKeyframe{1.0, glm::vec3{0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                      AnimInterpolation::Linear});
+        AnimationClip wave;
+        wave.name = "wave";
+        wave.duration = 1.0;
+        AnimTrack& w = wave.trackFor("armUpper");
+        w.keys.push_back(AnimKeyframe{0.0, glm::vec3{4.0f, 0.0f, 0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                      AnimInterpolation::Linear});
+        w.keys.push_back(AnimKeyframe{1.0, glm::vec3{4.0f, 0.0f, 0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                      AnimInterpolation::Linear});
+        player.clips.push_back(idle);
+        player.clips.push_back(wave);
+    }
+    check(!AnimationSystem::playClip(scene, root.handle(), "missing"), "anim: unknown clip refused");
+    check(AnimationSystem::playClip(scene, root.handle(), "idle"), "anim: playClip starts");
+    AnimationSystem::update(scene, 0.1);
+    check(nearlyEqual(scene.registry().get<TransformComponent>(arm.handle()).position.x, 0.0, 1e-6),
+          "anim: idle pose applied to the node transform");
+    check(AnimationSystem::playClip(scene, root.handle(), "wave", 1.0), "anim: blended playClip");
+    AnimationSystem::update(scene, 0.5); // halfway through the 1s crossfade
+    check(nearlyEqual(scene.registry().get<TransformComponent>(arm.handle()).position.x, 2.0, 1e-5),
+          "anim: crossfade mixes poses (smoothstep 0.5 -> halfway)");
+    AnimationSystem::update(scene, 0.6);
+    check(nearlyEqual(scene.registry().get<TransformComponent>(arm.handle()).position.x, 4.0, 1e-5),
+          "anim: crossfade completes on the new clip");
+    AnimationSystem::stopClip(scene, root.handle());
+    check(!player.playing && player.currentClip.empty(), "anim: stopClip clears playback");
+
+    // -- Ragdoll: spawn, simulate, restore ----------------------------------------------
+    RagdollComponent& ragdoll = root.addComponent<RagdollComponent>();
+    const glm::vec3 bindArmPos = scene.registry().get<TransformComponent>(arm.handle()).position;
+    check(AnimationSystem::setRagdollEnabled(scene, root.handle(), true), "ragdoll: enable accepted");
+    check(ragdoll.active && AnimationSystem::ragdollActive(scene, root.handle()), "ragdoll: active after enable");
+    check(scene.registry().all_of<RigidBodyComponent>(root.handle()), "ragdoll: root node got a body");
+    check(scene.registry().all_of<RigidBodyComponent, JointComponent>(hand.handle()),
+          "ragdoll: child node got a body + hinge joint");
+    check(scene.registry().get<JointComponent>(hand.handle()).other == arm.handle(),
+          "ragdoll: hinge binds child to its parent node");
+    {
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        PhysicsSystem physics;
+        const float rootYBefore = scene.registry().get<TransformComponent>(root.handle()).position.y;
+        for (int step = 0; step < 30; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        const float rootYAfter = scene.registry().get<TransformComponent>(root.handle()).position.y;
+        check(rootYAfter < rootYBefore - 0.1f, "ragdoll: the doll falls under gravity");
+    }
+    check(AnimationSystem::setRagdollEnabled(scene, root.handle(), false), "ragdoll: disable accepted");
+    check(!ragdoll.active && !scene.registry().all_of<RigidBodyComponent>(hand.handle()),
+          "ragdoll: spawned bodies removed on disable");
+    check(!scene.registry().all_of<RagdollNodeComponent>(hand.handle()), "ragdoll: markers removed on disable");
+    check(nearlyEqual(scene.registry().get<TransformComponent>(arm.handle()).position.x, bindArmPos.x, 1e-5) &&
+              nearlyEqual(scene.registry().get<TransformComponent>(arm.handle()).position.y, bindArmPos.y, 1e-5),
+          "ragdoll: bind pose restored on disable");
+
+    // Author-placed physics survives a ragdoll round trip.
+    hand.addComponent<RigidBodyComponent>(2.0f);
+    AnimationSystem::setRagdollEnabled(scene, root.handle(), true);
+    AnimationSystem::setRagdollEnabled(scene, root.handle(), false);
+    check(scene.registry().all_of<RigidBodyComponent>(hand.handle()),
+          "ragdoll: an author-placed body is never stripped");
+    scene.registry().remove<RigidBodyComponent>(hand.handle());
+
+    // -- Serialization round trips (GBQ + JSON) -------------------------------------------
+    {
+        Scene out;
+        auto puppet = out.createEntity("puppet");
+        puppet.addComponent<TransformComponent>();
+        auto limb = out.createEntity("limb");
+        limb.addComponent<TransformComponent>(glm::vec3{0.0f, 0.5f, 0.0f});
+        out.setParent(limb, puppet);
+        RigComponent outRig = AnimationRigging::buildFromHierarchy(out, puppet.handle());
+        puppet.addComponent<RigComponent>(outRig);
+        AnimationPlayerComponent& outPlayer = puppet.addComponent<AnimationPlayerComponent>();
+        AnimationClip clip;
+        clip.name = "wave";
+        clip.duration = 2.0;
+        clip.loop = false;
+        addKeyframe(clip, "limb", AnimKeyframe{0.25, glm::vec3{1.0f, 2.0f, 3.0f}, glm::vec3{0.0f, 45.0f, 0.0f},
+                                               glm::vec3{1.5f}, AnimInterpolation::EaseInOut});
+        outPlayer.clips.push_back(clip);
+        outPlayer.currentClip = "wave";
+        RagdollComponent& outRagdoll = puppet.addComponent<RagdollComponent>();
+        outRagdoll.bodyMass = 2.5f;
+
+        const auto verifyLoaded = [](Scene& loaded, const char* medium) {
+            entt::entity puppetHandle = entt::null;
+            entt::entity limbHandle = entt::null;
+            for (const entt::entity e : loaded.registry().view<TagComponent>()) {
+                const std::string& tag = loaded.registry().get<TagComponent>(e).tag;
+                if (tag == "puppet") puppetHandle = e;
+                if (tag == "limb") limbHandle = e;
+            }
+            const std::string prefix = std::string(medium) + ": ";
+            check(puppetHandle != entt::null && loaded.registry().all_of<RigComponent>(puppetHandle),
+                  prefix + "rig survives");
+            const RigComponent& loadedRig = loaded.registry().get<RigComponent>(puppetHandle);
+            check(loadedRig.nodes.size() == 2 && loadedRig.findNode("limb") != nullptr &&
+                      loadedRig.findNode("limb")->entity == limbHandle,
+                  prefix + "rig node entity links remapped");
+            const AnimationPlayerComponent& loadedPlayer =
+                loaded.registry().get<AnimationPlayerComponent>(puppetHandle);
+            const AnimationClip* loadedClip = loadedPlayer.findClip("wave");
+            check(loadedClip != nullptr && loadedClip->tracks.size() == 1 && loadedClip->tracks[0].keys.size() == 1,
+                  prefix + "clip library survives");
+            check(loadedClip != nullptr && nearlyEqual(loadedClip->tracks[0].keys[0].time, 0.25, 1e-9) &&
+                      loadedClip->tracks[0].keys[0].interpolation == AnimInterpolation::EaseInOut &&
+                      nearlyEqual(loadedClip->tracks[0].keys[0].position.y, 2.0, 1e-6),
+                  prefix + "keyframe payload survives");
+            check(nearlyEqual(loaded.registry().get<RagdollComponent>(puppetHandle).bodyMass, 2.5f, 1e-6),
+                  prefix + "ragdoll settings survive");
+        };
+        Scene gbqLoaded;
+        check(gbqLoaded.loadFromGbqBytes(out.saveToGbqBytes()), "anim: GBQ load ok");
+        verifyLoaded(gbqLoaded, "gbq");
+        Scene jsonLoaded;
+        check(jsonLoaded.loadFromString(out.saveToString()), "anim: JSON load ok");
+        verifyLoaded(jsonLoaded, "json");
+    }
+}
+
+void testScriptAnimation() {
+    std::cout << "DSL animation: parser, playback, death ragdoll\n";
+    using namespace engine;
+
+    const auto parse = [](const std::string& source) { return parseBackroomsScript(source); };
+    {
+        const DSLParseResult result = parse("from start() play.animation(\"walk\") script(end)");
+        check(result.ok() && result.program.statements.size() == 1 &&
+                  result.program.statements[0].kind == DSLNodeKind::PlayAnimation &&
+                  result.program.statements[0].name == "walk" && !result.program.statements[0].hasLerp,
+              "dsl: play.animation parses");
+        const DSLParseResult over = parse("from start() play.animation(\"wave\") over 1.5s script(end)");
+        check(over.ok() && over.program.statements[0].hasLerp &&
+                  nearlyEqual(over.program.statements[0].lerpDuration, 1.5, 1e-9),
+              "dsl: play.animation over Xs carries the blend duration");
+        const DSLParseResult blend = parse("from start() play.animation(\"wave\") blend 500ms script(end)");
+        check(blend.ok() && nearlyEqual(blend.program.statements[0].lerpDuration, 0.5, 1e-9),
+              "dsl: blend 500ms == 0.5s");
+        const DSLParseResult ragdoll = parse("from start() enable.ragdoll() disable.ragdoll() script(end)");
+        check(ragdoll.ok() && ragdoll.program.statements[0].kind == DSLNodeKind::RagdollToggle &&
+                  ragdoll.program.statements[0].ragdollEnable &&
+                  !ragdoll.program.statements[1].ragdollEnable,
+              "dsl: enable/disable.ragdoll parse with the flag");
+        check(!parse("from start() play.animation(walk) script(end)").ok(), "dsl: unquoted clip name rejected");
+        check(!parse("from start() play.sound(\"x\") script(end)").ok(), "dsl: play.sound is not a thing");
+        check(!parse("from start() enable.ragdoll( script(end)").ok(), "dsl: malformed ragdoll call rejected");
+        const DSLParseResult waitResult = parse("from start() wait(1s) script(end)");
+        check(!waitResult.ok() && !waitResult.errors.empty() &&
+                  waitResult.errors.front().find("wait") != std::string::npos,
+              "dsl: wait() fails with a helpful pointer to every/for");
+    }
+
+    // Runtime: scripted playback, blend, death -> ragdoll, revive.
+    Scene scene;
+    ScriptSystemContext ctx;
+    auto puppet = scene.createEntity("puppet");
+    puppet.addComponent<TransformComponent>(glm::vec3{0.0f, 2.0f, 0.0f});
+    auto arm = scene.createEntity("armUpper");
+    arm.addComponent<TransformComponent>(glm::vec3{0.4f, 0.0f, 0.0f});
+    scene.setParent(arm, puppet);
+    puppet.addComponent<RigComponent>(AnimationRigging::buildFromHierarchy(scene, puppet.handle()));
+    AnimationPlayerComponent& player = puppet.addComponent<AnimationPlayerComponent>();
+    for (const char* name : {"idle", "wave"}) {
+        AnimationClip clip;
+        clip.name = name;
+        clip.duration = 1.0;
+        AnimTrack& track = clip.trackFor("armUpper");
+        track.keys.push_back(AnimKeyframe{0.0, glm::vec3{0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                          AnimInterpolation::Linear});
+        track.keys.push_back(AnimKeyframe{1.0, glm::vec3{0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                          AnimInterpolation::Linear});
+        player.clips.push_back(clip);
+    }
+    auto enemy = scene.createEntity("Enemy");
+    enemy.addComponent<TransformComponent>();
+    puppet.addComponent<ScriptComponent>().source =
+        "from start()\n"
+        "    health = 100\n"
+        "    play.animation(\"idle\")\n"
+        "    on_input(\"LMB\") { play.animation(\"wave\") blend 0.5s }\n"
+        "    on_input(\"RMB\") { disable.ragdoll() }\n"
+        "    on_touch(\"Enemy\") { health -= 60 if (health <= 0) { enable.ragdoll() } }\n"
+        "script(end)";
+
+    const auto frame = [&]() {
+        ScriptSystem::update(scene, ctx, 0.1);
+        AnimationSystem::update(scene, 0.1);
+    };
+    frame();
+    check(player.currentClip == "idle" && player.playing, "dsl anim: setup plays idle");
+    ScriptSystem::postInputEvent(ctx, "LMB", false);
+    frame();
+    check(player.currentClip == "wave" && player.blendDuration > 0.0,
+          "dsl anim: play.animation with blend crossfades");
+    const auto hit = [&]() {
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, enemy.handle(),
+                                              puppet.handle()});
+        frame();
+    };
+    hit();
+    check(ScriptSystem::variable(ctx, puppet.handle(), "health").value_or(-1.0) == 40.0,
+          "dsl anim: first hit lands (health 40)");
+    check(!AnimationSystem::ragdollActive(scene, puppet.handle()), "dsl anim: still animated while alive");
+    hit();
+    check(ScriptSystem::variable(ctx, puppet.handle(), "health").value_or(0.0) <= 0.0, "dsl anim: lethal hit");
+    check(AnimationSystem::ragdollActive(scene, puppet.handle()),
+          "dsl anim: enable.ragdoll() on death binds bodies the same frame");
+    check(scene.registry().all_of<RigidBodyComponent>(arm.handle()), "dsl anim: limb became a physics body");
+    ScriptSystem::postInputEvent(ctx, "RMB", false);
+    frame();
+    check(!AnimationSystem::ragdollActive(scene, puppet.handle()), "dsl anim: disable.ragdoll() restores animation");
+    check(!scene.registry().all_of<RigidBodyComponent>(arm.handle()), "dsl anim: bodies cleaned up after revive");
+}
+
+void testTextEditorUpgrade() {
+    std::cout << "Text editor: highlighting v2, completion provider, popup logic\n";
+    using namespace engine;
+
+    const auto kindsOf = [](const std::string& line, const std::string& word) {
+        std::vector<DslHighlightKind> kinds;
+        for (const DslHighlightSpan& span : highlightDslLine(line)) {
+            if (std::string_view(line).substr(span.offset, span.length) == word) {
+                kinds.push_back(span.kind);
+            }
+        }
+        return kinds;
+    };
+    check(kindsOf("play.animation(\"walk\")", "play").front() == DslHighlightKind::Builtin,
+          "highlight: play is a builtin");
+    check(kindsOf("play.animation(\"walk\")", "animation").front() == DslHighlightKind::Builtin,
+          "highlight: dotted member reads as builtin");
+    check(kindsOf("x = 1 over 2s blend", "over").front() == DslHighlightKind::Keyword, "highlight: over keyword");
+    check(kindsOf("x = 1 over 2s blend", "blend").front() == DslHighlightKind::Keyword, "highlight: blend keyword");
+    check(kindsOf("enable.ragdoll()", "ragdoll").front() == DslHighlightKind::Builtin, "highlight: ragdoll builtin");
+    check(kindsOf("health -= 25", "health").front() == DslHighlightKind::Variable, "highlight: variable kind");
+    check(kindsOf("effect.chromatic_aberration = 0.2", "chromatic_aberration").front() == DslHighlightKind::Builtin,
+          "highlight: effect property after the dot");
+
+    // Completion provider ------------------------------------------------------
+    const std::vector<std::string> clips{"walk", "wave", "idle"};
+    const std::vector<std::string> entities{"stalker", "safe_room"};
+    {
+        const std::string source = "from start()\n    health = 100\n    hea";
+        const DslCompletionResult result = dslCompletions(source, source.size(), clips, entities);
+        bool hasVariable = false;
+        for (const DslCompletionItem& item : result.items) {
+            hasVariable = hasVariable || (item.text == "health" && item.kind == DslCompletionKind::Variable);
+        }
+        check(result.active && hasVariable, "completion: the script's own variables are offered");
+        check(result.replaceStart == source.size() - 3, "completion: replace range covers the partial word");
+    }
+    {
+        const std::string source = "from start()\n    on_t";
+        const DslCompletionResult result = dslCompletions(source, source.size(), clips, entities);
+        bool hasCommand = false;
+        for (const DslCompletionItem& item : result.items) {
+            hasCommand = hasCommand || item.text == "on_touch(\"";
+        }
+        check(hasCommand, "completion: engine commands are offered by prefix");
+    }
+    {
+        const std::string source = "from start()\n    play.animation(\"wal";
+        const DslCompletionResult result = dslCompletions(source, source.size(), clips, entities);
+        check(result.items.size() == 1 && result.items[0].text == "walk" &&
+                  result.items[0].kind == DslCompletionKind::AnimationClip,
+              "completion: clip names inside play.animation(\"...\")");
+    }
+    {
+        const std::string source = "from start()\n    part(\"sta";
+        const DslCompletionResult result = dslCompletions(source, source.size(), clips, entities);
+        check(result.items.size() == 1 && result.items[0].text == "stalker" &&
+                  result.items[0].kind == DslCompletionKind::EntityName,
+              "completion: entity names inside part(\"...\")");
+    }
+    {
+        const std::string dotted = "from start()\n    play.";
+        const DslCompletionResult member = dslCompletions(dotted, dotted.size(), clips, entities);
+        check(member.items.size() == 1 && member.items[0].text == "animation(\"",
+              "completion: play. offers animation(\"");
+        const std::string rag = "from start()\n    enable.";
+        const DslCompletionResult ragdoll = dslCompletions(rag, rag.size(), clips, entities);
+        check(ragdoll.items.size() == 1 && ragdoll.items[0].text == "ragdoll()",
+              "completion: enable. offers ragdoll()");
+        const std::string bare = "from start()\n    ";
+        check(!dslCompletions(bare, bare.size(), clips, entities).active,
+              "completion: no popup without a partial word");
+    }
+    {
+        const std::vector<std::string> variables = dslScriptVariables(
+            "from start() health = 100 health(max) = 100 speed = 2 over 1s if (health > 1) { x = 1 } script(end)");
+        check(std::find(variables.begin(), variables.end(), "health") != variables.end() &&
+                  std::find(variables.begin(), variables.end(), "speed") != variables.end() &&
+                  std::find(variables.begin(), variables.end(), "x") != variables.end() &&
+                  std::find(variables.begin(), variables.end(), "if") == variables.end(),
+              "completion: variable scan finds assignments + bound decls, skips keywords");
+    }
+
+    // TextEditor popup state machine (no drawing involved) ----------------------
+    {
+        TextEditor editor;
+        editor.loadText("from start()\n    hea\nscript(end)");
+        editor.setCursor(1, 7);
+        check(editor.cursorTextOffset() == std::string("from start()\n    hea").size(),
+              "editor: caret offset maths");
+        editor.showCompletions({{"health", "script variable"}, {"hudprint(\"", "command"}}, 17);
+        check(editor.completionsOpen() && editor.completionCount() == 2, "editor: popup opens with items");
+        editor.moveCompletionSelection(-1);
+        check(editor.completionSelection() == 1, "editor: selection wraps upward");
+        editor.moveCompletionSelection(1);
+        check(editor.completionSelection() == 0, "editor: selection wraps back");
+        check(editor.acceptCompletion(), "editor: accept applies");
+        check(editor.line(1) == "    health", "editor: accept replaces the partial word");
+        check(!editor.completionsOpen(), "editor: popup closes on accept");
+        check(!editor.acceptCompletion(), "editor: accepting a closed popup is a no-op");
+        editor.setDiagnostics({{0, "line 1: boom"}});
+        check(editor.diagnostics().size() == 1 && editor.diagnostics()[0].line == 0,
+              "editor: diagnostics stored for the gutter");
+        editor.showCompletions({}, 0);
+        check(!editor.completionsOpen(), "editor: empty candidates keep the popup closed");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -12061,6 +12492,9 @@ int main() {
     testDslExpansions();
     testDslScopingUniversalAndHudLive();
     testEventHandlerMutation();
+    testAnimationStudio();
+    testScriptAnimation();
+    testTextEditorUpgrade();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

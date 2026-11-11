@@ -310,6 +310,17 @@ private:
             if (word == "play_sound" || word == "emit_sound" || word == "print") {
                 return parseSoundCall(word);
             }
+            if (word == "play") {
+                return parsePlayAnimation();
+            }
+            if (word == "enable" || word == "disable") {
+                return parseRagdollToggle(word);
+            }
+            if (word == "wait") {
+                fail("'wait' is not a statement -- use every(...)/for(...) windows or 'over Xs' "
+                     "on an assignment for timed behaviour");
+                return std::nullopt;
+            }
             if (word == "position") {
                 return parsePosition();
             }
@@ -788,6 +799,73 @@ private:
         }
         fail("expected '=' (or '+=', '-=', '*=', '/=') in assignment");
         return false;
+    }
+
+    // play.animation("walk") / play.animation("walk") over 1.5s /
+    // play.animation("walk") blend 0.5s -- starts a clip on the
+    // host rig's AnimationPlayerComponent, crossfading when a
+    // transition duration is given.
+    std::optional<DSLNode> parsePlayAnimation() {
+        const int line = m_token.line;
+        advance(); // play
+        if (!expectSymbol(".")) {
+            return std::nullopt;
+        }
+        if (!atIdentifier("animation")) {
+            fail("expected 'animation' after 'play.' (play.animation(\"name\"))");
+            return std::nullopt;
+        }
+        advance();
+        if (!expectSymbol("(")) {
+            return std::nullopt;
+        }
+        auto name = parseStringArg("play.animation(...)");
+        if (!name.has_value() || !expectSymbol(")")) {
+            return std::nullopt;
+        }
+        DSLNode node;
+        node.kind = DSLNodeKind::PlayAnimation;
+        node.line = line;
+        node.name = *name;
+        if (atIdentifier("blend")) {
+            advance(); // blend
+            if (m_token.kind != Token::Kind::Duration && m_token.kind != Token::Kind::Number) {
+                fail("expected a duration after 'blend' (e.g. 'blend 0.5s')");
+                return std::nullopt;
+            }
+            node.hasLerp = true;
+            node.lerpDuration = std::max(0.0, m_token.number);
+            advance();
+            return node;
+        }
+        if (!parseOverSuffix(node)) {
+            return std::nullopt;
+        }
+        return node;
+    }
+
+    // enable.ragdoll() / disable.ragdoll() -- flips the host rig's
+    // RagdollComponent between keyframed animation and physics.
+    std::optional<DSLNode> parseRagdollToggle(const std::string& word) {
+        const int line = m_token.line;
+        advance(); // enable/disable
+        if (!expectSymbol(".")) {
+            return std::nullopt;
+        }
+        if (!atIdentifier("ragdoll")) {
+            fail("expected 'ragdoll' after '" + word + ".' (" + word + ".ragdoll())");
+            return std::nullopt;
+        }
+        advance();
+        if (!expectSymbol("(") || !expectSymbol(")")) {
+            return std::nullopt;
+        }
+        DSLNode node;
+        node.kind = DSLNodeKind::RagdollToggle;
+        node.line = line;
+        node.name = "ragdoll";
+        node.ragdollEnable = word == "enable";
+        return node;
     }
 
     std::optional<DSLNode> parseAssignment(const std::string& word) {

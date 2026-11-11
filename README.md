@@ -3266,3 +3266,64 @@ player headless runs clean.
 CTest 1/1, zero warnings, scripting-demo (including the new
 handler-mutation beat) and standalone player headless runs
 clean.
+
+## VibeAnim — animation & ragdoll studio, smarter script editor ✅
+
+- **Animation data model**: a rig is a subtree of ordinary
+  entities. `RigComponent` maps articulation points (node name,
+  entity, parent index, ragdoll hinge axis/limits);
+  `AnimationPlayerComponent` carries the clip library plus
+  playback state, so everything serializes (GBQ `RIGD`/`ANIM`/
+  `RGDL` sections + JSON twins), snapshots in Play/Stop, and is
+  referenced from scripts by clip name. Keyframes hold full TRS
+  with per-segment interpolation (`Linear`, `EaseInOut` smoothstep,
+  `Step`); rotation slerps through quaternions. Editing operations
+  (sorted insert, same-time replace, removal, duration growth) are
+  shared verbatim between the studio UI and the tests.
+- **Auto-rigging**: `AnimationRigging::buildFromHierarchy` walks a
+  mesh/primitive-stack subtree (root = node 0, pre-order parents)
+  and names nodes from their tags — one click in the Inspector or
+  the studio turns any hierarchy into a puppet, then joint axes
+  and hinge limits are refined per node.
+- **Ragdoll & physics integration**: `RagdollComponent` binds the
+  rig into the existing solver — activation captures the bind
+  pose, spawns rigid bodies + capsule colliders + limited hinge
+  joints (author-placed physics is never stripped), physics owns
+  the nodes while active, deactivation restores the bind pose
+  exactly. Runtime ordering is scripts → animation → physics, so
+  a death event drops the doll in the same fixed step.
+- **Native script animation**: `play.animation("walk")` starts a
+  clip on the host rig; `over Xs` / `blend Xs` crossfade from the
+  running clip; `enable.ragdoll()` / `disable.ragdoll()` flip the
+  rig between keyframes and physics from any handler (the classic
+  `health -= 60 if (health <= 0) { enable.ragdoll() }` death
+  transition). `wait(...)` now fails with a pointer to
+  `every`/`for` instead of a confusing parse error.
+- **VibeAnim studio** (third bottom-dock tab): rig hierarchy
+  panel (click a node to select it in the viewport), joint
+  axis/limit editors, clip library (create/delete/duration/loop),
+  and a minimalist timeline — transport, scrubbable playhead, key
+  ticks you can click, `Add Key at Playhead` capturing the node's
+  live transform, per-key interpolation cycling. **Anim Preview**
+  evaluates the selected rig right in the Edit-mode viewport with
+  snapshot/restore, so previewing never pollutes the authored
+  scene (and is force-stopped before Play snapshots).
+- **Text editor upgrade**: highlighting now covers variables,
+  dotted properties, and the full modern keyword set (`over`,
+  `blend`, `play`, `animation`, `ragdoll`, bound `max`/`lowest`,
+  ...). The buffer is re-parsed as you type: error lines get a red
+  gutter number, row wash and underline, and the Save & Compile
+  modal's rows are clickable line jumps. **Auto-completion**
+  (typing or Ctrl+Space) is context-aware via a pure, unit-tested
+  provider: engine commands, the script's own variables, member
+  completions (`play.` → `animation("`, `enable.` → `ragdoll()`),
+  animation clip names inside `play.animation("...")` and entity
+  names inside `part("...")`/`on_touch("...")` — accepting a
+  command stem lands the caret in the string, where the next
+  popup offers the names.
+
+1533 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, scripting-demo (including the new
+VibeAnim death-ragdoll beat) and standalone player headless
+runs clean.

@@ -90,6 +90,7 @@ struct UIInput {
         bool pageUp = false, pageDown = false;
         bool tab = false;
         bool saveCombo = false; // Ctrl+S edge
+        bool completionCombo = false; // Ctrl+Space: re-ask for completions
         bool copyCombo = false, pasteCombo = false, cutCombo = false, selectAllCombo = false; // Ctrl+C/V/X/A
     } editorKeys{};
     // Level state of the repeating editor keys (held = repeat).

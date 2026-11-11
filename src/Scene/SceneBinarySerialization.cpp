@@ -7,6 +7,7 @@
 // raw IEEE bits, so a round trip is bit-for-bit.
 
 #include "Scene/SceneBinarySerialization.h"
+#include "Scene/AnimationComponents.h"
 #include "Scripting/DSLComponents.h"
 
 #include "Core/Logger.h"
@@ -56,6 +57,11 @@ struct ByteWriter {
         uint32_t bits = 0;
         std::memcpy(&bits, &value, 4);
         u32(bits);
+    }
+    void f64(double value) {
+        uint64_t bits = 0;
+        std::memcpy(&bits, &value, 8);
+        u64(bits);
     }
     void vec2(const glm::vec2& value) {
         f32(value.x);
@@ -152,6 +158,14 @@ struct ByteReader {
         return true;
     }
     bool vec2(glm::vec2& value) { return f32(value.x) && f32(value.y); }
+    bool f64(double& value) {
+        uint64_t bits = 0;
+        if (!u64(bits)) {
+            return false;
+        }
+        std::memcpy(&value, &bits, 8);
+        return true;
+    }
     bool vec3(glm::vec3& value) { return f32(value.x) && f32(value.y) && f32(value.z); }
     bool quat(glm::quat& value) { return f32(value.w) && f32(value.x) && f32(value.y) && f32(value.z); }
     bool mat3(glm::mat3& value) {
@@ -296,6 +310,11 @@ struct StagedEntity {
     std::optional<DirectionalLightComponent> directionalLight;
     std::optional<std::string> script;
     std::optional<ScriptComponent> dslScript;
+    // VibeAnim: rig node entities stay file indices until handles exist.
+    std::optional<RigComponent> rig;
+    std::vector<int32_t> rigNodeEntities;
+    std::optional<AnimationPlayerComponent> animationPlayer;
+    std::optional<RagdollComponent> ragdoll;
 };
 
 struct StagedScene {
@@ -333,7 +352,8 @@ bool readComponentSection(const std::vector<std::byte>& bytes, const std::vector
 // record (Phase 32); version 1 files keep loading.
 bool sectionVersionsAcceptable(const std::vector<TocEntry>& toc) {
     static constexpr const char* kKnown[] = {"META", "ENTY", "TAGC", "TRNF", "CAMR", "MESH", "SPIN", "RGBD",
-                                             "CLDR", "GRVF", "JONT", "THRS", "PLGT", "SLGT", "NSCR", "DIRL", "DSCR"};
+                                             "CLDR", "GRVF", "JONT", "THRS", "PLGT", "SLGT", "NSCR", "DIRL", "DSCR", "RIGD",
+                                             "ANIM", "RGDL"};
     for (const TocEntry& entry : toc) {
         for (const char* known : kKnown) {
             if (std::memcmp(entry.type.data(), known, 4) != 0) {
@@ -633,6 +653,98 @@ bool parseGbq(const std::vector<std::byte>& bytes, StagedScene& staged) {
                                   if (ok) {
                                       value.compileFlags = static_cast<ScriptCompileFlags>(flags);
                                       staged.entities[index].dslScript = value;
+                                  }
+                                  return ok;
+                              })) {
+        return false;
+    }
+    if (!readComponentSection(bytes, toc, "RIGD", entityCount,
+                              [&staged, entityCount](ByteReader& reader, uint32_t index) {
+                                  RigComponent value;
+                                  std::vector<int32_t> nodeEntities;
+                                  uint32_t nodeCount = 0;
+                                  bool ok = reader.u32(nodeCount) && nodeCount <= 4096;
+                                  for (uint32_t n = 0; ok && n < nodeCount; ++n) {
+                                      RigNode node;
+                                      uint32_t entityIndex = 0;
+                                      uint32_t parent = 0;
+                                      ok = reader.str(node.name) && reader.u32(entityIndex) && reader.u32(parent) &&
+                                           reader.vec3(node.jointAxis) && reader.f32(node.minAngleDegrees) &&
+                                           reader.f32(node.maxAngleDegrees);
+                                      if (ok && entityIndex != kNoEntity && entityIndex >= entityCount) {
+                                          ok = false;
+                                      }
+                                      if (ok && parent != kNoEntity && parent >= nodeCount) {
+                                          ok = false;
+                                      }
+                                      if (ok) {
+                                          node.parent = parent == kNoEntity ? -1 : static_cast<int32_t>(parent);
+                                          value.nodes.push_back(node);
+                                          nodeEntities.push_back(entityIndex == kNoEntity
+                                                                       ? -1
+                                                                       : static_cast<int32_t>(entityIndex));
+                                      }
+                                  }
+                                  if (ok) {
+                                      staged.entities[index].rig = std::move(value);
+                                      staged.entities[index].rigNodeEntities = std::move(nodeEntities);
+                                  }
+                                  return ok;
+                              })) {
+        return false;
+    }
+    if (!readComponentSection(bytes, toc, "ANIM", entityCount,
+                              [&staged](ByteReader& reader, uint32_t index) {
+                                  AnimationPlayerComponent value;
+                                  uint32_t clipCount = 0;
+                                  bool ok = reader.str(value.currentClip) && reader.str(value.blendFromClip) &&
+                                            reader.f64(value.time) && reader.f64(value.blendFromTime) &&
+                                            reader.f64(value.blendElapsed) && reader.f64(value.blendDuration) &&
+                                            reader.f32(value.speed) && reader.boolean(value.playing) &&
+                                            reader.u32(clipCount) && clipCount <= 1024;
+                                  for (uint32_t ci = 0; ok && ci < clipCount; ++ci) {
+                                      AnimationClip clip;
+                                      uint32_t trackCount = 0;
+                                      ok = reader.str(clip.name) && reader.f64(clip.duration) &&
+                                           reader.boolean(clip.loop) && reader.u32(trackCount) && trackCount <= 4096;
+                                      for (uint32_t ti = 0; ok && ti < trackCount; ++ti) {
+                                          AnimTrack track;
+                                          uint32_t keyCount = 0;
+                                          ok = reader.str(track.node) && reader.u32(keyCount) && keyCount <= 16384;
+                                          for (uint32_t ki = 0; ok && ki < keyCount; ++ki) {
+                                              AnimKeyframe key;
+                                              uint8_t interpolation = 0;
+                                              ok = reader.f64(key.time) && reader.vec3(key.position) &&
+                                                   reader.vec3(key.rotationDegrees) && reader.vec3(key.scale) &&
+                                                   reader.u8(interpolation) && interpolation <= 2;
+                                              if (ok) {
+                                                  key.interpolation = static_cast<AnimInterpolation>(interpolation);
+                                                  track.keys.push_back(key);
+                                              }
+                                          }
+                                          if (ok) {
+                                              clip.tracks.push_back(std::move(track));
+                                          }
+                                      }
+                                      if (ok) {
+                                          value.clips.push_back(std::move(clip));
+                                      }
+                                  }
+                                  if (ok) {
+                                      staged.entities[index].animationPlayer = std::move(value);
+                                  }
+                                  return ok;
+                              })) {
+        return false;
+    }
+    if (!readComponentSection(bytes, toc, "RGDL", entityCount,
+                              [&staged](ByteReader& reader, uint32_t index) {
+                                  RagdollComponent value;
+                                  const bool ok = reader.boolean(value.enabled) && reader.f32(value.bodyMass) &&
+                                                  reader.f32(value.compliance);
+                                  if (ok) {
+                                      value.active = false; // bodies respawn on first AnimationSystem tick
+                                      staged.entities[index].ragdoll = value;
                                   }
                                   return ok;
                               })) {
@@ -973,6 +1085,77 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
         return true;
     });
 
+    // VibeAnim rigs: node entity references travel as file indices.
+    writeSection("RIGD", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
+        const RigComponent* value = m_registry.try_get<RigComponent>(entity);
+        if (value == nullptr) {
+            return false;
+        }
+        out.u32(index);
+        out.u32(static_cast<uint32_t>(value->nodes.size()));
+        for (const RigNode& node : value->nodes) {
+            uint32_t nodeIndex = kNoEntity;
+            if (node.entity != entt::null && m_registry.valid(node.entity)) {
+                if (const auto found = indexOf.find(entt::to_integral(node.entity)); found != indexOf.end()) {
+                    nodeIndex = found->second;
+                }
+            }
+            out.str(node.name);
+            out.u32(nodeIndex);
+            out.u32(node.parent < 0 ? kNoEntity : static_cast<uint32_t>(node.parent));
+            out.vec3(node.jointAxis);
+            out.f32(node.minAngleDegrees);
+            out.f32(node.maxAngleDegrees);
+        }
+        return true;
+    });
+    // Animation players carry the whole clip library (assets by name).
+    writeSection("ANIM", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
+        const AnimationPlayerComponent* value = m_registry.try_get<AnimationPlayerComponent>(entity);
+        if (value == nullptr) {
+            return false;
+        }
+        out.u32(index);
+        out.str(value->currentClip);
+        out.str(value->blendFromClip);
+        out.f64(value->time);
+        out.f64(value->blendFromTime);
+        out.f64(value->blendElapsed);
+        out.f64(value->blendDuration);
+        out.f32(value->speed);
+        out.boolean(value->playing);
+        out.u32(static_cast<uint32_t>(value->clips.size()));
+        for (const AnimationClip& clip : value->clips) {
+            out.str(clip.name);
+            out.f64(clip.duration);
+            out.boolean(clip.loop);
+            out.u32(static_cast<uint32_t>(clip.tracks.size()));
+            for (const AnimTrack& track : clip.tracks) {
+                out.str(track.node);
+                out.u32(static_cast<uint32_t>(track.keys.size()));
+                for (const AnimKeyframe& key : track.keys) {
+                    out.f64(key.time);
+                    out.vec3(key.position);
+                    out.vec3(key.rotationDegrees);
+                    out.vec3(key.scale);
+                    out.u8(static_cast<uint8_t>(key.interpolation));
+                }
+            }
+        }
+        return true;
+    });
+    writeSection("RGDL", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
+        const RagdollComponent* value = m_registry.try_get<RagdollComponent>(entity);
+        if (value == nullptr) {
+            return false;
+        }
+        out.u32(index);
+        out.boolean(value->enabled);
+        out.f32(value->bodyMass);
+        out.f32(value->compliance);
+        return true;
+    });
+
     // Assemble: header, TOC, then 8-byte-aligned section payloads.
     ByteWriter file;
     file.bytes(kGbqMagic, 4);
@@ -1104,6 +1287,28 @@ bool Scene::loadFromGbqBytes(const std::vector<std::byte>& bytes) {
         if (stagedEntity.dslScript.has_value()) {
             m_registry.emplace<ScriptComponent>(handle, *stagedEntity.dslScript);
         }
+        if (stagedEntity.animationPlayer.has_value()) {
+            m_registry.emplace<AnimationPlayerComponent>(handle, *stagedEntity.animationPlayer);
+        }
+        if (stagedEntity.ragdoll.has_value()) {
+            m_registry.emplace<RagdollComponent>(handle, *stagedEntity.ragdoll);
+        }
+    }
+    // Rig node links likewise: node entities become real handles
+    // now that every entity exists.
+    for (size_t i = 0; i < staged.entities.size(); ++i) {
+        if (!staged.entities[i].rig.has_value()) {
+            continue;
+        }
+        RigComponent rig = *staged.entities[i].rig;
+        for (size_t n = 0; n < rig.nodes.size() && n < staged.entities[i].rigNodeEntities.size(); ++n) {
+            const int32_t nodeIndex = staged.entities[i].rigNodeEntities[n];
+            rig.nodes[n].entity =
+                nodeIndex >= 0 && static_cast<size_t>(nodeIndex) < handles.size()
+                    ? handles[static_cast<size_t>(nodeIndex)]
+                    : entt::null;
+        }
+        m_registry.emplace<RigComponent>(handles[i], std::move(rig));
     }
     // Joint links point at entities that may be created later in
     // the file order: remap them now that every handle exists.

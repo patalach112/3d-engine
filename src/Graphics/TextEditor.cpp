@@ -39,7 +39,8 @@ namespace {
 [[nodiscard]] DslHighlightKind classifyWord(std::string_view word) {
     using enum DslHighlightKind;
     if (word == "from" || word == "start" || word == "script" || word == "end" || word == "if" || word == "for" ||
-        word == "every" || word == "inhand" || word == "part" || word == "position" || word == "behavior") {
+        word == "every" || word == "inhand" || word == "part" || word == "position" || word == "behavior" ||
+        word == "over" || word == "blend" || word == "wait" || word == "max" || word == "lowest") {
         return Keyword;
     }
     if (word == "on_touch" || word == "on_trigger" || word == "on_collide" || word == "on_collision" ||
@@ -48,10 +49,12 @@ namespace {
         return Event;
     }
     if (word == "play_sound" || word == "emit_sound" || word == "print" || word == "destroy" || word == "freeze" ||
-        word == "reset" || word == "stalker" || word == "scale" || word == "hudprint" || word == "effect") {
+        word == "reset" || word == "stalker" || word == "scale" || word == "hudprint" || word == "hudclear" ||
+        word == "effect" || word == "play" || word == "animation" || word == "ragdoll" || word == "enable" ||
+        word == "disable") {
         return Builtin;
     }
-    return Plain;
+    return Variable; // any other identifier reads as a script variable
 }
 
 } // namespace
@@ -107,7 +110,11 @@ std::vector<DslHighlightSpan> highlightDslLine(std::string_view line) {
             while (j < line.size() && isWordByte(static_cast<unsigned char>(line[j]))) {
                 ++j;
             }
-            push(i, j - i, classifyWord(line.substr(i, j - i)));
+            DslHighlightKind kind = classifyWord(line.substr(i, j - i));
+            if (kind == DslHighlightKind::Variable && i > 0 && line[i - 1] == '.') {
+                kind = DslHighlightKind::Builtin; // member/property after a dot
+            }
+            push(i, j - i, kind);
             i = j;
             continue;
         }
@@ -128,6 +135,7 @@ glm::vec4 dslHighlightColor(DslHighlightKind kind) {
     case DslHighlightKind::Number: return glm::vec4{0.710f, 0.808f, 0.659f, 1.0f};   // #b5cea8
     case DslHighlightKind::String: return glm::vec4{0.808f, 0.569f, 0.471f, 1.0f};   // #ce9178
     case DslHighlightKind::Comment: return glm::vec4{0.416f, 0.600f, 0.333f, 1.0f};  // #6a9955
+    case DslHighlightKind::Variable: return glm::vec4{0.616f, 0.863f, 0.996f, 1.0f}; // #9cdcfe
     case DslHighlightKind::Plain: break;
     }
     return glm::vec4{0.878f, 0.878f, 0.878f, 1.0f}; // theme text #e0e0e0
@@ -516,6 +524,90 @@ size_t TextEditor::columnAtX(UIBatch& batch, const std::string& lineText, float 
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics + completion popup state
+// ---------------------------------------------------------------------------
+
+void TextEditor::setDiagnostics(std::vector<Diagnostic> diagnostics) { m_diagnostics = std::move(diagnostics); }
+
+size_t TextEditor::cursorTextOffset() const {
+    size_t offset = m_cursorCol;
+    for (size_t i = 0; i < m_cursorLine && i < m_lines.size(); ++i) {
+        offset += m_lines[i].size() + 1; // + the newline text() inserts
+    }
+    return offset;
+}
+
+void TextEditor::showCompletions(std::vector<CompletionItem> items, size_t replaceStartOffset) {
+    if (m_completionDismissed) {
+        return; // Esc closes the popup until the buffer changes
+    }
+    if (items.empty()) {
+        closeCompletions();
+        return;
+    }
+    bool same = items.size() == m_completions.size();
+    for (size_t i = 0; same && i < items.size(); ++i) {
+        same = items[i].text == m_completions[i].text;
+    }
+    m_completions = std::move(items);
+    if (!same || m_completionIndex >= m_completions.size()) {
+        m_completionIndex = 0;
+    }
+    // Source offset -> (line, byte column) in the line buffer.
+    size_t offset = 0;
+    m_completionReplaceLine = m_lines.empty() ? 0 : m_lines.size() - 1;
+    m_completionReplaceCol = m_lines.empty() ? 0 : m_lines.back().size();
+    for (size_t i = 0; i < m_lines.size(); ++i) {
+        if (replaceStartOffset <= offset + m_lines[i].size()) {
+            m_completionReplaceLine = i;
+            m_completionReplaceCol = replaceStartOffset - offset;
+            break;
+        }
+        offset += m_lines[i].size() + 1;
+    }
+    m_completionsOpen = true;
+}
+
+void TextEditor::closeCompletions() {
+    m_completionsOpen = false;
+    m_completions.clear();
+    m_completionIndex = 0;
+    m_completionPopupValid = false;
+}
+
+void TextEditor::moveCompletionSelection(int delta) {
+    if (m_completions.empty()) {
+        return;
+    }
+    const long count = static_cast<long>(m_completions.size());
+    long next = (static_cast<long>(m_completionIndex) + delta) % count;
+    if (next < 0) {
+        next += count;
+    }
+    m_completionIndex = static_cast<size_t>(next);
+    m_blinkSeconds = 0.0f;
+}
+
+bool TextEditor::acceptCompletion() {
+    if (!m_completionsOpen || m_completions.empty()) {
+        return false;
+    }
+    const CompletionItem item = m_completions[std::min(m_completionIndex, m_completions.size() - 1)];
+    closeCompletions();
+    if (m_completionReplaceLine == m_cursorLine) {
+        const size_t from = std::min(m_completionReplaceCol, m_cursorCol);
+        if (m_cursorCol > from) {
+            m_lines[m_cursorLine].erase(from, m_cursorCol - from);
+        }
+        m_cursorCol = from;
+        m_goalColumn = from;
+    }
+    m_selectionActive = false;
+    insertText(item.text);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Widget rendering + input
 // ---------------------------------------------------------------------------
 
@@ -551,7 +643,20 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
         m_blinkSeconds = 0.0f;
     };
     if (pressEdge) {
-        if (rect.contains(input.mouseX, input.mouseY)) {
+        if (m_completionsOpen && m_completionPopupValid &&
+            m_completionPopupRect.contains(input.mouseX, input.mouseY)) {
+            const size_t row =
+                static_cast<size_t>(std::max(0.0f, input.mouseY - m_completionPopupRect.y - 2.0f) / 20.0f);
+            if (row < m_completions.size()) {
+                m_completionIndex = row;
+                if (acceptCompletion()) {
+                    result.changed = true;
+                }
+            } else {
+                closeCompletions();
+            }
+            m_focused = true;
+        } else if (rect.contains(input.mouseX, input.mouseY)) {
             m_focused = true;
             caretFromMouse();
             m_anchorLine = m_cursorLine;
@@ -610,10 +715,33 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
             m_blinkSeconds = 0.0f;
         };
         const UIInput::EditorKeys& keys = input.editorKeys;
+        // The completion popup owns Up/Down/Enter/Tab/Esc while open.
+        bool completionConsumed = false;
+        if (m_completionsOpen) {
+            if (input.escapePressed) {
+                closeCompletions();
+                m_completionDismissed = true;
+                completionConsumed = true;
+            } else if (keys.up) {
+                moveCompletionSelection(-1);
+                completionConsumed = true;
+            } else if (keys.down) {
+                moveCompletionSelection(1);
+                completionConsumed = true;
+            } else if (input.enterPressed || keys.tab) {
+                if (acceptCompletion()) {
+                    result.changed = true;
+                }
+                completionConsumed = true;
+            }
+        }
+        if (keys.completionCombo) {
+            m_completionDismissed = false; // Ctrl+Space explicitly re-asks
+        }
         if (edge(keys.left, Left)) fire(Left);
         if (edge(keys.right, Right)) fire(Right);
-        if (edge(keys.up, Up)) fire(Up);
-        if (edge(keys.down, Down)) fire(Down);
+        if (!completionConsumed && edge(keys.up, Up)) fire(Up);
+        if (!completionConsumed && edge(keys.down, Down)) fire(Down);
         if (edge(input.backspacePressed, Back)) fire(Back);
         if (edge(keys.del, Del)) fire(Del);
         if (edge(keys.home, Home)) fire(Home);
@@ -629,7 +757,7 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
         if (keys.saveCombo) {
             result.saveRequested = true;
         }
-        if (keys.tab) {
+        if (!completionConsumed && keys.tab) {
             insertText("  ");
             result.changed = true;
             m_blinkSeconds = 0.0f;
@@ -668,7 +796,7 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
                 }
             }
         }
-        if (input.enterPressed) {
+        if (!completionConsumed && input.enterPressed) {
             insertNewline();
             result.changed = true;
             m_repeatAction = None;
@@ -682,6 +810,9 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
         }
     } else {
         m_repeatAction = 0;
+    }
+    if (result.changed) {
+        m_completionDismissed = false;
     }
     ensureCaretVisible(rowHeight, viewHeight);
     const size_t visibleRows = static_cast<size_t>(viewHeight / rowHeight) + 1;
@@ -702,6 +833,14 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
             batch->drawRect(textX - 4.0f, y - 1.0f, rect.x + rect.width - textX + 4.0f, rowHeight,
                             glm::vec4{1.0f, 1.0f, 1.0f, 0.045f});
         }
+        bool errorLine = false;
+        for (const Diagnostic& diagnostic : m_diagnostics) {
+            errorLine = errorLine || diagnostic.line == lineIndex;
+        }
+        if (errorLine) {
+            batch->drawRect(textX - 4.0f, y - 1.0f, rect.x + rect.width - textX + 4.0f, rowHeight,
+                            glm::vec4{0.85f, 0.25f, 0.20f, 0.10f});
+        }
         // Selection background under this line's covered range.
         if (hasSelection()) {
             size_t selStartLine, selStartCol, selEndLine, selEndCol;
@@ -718,7 +857,8 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
         }
         const std::string number = std::to_string(lineIndex + 1);
         const float numberWidth = batch->measureText(number, kTextScale);
-        batch->drawText(number, rect.x + gutterWidth - 8.0f - numberWidth, y, kTextScale, gutterText);
+        batch->drawText(number, rect.x + gutterWidth - 8.0f - numberWidth, y, kTextScale,
+                        errorLine ? glm::vec4{1.0f, 0.45f, 0.40f, 1.0f} : gutterText);
         const std::string& lineText = m_lines[lineIndex];
         float x = textX;
         for (const DslHighlightSpan& span : highlightDslLine(lineText)) {
@@ -727,12 +867,53 @@ TextEditor::Result TextEditor::draw(UIContext& ui, const UIRect& rect, float del
             batch->drawText(segment, x, y, kTextScale, dslHighlightColor(span.kind));
             x += batch->measureText(segment, kTextScale);
         }
+        if (errorLine) {
+            batch->drawRect(textX, y + rowHeight - 4.0f, std::max(12.0f, x - textX), 2.0f,
+                            glm::vec4{0.90f, 0.30f, 0.25f, 1.0f});
+        }
         if (lineIndex == m_cursorLine && m_focused && std::fmod(m_blinkSeconds, 1.1f) < 0.62f) {
             const float caretX = textX + batch->measureText(std::string_view(lineText).substr(0, m_cursorCol), kTextScale);
             batch->drawRect(caretX, y - 1.0f, 2.0f, rowHeight, theme.focusBorder);
         }
     }
     batch->popScissor();
+    // Completion popup: anchored under the caret line (above it
+    // when the dock bottom is close), selected row accented.
+    m_completionPopupValid = false;
+    if (m_completionsOpen && !m_completions.empty() && m_cursorLine >= m_scrollLine) {
+        const float popupRowHeight = 20.0f;
+        const float popupWidth = 400.0f;
+        const size_t popupRows = std::min<size_t>(m_completions.size(), 8);
+        const std::string& caretLineText = m_lines[m_cursorLine];
+        const float caretX =
+            textX + batch->measureText(std::string_view(caretLineText).substr(0, m_cursorCol), kTextScale);
+        const float caretLineY = textY + static_cast<float>(m_cursorLine - m_scrollLine) * rowHeight;
+        float popupX = std::max(rect.x + 4.0f, std::min(caretX, rect.x + rect.width - popupWidth - 4.0f));
+        float popupY = caretLineY + rowHeight + 2.0f;
+        if (popupY + popupRows * popupRowHeight + 4.0f > rect.y + rect.height) {
+            popupY = caretLineY - popupRows * popupRowHeight - 6.0f;
+        }
+        m_completionPopupRect = UIRect{popupX, popupY, popupWidth, popupRows * popupRowHeight + 4.0f};
+        m_completionPopupValid = true;
+        batch->drawRect(popupX, popupY, popupWidth, popupRows * popupRowHeight + 4.0f, theme.panelFill);
+        batch->drawRect(popupX, popupY, popupWidth, 1.0f, theme.focusBorder);
+        batch->drawRect(popupX, popupY + popupRows * popupRowHeight + 3.0f, popupWidth, 1.0f, theme.focusBorder);
+        batch->drawRect(popupX, popupY, 1.0f, popupRows * popupRowHeight + 4.0f, theme.focusBorder);
+        batch->drawRect(popupX + popupWidth - 1.0f, popupY, 1.0f, popupRows * popupRowHeight + 4.0f, theme.focusBorder);
+        for (size_t row = 0; row < popupRows; ++row) {
+            const CompletionItem& item = m_completions[row];
+            const float rowY = popupY + 2.0f + static_cast<float>(row) * popupRowHeight;
+            if (row == m_completionIndex) {
+                batch->drawRect(popupX + 2.0f, rowY, popupWidth - 4.0f, popupRowHeight,
+                                glm::vec4{0.0f, 0.478f, 0.800f, 0.35f});
+            }
+            batch->drawText(item.text, popupX + 8.0f, rowY + 3.0f, 1.3f, theme.text);
+            const float detailX = popupX + 8.0f + batch->measureText(item.text, 1.3f) + 14.0f;
+            if (detailX < popupX + popupWidth - 40.0f) {
+                batch->drawText(item.detail, detailX, rowY + 3.0f, 1.3f, glm::vec4{0.55f, 0.60f, 0.70f, 1.0f});
+            }
+        }
+    }
     // Border (accent while focused).
     const glm::vec4 border = m_focused ? theme.focusBorder : theme.panelBorder;
     batch->drawRect(rect.x, rect.y, rect.width, 1.0f, border);

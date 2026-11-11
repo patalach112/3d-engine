@@ -32,7 +32,7 @@ namespace engine {
 // since the last load/save.
 // ---------------------------------------------------------------------------
 
-enum class DslHighlightKind : uint8_t { Plain, Keyword, Event, Builtin, Number, String, Comment };
+enum class DslHighlightKind : uint8_t { Plain, Keyword, Event, Builtin, Number, String, Comment, Variable };
 
 struct DslHighlightSpan {
     uint32_t offset = 0; // byte offset into the line
@@ -57,6 +57,36 @@ public:
     void markClean() { m_dirty = false; }
     void markDirty() { m_dirty = true; }
     [[nodiscard]] bool dirty() const { return m_dirty; }
+
+    // Real-time diagnostics (the host parses the buffer as it is
+    // edited and pushes the result): error lines get a red gutter
+    // number, a faint red row wash and an underline in draw().
+    struct Diagnostic {
+        size_t line = 0; // 0-based
+        std::string message;
+    };
+    void setDiagnostics(std::vector<Diagnostic> diagnostics);
+    [[nodiscard]] const std::vector<Diagnostic>& diagnostics() const { return m_diagnostics; }
+    // Byte offset of the caret inside text() (host completion maths).
+    [[nodiscard]] size_t cursorTextOffset() const;
+
+    // Auto-completion popup. The host computes candidates (see
+    // DslCompletion) and hands them over with the source offset the
+    // accepted text should replace; the widget owns navigation
+    // (Up/Down), acceptance (Enter/Tab or click) and dismissal
+    // (Esc, remembered until the buffer changes). All state lives
+    // in these methods so the behaviour is testable without draw().
+    struct CompletionItem {
+        std::string text;
+        std::string detail;
+    };
+    void showCompletions(std::vector<CompletionItem> items, size_t replaceStartOffset);
+    void closeCompletions();
+    [[nodiscard]] bool completionsOpen() const { return m_completionsOpen; }
+    [[nodiscard]] size_t completionCount() const { return m_completions.size(); }
+    [[nodiscard]] size_t completionSelection() const { return m_completionIndex; }
+    void moveCompletionSelection(int delta);
+    bool acceptCompletion(); // false when closed/empty
 
     [[nodiscard]] size_t lineCount() const { return m_lines.size(); }
     [[nodiscard]] const std::string& line(size_t index) const { return m_lines[index]; }
@@ -144,6 +174,16 @@ private:
     bool m_focused = false;
     float m_blinkSeconds = 0.0f;
     bool m_prevMouseDown = false;
+    // Diagnostics + completion state.
+    std::vector<Diagnostic> m_diagnostics;
+    std::vector<CompletionItem> m_completions;
+    size_t m_completionIndex = 0;
+    size_t m_completionReplaceLine = 0;
+    size_t m_completionReplaceCol = 0;
+    bool m_completionsOpen = false;
+    bool m_completionDismissed = false; // Esc: stay closed until the buffer changes
+    UIRect m_completionPopupRect{};
+    bool m_completionPopupValid = false;
     // Held-key repeat: which action is repeating and for how long.
     int m_repeatAction = 0; // 0 none, else an action code below
     float m_repeatSeconds = 0.0f;

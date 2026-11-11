@@ -34,6 +34,11 @@ namespace engine {
 //                     color = #FFAA00 / fade = true|false
 //   effectAssign:= 'effect' '.' IDENT '=' expr ('over' duration)?
 //                  -- effect.chromatic_aberration = 0.3 (global post)
+//   animCall    := 'play' '.' 'animation' '(' STRING ')'
+//                  (('over'|'blend') duration)?
+//                  -- play.animation("walk") blend 0.5s (crossfade)
+//   ragdollCall := ('enable'|'disable') '.' 'ragdoll' '(' ')'
+//                  -- enable.ragdoll() on death, disable.ragdoll()
 //   partAssign  := 'part' '(' target ')' '.' IDENT '=' expr
 //                  -- part("safe_lights").intensity = 1.0
 //                  'part' '(' target ')' '.' 'scale' '(' 'x'|'y'|'z' ')' '=' expr
@@ -81,6 +86,8 @@ enum class DSLNodeKind : uint8_t {
     HudPrint,    // hudprint("text") { position/duration/color/fade }
     HudClear,    // hudclear("text")? -- removes this script's HUD prints
     EffectAssign, // effect.<property> = expr   (property name in `name`)
+    PlayAnimation, // play.animation("clip") (over|blend Xs)?  (clip in `name`)
+    RagdollToggle, // enable.ragdoll() / disable.ragdoll()  (ragdollEnable)
 };
 
 enum class DSLEventKind : uint8_t { None, Interact, Touch, Trigger, Collide, InputPress, InputHold, InputRelease, Start };
@@ -104,6 +111,10 @@ struct DSLNode {
     // EffectAssign spawns a non-blocking lerp task in the runtime.
     bool hasLerp = false;
     double lerpDuration = 0.0; // seconds
+    // play.animation transitions reuse hasLerp/lerpDuration as the
+    // crossfade seconds (`over Xs` and `blend Xs` are synonyms).
+    // RagdollToggle only.
+    bool ragdollEnable = true;
     // Compound assignment (health -= 25): empty means plain;
     // otherwise one of "+","-","*","/" applied as
     // target = target <op> expr through the clamped write path.

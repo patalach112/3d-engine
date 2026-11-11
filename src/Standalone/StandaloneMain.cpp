@@ -35,6 +35,7 @@
 #include "Scene/SceneBinarySerialization.h"
 #include "Scene/Systems/CameraSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
+#include "Scene/Systems/AnimationSystem.h"
 #include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RenderSystem.h"
 #include "Scene/Systems/RotationSystem.h"
@@ -400,6 +401,9 @@ public:
                 buildModuleContext(0.0f, static_cast<float>(fixedDeltaSeconds));
             m_moduleManager.fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
             engine::NativeScriptSystem::fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
+            // Animation playback + ragdoll transitions tick before
+            // physics so exported games animate identically.
+            engine::AnimationSystem::update(m_scene, fixedDeltaSeconds);
             engine::PlayerSystem::update(m_scene, m_input, fixedDeltaSeconds);
             m_physicsSystem.update(m_scene, fixedDeltaSeconds, m_config.physics, m_jobSystem);
             engine::PlayerSystem::syncCamera(m_scene);

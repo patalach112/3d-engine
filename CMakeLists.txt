@@ -185,6 +185,7 @@ engine_module(EngineGraphics ENGINE_BUILDING_GRAPHICS
     src/Graphics/UIRenderer.cpp
     src/Graphics/Renderer.cpp
     src/Graphics/TextEditor.cpp
+    src/Graphics/DslCompletion.cpp
     src/Graphics/ConsoleLog.cpp
 )
 target_link_libraries(EngineGraphics
@@ -216,6 +217,7 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Systems/RotationSystem.cpp
     src/Scene/Systems/RenderSystem.cpp
     src/Scene/Systems/TransformSystem.cpp
+    src/Scene/Systems/AnimationSystem.cpp
     src/Scripting/DSLParser.cpp
     src/Scripting/ScriptSystem.cpp
     src/Scripting/StalkerAISystem.cpp

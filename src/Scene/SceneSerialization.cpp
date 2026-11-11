@@ -7,6 +7,7 @@
 // remapped to fresh handles after every entity exists.
 
 #include "Scene/Scene.h"
+#include "Scene/AnimationComponents.h"
 #include "Scripting/DSLComponents.h"
 
 #include "Core/Json.h"
@@ -91,6 +92,22 @@ const char* jointTypeName(JointType type) {
         case JointType::SpringDamper: return "springDamper";
     }
     return "distance";
+}
+
+const char* animInterpolationName(AnimInterpolation mode) {
+    switch (mode) {
+    case AnimInterpolation::EaseInOut: return "easeInOut";
+    case AnimInterpolation::Step: return "step";
+    case AnimInterpolation::Linear: break;
+    }
+    return "linear";
+}
+
+bool animInterpolationFromName(const std::string& name, AnimInterpolation& out) {
+    if (name == "easeInOut") { out = AnimInterpolation::EaseInOut; return true; }
+    if (name == "step") { out = AnimInterpolation::Step; return true; }
+    if (name == "linear") { out = AnimInterpolation::Linear; return true; }
+    return false;
 }
 
 bool jointTypeFromName(const std::string& name, JointType& out) {
@@ -284,6 +301,71 @@ std::string Scene::saveToString() const {
             object.set("enabled", Value::boolean(script->enabled));
             components.set("script", std::move(object));
         }
+        if (const RigComponent* rig = m_registry.try_get<RigComponent>(entity); rig != nullptr) {
+            Value nodes = Value::array();
+            for (const RigNode& node : rig->nodes) {
+                Value nodeObject = Value::object();
+                nodeObject.set("name", Value::string(node.name));
+                nodeObject.set("entity", node.entity != entt::null && m_registry.valid(node.entity)
+                                             ? entityIndex(node.entity)
+                                             : Value::null());
+                nodeObject.set("parent", Value::number(static_cast<double>(node.parent)));
+                nodeObject.set("jointAxis", vec3Json(node.jointAxis));
+                nodeObject.set("minAngleDegrees", Value::number(node.minAngleDegrees));
+                nodeObject.set("maxAngleDegrees", Value::number(node.maxAngleDegrees));
+                nodes.push(std::move(nodeObject));
+            }
+            Value object = Value::object();
+            object.set("nodes", std::move(nodes));
+            components.set("rig", std::move(object));
+        }
+        if (const AnimationPlayerComponent* player = m_registry.try_get<AnimationPlayerComponent>(entity);
+            player != nullptr) {
+            Value clips = Value::array();
+            for (const AnimationClip& clip : player->clips) {
+                Value tracks = Value::array();
+                for (const AnimTrack& track : clip.tracks) {
+                    Value keys = Value::array();
+                    for (const AnimKeyframe& key : track.keys) {
+                        Value keyObject = Value::object();
+                        keyObject.set("time", Value::number(key.time));
+                        keyObject.set("position", vec3Json(key.position));
+                        keyObject.set("rotationDegrees", vec3Json(key.rotationDegrees));
+                        keyObject.set("scale", vec3Json(key.scale));
+                        keyObject.set("interpolation", Value::string(animInterpolationName(key.interpolation)));
+                        keys.push(std::move(keyObject));
+                    }
+                    Value trackObject = Value::object();
+                    trackObject.set("node", Value::string(track.node));
+                    trackObject.set("keys", std::move(keys));
+                    tracks.push(std::move(trackObject));
+                }
+                Value clipObject = Value::object();
+                clipObject.set("name", Value::string(clip.name));
+                clipObject.set("duration", Value::number(clip.duration));
+                clipObject.set("loop", Value::boolean(clip.loop));
+                clipObject.set("tracks", std::move(tracks));
+                clips.push(std::move(clipObject));
+            }
+            Value object = Value::object();
+            object.set("currentClip", Value::string(player->currentClip));
+            object.set("blendFromClip", Value::string(player->blendFromClip));
+            object.set("time", Value::number(player->time));
+            object.set("blendFromTime", Value::number(player->blendFromTime));
+            object.set("blendElapsed", Value::number(player->blendElapsed));
+            object.set("blendDuration", Value::number(player->blendDuration));
+            object.set("speed", Value::number(player->speed));
+            object.set("playing", Value::boolean(player->playing));
+            object.set("clips", std::move(clips));
+            components.set("animationPlayer", std::move(object));
+        }
+        if (const RagdollComponent* ragdoll = m_registry.try_get<RagdollComponent>(entity); ragdoll != nullptr) {
+            Value object = Value::object();
+            object.set("enabled", Value::boolean(ragdoll->enabled));
+            object.set("bodyMass", Value::number(ragdoll->bodyMass));
+            object.set("compliance", Value::number(ragdoll->compliance));
+            components.set("ragdoll", std::move(object));
+        }
         if (const RigidBodyComponent* body = m_registry.try_get<RigidBodyComponent>(entity);
             body != nullptr) {
             Value object = Value::object();
@@ -421,6 +503,7 @@ bool Scene::loadFromString(std::string_view text) {
     std::vector<entt::entity> handles;
     handles.reserve(entityArray->items().size());
     std::vector<std::pair<entt::entity, int>> jointFixups;
+    std::vector<std::pair<entt::entity, std::vector<int>>> rigFixups;
     for (const Value& entityObject : entityArray->items()) {
         Entity entity = createEntity("Entity");
         handles.push_back(entity.handle());
@@ -489,6 +572,71 @@ bool Scene::loadFromString(std::string_view text) {
             script.compileFlags =
                 static_cast<ScriptCompileFlags>(static_cast<uint32_t>(getFloat(*object, "compileFlags", 0.0f)));
             script.enabled = getBool(*object, "enabled", script.enabled);
+        }
+        if (const Value* object = components->find("rig"); object != nullptr) {
+            RigComponent& rig = entity.addComponent<RigComponent>();
+            std::vector<int> nodeEntities;
+            if (const Value* nodes = object->find("nodes"); nodes != nullptr) {
+                for (const Value& nodeValue : nodes->items()) {
+                    RigNode node;
+                    node.name = getString(nodeValue, "name", node.name);
+                    node.parent = static_cast<int32_t>(getFloat(nodeValue, "parent", -1.0f));
+                    node.jointAxis = getVec3(nodeValue, "jointAxis", node.jointAxis);
+                    node.minAngleDegrees = getFloat(nodeValue, "minAngleDegrees", node.minAngleDegrees);
+                    node.maxAngleDegrees = getFloat(nodeValue, "maxAngleDegrees", node.maxAngleDegrees);
+                    rig.nodes.push_back(node);
+                    nodeEntities.push_back(getEntityIndex(nodeValue, "entity"));
+                }
+            }
+            rigFixups.emplace_back(entity.handle(), std::move(nodeEntities));
+        }
+        if (const Value* object = components->find("animationPlayer"); object != nullptr) {
+            AnimationPlayerComponent& player = entity.addComponent<AnimationPlayerComponent>();
+            player.currentClip = getString(*object, "currentClip", player.currentClip);
+            player.blendFromClip = getString(*object, "blendFromClip", player.blendFromClip);
+            player.time = getFloat(*object, "time", 0.0f);
+            player.blendFromTime = getFloat(*object, "blendFromTime", 0.0f);
+            player.blendElapsed = getFloat(*object, "blendElapsed", 0.0f);
+            player.blendDuration = getFloat(*object, "blendDuration", 0.0f);
+            player.speed = getFloat(*object, "speed", player.speed);
+            player.playing = getBool(*object, "playing", player.playing);
+            if (const Value* clips = object->find("clips"); clips != nullptr) {
+                for (const Value& clipValue : clips->items()) {
+                    AnimationClip clip;
+                    clip.name = getString(clipValue, "name", clip.name);
+                    clip.duration = getFloat(clipValue, "duration", static_cast<float>(clip.duration));
+                    clip.loop = getBool(clipValue, "loop", clip.loop);
+                    if (const Value* tracks = clipValue.find("tracks"); tracks != nullptr) {
+                        for (const Value& trackValue : tracks->items()) {
+                            AnimTrack track;
+                            track.node = getString(trackValue, "node", track.node);
+                            if (const Value* keys = trackValue.find("keys"); keys != nullptr) {
+                                for (const Value& keyValue : keys->items()) {
+                                    AnimKeyframe key;
+                                    key.time = getFloat(keyValue, "time", 0.0f);
+                                    key.position = getVec3(keyValue, "position", key.position);
+                                    key.rotationDegrees = getVec3(keyValue, "rotationDegrees", key.rotationDegrees);
+                                    key.scale = getVec3(keyValue, "scale", key.scale);
+                                    AnimInterpolation mode = key.interpolation;
+                                    if (animInterpolationFromName(getString(keyValue, "interpolation", "linear"), mode)) {
+                                        key.interpolation = mode;
+                                    }
+                                    track.keys.push_back(key);
+                                }
+                            }
+                            clip.tracks.push_back(std::move(track));
+                        }
+                    }
+                    player.clips.push_back(std::move(clip));
+                }
+            }
+        }
+        if (const Value* object = components->find("ragdoll"); object != nullptr) {
+            RagdollComponent& ragdoll = entity.addComponent<RagdollComponent>();
+            ragdoll.enabled = getBool(*object, "enabled", ragdoll.enabled);
+            ragdoll.bodyMass = getFloat(*object, "bodyMass", ragdoll.bodyMass);
+            ragdoll.compliance = getFloat(*object, "compliance", ragdoll.compliance);
+            ragdoll.active = false; // bodies respawn on first AnimationSystem tick
         }
         if (const Value* object = components->find("rigidBody"); object != nullptr) {
             RigidBodyComponent& body = entity.addComponent<RigidBodyComponent>();
@@ -592,6 +740,15 @@ bool Scene::loadFromString(std::string_view text) {
         joint.other = otherIndex >= 0 && static_cast<size_t>(otherIndex) < handles.size()
                           ? handles[static_cast<size_t>(otherIndex)]
                           : entt::null;
+    }
+    for (const auto& [rigEntity, nodeIndices] : rigFixups) {
+        RigComponent& rig = m_registry.get<RigComponent>(rigEntity);
+        for (size_t n = 0; n < rig.nodes.size() && n < nodeIndices.size(); ++n) {
+            const int nodeIndex = nodeIndices[n];
+            rig.nodes[n].entity = nodeIndex >= 0 && static_cast<size_t>(nodeIndex) < handles.size()
+                                      ? handles[static_cast<size_t>(nodeIndex)]
+                                      : entt::null;
+        }
     }
 
     ENGINE_LOG_INFO("Scene: loaded " << handles.size() << " entities from serialized document");

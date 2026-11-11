@@ -29,6 +29,7 @@
 #include "Scene/TransformGizmo.h"
 #include "Scene/UIAssetBrowser.h"
 #include "Scene/UIOutliner.h"
+#include "Scene/Systems/AnimationSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Systems/RenderSystem.h"
 
@@ -132,6 +133,15 @@ private:
     void resetScriptRuntimes();
     float inspectScriptAt(float x, float y, float width, entt::entity entity);
     void drawScriptDock(const UIRect& rect, double deltaSeconds);
+    // VibeAnim studio (bottom-dock tab) + its inspector section.
+    float inspectAnimationAt(float x, float y, float width, entt::entity entity);
+    void drawAnimStudio(const UIRect& rect, double deltaSeconds);
+    entt::entity resolveAnimRig();
+    // Script-editor live services: re-parse the buffer into gutter
+    // diagnostics, and refresh the completion popup from the DSL
+    // completion provider (clip/entity names read live).
+    void updateScriptLiveDiagnostics();
+    void refreshScriptCompletions();
     void updateSplitters(const EditorLayout& layout);
     // Assembles the context handed to the game module (Phase 23).
     EngineContext buildModuleContext(float deltaSeconds, float fixedDeltaSeconds);
@@ -207,15 +217,29 @@ private:
     EditorDockSizes m_dockSizes;
     int m_activeSplitter = 0;  // 0 none, 1 hierarchy, 2 inspector, 3 bottom dock
     int m_hoveredSplitter = 0; // same encoding, for hover/cursor feedback
-    enum class BottomDockTab : uint8_t { Assets, Script };
+    enum class BottomDockTab : uint8_t { Assets, Script, Anim };
     BottomDockTab m_bottomDockTab = BottomDockTab::Assets;
     TextEditor m_scriptEditor;
     std::string m_scriptStatus; // last Save & Compile verdict for the bound script
     // Compile-error modal: set by a failed Save & Compile, drawn
-    // over the editor until dismissed (OK / Enter / Escape).
+    // over the editor until dismissed (OK / Enter / Escape). Each
+    // row is clickable and jumps the script editor to its line.
     bool m_scriptErrorOpen = false;
     std::string m_scriptErrorTitle;
-    std::string m_scriptErrorBody;
+    std::vector<std::pair<std::string, int>> m_scriptErrorLines; // text + 1-based line (0 = none)
+    // Live script services: last buffer parsed for gutter
+    // diagnostics, and the last editor caret line (line changes
+    // close the completion popup).
+    std::string m_scriptLiveSource;
+    size_t m_scriptEditorLastLine = 0;
+    // VibeAnim studio + animation preview state.
+    AnimationContext m_animationContext;
+    entt::entity m_animRig = entt::null;
+    std::string m_animSelectedClip;
+    std::string m_animSelectedNode;
+    std::string m_animNewClipName = "clip";
+    double m_animSelectedKeyTime = -1.0; // < 0 = no key selected
+    int m_animInterpChoice = 0;          // AnimInterpolation as int (new keys)
     UIRect m_scriptEditorRect{}; // last drawn script-dock rect (I-beam cursor)
     // In-engine console: Logger listener -> ring buffer -> panel.
     // Visible in Edit and Play (layout.console strip).

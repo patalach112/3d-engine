@@ -15,6 +15,9 @@
 // ---------------------------------------------------------------------------
 
 #include "Physics/PhysicsComponents.h"
+#include "Scene/AnimationComponents.h"
+#include "Scene/Systems/AnimationSystem.h"
+#include "Scene/Systems/PhysicsSystem.h"
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
 #include "Scripting/DSLComponents.h"
@@ -165,6 +168,69 @@ int main() {
         }
     }
     expect(hudShowsDamage, "arena: HUD shows the mutated value on the next frame");
+
+    // -- VibeAnim: scripted playback, blend, death -> ragdoll ---------------
+    auto puppet = scene.createEntity("puppet");
+    puppet.addComponent<TransformComponent>().position = glm::vec3{10.0f, 3.0f, 10.0f};
+    auto puppetArm = scene.createEntity("puppetArm");
+    puppetArm.addComponent<TransformComponent>().position = glm::vec3{0.45f, 0.0f, 0.0f};
+    scene.setParent(puppetArm, puppet);
+    puppet.addComponent<RigComponent>(AnimationRigging::buildFromHierarchy(scene, puppet.handle()));
+    AnimationPlayerComponent& puppetPlayer = puppet.addComponent<AnimationPlayerComponent>();
+    for (const char* clipName : {"idle", "wave"}) {
+        AnimationClip clip;
+        clip.name = clipName;
+        clip.duration = 1.0;
+        AnimTrack& track = clip.trackFor("puppetArm");
+        const float endAngle = std::string(clipName) == "wave" ? 60.0f : 0.0f;
+        track.keys.push_back(AnimKeyframe{0.0, glm::vec3{0.45f, 0.0f, 0.0f}, glm::vec3{0.0f}, glm::vec3{1.0f},
+                                          AnimInterpolation::Linear});
+        track.keys.push_back(AnimKeyframe{1.0, glm::vec3{0.45f, 0.0f, 0.0f}, glm::vec3{0.0f, endAngle, 0.0f},
+                                          glm::vec3{1.0f}, AnimInterpolation::EaseInOut});
+        puppetPlayer.clips.push_back(clip);
+    }
+    puppet.addComponent<ScriptComponent>().source =
+        "from start()\n"
+        "    health = 100\n"
+        "    play.animation(\"idle\")\n"
+        "    on_input(\"LMB\") { play.animation(\"wave\") blend 0.4s }\n"
+        "    on_touch(\"stalker\") { health -= 60 if (health <= 0) { enable.ragdoll() } }\n"
+        "script(end)";
+    auto animFrame = [&](double dt) {
+        ScriptSystem::update(scene, scripts, dt);
+        AnimationSystem::update(scene, dt);
+    };
+    animFrame(0.1);
+    expect(puppetPlayer.currentClip == "idle", "vibeanim: script starts the idle clip");
+    ScriptSystem::postInputEvent(scripts, "LMB", false);
+    for (int i = 0; i < 6; ++i) {
+        animFrame(0.1);
+    }
+    expect(puppetPlayer.currentClip == "wave", "vibeanim: LMB blends into the wave clip");
+    const float armAngle = registry.get<TransformComponent>(puppetArm.handle()).rotationDegrees.y;
+    expect(armAngle > 5.0f, "vibeanim: the arm node is animated by the clip");
+    const auto puppetHit = [&]() {
+        ScriptSystem::postEvent(scripts, DSLEvent{DSLEventKind::Touch, "stalker", stalker.handle(), puppet.handle(),
+                                                  stalker.handle(), puppet.handle()});
+        animFrame(0.1);
+    };
+    puppetHit();
+    expect(!AnimationSystem::ragdollActive(scene, puppet.handle()), "vibeanim: alive after the first hit");
+    puppetHit();
+    expect(AnimationSystem::ragdollActive(scene, puppet.handle()),
+           "vibeanim: health hit 0 -> enable.ragdoll() dropped the puppet");
+    expect(registry.all_of<RigidBodyComponent>(puppetArm.handle()), "vibeanim: limb nodes carry rigid bodies");
+    {
+        PhysicsSystem physics;
+        PhysicsSettings settings;
+        settings.gravity = glm::vec3{0.0f, -10.0f, 0.0f};
+        const float startY = registry.get<TransformComponent>(puppet.handle()).position.y;
+        for (int step = 0; step < 30; ++step) {
+            physics.update(scene, 1.0 / 60.0, settings);
+        }
+        expect(registry.get<TransformComponent>(puppet.handle()).position.y < startY - 0.1f,
+               "vibeanim: the ragdoll falls under physics");
+    }
 
     std::cout << "script log lines: " << scripts.log.size() << ", sounds: " << scripts.sounds.size() << '\n';
     std::cout << (g_failures == 0 ? "scripting-demo: ALL CHECKS PASSED\n" : "scripting-demo: FAILURES\n");
