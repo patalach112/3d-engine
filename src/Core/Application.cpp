@@ -637,6 +637,15 @@ void Application::run() {
             // the native stalker AI steers whatever the scripts
             // tagged with `behavior = stalker`.
             ScriptSystem::update(m_scene, m_scriptContext, m_input, fixedDeltaSeconds);
+            // DSL post effects are global: mirror the script
+            // context into the renderer every fixed step (the
+            // composite shader reads chromaticAberration from the
+            // post settings push constant).
+            {
+                PostSettings post = m_renderer.postSettings();
+                post.chromaticAberration = static_cast<float>(m_scriptContext.effects.chromaticAberration);
+                m_renderer.setPostSettings(post);
+            }
             StalkerAISystem::update(m_scene, static_cast<float>(fixedDeltaSeconds));
             // Rigid-body physics is deterministic simulation, so it lives in
             // the fixed step (never the variable/render-rate update). Its
@@ -1349,6 +1358,23 @@ void Application::run() {
             // warnings, compile errors and DSL print() output.
             if (layout.console.height > 0.0f) {
                 drawConsolePanel(m_uiContext, layout.console, m_consoleLog, m_consoleState);
+            }
+
+            // DSL hudprint overlay: percentage-anchored screen
+            // text, centred on its anchor, alpha from the fade
+            // curve the runtime ticks each frame.
+            if (playing) {
+                for (const auto& print : m_scriptContext.hudPrints) {
+                    if (print.alpha <= 0.01f) {
+                        continue;
+                    }
+                    const float hudScale = 2.0f;
+                    const float textWidth = ui.measureText(print.text, hudScale);
+                    const float anchorX = print.xPercent * 0.01f * static_cast<float>(framebufferWidth);
+                    const float anchorY = print.yPercent * 0.01f * static_cast<float>(framebufferHeight);
+                    ui.drawText(print.text, anchorX - 0.5f * textWidth, anchorY, hudScale,
+                                glm::vec4{print.color, print.alpha});
+                }
             }
 
             // Splitter affordance: accent line on the hovered /

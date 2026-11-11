@@ -11,7 +11,7 @@ layout(push_constant) uniform PushConstants {
     float exposure;
     float bloomStrength;
     float bloomEnabled;
-    float padding;
+    float chromaticAberration;
 } push;
 
 layout(location = 0) in vec2 fragUv;
@@ -29,7 +29,13 @@ float linearToSrgb(float value) {
 }
 
 void main() {
-    vec3 hdr = texture(sceneTexture, fragUv).rgb;
+    // Chromatic aberration: R/B channels split radially from the
+    // centre, scaled by the (script-driven) aberration amount.
+    vec2 caOffset = (fragUv - 0.5) * push.chromaticAberration * 0.02;
+    vec3 hdr;
+    hdr.r = texture(sceneTexture, fragUv + caOffset).r;
+    hdr.g = texture(sceneTexture, fragUv).g;
+    hdr.b = texture(sceneTexture, fragUv - caOffset).b;
     if (push.bloomEnabled > 0.5) {
         hdr += texture(bloomTexture, fragUv).rgb * push.bloomStrength;
     }

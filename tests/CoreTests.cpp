@@ -10742,13 +10742,13 @@ void testBackroomsScripting() {
     const DSLParseResult scenario = parseBackroomsScript(kScenario18Script);
     check(scenario.ok(), "scenario18: parses clean");
     check(scenario.program.statements.size() >= 5, "scenario18: top-level statements present");
-    bool sawInteract = false, sawIf = false, sawTouch = false;
+    bool sawInteract = false, sawIf = false, sawTrigger = false;
     for (const DSLNode& node : scenario.program.statements) {
         if (node.kind == DSLNodeKind::EventBlock && node.event == DSLEventKind::Interact) sawInteract = true;
         if (node.kind == DSLNodeKind::If) sawIf = true;
-        if (node.kind == DSLNodeKind::EventBlock && node.event == DSLEventKind::Touch) sawTouch = true;
+        if (node.kind == DSLNodeKind::EventBlock && node.event == DSLEventKind::Trigger) sawTrigger = true;
     }
-    check(sawInteract && sawTouch, "scenario18: interact + touch event nodes");
+    check(sawInteract && sawTrigger, "scenario18: interact + trigger event nodes");
     check(sawIf, "scenario18: guarded if composition node");
 
     // -- Parser: expression precedence via the interpreter ---------
@@ -10904,7 +10904,7 @@ void testBackroomsScripting() {
         for (int i = 0; i < 25; ++i) ScriptSystem::update(scene, ctx, 0.1); // 2.6 s of regen
         check(var("health") == 104.0 && var("sanity") == 200.0, "scenario18 e2e: almond regen ticks while held");
         for (int i = 0; i < 80; ++i) ScriptSystem::update(scene, ctx, 0.1); // expire window
-        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "safe_room", room.handle(), player.handle(), room.handle(), player.handle()});
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Trigger, "safe_room", room.handle(), player.handle(), room.handle(), player.handle()});
         ScriptSystem::update(scene, ctx, 0.1);
         check(std::abs(scene.registry().get<PointLightComponent>(lights.handle()).intensity - 1.0f) < 1e-6f,
               "scenario18 e2e: safe room lights up");
@@ -11372,6 +11372,258 @@ void testPlayRestoreClipboardAndRobustSaves() {
     check(TextEditor::kTextScale >= 1.9f, "font: script editor scale stays comfortably large");
 }
 
+void testDslExpansions() {
+    std::cout << "DSL expansions: bounds, lerp, hudprint, touch/trigger, effects\n";
+    using namespace engine;
+
+    // -- (1) Beginner-friendly parameter constraints -------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() health(max) = 100 health(lowest) = 0 health = 80 sanity(max) = 100 sanity = 250 "
+            "on_input(\"LMB\") { health = health + 50 } on_input(\"RMB\") { health = health - 500 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "health").value_or(-1.0) == 80.0,
+              "bounds: in-range assignment untouched");
+        check(ScriptSystem::variable(ctx, brain.handle(), "sanity").value_or(-1.0) == 100.0,
+              "bounds: assignment above max clamps at write time");
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "health").value_or(-1.0) == 100.0,
+              "bounds: event-driven overflow clamps to max");
+        ScriptSystem::postInputEvent(ctx, "RMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "health").value_or(-1.0) == 0.0,
+              "bounds: event-driven underflow clamps to lowest");
+    }
+    {
+        // Declaring a bound after the fact re-clamps the live value.
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source = "from start() mood = 500 mood(max) = 100 script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "mood").value_or(-1.0) == 100.0,
+              "bounds: late declaration clamps the existing value");
+        const DSLParseResult parsed = parseBackroomsScript("from start() health(max) = 100 health(lowest) = 0 script(end)");
+        check(parsed.ok() && parsed.program.statements[0].kind == DSLNodeKind::BoundDecl &&
+                  parsed.program.statements[1].kind == DSLNodeKind::BoundDecl,
+              "bounds: declarations parse to BoundDecl nodes");
+    }
+
+    // -- (2) Smooth interpolation: variables ---------------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source = "from start() speed = 0 speed = 10 over 1s script(end)";
+        ScriptSystem::update(scene, ctx, 0.25);
+        check(nearlyEqual(ScriptSystem::variable(ctx, brain.handle(), "speed").value_or(-1.0), 2.5, 1e-9),
+              "lerp: quarter of the way after 0.25s (non-blocking, dt-driven)");
+        ScriptSystem::update(scene, ctx, 0.25);
+        check(nearlyEqual(ScriptSystem::variable(ctx, brain.handle(), "speed").value_or(-1.0), 5.0, 1e-9),
+              "lerp: halfway after 0.5s");
+        ScriptSystem::update(scene, ctx, 0.5);
+        check(nearlyEqual(ScriptSystem::variable(ctx, brain.handle(), "speed").value_or(-1.0), 10.0, 1e-9),
+              "lerp: lands exactly on target");
+        ScriptSystem::update(scene, ctx, 0.5);
+        check(nearlyEqual(ScriptSystem::variable(ctx, brain.handle(), "speed").value_or(-1.0), 10.0, 1e-9),
+              "lerp: completed task stays at target");
+        const ScriptSystemContext::Runtime* rt = ScriptSystem::findRuntime(ctx, brain.handle());
+        check(rt != nullptr && rt->lerps.empty(), "lerp: finished tasks are removed");
+    }
+    {
+        // fov-style variable + interruption by an instant write.
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() fov = 60 on_input(\"LMB\") { fov = 90 over 0.3s } on_input(\"RMB\") { fov = 70 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.15);
+        check(nearlyEqual(ScriptSystem::variable(ctx, brain.handle(), "fov").value_or(-1.0), 75.0, 1e-6),
+              "lerp: fov interpolates toward 90");
+        ScriptSystem::postInputEvent(ctx, "RMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(nearlyEqual(ScriptSystem::variable(ctx, brain.handle(), "fov").value_or(-1.0), 70.0, 1e-9),
+              "lerp: instant assignment cancels the running interpolation");
+        ScriptSystem::update(scene, ctx, 0.5);
+        check(nearlyEqual(ScriptSystem::variable(ctx, brain.handle(), "fov").value_or(-1.0), 70.0, 1e-9),
+              "lerp: cancelled task never resumes");
+    }
+    {
+        // A lerped target respects declared bounds.
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() health(max) = 100 health = 0 health = 500 over 1s script(end)";
+        ScriptSystem::update(scene, ctx, 1.0);
+        check(nearlyEqual(ScriptSystem::variable(ctx, brain.handle(), "health").value_or(-1.0), 100.0, 1e-9),
+              "lerp: interpolated target clamps to the declared max");
+    }
+
+    // -- (2b) Smooth interpolation: component properties ----------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto light = scene.createEntity("light");
+        auto& point = light.addComponent<PointLightComponent>();
+        point.intensity = 0.0f;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source = "from start() light.intensity = 2.0 over 2s script(end)";
+        ScriptSystem::update(scene, ctx, 1.0);
+        check(nearlyEqual(point.intensity, 1.0, 1e-6), "lerp: light.intensity halfway through over 2s");
+        ScriptSystem::update(scene, ctx, 1.0);
+        check(nearlyEqual(point.intensity, 2.0, 1e-6), "lerp: light.intensity reaches target");
+
+        Scene scene2;
+        ScriptSystemContext ctx2;
+        auto light2 = scene2.createEntity("safe_lights");
+        auto& point2 = light2.addComponent<PointLightComponent>();
+        point2.intensity = 0.0f;
+        auto brain2 = scene2.createEntity("brain");
+        brain2.addComponent<ScriptComponent>().source =
+            "from start() part(\"safe_lights\").intensity = 4.0 over 1s script(end)";
+        ScriptSystem::update(scene2, ctx2, 0.5);
+        check(nearlyEqual(point2.intensity, 2.0, 1e-6), "lerp: part(...).intensity honours over as well");
+    }
+
+    // -- (3) hudprint ------------------------------------------------------------
+    {
+        const DSLParseResult parsed = parseBackroomsScript(
+            "from start() hudprint(\"Wake up\") { position = 25%, 75% duration = 2s color = #FF8000 fade = true } script(end)");
+        check(parsed.ok() && parsed.program.statements.size() == 1 &&
+                  parsed.program.statements[0].kind == DSLNodeKind::HudPrint,
+              "hudprint: block parses to a HudPrint node");
+        const DSLNode& node = parsed.program.statements[0];
+        check(node.name == "Wake up" && nearlyEqual(node.hudXPercent, 25.0, 1e-6) &&
+                  nearlyEqual(node.hudYPercent, 75.0, 1e-6) && nearlyEqual(node.hudDuration, 2.0, 1e-9) &&
+                  nearlyEqual(node.hudRed, 1.0, 1e-6) && nearlyEqual(node.hudGreen, 128.0 / 255.0, 1e-4) &&
+                  nearlyEqual(node.hudBlue, 0.0, 1e-9) && node.hudFade,
+              "hudprint: position/duration/#HEX/fade fields parse");
+        check(!parseBackroomsScript("from start() hudprint(\"X\") { color = #XYZ } script(end)").ok(),
+              "hudprint: invalid hex colour is a parse error");
+    }
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() hudprint(\"Wake up\") { position = 25%, 75% duration = 2s color = #FF8000 fade = true } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ctx.hudPrints.size() == 1 && ctx.hudPrints[0].text == "Wake up",
+              "hudprint: executing the block queues an active print");
+        check(nearlyEqual(ctx.hudPrints[0].xPercent, 25.0, 1e-6) && nearlyEqual(ctx.hudPrints[0].yPercent, 75.0, 1e-6) &&
+                  nearlyEqual(ctx.hudPrints[0].color.r, 1.0, 1e-6) &&
+                  nearlyEqual(ctx.hudPrints[0].color.g, 128.0 / 255.0, 1e-4),
+              "hudprint: anchor and colour reach the active print");
+        check(ctx.hudPrints[0].alpha > 0.0f && ctx.hudPrints[0].alpha < 1.0f,
+              "hudprint: fade-in interpolates alpha over dt");
+        ScriptSystem::update(scene, ctx, 0.9);
+        check(ctx.hudPrints.size() == 1 && nearlyEqual(ctx.hudPrints[0].alpha, 1.0, 1e-6),
+              "hudprint: alpha reaches full opacity mid-life");
+        ScriptSystem::update(scene, ctx, 1.5);
+        check(ctx.hudPrints.empty(), "hudprint: print expires after its duration");
+
+        Scene scene2;
+        ScriptSystemContext ctx2;
+        auto brain2 = scene2.createEntity("brain");
+        brain2.addComponent<ScriptComponent>().source = "from start() hudprint(\"Static\") { duration = 1s } script(end)";
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        check(ctx2.hudPrints.size() == 1 && nearlyEqual(ctx2.hudPrints[0].alpha, 1.0, 1e-9) &&
+                  nearlyEqual(ctx2.hudPrints[0].xPercent, 50.0, 1e-6),
+              "hudprint: defaults are centred, opaque without fade");
+    }
+
+    // -- (4) on_touch vs on_trigger, on_input_release ------------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto crate = scene.createEntity("crate");
+        crate.addComponent<TransformComponent>();
+        auto zone = scene.createEntity("zone");
+        zone.addComponent<TransformComponent>();
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() touched = 0 triggered = 0 released = 0 "
+            "on_touch(\"crate\") { touched = touched + 1 } on_trigger(\"zone\") { triggered = triggered + 1 } "
+            "on_input_release(\"LMB\") { released = released + 1 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "", entt::null, entt::null, crate.handle(), brain.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "touched").value_or(-1.0) == 1.0 &&
+                  ScriptSystem::variable(ctx, brain.handle(), "triggered").value_or(-1.0) == 0.0,
+              "events: solid impact fires on_touch only");
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Trigger, "", entt::null, entt::null, zone.handle(), brain.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "triggered").value_or(-1.0) == 1.0 &&
+                  ScriptSystem::variable(ctx, brain.handle(), "touched").value_or(-1.0) == 1.0,
+              "events: ghost volume entry fires on_trigger only");
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "released").value_or(-1.0) == 0.0,
+              "events: a press does not fire on_input_release");
+        ScriptSystem::postInputRelease(ctx, "LMB");
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "released").value_or(-1.0) == 1.0,
+              "events: release edge fires on_input_release");
+    }
+    {
+        // The physics bus mapping: collisions are touch+collide,
+        // trigger entries are trigger (entered edges only).
+        EventBus bus;
+        ScriptSystemContext ctx;
+        ScriptSystem::attach(ctx, bus);
+        bus.publish(CollisionEvent{});
+        bus.publish(TriggerEvent{entt::null, entt::null, true});
+        bus.publish(TriggerEvent{entt::null, entt::null, false});
+        size_t touch = 0, collide = 0, trigger = 0;
+        for (const DSLEvent& event : ctx.eventQueue) {
+            touch += event.kind == DSLEventKind::Touch ? 1 : 0;
+            collide += event.kind == DSLEventKind::Collide ? 1 : 0;
+            trigger += event.kind == DSLEventKind::Trigger ? 1 : 0;
+        }
+        check(touch == 1 && collide == 1, "events: a physics collision feeds on_touch and on_collide");
+        check(trigger == 1, "events: trigger entry feeds on_trigger, exit does not");
+    }
+
+    // -- (5) Global post-processing effects -----------------------------------------
+    {
+        check(nearlyEqual(PostSettings{}.chromaticAberration, 0.0, 1e-9),
+              "effect: renderer chromatic aberration defaults to off");
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source = "from start() effect.chromatic_aberration = 0.3 script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(nearlyEqual(ctx.effects.chromaticAberration, 0.3, 1e-9),
+              "effect: constant assignment sets the global baseline");
+
+        Scene scene2;
+        ScriptSystemContext ctx2;
+        auto brain2 = scene2.createEntity("brain");
+        brain2.addComponent<ScriptComponent>().source =
+            "from start() on_start() { effect.chromatic_aberration = 0.25 } "
+            "on_input(\"LMB\") { effect.chromatic_aberration = 1.0 over 1s } script(end)";
+        ScriptSystem::update(scene2, ctx2, 0.1);
+        check(nearlyEqual(ctx2.effects.chromaticAberration, 0.25, 1e-9),
+              "effect: on_start() runs once at setup (baseline VHS look)");
+        ScriptSystem::postInputEvent(ctx2, "LMB", false);
+        ScriptSystem::update(scene2, ctx2, 0.5);
+        check(nearlyEqual(ctx2.effects.chromaticAberration, 0.625, 1e-6),
+              "effect: jump-scare spike interpolates over time");
+        ScriptSystem::update(scene2, ctx2, 0.5);
+        check(nearlyEqual(ctx2.effects.chromaticAberration, 1.0, 1e-9),
+              "effect: spike lands on target and holds");
+        check(!parseBackroomsScript("from start() speed = 1 over later script(end)").ok(),
+              "lerp: 'over' without a duration is a parse error");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -11437,6 +11689,7 @@ int main() {
     testEditorScriptingUpgrades();
     testConsoleAndPlayPersistence();
     testPlayRestoreClipboardAndRobustSaves();
+    testDslExpansions();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

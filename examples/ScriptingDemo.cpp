@@ -117,7 +117,7 @@ int main() {
     }
 
     // -- safe room ------------------------------------------------------
-    ScriptSystem::postEvent(scripts, DSLEvent{DSLEventKind::Touch, "safe_room", safeRoom.handle(), player.handle(),
+    ScriptSystem::postEvent(scripts, DSLEvent{DSLEventKind::Trigger, "safe_room", safeRoom.handle(), player.handle(),
                                               safeRoom.handle(), player.handle()});
     frame(0.1);
     const double healthRoom = var("health");

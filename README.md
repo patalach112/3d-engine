@@ -3145,3 +3145,43 @@ CTest 1/1, zero warnings, standalone player headless run clean.
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, scripting-demo and standalone
 player headless runs clean.
+
+## DSL expansions — bounds, `over` lerps, hudprint, touch/trigger split, post effects ✅
+
+- **Parameter constraints**: `health(max) = 100` /
+  `health(lowest) = 0` declare native boundaries (`BoundDecl`
+  AST nodes, per-runtime bound tables). Every write — instant,
+  event-driven, or lerped — clamps into range, and declaring a
+  bound re-clamps the live value, so no manual clamp functions
+  are ever needed.
+- **Smooth interpolation**: `speed = 6.0 over 1s`,
+  `fov = 90 over 0.3s`, `light.intensity = 0.0 over 2s` (both the
+  `part("...")` form and the new dotted `entity.property`
+  shorthand) spawn non-blocking lerp tasks ticked by frame dt.
+  They start from the target's current value (mid-flight
+  re-issue bends smoothly), land exactly on target, and are
+  cancelled by any instant write to the same target.
+- **hudprint**: `hudprint("Text") { position = 25%, 75%
+  duration = 2s color = #FF8000 fade = true }` queues an
+  `ActiveHudPrint` on the script context (percentage canvas
+  anchors, #RRGGBB colour via a new hex lexer token, fade
+  in/out alpha computed per tick); the Application draws live
+  prints over the Play viewport, centred on their anchor.
+- **Event split**: `on_touch` is now solid-collider impact and
+  `on_trigger` is ghost-volume entry (the physics bus feeds
+  collisions to touch+collide, trigger-entered edges to
+  trigger only), plus `on_input_release("ActionName")` release
+  edges from the real Input state. Scenario 18's safe room
+  migrated to `on_trigger`. Migration note: scripts that used
+  `on_touch` for zones should switch to `on_trigger`.
+- **Global post effects**: `effect.chromatic_aberration = 0.3`
+  drives a ScriptSystemContext post-effects state the host
+  mirrors into `PostSettings` every fixed step; the composite
+  shader splits R/B radially by that amount (0 = off). It takes
+  constants, `over Xs` spike lerps, and an `on_start() { ... }`
+  block that runs once at setup for baselines.
+
+1392 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, scripting-demo (Scenario 18) and
+standalone player headless runs clean.

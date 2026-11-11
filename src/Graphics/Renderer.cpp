@@ -1136,10 +1136,10 @@ void Renderer::recordComposite(VkCommandBuffer commandBuffer, uint32_t imageInde
         float exposure;
         float bloomStrength;
         float bloomEnabled;
-        float padding;
+        float chromaticAberration;
     };
     const CompositePush push{m_postSettings.exposure, m_postSettings.bloomStrength,
-                             m_postSettings.bloomEnabled ? 1.0f : 0.0f, 0.0f};
+                             m_postSettings.bloomEnabled ? 1.0f : 0.0f, m_postSettings.chromaticAberration};
     vkCmdPushConstants(commandBuffer, m_postPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(CompositePush),
                        &push);
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);

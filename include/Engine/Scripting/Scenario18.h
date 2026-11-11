@@ -10,7 +10,7 @@ namespace engine {
 // guarded input composition if { inhand { on_input } }, the
 // Almond Water regeneration window for(10s) { every(1s) }, the
 // safe-room heal window with a light mutation, and the nested
-// event composition on_touch { on_collision(part) { position =
+// event composition on_trigger { on_collision(part) { position =
 // reset } }. Shared verbatim by the scripting demo executable and
 // the core test suite so the two can never drift apart.
 // ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ inline constexpr const char* kScenario18Script = R"DSL(from start()
     // The safe room: heals over time, lights come up, and the
     // stalker can never stay inside — any collision it has after
     // the room is touched resets it to its spawn point.
-    on_touch("safe_room") {
+    on_trigger("safe_room") {
         for(10s) {
             every(3s) {
                 health = health + 2

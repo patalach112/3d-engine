@@ -10,7 +10,7 @@ namespace engine {
 namespace {
 
 struct Token {
-    enum class Kind : uint8_t { Identifier, Number, String, Duration, Symbol, End } kind = Kind::End;
+    enum class Kind : uint8_t { Identifier, Number, String, Duration, HexColor, Symbol, End } kind = Kind::End;
     std::string text;   // identifier text / string contents / symbol
     double number = 0.0; // Number value, Duration in seconds
     int line = 0;
@@ -116,6 +116,23 @@ public:
             }
             token.kind = Token::Kind::String;
             token.text = std::move(value);
+            return token;
+        }
+        if (c == '#') {
+            // Hex colour literal: #RRGGBB (hudprint colours).
+            ++m_pos; // consume '#'
+            const size_t start = m_pos;
+            while (m_pos < m_source.size() && std::isxdigit(static_cast<unsigned char>(m_source[m_pos])) != 0) {
+                ++m_pos;
+            }
+            if (m_pos == start) {
+                m_errors.push_back("line " + std::to_string(token.line) + ": '#' must be followed by hex digits (#RRGGBB)");
+                token.kind = Token::Kind::Symbol;
+                token.text = "#";
+                return token;
+            }
+            token.kind = Token::Kind::HexColor;
+            token.text = std::string(m_source.substr(start, m_pos - start));
             return token;
         }
         // Multi-character operators first.
@@ -255,9 +272,13 @@ private:
             if (word == "part") {
                 return parsePart();
             }
-            if (word == "on_input" || word == "on_hold" || word == "on_touch" || word == "on_collide" ||
-                word == "on_collision" || word == "on_interact") {
+            if (word == "on_input" || word == "on_input_release" || word == "on_hold" || word == "on_touch" ||
+                word == "on_trigger" || word == "on_collide" || word == "on_collision" || word == "on_interact" ||
+                word == "on_start") {
                 return parseEvent(word);
+            }
+            if (word == "hudprint") {
+                return parseHudPrint();
             }
             if (word == "every" || word == "for") {
                 return parseTemporal(word);
@@ -367,6 +388,9 @@ private:
                     return std::nullopt;
                 }
                 node.expr = std::move(*value);
+                if (!parseOverSuffix(node)) {
+                    return std::nullopt;
+                }
                 return node;
             }
             if (member != "destroy" && member != "freeze") {
@@ -390,6 +414,9 @@ private:
             return std::nullopt;
         }
         node.expr = std::move(*value);
+        if (!parseOverSuffix(node)) {
+            return std::nullopt;
+        }
         return node;
     }
 
@@ -399,20 +426,37 @@ private:
         if (!expectSymbol("(")) {
             return std::nullopt;
         }
+        DSLNode node;
+        node.kind = DSLNodeKind::EventBlock;
+        node.line = line;
+        if (word == "on_start") {
+            // on_start() { ... }: runs once when the script sets up.
+            if (!expectSymbol(")")) {
+                return std::nullopt;
+            }
+            node.event = DSLEventKind::Start;
+            auto block = parseBlock();
+            if (!block.has_value()) {
+                return std::nullopt;
+            }
+            node.body = std::move(*block);
+            return node;
+        }
         auto target = parseTargetArg("event");
         if (!target.has_value() || !expectSymbol(")")) {
             return std::nullopt;
         }
-        DSLNode node;
-        node.kind = DSLNodeKind::EventBlock;
-        node.line = line;
         node.name = *target;
         if (word == "on_input") {
             node.event = DSLEventKind::InputPress;
+        } else if (word == "on_input_release") {
+            node.event = DSLEventKind::InputRelease;
         } else if (word == "on_hold") {
             node.event = DSLEventKind::InputHold;
         } else if (word == "on_touch") {
             node.event = DSLEventKind::Touch;
+        } else if (word == "on_trigger") {
+            node.event = DSLEventKind::Trigger;
         } else if (word == "on_collide" || word == "on_collision") {
             node.event = DSLEventKind::Collide;
         } else {
@@ -548,13 +592,188 @@ private:
         return node;
     }
 
+    // Optional `over <duration>` tail on assignments: spawns a
+    // non-blocking lerp in the runtime instead of snapping.
+    bool parseOverSuffix(DSLNode& node) {
+        if (!atIdentifier("over")) {
+            return true;
+        }
+        advance(); // over
+        if (m_token.kind != Token::Kind::Duration && m_token.kind != Token::Kind::Number) {
+            fail("expected a duration after 'over' (e.g. 'over 1s')");
+            return false;
+        }
+        node.hasLerp = true;
+        node.lerpDuration = std::max(0.0, m_token.number);
+        advance();
+        return true;
+    }
+
+    bool parseHexColor(const std::string& hex, DSLNode& node) {
+        std::string digits = hex;
+        if (digits.size() == 3) { // #RGB shorthand
+            digits = std::string{digits[0], digits[0], digits[1], digits[1], digits[2], digits[2]};
+        }
+        if (digits.size() != 6) {
+            fail("hudprint color must be #RRGGBB");
+            return false;
+        }
+        const auto channel = [&digits](size_t at) {
+            return static_cast<float>(std::strtoul(digits.substr(at, 2).c_str(), nullptr, 16)) / 255.0f;
+        };
+        node.hudRed = channel(0);
+        node.hudGreen = channel(2);
+        node.hudBlue = channel(4);
+        return true;
+    }
+
+    // hudprint("Text") { position = 50%, 90% duration = 3s
+    //                     color = #FFAA00 fade = true }
+    std::optional<DSLNode> parseHudPrint() {
+        const int line = m_token.line;
+        advance(); // hudprint
+        if (!expectSymbol("(")) {
+            return std::nullopt;
+        }
+        auto text = parseStringArg("hudprint(...)");
+        if (!text.has_value() || !expectSymbol(")") || !expectSymbol("{")) {
+            return std::nullopt;
+        }
+        DSLNode node;
+        node.kind = DSLNodeKind::HudPrint;
+        node.line = line;
+        node.name = *text;
+        while (!atSymbol("}")) {
+            if (m_token.kind != Token::Kind::Identifier) {
+                fail("expected a hudprint setting (position/duration/color/fade)");
+                return std::nullopt;
+            }
+            const std::string key = m_token.text;
+            advance();
+            if (!expectSymbol("=")) {
+                return std::nullopt;
+            }
+            if (key == "position") {
+                if (m_token.kind != Token::Kind::Number) {
+                    fail("hudprint position expects percentages (position = 50%, 90%)");
+                    return std::nullopt;
+                }
+                node.hudXPercent = static_cast<float>(m_token.number);
+                advance();
+                if (!expectSymbol("%") || !expectSymbol(",")) {
+                    return std::nullopt;
+                }
+                if (m_token.kind != Token::Kind::Number) {
+                    fail("hudprint position expects a second percentage");
+                    return std::nullopt;
+                }
+                node.hudYPercent = static_cast<float>(m_token.number);
+                advance();
+                if (!expectSymbol("%")) {
+                    return std::nullopt;
+                }
+            } else if (key == "duration") {
+                if (m_token.kind != Token::Kind::Duration && m_token.kind != Token::Kind::Number) {
+                    fail("hudprint duration expects a time (duration = 3s)");
+                    return std::nullopt;
+                }
+                node.hudDuration = std::max(0.0, m_token.number);
+                advance();
+            } else if (key == "color") {
+                if (m_token.kind == Token::Kind::HexColor) {
+                    const std::string hex = m_token.text;
+                    advance();
+                    if (!parseHexColor(hex, node)) {
+                        return std::nullopt;
+                    }
+                } else if (m_token.kind == Token::Kind::String && !m_token.text.empty() && m_token.text.front() == '#') {
+                    const std::string hex = m_token.text.substr(1);
+                    advance();
+                    if (!parseHexColor(hex, node)) {
+                        return std::nullopt;
+                    }
+                } else {
+                    fail("hudprint color expects #RRGGBB");
+                    return std::nullopt;
+                }
+            } else if (key == "fade") {
+                if (atIdentifier("true")) {
+                    node.hudFade = true;
+                    advance();
+                } else if (atIdentifier("false")) {
+                    node.hudFade = false;
+                    advance();
+                } else {
+                    fail("hudprint fade expects true or false");
+                    return std::nullopt;
+                }
+            } else {
+                fail("unknown hudprint setting '" + key + "'");
+                return std::nullopt;
+            }
+        }
+        advance(); // }
+        return node;
+    }
+
     std::optional<DSLNode> parseAssignment(const std::string& word) {
         const int line = m_token.line;
         advance(); // variable name
         DSLNode node;
         node.line = line;
-        node.kind = DSLNodeKind::Assign;
         node.name = word;
+        // Bound declaration: health(max) = 100 / health(lowest) = 0.
+        if (atSymbol("(")) {
+            advance();
+            if (!atIdentifier("max") && !atIdentifier("lowest")) {
+                fail("expected 'max' or 'lowest' in a bound declaration (e.g. health(max) = 100)");
+                return std::nullopt;
+            }
+            node.kind = DSLNodeKind::BoundDecl;
+            node.property = m_token.text;
+            advance();
+            if (!expectSymbol(")") || !expectSymbol("=")) {
+                return std::nullopt;
+            }
+            auto bound = parseExpression();
+            if (!bound.has_value()) {
+                return std::nullopt;
+            }
+            node.expr = std::move(*bound);
+            return node;
+        }
+        // Dotted assignment: light.intensity = 0.5 over 2s, or the
+        // global effect.chromatic_aberration = 0.3 over 0.5s.
+        if (atSymbol(".")) {
+            advance();
+            if (m_token.kind != Token::Kind::Identifier) {
+                fail("expected a property after '.'");
+                return std::nullopt;
+            }
+            const std::string member = m_token.text;
+            advance();
+            if (!expectSymbol("=")) {
+                return std::nullopt;
+            }
+            auto dotted = parseExpression();
+            if (!dotted.has_value()) {
+                return std::nullopt;
+            }
+            node.expr = std::move(*dotted);
+            if (word == "effect") {
+                node.kind = DSLNodeKind::EffectAssign;
+                node.name = member;
+                node.property = member;
+            } else {
+                node.kind = DSLNodeKind::PartAssign;
+                node.property = member; // node.name keeps the entity name
+            }
+            if (!parseOverSuffix(node)) {
+                return std::nullopt;
+            }
+            return node;
+        }
+        node.kind = DSLNodeKind::Assign;
         if (!expectSymbol("=")) {
             fail("expected '=' after '" + word + "'");
             return std::nullopt;
@@ -564,6 +783,9 @@ private:
             return std::nullopt;
         }
         node.expr = std::move(*value);
+        if (!parseOverSuffix(node)) {
+            return std::nullopt;
+        }
         return node;
     }
 

@@ -104,6 +104,9 @@ struct PostSettings {
     float bloomThreshold = 1.0f; // HDR luminance where bloom starts
     bool skyboxEnabled = true;
     float environmentIntensity = 1.0f;
+    // Radial RGB channel split (DSL `effect.chromatic_aberration`,
+    // 0 = off; ~0.3 is a subtle VHS fringe).
+    float chromaticAberration = 0.0f;
 };
 
 // One CPU-side texture for syncMaterialTextures: RGBA8 pixels in

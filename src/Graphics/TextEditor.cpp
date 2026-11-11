@@ -42,12 +42,13 @@ namespace {
         word == "every" || word == "inhand" || word == "part" || word == "position" || word == "behavior") {
         return Keyword;
     }
-    if (word == "on_touch" || word == "on_collide" || word == "on_collision" || word == "on_interact" ||
-        word == "on_input" || word == "on_hold") {
+    if (word == "on_touch" || word == "on_trigger" || word == "on_collide" || word == "on_collision" ||
+        word == "on_interact" || word == "on_input" || word == "on_input_release" || word == "on_hold" ||
+        word == "on_start") {
         return Event;
     }
     if (word == "play_sound" || word == "emit_sound" || word == "print" || word == "destroy" || word == "freeze" ||
-        word == "reset" || word == "stalker" || word == "scale") {
+        word == "reset" || word == "stalker" || word == "scale" || word == "hudprint" || word == "effect") {
         return Builtin;
     }
     return Plain;

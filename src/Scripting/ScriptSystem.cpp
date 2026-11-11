@@ -20,6 +20,8 @@ namespace engine {
 
 using Runtime = ScriptSystemContext::Runtime;
 using Timer = ScriptSystemContext::Timer;
+using Lerp = ScriptSystemContext::Lerp;
+using ActiveHudPrint = ScriptSystemContext::ActiveHudPrint;
 
 namespace {
 
@@ -97,6 +99,182 @@ void applyBehavior(Frame& frame, entt::entity target, const std::string& behavio
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bounds, part properties and lerp plumbing (DSL expansion)
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] double clampToBounds(const Runtime& rt, const std::string& name, double value) {
+    const auto it = rt.bounds.find(name);
+    if (it == rt.bounds.end()) {
+        return value;
+    }
+    if (it->second.hasLowest) {
+        value = std::max(value, it->second.lowest);
+    }
+    if (it->second.hasHighest) {
+        value = std::min(value, it->second.highest);
+    }
+    return value;
+}
+
+bool applyPartProperty(Scene::Registry& registry, entt::entity target, const std::string& property,
+                       const std::string& axis, double value) {
+    if (target == entt::null || !registry.valid(target)) {
+        return false;
+    }
+    if (property == "intensity") {
+        if (registry.all_of<PointLightComponent>(target)) {
+            registry.get<PointLightComponent>(target).intensity = static_cast<float>(value);
+            return true;
+        }
+        if (registry.all_of<SpotLightComponent>(target)) {
+            registry.get<SpotLightComponent>(target).intensity = static_cast<float>(value);
+            return true;
+        }
+        if (registry.all_of<DirectionalLightComponent>(target)) {
+            registry.get<DirectionalLightComponent>(target).intensity = static_cast<float>(value);
+            return true;
+        }
+        return false;
+    }
+    if (property == "scale") {
+        if (!registry.all_of<TransformComponent>(target)) {
+            return false;
+        }
+        auto& scale = registry.get<TransformComponent>(target).scale;
+        if (axis == "x") {
+            scale.x = static_cast<float>(value);
+        } else if (axis == "y") {
+            scale.y = static_cast<float>(value);
+        } else if (axis == "z") {
+            scale.z = static_cast<float>(value);
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (property == "range") {
+        if (registry.all_of<PointLightComponent>(target)) {
+            registry.get<PointLightComponent>(target).range = static_cast<float>(value);
+            return true;
+        }
+        if (registry.all_of<AudioComponent>(target)) {
+            registry.get<AudioComponent>(target).range = static_cast<float>(value);
+            return true;
+        }
+        return false;
+    }
+    if (property == "volume") {
+        registry.get_or_emplace<AudioComponent>(target).volume = static_cast<float>(value);
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] std::optional<double> readPartProperty(Scene::Registry& registry, entt::entity target,
+                                                     const std::string& property, const std::string& axis) {
+    if (target == entt::null || !registry.valid(target)) {
+        return std::nullopt;
+    }
+    if (property == "intensity") {
+        if (registry.all_of<PointLightComponent>(target)) {
+            return registry.get<PointLightComponent>(target).intensity;
+        }
+        if (registry.all_of<SpotLightComponent>(target)) {
+            return registry.get<SpotLightComponent>(target).intensity;
+        }
+        if (registry.all_of<DirectionalLightComponent>(target)) {
+            return registry.get<DirectionalLightComponent>(target).intensity;
+        }
+    } else if (property == "scale") {
+        if (registry.all_of<TransformComponent>(target)) {
+            const auto& scale = registry.get<TransformComponent>(target).scale;
+            if (axis == "x") return scale.x;
+            if (axis == "y") return scale.y;
+            if (axis == "z") return scale.z;
+        }
+    } else if (property == "range") {
+        if (registry.all_of<PointLightComponent>(target)) {
+            return registry.get<PointLightComponent>(target).range;
+        }
+        if (const AudioComponent* audio = registry.try_get<AudioComponent>(target)) {
+            return audio->range;
+        }
+    } else if (property == "volume") {
+        if (const AudioComponent* audio = registry.try_get<AudioComponent>(target)) {
+            return audio->volume;
+        }
+    }
+    return std::nullopt;
+}
+
+void applyLerpTarget(Scene& scene, ScriptSystemContext& context, Runtime& rt, const Lerp& lerp, double value) {
+    switch (lerp.target) {
+    case Lerp::Target::Variable:
+        rt.variables[lerp.name] = clampToBounds(rt, lerp.name, value);
+        return;
+    case Lerp::Target::PartProperty:
+        applyPartProperty(scene.registry(), findByName(scene.registry(), lerp.name), lerp.property, lerp.axis, value);
+        return;
+    case Lerp::Target::EffectProperty:
+        if (lerp.name == "chromatic_aberration") {
+            context.effects.chromaticAberration = value;
+        }
+        return;
+    }
+}
+
+void cancelLerps(Runtime& rt, Lerp::Target target, const std::string& name, const std::string& property,
+                 const std::string& axis) {
+    rt.lerps.erase(std::remove_if(rt.lerps.begin(), rt.lerps.end(),
+                                  [&](const Lerp& lerp) {
+                                      return lerp.target == target && lerp.name == name &&
+                                             lerp.property == property && lerp.axis == axis;
+                                  }),
+                   rt.lerps.end());
+}
+
+// Spawns (or replaces) a non-blocking interpolation toward `to`.
+// The start value is whatever the target reads right now, so
+// re-issuing an `over` assignment mid-flight bends smoothly from
+// the current position instead of snapping back.
+void startLerp(Frame& frame, Lerp::Target target, const std::string& name, const std::string& property,
+               const std::string& axis, double to, double duration) {
+    Runtime& rt = frame.runtime;
+    cancelLerps(rt, target, name, property, axis);
+    double from = to;
+    if (target == Lerp::Target::Variable) {
+        to = clampToBounds(rt, name, to);
+        const auto it = rt.variables.find(name);
+        from = it != rt.variables.end() ? it->second : 0.0;
+    } else if (target == Lerp::Target::PartProperty) {
+        auto& registry = frame.scene.registry();
+        if (const auto current = readPartProperty(registry, findByName(registry, name), property, axis)) {
+            from = *current;
+        }
+    } else if (name == "chromatic_aberration") {
+        from = frame.context.effects.chromaticAberration;
+    }
+    if (duration <= 0.0 || from == to) {
+        Lerp instant;
+        instant.target = target;
+        instant.name = name;
+        instant.property = property;
+        instant.axis = axis;
+        applyLerpTarget(frame.scene, frame.context, rt, instant, to);
+        return;
+    }
+    Lerp lerp;
+    lerp.target = target;
+    lerp.name = name;
+    lerp.property = property;
+    lerp.axis = axis;
+    lerp.from = from;
+    lerp.to = to;
+    lerp.duration = duration;
+    rt.lerps.push_back(lerp);
+}
+
 void execBlock(Frame& frame, const std::vector<DSLNode>& body);
 void spawnTimer(Frame& frame, const DSLNode& node);
 [[nodiscard]] bool insideZone(Frame& frame, const std::string& zoneName, entt::entity& zoneOut);
@@ -144,46 +322,89 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
             rt.textVariables[node.name] = *evaluateText(node.expr, rt);
             return;
         }
-        rt.variables[node.name] = evaluateExpr(node.expr, rt);
+        if (node.hasLerp) {
+            startLerp(frame, Lerp::Target::Variable, node.name, "", "", evaluateExpr(node.expr, rt),
+                      node.lerpDuration);
+            return;
+        }
+        cancelLerps(rt, Lerp::Target::Variable, node.name, "", "");
+        rt.variables[node.name] = clampToBounds(rt, node.name, evaluateExpr(node.expr, rt));
+        return;
+    }
+    case DSLNodeKind::BoundDecl: {
+        if (arming) {
+            return;
+        }
+        ScriptSystemContext::VariableBounds& bounds = rt.bounds[node.name];
+        const double value = evaluateExpr(node.expr, rt);
+        if (node.property == "max") {
+            bounds.highest = value;
+            bounds.hasHighest = true;
+        } else {
+            bounds.lowest = value;
+            bounds.hasLowest = true;
+        }
+        // Declaring a bound also re-clamps whatever the variable
+        // already holds, so declaration order never leaks a
+        // pre-bound overflow into the game.
+        if (const auto it = rt.variables.find(node.name); it != rt.variables.end()) {
+            it->second = clampToBounds(rt, node.name, it->second);
+        }
+        return;
+    }
+    case DSLNodeKind::EffectAssign: {
+        if (arming) {
+            return;
+        }
+        if (node.name != "chromatic_aberration") {
+            ENGINE_LOG_WARNING("Script: unknown effect property '" << node.name
+                                                                    << "' (supported: chromatic_aberration)");
+            return;
+        }
+        if (node.hasLerp) {
+            startLerp(frame, Lerp::Target::EffectProperty, node.name, node.property, "", evaluateExpr(node.expr, rt),
+                      node.lerpDuration);
+            return;
+        }
+        cancelLerps(rt, Lerp::Target::EffectProperty, node.name, node.property, "");
+        frame.context.effects.chromaticAberration = evaluateExpr(node.expr, rt);
+        return;
+    }
+    case DSLNodeKind::HudPrint: {
+        if (arming) {
+            return;
+        }
+        ActiveHudPrint print;
+        print.text = node.name;
+        print.xPercent = node.hudXPercent;
+        print.yPercent = node.hudYPercent;
+        print.color = glm::vec3{node.hudRed, node.hudGreen, node.hudBlue};
+        print.duration = node.hudDuration;
+        print.fade = node.hudFade;
+        print.source = frame.self;
+        print.alpha = print.fade ? 0.0f : 1.0f;
+        // Re-printing the same text refreshes it in place.
+        auto& prints = frame.context.hudPrints;
+        prints.erase(std::remove_if(prints.begin(), prints.end(),
+                                    [&](const ActiveHudPrint& other) {
+                                        return other.source == print.source && other.text == print.text;
+                                    }),
+                     prints.end());
+        prints.push_back(print);
         return;
     }
     case DSLNodeKind::PartAssign: {
         if (arming) {
             return;
         }
-        const entt::entity target = findByName(registry, node.name);
-        if (target == entt::null) {
+        if (node.hasLerp) {
+            startLerp(frame, Lerp::Target::PartProperty, node.name, node.property, node.extra,
+                      evaluateExpr(node.expr, rt), node.lerpDuration);
             return;
         }
-        const double value = evaluateExpr(node.expr, rt);
-        if (node.property == "intensity") {
-            if (registry.all_of<PointLightComponent>(target)) {
-                registry.get<PointLightComponent>(target).intensity = static_cast<float>(value);
-            } else if (registry.all_of<SpotLightComponent>(target)) {
-                registry.get<SpotLightComponent>(target).intensity = static_cast<float>(value);
-            } else if (registry.all_of<DirectionalLightComponent>(target)) {
-                registry.get<DirectionalLightComponent>(target).intensity = static_cast<float>(value);
-            }
-        } else if (node.property == "scale") {
-            if (registry.all_of<TransformComponent>(target)) {
-                auto& scale = registry.get<TransformComponent>(target).scale;
-                if (node.extra == "x") {
-                    scale.x = static_cast<float>(value);
-                } else if (node.extra == "y") {
-                    scale.y = static_cast<float>(value);
-                } else if (node.extra == "z") {
-                    scale.z = static_cast<float>(value);
-                }
-            }
-        } else if (node.property == "range") {
-            if (registry.all_of<PointLightComponent>(target)) {
-                registry.get<PointLightComponent>(target).range = static_cast<float>(value);
-            } else if (registry.all_of<AudioComponent>(target)) {
-                registry.get<AudioComponent>(target).range = static_cast<float>(value);
-            }
-        } else if (node.property == "volume") {
-            registry.get_or_emplace<AudioComponent>(target).volume = static_cast<float>(value);
-        }
+        cancelLerps(rt, Lerp::Target::PartProperty, node.name, node.property, node.extra);
+        applyPartProperty(registry, findByName(registry, node.name), node.property, node.extra,
+                          evaluateExpr(node.expr, rt));
         return;
     }
     case DSLNodeKind::PartCall: {
@@ -238,6 +459,16 @@ void execNode(Frame& frame, const DSLNode& node, bool arming) {
         return;
     }
     case DSLNodeKind::EventBlock: {
+        if (node.event == DSLEventKind::Start) {
+            // on_start() { ... }: runs once at setup; handlers
+            // nested inside latch so they arm from this frame on.
+            if (!arming) {
+                Frame inner = frame;
+                inner.latchSink = &rt.latched;
+                execBlock(inner, node.body);
+            }
+            return;
+        }
         if (frame.armed != nullptr) {
             frame.armed->push_back({&node, frame});
         }
@@ -388,19 +619,25 @@ double ScriptInterpreter::evaluate(const DSLExpr& expr, const std::unordered_map
 }
 
 void ScriptSystem::attach(ScriptSystemContext& context, EventBus& bus) {
+    // Physical (solid) impacts are on_touch / on_collide events:
+    // one CollisionEvent feeds both spellings, each handler kind
+    // still matches exactly once.
     bus.subscribe<CollisionEvent>([&context](const CollisionEvent& e) {
-        DSLEvent event;
-        event.kind = DSLEventKind::Collide;
-        event.entityA = e.entityA;
-        event.entityB = e.entityB;
-        context.eventQueue.push_back(event);
+        for (const DSLEventKind kind : {DSLEventKind::Touch, DSLEventKind::Collide}) {
+            DSLEvent event;
+            event.kind = kind;
+            event.entityA = e.entityA;
+            event.entityB = e.entityB;
+            context.eventQueue.push_back(event);
+        }
     });
+    // Ghost volumes are on_trigger events (entered edges only).
     bus.subscribe<TriggerEvent>([&context](const TriggerEvent& e) {
         if (!e.entered) {
             return;
         }
         DSLEvent event;
-        event.kind = DSLEventKind::Touch;
+        event.kind = DSLEventKind::Trigger;
         event.entityA = e.triggerEntity;
         event.entityB = e.otherEntity;
         event.targetEntity = e.triggerEntity;
@@ -412,6 +649,13 @@ void ScriptSystem::attach(ScriptSystemContext& context, EventBus& bus) {
 void ScriptSystem::postInputEvent(ScriptSystemContext& context, const std::string& key, bool held) {
     DSLEvent event;
     event.kind = held ? DSLEventKind::InputHold : DSLEventKind::InputPress;
+    event.target = key;
+    context.eventQueue.push_back(event);
+}
+
+void ScriptSystem::postInputRelease(ScriptSystemContext& context, const std::string& key) {
+    DSLEvent event;
+    event.kind = DSLEventKind::InputRelease;
     event.target = key;
     context.eventQueue.push_back(event);
 }
@@ -590,6 +834,8 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
             rt.deadReported = false;
             rt.variables.clear();
             rt.textVariables.clear();
+            rt.bounds.clear();
+            rt.lerps.clear();
             rt.heldItems.clear();
             if (!rt.errors.empty()) {
                 for (const std::string& error : rt.errors) {
@@ -708,7 +954,8 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
             }
             bool match = false;
             entt::entity resolvedTarget = event.targetEntity;
-            if (event.kind == DSLEventKind::InputPress || event.kind == DSLEventKind::InputHold) {
+            if (event.kind == DSLEventKind::InputPress || event.kind == DSLEventKind::InputHold ||
+                event.kind == DSLEventKind::InputRelease) {
                 match = node->name == event.target;
             } else if (event.kind == DSLEventKind::Interact) {
                 match = node->name == event.target;
@@ -735,7 +982,9 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
             Frame exec = frame;
             exec.event = &fired;
             exec.latchSink = &exec.runtime.latched;
-            if (exec.positionEntity == entt::null && (event.kind == DSLEventKind::Touch || event.kind == DSLEventKind::Collide)) {
+            if (exec.positionEntity == entt::null &&
+                (event.kind == DSLEventKind::Touch || event.kind == DSLEventKind::Trigger ||
+                 event.kind == DSLEventKind::Collide)) {
                 exec.positionEntity = resolvedTarget;
             }
             execBlock(exec, node->body);
@@ -787,6 +1036,41 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double del
                         rt.timers.end());
     }
 
+    // Tick lerps (the `over Xs` interpolation tasks): every frame
+    // advances each task by dt and writes the interpolated value;
+    // reaching the target completes and removes the task.
+    for (auto& [scriptEntity, rt] : context.runtimes) {
+        (void)scriptEntity;
+        for (Lerp& lerp : rt.lerps) {
+            lerp.elapsed += deltaSeconds;
+            const double t = lerp.duration > 0.0 ? std::min(1.0, lerp.elapsed / lerp.duration) : 1.0;
+            applyLerpTarget(scene, context, rt, lerp, lerp.from + (lerp.to - lerp.from) * t);
+            lerp.dead = t >= 1.0;
+        }
+        rt.lerps.erase(std::remove_if(rt.lerps.begin(), rt.lerps.end(),
+                                      [](const Lerp& lerp) { return lerp.dead; }),
+                       rt.lerps.end());
+    }
+
+    // Tick HUD prints: age them, compute the fade alpha (equal
+    // fade-in/out windows capped at half the lifetime), expire.
+    for (ActiveHudPrint& print : context.hudPrints) {
+        print.elapsed += deltaSeconds;
+        if (!print.fade) {
+            print.alpha = 1.0f;
+        } else {
+            const double window = std::min(0.5, print.duration * 0.5);
+            const double in = window > 0.0 ? print.elapsed / window : 1.0;
+            const double out = window > 0.0 ? (print.duration - print.elapsed) / window : 1.0;
+            print.alpha = static_cast<float>(std::clamp(std::min(in, out), 0.0, 1.0));
+        }
+    }
+    context.hudPrints.erase(std::remove_if(context.hudPrints.begin(), context.hudPrints.end(),
+                                           [](const ActiveHudPrint& print) {
+                                               return print.duration <= 0.0 || print.elapsed >= print.duration;
+                                           }),
+                            context.hudPrints.end());
+
     // Deferred destroys.
     for (const entt::entity target : destroyQueue) {
         if (registry.valid(target)) {
@@ -825,9 +1109,13 @@ void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, const Inpu
     };
     for (const KeyName& entry : kKeys) {
         const bool pressed = entry.isKey ? input.wasKeyPressed(entry.key) : input.wasMouseButtonPressed(entry.button);
+        const bool released = entry.isKey ? input.wasKeyReleased(entry.key) : input.wasMouseButtonReleased(entry.button);
         const bool down = entry.isKey ? input.isKeyDown(entry.key) : input.isMouseButtonDown(entry.button);
         if (pressed) {
             postInputEvent(context, entry.name, false);
+        }
+        if (released) {
+            postInputRelease(context, entry.name);
         }
         if (down) {
             postInputEvent(context, entry.name, true);

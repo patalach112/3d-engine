@@ -5,6 +5,7 @@
 
 #include <entt/entity/entity.hpp>
 #include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
 
 #include <deque>
 #include <optional>
@@ -95,11 +96,38 @@ struct ScriptSystemContext {
         entt::entity positionEntity = entt::null;
         uint32_t group = 0;
     };
+    // Declared value boundaries: health(max) = 100 /
+    // health(lowest) = 0. Every write to a bounded variable
+    // (instant or lerped) is clamped into [lowest, highest].
+    struct VariableBounds {
+        double lowest = 0.0;
+        double highest = 0.0;
+        bool hasLowest = false;
+        bool hasHighest = false;
+    };
+    // A non-blocking linear interpolation spawned by
+    // `target = value over Xs`: ticked every frame with dt until
+    // the target is reached, then removed. A fresh write to the
+    // same target replaces (or, without `over`, cancels) it.
+    struct Lerp {
+        enum class Target : uint8_t { Variable, PartProperty, EffectProperty };
+        Target target = Target::Variable;
+        std::string name;     // variable name / part target name / effect property
+        std::string property; // part/effect property ("" for variables)
+        std::string axis;     // scale axis for part targets
+        double from = 0.0;
+        double to = 0.0;
+        double elapsed = 0.0;
+        double duration = 0.0;
+        bool dead = false;
+    };
     struct Runtime {
         DSLProgram program;
         std::vector<std::string> errors;
         std::unordered_map<std::string, double> variables;
         std::unordered_map<std::string, std::string> textVariables;
+        std::unordered_map<std::string, VariableBounds> bounds;
+        std::vector<Lerp> lerps;
         std::vector<std::string> heldItems;
         std::vector<Timer> timers;
         std::vector<LatchedHandler> latched;
@@ -111,7 +139,30 @@ struct ScriptSystemContext {
         std::vector<const DSLNode*> finishedFors; // top-level windows never restart
     };
 
+    // One live hudprint("...") instance: percentage-anchored
+    // screen text with a lifetime; `alpha` is recomputed every
+    // tick (fade in/out) for the host's HUD pass to draw with.
+    struct ActiveHudPrint {
+        std::string text;
+        float xPercent = 50.0f;
+        float yPercent = 50.0f;
+        glm::vec3 color{1.0f};
+        float alpha = 1.0f;
+        double duration = 3.0;
+        double elapsed = 0.0;
+        bool fade = false;
+        entt::entity source = entt::null; // script entity that printed it
+    };
+    // Global post-processing state scripts drive through
+    // `effect.<property> = value` (the host mirrors it into the
+    // renderer's PostSettings every frame).
+    struct PostEffects {
+        double chromaticAberration = 0.0;
+    };
+
     std::unordered_map<entt::entity, Runtime> runtimes;
+    std::vector<ActiveHudPrint> hudPrints;
+    PostEffects effects;
     std::unordered_map<entt::entity, int64_t> fileStamps; // .dsla mtimes seen (AutoReload)
     std::unordered_map<entt::entity, glm::vec3> spawnPositions; // first-seen transforms (position = reset)
     std::deque<DSLEvent> eventQueue;
@@ -131,6 +182,8 @@ public:
     // on_input, InputHold stays level-true while held (re-latch
     // each frame while the key is down).
     static void postInputEvent(ScriptSystemContext& context, const std::string& key, bool held);
+    // Release edge for on_input_release("ActionName") handlers.
+    static void postInputRelease(ScriptSystemContext& context, const std::string& key);
     static void postInteract(ScriptSystemContext& context, const std::string& targetName, entt::entity actor);
     static void postEvent(ScriptSystemContext& context, DSLEvent event);
 
