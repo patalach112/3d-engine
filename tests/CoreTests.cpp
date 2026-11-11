@@ -42,7 +42,7 @@
 #include "Graphics/EditorLayout.h"
 #include "Graphics/HudFont.h"
 #include "Graphics/RenderQueue.h"
-#include "Graphics/BitmapFont.h"
+#include "Graphics/DynamicFont.h"
 #include "Graphics/UIContext.h"
 #include "Graphics/UIInspector.h"
 #include "Graphics/UIRenderer.h"
@@ -7929,11 +7929,10 @@ void testPhase26UIRenderer() {
     check(batch.empty() && !batch.truncated() && batch.textItemCount() == 0,
           "ui: begin resets geometry, text items and truncation");
 
-    // --- (g) TrueType font atlas generation ----------------------------------
-    const engine::FontAtlas atlas = engine::generateFontAtlas();
-    check(!atlas.empty() && atlas.trueType && !atlas.fontName.empty() &&
-              atlas.pixels.size() == static_cast<size_t>(atlas.width) * atlas.height,
-          "ui font: a real TrueType font bakes the bitmap coverage page (system sans or bundled fallback)");
+    // --- (g) Dynamic TrueType font -------------------------------------------
+    engine::DynamicFont atlas = engine::createUiFont();
+    check(atlas.trueType() && !atlas.fontName().empty(),
+          "ui font: a real TrueType face backs the dynamic font (system sans or bundled fallback)");
     const engine::FontGlyph& glyphA = atlas.glyphFor('A');
     check(glyphA.u0 >= 0.0f && glyphA.v0 >= 0.0f && glyphA.u1 <= 1.0f && glyphA.v1 <= 1.0f &&
               glyphA.u1 > glyphA.u0 && glyphA.advance > 0.0f && glyphA.width > 0.0f && glyphA.height > 0.0f,
@@ -7941,59 +7940,49 @@ void testPhase26UIRenderer() {
     check(atlas.glyphFor('a').u0 != glyphA.u0 && atlas.glyphFor('a').advance != glyphA.advance &&
               atlas.glyphFor('\x01').u0 == atlas.glyphFor('?').u0,
           "ui font: mixed case is distinct ('a' != 'A'); unknown glyphs fall back to '?'");
-    check(atlas.glyphFor('W').advance > atlas.glyphFor('i').advance && atlas.ascent > 0.0f &&
-              atlas.lineHeight > atlas.ascent && atlas.glyphFor(' ').advance > 0.0f &&
+    check(atlas.glyphFor('W').advance > atlas.glyphFor('i').advance && atlas.ascent() > 0.0f &&
+              atlas.lineHeight() > atlas.ascent() && atlas.glyphFor(' ').advance > 0.0f &&
               atlas.glyphFor(' ').width == 0.0f,
           "ui font: proportional advances, baseline metrics, space advances without a quad");
     {
-        // Inspect the 'A' glyph rect: deep-interior texels and a
-        // populated ramp band (a true distance field, not a mask).
-        const uint32_t x0 = static_cast<uint32_t>(glyphA.u0 * static_cast<float>(atlas.width));
-        const uint32_t y0 = static_cast<uint32_t>(glyphA.v0 * static_cast<float>(atlas.height));
-        const uint32_t x1 = static_cast<uint32_t>(glyphA.u1 * static_cast<float>(atlas.width));
-        const uint32_t y1 = static_cast<uint32_t>(glyphA.v1 * static_cast<float>(atlas.height));
+        // Inspect the 'A' glyph rect in its page: solid interior
+        // texels (coverage, not a mask) and a populated AA ramp band.
+        const std::vector<uint8_t>& page = atlas.pagePixels(glyphA.page);
+        const float pageSize = static_cast<float>(atlas.pageSize());
+        const uint32_t x0 = static_cast<uint32_t>(std::lround(glyphA.u0 * pageSize));
+        const uint32_t y0 = static_cast<uint32_t>(std::lround(glyphA.v0 * pageSize));
+        const uint32_t x1 = static_cast<uint32_t>(std::lround(glyphA.u1 * pageSize));
+        const uint32_t y1 = static_cast<uint32_t>(std::lround(glyphA.v1 * pageSize));
         uint32_t mid = 0;
         uint8_t deepest = 0;
         for (uint32_t y = y0; y < y1; ++y) {
             for (uint32_t x = x0; x < x1; ++x) {
-                const uint8_t value = atlas.pixels[y * atlas.width + x];
+                const uint8_t value = page[y * atlas.pageSize() + x];
                 deepest = std::max(deepest, value);
                 if (value > 64 && value < 192) {
                     ++mid;
                 }
             }
         }
-        check(deepest >= 160 && mid > 0, "ui font: field has interior and ramp where expected");
-        check(engine::generateTrueTypeBitmapAtlas(std::span<const uint8_t>{}).empty() &&
-                  engine::generateTrueTypeBitmapAtlas(
-                      std::span<const uint8_t>{std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}})
-                      .empty(),
-              "ui font: empty/garbage font bytes are rejected without crashing the rasterizer");
-    }
-
-    // --- (h) Atlas save/load round-trip ----------------------------------------
-    {
-        const std::vector<uint8_t> blob = engine::saveFontAtlas(atlas);
-        engine::FontAtlas loaded;
-        check(engine::loadFontAtlas(blob, loaded) && loaded.width == atlas.width &&
-                  loaded.height == atlas.height && loaded.pixels == atlas.pixels &&
-                  loaded.glyphFor('A').u1 == glyphA.u1 && loaded.advance == atlas.advance,
-              "ui font blob: save/load round-trips page, glyph table and metrics");
-        engine::FontAtlas untouched;
-        const std::vector<uint8_t> shortBlob(blob.begin(), blob.begin() + 20);
-        std::vector<uint8_t> corrupt = blob;
-        corrupt[0] = 'X';
-        check(!engine::loadFontAtlas(shortBlob, untouched) && !engine::loadFontAtlas(corrupt, untouched) &&
-                  untouched.empty(),
-              "ui font blob: truncated/corrupt blobs are rejected without touching the output");
+        check(deepest == 255 && mid > 0, "ui font: glyph coverage has solid interior and an AA ramp");
+        check(!engine::DynamicFont::fromBytes({}, "none").trueType() &&
+                  !engine::DynamicFont::fromBytes(
+                       std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, "junk")
+                       .trueType(),
+              "ui font: empty/garbage font bytes degrade to the fallback face without crashing");
     }
 
     // --- (i) TrueType text layout (proportional, kerned, baseline) ------------
     engine::UIBatch textBatch;
-    textBatch.setFontAtlas(&atlas);
+    textBatch.setFont(&atlas);
     textBatch.begin(1280, 720);
-    const engine::FontGlyph& glyphB = atlas.glyphFor('B');
-    const float expectedAB = glyphA.advance + atlas.kernFor('A', 'B') + glyphB.advance;
+    // scale 1.0 typesets at its own quantized pixel size; expected
+    // metrics come from that size, not the default one.
+    const int sizeAtScale1 = engine::fontPixelSizeForScale(1.0f);
+    const engine::FontGlyph& glyphA1 = atlas.glyphFor('A', sizeAtScale1);
+    const engine::FontGlyph& glyphB = atlas.glyphFor('B', sizeAtScale1);
+    const float expectedAB =
+        glyphA1.advance + atlas.kernFor('A', 'B', sizeAtScale1) + glyphB.advance;
     check(textBatch.measureText("AB", 1.0f) == expectedAB && textBatch.measureText("", 3.0f) == 0.0f &&
               textBatch.measureText("ABC\nD", 1.0f) >
                   textBatch.measureText("ABC", 1.0f) - textBatch.measureText("D", 1.0f),
@@ -8006,22 +7995,33 @@ void testPhase26UIRenderer() {
     {
         const std::vector<engine::UIVertex>& v = textBatch.vertices();
         check(v[0].kind == engine::kUITextPrimitive &&
-                  v[0].uvRect == glm::vec4{glyphA.u0, glyphA.v0, glyphA.u1, glyphA.v1},
+                  v[0].uvRect == glm::vec4{glyphA1.u0, glyphA1.v0, glyphA1.u1, glyphA1.v1},
               "ui text: glyph quad samples its atlas rect as bitmap text");
-        check(v[0].position == glm::vec2{std::round(100.0f + glyphA.bearingX),
-                                         std::round(50.0f + atlas.ascent + glyphA.bearingY)},
+        check(v[0].position == glm::vec2{std::round(100.0f + glyphA1.bearingX),
+                                         std::round(50.0f + atlas.ascent(sizeAtScale1) + glyphA1.bearingY)},
               "ui text: quad hangs off the baseline by the glyph's bearing, std::round-snapped to a pixel");
+        // The quad is exactly the rasterized bitmap: integer texels
+        // wide/high, so sampling can never rescale the ink.
+        check(v[2].position.x - v[0].position.x == glyphA1.width &&
+                  v[2].position.y - v[0].position.y == glyphA1.height &&
+                  std::floor(glyphA1.width) == glyphA1.width && std::floor(glyphA1.height) == glyphA1.height,
+              "ui text: glyph quad size is the exact whole-pixel bitmap (1:1 texel transfer)");
         check(nearlyEqual(v[4].position.x - v[0].position.x,
-                          glyphA.advance + atlas.kernFor('A', 'B') + glyphB.bearingX - glyphA.bearingX, 1.0) &&
+                          glyphA1.advance + atlas.kernFor('A', 'B', sizeAtScale1) + glyphB.bearingX -
+                              glyphA1.bearingX,
+                          1.0) &&
                   v[4].uvRect.x == glyphB.u0,
               "ui text: pen advances by proportional advance + kerning (within the 1px snap)");
         check(textBatch.segments().size() == 1 && textBatch.segments()[0].texture == engine::kUIFontTexture,
               "ui text: glyphs batch into one font-texture segment");
     }
+    const int sizeAtScale2 = engine::fontPixelSizeForScale(2.0f);
+    const engine::FontGlyph& glyphA2 = atlas.glyphFor('A', sizeAtScale2);
+    const engine::FontGlyph& glyphB2 = atlas.glyphFor('B', sizeAtScale2);
     textBatch.drawText("A\nB", 0.0f, 0.0f, 2.0f, fill);
     check(nearlyEqual(textBatch.vertices()[12].position.y - textBatch.vertices()[8].position.y,
-                      atlas.lineHeight * 2.0f + (glyphB.bearingY - glyphA.bearingY) * 2.0f, 1.0) &&
-              nearlyEqual(textBatch.vertices()[12].position.x, glyphB.bearingX * 2.0f, 0.75),
+                      atlas.lineHeight(sizeAtScale2) + (glyphB2.bearingY - glyphA2.bearingY), 1.0) &&
+              nearlyEqual(textBatch.vertices()[12].position.x, glyphB2.bearingX, 0.75),
           "ui text: newline resets the pen and steps one (font-metric) line height (within the 1px snap)");
 
     // --- (j) Texture batching splits segments by texture id ----------------------
@@ -8083,10 +8083,10 @@ void testPhase26UIRenderer() {
 
 void testPhase26Widgets() {
     struct Rig {
-        engine::FontAtlas atlas = engine::generateFontAtlas();
+        engine::DynamicFont atlas = engine::createUiFont();
         engine::UIBatch batch;
         engine::UIContext ctx;
-        Rig() { batch.setFontAtlas(&atlas); }
+        Rig() { batch.setFont(&atlas); }
         void begin(float mouseX, float mouseY, bool mouseDown, int keyStep = 0) {
             batch.begin(800, 600);
             ctx.beginFrame(engine::UIInput{mouseX, mouseY, mouseDown, keyStep}, batch);
@@ -8300,10 +8300,10 @@ void testPhase26Widgets() {
 void testPhase27Editor() {
     std::cout << "Phase 27: editor shell, outliner & context menus\n";
     struct EditorRig {
-        engine::FontAtlas atlas = engine::generateFontAtlas();
+        engine::DynamicFont atlas = engine::createUiFont();
         engine::UIBatch batch;
         engine::UIContext ctx;
-        EditorRig() { batch.setFontAtlas(&atlas); }
+        EditorRig() { batch.setFont(&atlas); }
         void frame(float mouseX, float mouseY, bool down, bool right = false, bool esc = false, float scroll = 0.0f) {
             batch.begin(800, 600);
             engine::UIInput input;
@@ -8641,10 +8641,10 @@ void testPhase27Editor() {
 void testPhase28Gizmos() {
     std::cout << "Phase 28: raycast picking & transform gizmos\n";
     struct GizmoRig {
-        engine::FontAtlas atlas = engine::generateFontAtlas();
+        engine::DynamicFont atlas = engine::createUiFont();
         engine::UIBatch batch;
         engine::UIContext ctx;
-        GizmoRig() { batch.setFontAtlas(&atlas); }
+        GizmoRig() { batch.setFont(&atlas); }
         void frame(float mouseX, float mouseY, bool down) {
             batch.begin(800, 600);
             engine::UIInput input;
@@ -8942,10 +8942,10 @@ void testPhase28Gizmos() {
 void testPhase29Assets() {
     std::cout << "Phase 29: asset browser & drag-and-drop\n";
     struct AssetRig {
-        engine::FontAtlas atlas = engine::generateFontAtlas();
+        engine::DynamicFont atlas = engine::createUiFont();
         engine::UIBatch batch;
         engine::UIContext ctx;
-        AssetRig() { batch.setFontAtlas(&atlas); }
+        AssetRig() { batch.setFont(&atlas); }
         void frame(float mouseX, float mouseY, bool down, bool esc = false) {
             batch.begin(800, 600);
             engine::UIInput input;
@@ -9592,9 +9592,9 @@ void testEditorSelectionOutline() {
     {
         // Gizmo handles: the same confinement spans the whole
         // rendering block of update().
-        engine::FontAtlas atlas = engine::generateFontAtlas();
+        engine::DynamicFont atlas = engine::createUiFont();
         engine::UIBatch batch;
-        batch.setFontAtlas(&atlas);
+        batch.setFont(&atlas);
         engine::UIContext ctx;
         batch.begin(1280, 720);
         engine::UIInput input;
@@ -9613,14 +9613,148 @@ void testEditorSelectionOutline() {
     }
 }
 
+void testDynamicFont() {
+    std::cout << "Dynamic font: exact-size glyph cache\n";
+
+    engine::DynamicFont font = engine::createUiFont();
+    if (!font.trueType()) {
+        check(false, "dynamic font: a TrueType face is available for the cache tests");
+        return;
+    }
+
+    // --- Exact-size rasterization ---------------------------------------------
+    const engine::FontGlyph& small = font.glyphFor('H', 12);
+    const float smallW = small.width;
+    const float smallH = small.height;
+    const engine::FontGlyph& large = font.glyphFor('H', 48);
+    check(large.width > smallW * 3.0f && large.height > smallH * 3.0f &&
+              std::floor(large.width) == large.width && std::floor(small.width) == small.width,
+          "dynamic font: each size rasterizes its own whole-pixel bitmap (no shared fixed bake)");
+    check(font.cachedSizeCount() >= 2,
+          "dynamic font: multiple sizes are cached side by side (zoom switches never re-rasterize)");
+    const size_t cachedBefore = font.cachedGlyphCount();
+    const engine::FontGlyph& again = font.glyphFor('H', 12);
+    check(&again == &small && font.cachedGlyphCount() == cachedBefore,
+          "dynamic font: a cached (codepoint, size) resolves to the same glyph without re-baking");
+    check(nearlyEqual((large.u1 - large.u0) * static_cast<float>(font.pageSize()), large.width, 0.01) &&
+              nearlyEqual((small.v1 - small.v0) * static_cast<float>(font.pageSize()), small.height, 0.01),
+          "dynamic font: glyph page rects are exactly the rasterized bitmaps, texel for texel");
+
+    // --- Metrics without ink; layout/render agreement --------------------------
+    const float advanceOnly = font.advanceFor('Z', 18);
+    check(font.glyphFor('Z', 18).width > 0.0f && font.glyphFor('Z', 18).advance == advanceOnly,
+          "dynamic font: advanceFor measures without ink; glyphFor upgrades the same entry");
+    check(font.advanceFor(' ', 18) > 0.0f && font.glyphFor(' ', 18).width == 0.0f,
+          "dynamic font: space advances but rasterizes no quad");
+    {
+        engine::UIBatch batch;
+        batch.setFont(&font);
+        batch.begin(800, 200);
+        const float w1 = batch.measureText("Viewport", 1.0f);
+        batch.drawText("Viewport", 10.0f, 10.0f, 1.0f, glm::vec4{1.0f});
+        // The rendered run's advance span (last snap + last advance)
+        // brackets the measurement within one snap pixel.
+        const auto& verts = batch.vertices();
+        const int sizeAtScale1 = engine::fontPixelSizeForScale(1.0f);
+        const float expectedLastX =
+            10.0f + (w1 - font.advanceFor('t', sizeAtScale1)) + font.glyphFor('t', sizeAtScale1).bearingX;
+        check(!verts.empty() && w1 > 0.0f && std::abs(verts.back().position.x - expectedLastX) <= 1.0f,
+              "dynamic font: measured width and rendered advance span agree (layout cannot drift)");
+    }
+
+    // --- Unicode + tofu ---------------------------------------------------------
+    const engine::FontGlyph& eAcute = font.glyphFor(0xE9, 18); // LATIN SMALL LETTER E WITH ACUTE
+    const engine::FontGlyph& tofu = font.glyphFor('?', 18);
+    check(eAcute.width > 0.0f && eAcute.u0 != tofu.u0,
+          "dynamic font: non-ASCII codepoints the face carries typeset as themselves, not '?'");
+    const engine::FontGlyph& missing = font.glyphFor(0x4E2D, 18); // CJK: absent from the candidate faces
+    check(missing.u0 == tofu.u0 && missing.v0 == tofu.v0 && missing.advance == tofu.advance &&
+              missing.width == tofu.width,
+          "dynamic font: a codepoint the face lacks resolves to the '?' glyph exactly");
+
+    // --- Saturation restart -----------------------------------------------------
+    {
+        std::vector<uint8_t> bytes;
+        for (const std::string& candidate : engine::uiFontCandidatePaths()) {
+            std::ifstream file(candidate, std::ios::binary | std::ios::ate);
+            if (!file) {
+                continue;
+            }
+            const std::streamoff size = file.tellg();
+            if (size <= 0) {
+                continue;
+            }
+            bytes.resize(static_cast<size_t>(size));
+            file.seekg(0, std::ios::beg);
+            file.read(reinterpret_cast<char*>(bytes.data()), size);
+            if (file) {
+                break;
+            }
+            bytes.clear();
+        }
+        check(!bytes.empty(), "dynamic font: candidate font bytes readable for the saturation test");
+        engine::DynamicFont tiny =
+            engine::DynamicFont::fromBytes(bytes, "tiny-pages", 128, 2); // 2 pages of 128x128
+        const engine::FontGlyph tofu24 = tiny.glyphFor('?', 24); // snapshot: later calls may restart
+        bool saturated = false;
+        for (int size : {24, 32, 40, 48}) {
+            const engine::FontGlyph tofuAtSize = tiny.glyphFor('?', size);
+            for (uint32_t cp = engine::kFontFirstChar; cp <= engine::kFontLastChar && !saturated; ++cp) {
+                if (cp == static_cast<uint32_t>('?')) {
+                    continue;
+                }
+                const engine::FontGlyph& g = tiny.glyphFor(cp, size);
+                saturated = g.u0 == tofuAtSize.u0 && g.v0 == tofuAtSize.v0 && g.width == tofuAtSize.width &&
+                            g.width > 0.0f;
+            }
+        }
+        check(saturated, "dynamic font: when every page fills, new glyphs degrade to '?' (never corrupt ink)");
+        check(tiny.pageCount() == 2, "dynamic font: the cache is bounded at the configured page count");
+        const uint64_t revisionBefore = tiny.pageRevision(0);
+        tiny.beginFrame(); // the frame-boundary restart UIBatch::begin drives
+        const engine::FontGlyph freshA = tiny.glyphFor('A', 24);
+        check(tiny.pageCount() >= 1 && freshA.width > 0.0f &&
+                  !(freshA.u0 == tofu24.u0 && freshA.width == tofu24.width) &&
+                  tiny.pageRevision(freshA.page) > revisionBefore,
+              "dynamic font: after the restart glyphs re-rasterize fresh, page revisions stay monotonic");
+    }
+
+    // --- Batch segment splits across pages --------------------------------------
+    {
+        engine::UIBatch batch;
+        batch.setFont(&font);
+        batch.begin(800, 200);
+        batch.drawText("PageZero", 0.0f, 0.0f, 1.0f, glm::vec4{1.0f});
+        bool texturesSane = !batch.segments().empty();
+        for (const engine::UISegment& segment : batch.segments()) {
+            texturesSane = texturesSane && segment.texture >= engine::kUIFontTexture &&
+                            segment.texture < engine::kUIFontTexture + engine::kFontTexturePages;
+        }
+        check(texturesSane, "dynamic font: text segments always reference reserved font-page textures");
+    }
+
+    // --- Synthetic fallback face -----------------------------------------------
+    {
+        engine::DynamicFont fallback; // no TrueType bytes anywhere
+        check(!fallback.trueType(), "dynamic font: the default font is the synthetic fallback face");
+        const engine::FontGlyph& fa = fallback.glyphFor('A', 18);
+        const engine::FontGlyph& faLower = fallback.glyphFor('a', 18);
+        check(fa.width == 10.0f && fa.height == 14.0f && fa.advance == 12.0f &&
+                  faLower.width == fa.width && faLower.advance == fa.advance &&
+                  fallback.glyphFor('W', 18).advance == fallback.glyphFor('i', 18).advance &&
+                  fallback.kernFor('A', 'V', 18) == 0.0f,
+              "dynamic font: fallback typesets monospace 5x7 blocks (all-caps, unkerned) at any size");
+    }
+}
+
 void testPhase34EditorFixes() {
     std::cout << "Phase 34: editor fixes — SDF batch integrity, slider ranges, local-frame gizmo, "
                  "context menus, text entry\n";
     struct Rig {
-        engine::FontAtlas atlas = engine::generateFontAtlas();
+        engine::DynamicFont atlas = engine::createUiFont();
         engine::UIBatch batch;
         engine::UIContext ctx;
-        Rig() { batch.setFontAtlas(&atlas); }
+        Rig() { batch.setFont(&atlas); }
         void begin(const engine::UIInput& input) {
             batch.begin(800, 600);
             ctx.beginFrame(input, batch);
@@ -9650,7 +9784,7 @@ void testPhase34EditorFixes() {
                   segments[1].texture == engine::kUIFontTexture &&
                   segments[0].indexCount + segments[1].indexCount == indices.size(),
               "text batch: segments partition the index buffer contiguously, split on the texture switch");
-        const engine::FontGlyph& glyphH = rig.atlas.glyphFor('H');
+        const engine::FontGlyph& glyphH = rig.atlas.glyphFor('H', engine::fontPixelSizeForScale(1.5f));
         const engine::UIVertex& q0 = vertices[4];
         const engine::UIVertex& q2 = vertices[6];
         check(q0.kind == engine::kUITextPrimitive && q0.uvRect == glm::vec4{glyphH.u0, glyphH.v0, glyphH.u1, glyphH.v1} &&
@@ -9670,35 +9804,47 @@ void testPhase34EditorFixes() {
                   layout.attributes[6].offset == offsetof(engine::UIVertex, uvRect) &&
                   layout.attributes[7].offset == offsetof(engine::UIVertex, kind),
               "text batch: Vulkan attribute offsets/stride match the CPU vertex layout exactly");
-        // Atlas packing: glyph rects never overlap, and TrueType
-        // glyphs keep a 2-texel empty gap so bilinear edge taps and
-        // the (mild) mip footprint never reach a neighbour's ink.
+        // Atlas packing: within a page, the dynamically baked
+        // glyph rects (several sizes may share one) never overlap,
+        // and TrueType glyphs keep a 2-texel empty gap so bilinear
+        // edge taps never reach a neighbour's ink.
         bool overlapFree = true;
         bool moatKept = true;
-        const float atlasW = static_cast<float>(rig.atlas.width);
-        const float atlasH = static_cast<float>(rig.atlas.height);
-        for (size_t a = 0; a < rig.atlas.glyphs.size(); ++a) {
-            const engine::FontGlyph& ga = rig.atlas.glyphs[a];
-            if (ga.width <= 0.0f || ga.height <= 0.0f) {
-                continue;
-            }
-            for (size_t b = a + 1; b < rig.atlas.glyphs.size(); ++b) {
-                const engine::FontGlyph& gb = rig.atlas.glyphs[b];
-                if (gb.width <= 0.0f || gb.height <= 0.0f) {
-                    continue;
+        const auto texelRect = [](const engine::FontGlyph& g, float pageSize, float& x0, float& y0,
+                                  float& x1, float& y1) {
+            x0 = std::round(g.u0 * pageSize);
+            y0 = std::round(g.v0 * pageSize);
+            x1 = std::round(g.u1 * pageSize);
+            y1 = std::round(g.v1 * pageSize);
+        };
+        const float pageSize = static_cast<float>(rig.atlas.pageSize());
+        for (int size : {engine::kReferenceFontPixelSize, 27}) {
+            std::vector<const engine::FontGlyph*> baked;
+            for (uint32_t cp = engine::kFontFirstChar; cp <= engine::kFontLastChar; ++cp) {
+                const engine::FontGlyph& g = rig.atlas.glyphFor(cp, size);
+                if (g.width > 0.0f && g.height > 0.0f) {
+                    baked.push_back(&g);
                 }
-                const float ax0 = ga.u0 * atlasW, ax1 = ga.u1 * atlasW;
-                const float ay0 = ga.v0 * atlasH, ay1 = ga.v1 * atlasH;
-                const float bx0 = gb.u0 * atlasW, bx1 = gb.u1 * atlasW;
-                const float by0 = gb.v0 * atlasH, by1 = gb.v1 * atlasH;
-                overlapFree = overlapFree && (ax1 <= bx0 || bx1 <= ax0 || ay1 <= by0 || by1 <= ay0);
-                const float sepX = std::max({bx0 - ax1, ax0 - bx1, 0.0f});
-                const float sepY = std::max({by0 - ay1, ay0 - by1, 0.0f});
-                moatKept = moatKept && (sepX >= 2.0f - 0.01f || sepY >= 2.0f - 0.01f);
+            }
+            for (size_t a = 0; a < baked.size(); ++a) {
+                for (size_t b = a + 1; b < baked.size(); ++b) {
+                    const engine::FontGlyph& ga = *baked[a];
+                    const engine::FontGlyph& gb = *baked[b];
+                    if (ga.page != gb.page) {
+                        continue;
+                    }
+                    float ax0, ay0, ax1, ay1, bx0, by0, bx1, by1;
+                    texelRect(ga, pageSize, ax0, ay0, ax1, ay1);
+                    texelRect(gb, pageSize, bx0, by0, bx1, by1);
+                    overlapFree = overlapFree && (ax1 <= bx0 || bx1 <= ax0 || ay1 <= by0 || by1 <= ay0);
+                    const float sepX = std::max({bx0 - ax1, ax0 - bx1, 0.0f});
+                    const float sepY = std::max({by0 - ay1, ay0 - by1, 0.0f});
+                    moatKept = moatKept && (sepX >= 2.0f - 0.01f || sepY >= 2.0f - 0.01f);
+                }
             }
         }
         check(overlapFree, "text atlas: no two glyph rects overlap in the page");
-        check(!rig.atlas.trueType || moatKept,
+        check(!rig.atlas.trueType() || moatKept,
               "text atlas: TrueType glyphs keep the 2-texel empty gap that stops edge bleed");
     }
 
@@ -9838,10 +9984,10 @@ void testPhase34EditorFixes() {
     // --- (f) Gizmo drags open with a zero delta: no snap on the grab frame ------
     {
         struct GizmoRig {
-            engine::FontAtlas atlas = engine::generateFontAtlas();
+            engine::DynamicFont atlas = engine::createUiFont();
             engine::UIBatch batch;
             engine::UIContext ctx;
-            GizmoRig() { batch.setFontAtlas(&atlas); }
+            GizmoRig() { batch.setFont(&atlas); }
         } rig;
         engine::Scene scene;
         engine::TransformGizmo gizmo;
@@ -9884,10 +10030,10 @@ void testPhase34EditorFixes() {
     // --- (g) Local-frame gizmo: a 90°-rotated entity scales/moves along ITS axes -
     {
         struct GizmoRig {
-            engine::FontAtlas atlas = engine::generateFontAtlas();
+            engine::DynamicFont atlas = engine::createUiFont();
             engine::UIBatch batch;
             engine::UIContext ctx;
-            GizmoRig() { batch.setFontAtlas(&atlas); }
+            GizmoRig() { batch.setFont(&atlas); }
         } rig;
         engine::Scene scene;
         engine::CameraConfig camConfig;
@@ -9939,10 +10085,10 @@ void testPhase34EditorFixes() {
     // --- (h) Outliner context menu: Rename / Reset Transform / Focus ------------
     {
         struct EditorRig {
-            engine::FontAtlas atlas = engine::generateFontAtlas();
+            engine::DynamicFont atlas = engine::createUiFont();
             engine::UIBatch batch;
             engine::UIContext ctx;
-            EditorRig() { batch.setFontAtlas(&atlas); }
+            EditorRig() { batch.setFont(&atlas); }
         } rig;
         engine::Scene scene;
         engine::UIOutliner outliner;
@@ -10155,20 +10301,22 @@ void testPhase35RenderingFixes() {
     // around each glyph rect carrying zero coverage so neighbours
     // cannot bleed in.
     {
-        const engine::FontAtlas atlas = engine::generateFontAtlas();
-        check(atlas.trueType && !atlas.empty(), "bitmap text: TrueType coverage atlas baked");
-        if (atlas.trueType && !atlas.empty()) {
-            auto sampleAtlas = [&](float u, float v) {
-                const float x = u * static_cast<float>(atlas.width) - 0.5f;
-                const float y = v * static_cast<float>(atlas.height) - 0.5f;
+        engine::DynamicFont atlas = engine::createUiFont();
+        check(atlas.trueType(), "bitmap text: TrueType face backs the dynamic coverage font");
+        if (atlas.trueType()) {
+            const uint32_t pageSize = atlas.pageSize();
+            auto sampleAtlas = [&](uint32_t pageIndex, float u, float v) {
+                const std::vector<uint8_t>& pixels = atlas.pagePixels(pageIndex);
+                const float x = u * static_cast<float>(pageSize) - 0.5f;
+                const float y = v * static_cast<float>(pageSize) - 0.5f;
                 const int x0 = static_cast<int>(std::floor(x));
                 const int y0 = static_cast<int>(std::floor(y));
                 const float fx = x - static_cast<float>(x0);
                 const float fy = y - static_cast<float>(y0);
                 auto texel = [&](int tx, int ty) {
-                    tx = std::clamp(tx, 0, static_cast<int>(atlas.width) - 1);
-                    ty = std::clamp(ty, 0, static_cast<int>(atlas.height) - 1);
-                    return atlas.pixels[static_cast<size_t>(ty) * atlas.width + static_cast<size_t>(tx)] / 255.0f;
+                    tx = std::clamp(tx, 0, static_cast<int>(pageSize) - 1);
+                    ty = std::clamp(ty, 0, static_cast<int>(pageSize) - 1);
+                    return pixels[static_cast<size_t>(ty) * pageSize + static_cast<size_t>(tx)] / 255.0f;
                 };
                 return (texel(x0, y0) * (1.0f - fx) + texel(x0 + 1, y0) * fx) * (1.0f - fy) +
                        (texel(x0, y0 + 1) * (1.0f - fx) + texel(x0 + 1, y0 + 1) * fx) * fy;
@@ -10181,21 +10329,23 @@ void testPhase35RenderingFixes() {
             bool rectsSane = true;
             bool moatClean = true;
             for (const char32_t ch : {U'H', U'W', U'g', U'j', U'@'}) {
-                const engine::FontGlyph& glyph = atlas.glyphFor(ch);
+                const engine::FontGlyph& glyph = atlas.glyphFor(ch, 36); // a zoomed size: strokes saturate
                 rectsSane = rectsSane && glyph.u0 >= 0.0f && glyph.v0 >= 0.0f && glyph.u1 <= 1.0f &&
                             glyph.v1 <= 1.0f && glyph.u0 < glyph.u1 && glyph.v0 < glyph.v1;
-                const float texelU = 1.0f / static_cast<float>(atlas.width);
-                const float outside = sampleAtlas(glyph.u0 - 1.0f * texelU, (glyph.v0 + glyph.v1) * 0.5f);
+                const float texelU = 1.0f / static_cast<float>(pageSize);
+                const float outside =
+                    sampleAtlas(glyph.page, glyph.u0 - 1.0f * texelU, (glyph.v0 + glyph.v1) * 0.5f);
                 moatClean = moatClean && outside == 0.0f;
-                const int gx0 = static_cast<int>(glyph.u0 * static_cast<float>(atlas.width));
-                const int gy0 = static_cast<int>(glyph.v0 * static_cast<float>(atlas.height));
-                const int gx1 = static_cast<int>(glyph.u1 * static_cast<float>(atlas.width));
-                const int gy1 = static_cast<int>(glyph.v1 * static_cast<float>(atlas.height));
+                const std::vector<uint8_t>& pixels = atlas.pagePixels(glyph.page);
+                const int gx0 = static_cast<int>(glyph.u0 * static_cast<float>(pageSize));
+                const int gy0 = static_cast<int>(glyph.v0 * static_cast<float>(pageSize));
+                const int gx1 = static_cast<int>(glyph.u1 * static_cast<float>(pageSize));
+                const int gy1 = static_cast<int>(glyph.v1 * static_cast<float>(pageSize));
                 uint8_t deepest = 0;
                 for (int ty = gy0; ty < gy1; ++ty) {
                     for (int tx = gx0; tx < gx1; ++tx) {
-                        deepest = std::max(deepest,
-                                           atlas.pixels[static_cast<size_t>(ty) * atlas.width + static_cast<size_t>(tx)]);
+                        deepest =
+                            std::max(deepest, pixels[static_cast<size_t>(ty) * pageSize + static_cast<size_t>(tx)]);
                     }
                 }
                 rectsSane = rectsSane && deepest == 255;
@@ -10205,7 +10355,7 @@ void testPhase35RenderingFixes() {
 
             // Software-render "Hello" through the batch's real quads.
             engine::UIBatch batch;
-            batch.setFontAtlas(&atlas);
+            batch.setFont(&atlas);
             batch.begin(400, 120);
             batch.drawText("Hello", 4.0f, 4.0f, 3.0f, glm::vec4{1.0f});
             constexpr int kCanvasW = 200;
@@ -10214,8 +10364,13 @@ void testPhase35RenderingFixes() {
             const auto& verts = batch.vertices();
             const auto& idx = batch.indices();
             check(batch.textItemCount() > 0 && verts.size() == 20 && idx.size() == 30,
-                  "sdf legibility: 'Hello' emits five glyph quads");
-            for (size_t t = 0; t + 2 < idx.size(); t += 3) {
+                  "bitmap text: 'Hello' emits five glyph quads");
+            for (const engine::UISegment& segment : batch.segments()) {
+                if (segment.texture < engine::kUIFontTexture) {
+                    continue; // per segment, sample the page its glyphs live on
+                }
+                const uint32_t pageIndex = segment.texture - engine::kUIFontTexture;
+                for (uint32_t t = segment.firstIndex; t + 2 < segment.firstIndex + segment.indexCount; t += 3) {
                 const engine::UIVertex& a = verts[idx[t]];
                 const engine::UIVertex& b = verts[idx[t + 1]];
                 const engine::UIVertex& c = verts[idx[t + 2]];
@@ -10236,10 +10391,11 @@ void testPhase35RenderingFixes() {
                         const float fv = (static_cast<float>(y) + 0.5f - miny) / quadH;
                         const float u = a.uvRect.x + (a.uvRect.z - a.uvRect.x) * fu;
                         const float v = a.uvRect.y + (a.uvRect.w - a.uvRect.y) * fv;
-                        const float coverage = sampleAtlas(u, v);
+                        const float coverage = sampleAtlas(pageIndex, u, v);
                         float& cell = ink[static_cast<size_t>(y) * kCanvasW + static_cast<size_t>(x)];
                         cell = std::max(cell, coverage);
                     }
+                }
                 }
             }
             float inkTotal = 0.0f;
@@ -10324,14 +10480,14 @@ void testPhase36LayoutThemeFont() {
               "layout: a degenerate window yields an empty, bounded viewport");
     }
 
-    const engine::FontAtlas atlas = engine::generateFontAtlas();
-    check(atlas.trueType && !atlas.empty(), "phase36: TrueType atlas baked for the font checks");
+    engine::DynamicFont atlas = engine::createUiFont();
+    check(atlas.trueType(), "phase36: TrueType face backs the dynamic font checks");
 
     // --- (b) Dock clipping: a panel's children are bound to the panel
     // rect by the batch scissor, even geometry emitted far outside it.
     {
         engine::UIBatch batch;
-        batch.setFontAtlas(&atlas);
+        batch.setFont(&atlas);
         batch.begin(800, 600);
         batch.pushScissor(100.0f, 100.0f, 200.0f, 100.0f); // a dock rect
         const engine::UIScissorRect panelScissor = batch.currentScissor();
@@ -10367,21 +10523,31 @@ void testPhase36LayoutThemeFont() {
 
     // --- (d) Global font scale: bumped ~10% for legibility, and a
     // line still fits the fixed row height so bounding boxes hold.
+    // The raster size quantizes to the displayed em height, so at
+    // any scale the glyphs are baked exactly as large as drawn.
     {
         check(engine::UIContext::kTextScale == 1.8f, "font: global UI text scale is 1.8 (comfortably legible)");
-        check(engine::kBitmapFontBakePixels == 26.0f, "font: glyphs bake at a 26px em, above the on-screen size");
+        check(engine::fontPixelSizeForScale(engine::UIContext::kTextScale) == 18 &&
+                  engine::fontPixelSizeForScale(1.0f) == 10 &&
+                  engine::fontPixelSizeForScale(0.55f) == engine::kMinFontPixelSize &&
+                  engine::fontPixelSizeForScale(100.0f) == engine::kMaxFontPixelSize,
+              "font: the raster size is the displayed em height in whole pixels, floored and capped");
         {
-            const engine::FontGlyph& glyphH = atlas.glyphFor('H');
-            const float texelHeight = (glyphH.v1 - glyphH.v0) * static_cast<float>(atlas.height);
-            check(texelHeight > 15.5f, "font: the baked 'H' carries >15 texels of cap height (26px bake)");
+            const int editorSize = engine::fontPixelSizeForScale(engine::UIContext::kTextScale);
+            const engine::FontGlyph& glyphH = atlas.glyphFor('H', editorSize);
+            const float texelHeight = (glyphH.v1 - glyphH.v0) * static_cast<float>(atlas.pageSize());
+            check(texelHeight == glyphH.height && glyphH.height > 10.0f &&
+                      std::floor(glyphH.width) == glyphH.width,
+                  "font: at the editor size the 'H' rect is exactly its whole-pixel bitmap (1:1, >10px cap)");
         }
         engine::UIBatch batch;
-        batch.setFontAtlas(&atlas);
+        batch.setFont(&atlas);
         batch.begin(800, 600);
         check(nearlyEqual(batch.measureText("Hello", engine::UIContext::kTextScale),
                           batch.measureText("Hello", 1.0f) * engine::UIContext::kTextScale, 1e-3),
               "font: text metrics scale linearly with the global scale");
-        check(atlas.lineHeight * engine::UIContext::kTextScale < engine::UIContext::kRowHeight,
+        check(atlas.lineHeight(engine::fontPixelSizeForScale(engine::UIContext::kTextScale)) <
+                  engine::UIContext::kRowHeight,
               "font: a line at the global scale still fits the 26px widget rows");
     }
 
@@ -10390,13 +10556,14 @@ void testPhase36LayoutThemeFont() {
     // corners), positions and indices strictly ordered.
     {
         engine::UIBatch batch;
-        batch.setFontAtlas(&atlas);
+        batch.setFont(&atlas);
         batch.begin(400, 100);
         batch.drawText("Ag", 10.0f, 10.0f, 1.0f, glm::vec4{1.0f});
         const auto& verts = batch.vertices();
         const auto& idx = batch.indices();
-        const engine::FontGlyph& glyphA = atlas.glyphFor('A');
-        const engine::FontGlyph& glyphG = atlas.glyphFor('g');
+        const int sizeAtScale1 = engine::fontPixelSizeForScale(1.0f);
+        const engine::FontGlyph& glyphA = atlas.glyphFor('A', sizeAtScale1);
+        const engine::FontGlyph& glyphG = atlas.glyphFor('g', sizeAtScale1);
         check(verts.size() == 8 && idx.size() == 12 && batch.textItemCount() == 1,
               "text attributes: 'Ag' emits exactly two glyph quads");
         if (verts.size() == 8 && idx.size() == 12) {
@@ -10426,66 +10593,31 @@ void testPhase36LayoutThemeFont() {
     }
 
     // --- (f) Crisp at the real editor scale: software-render "Hello"
-    // at kTextScale with the full mip chain + trilinear coverage
-    // sampling, exactly as ui.frag blends it. Ink must be present
-    // per glyph and the partial-coverage fringe must stay a thin
-    // edge, not a smear.
-    if (!atlas.empty()) {
-        struct Level {
-            std::vector<float> px;
-            int w, h;
-        };
-        std::vector<Level> levels;
-        {
-            Level base;
-            base.w = static_cast<int>(atlas.width);
-            base.h = static_cast<int>(atlas.height);
-            base.px.resize(atlas.pixels.size());
-            for (size_t i = 0; i < atlas.pixels.size(); ++i) {
-                base.px[i] = atlas.pixels[i] / 255.0f;
-            }
-            levels.push_back(std::move(base));
-            while (levels.back().w > 1 || levels.back().h > 1) {
-                const Level& src = levels.back();
-                Level dst;
-                dst.w = std::max(1, src.w / 2);
-                dst.h = std::max(1, src.h / 2);
-                dst.px.assign(static_cast<size_t>(dst.w) * dst.h, 0.0f);
-                for (int y = 0; y < dst.h; ++y) {
-                    for (int x = 0; x < dst.w; ++x) {
-                        float sum = 0.0f;
-                        for (int dy = 0; dy < 2; ++dy) {
-                            for (int dx = 0; dx < 2; ++dx) {
-                                const int sx = std::min(src.w - 1, x * 2 + dx);
-                                const int sy = std::min(src.h - 1, y * 2 + dy);
-                                sum += src.px[static_cast<size_t>(sy) * src.w + sx];
-                            }
-                        }
-                        dst.px[static_cast<size_t>(y) * dst.w + x] = sum * 0.25f;
-                    }
-                }
-                levels.push_back(std::move(dst));
-            }
-        }
-        auto sampleLevel = [&](int lvl, float u, float v) {
-            const Level& level = levels[std::min<size_t>(static_cast<size_t>(std::max(lvl, 0)), levels.size() - 1)];
-            const float x = u * static_cast<float>(level.w) - 0.5f;
-            const float y = v * static_cast<float>(level.h) - 0.5f;
+    // at kTextScale sampling the glyph pages exactly as ui.frag does
+    // (bilinear coverage, 0.1 cutout -- no mips exist: every quad is
+    // its bitmap at 1:1). Ink must be present per glyph and the
+    // partial-coverage fringe must stay a thin edge, not a smear.
+    if (atlas.trueType()) {
+        const uint32_t pageSize = atlas.pageSize();
+        auto samplePage = [&](uint32_t pageIndex, float u, float v) {
+            const std::vector<uint8_t>& pixels = atlas.pagePixels(pageIndex);
+            const float x = u * static_cast<float>(pageSize) - 0.5f;
+            const float y = v * static_cast<float>(pageSize) - 0.5f;
             const int x0 = static_cast<int>(std::floor(x));
             const int y0 = static_cast<int>(std::floor(y));
             const float fx = x - static_cast<float>(x0);
             const float fy = y - static_cast<float>(y0);
             auto texel = [&](int tx, int ty) {
-                tx = std::clamp(tx, 0, level.w - 1);
-                ty = std::clamp(ty, 0, level.h - 1);
-                return level.px[static_cast<size_t>(ty) * level.w + static_cast<size_t>(tx)];
+                tx = std::clamp(tx, 0, static_cast<int>(pageSize) - 1);
+                ty = std::clamp(ty, 0, static_cast<int>(pageSize) - 1);
+                return pixels[static_cast<size_t>(ty) * pageSize + static_cast<size_t>(tx)] / 255.0f;
             };
             return (texel(x0, y0) * (1.0f - fx) + texel(x0 + 1, y0) * fx) * (1.0f - fy) +
                    (texel(x0, y0 + 1) * (1.0f - fx) + texel(x0 + 1, y0 + 1) * fx) * fy;
         };
 
         engine::UIBatch batch;
-        batch.setFontAtlas(&atlas);
+        batch.setFont(&atlas);
         batch.begin(200, 60);
         const float scale = engine::UIContext::kTextScale;
         batch.drawText("Hello", 2.0f, 2.0f, scale, glm::vec4{1.0f});
@@ -10496,33 +10628,40 @@ void testPhase36LayoutThemeFont() {
         std::vector<float> field(kW * kH, -1.0f);
         const auto& verts = batch.vertices();
         const auto& idx = batch.indices();
-        for (size_t t = 0; t + 2 < idx.size(); t += 3) {
-            const engine::UIVertex& a = verts[idx[t]];
-            const engine::UIVertex& b = verts[idx[t + 1]];
-            const engine::UIVertex& c = verts[idx[t + 2]];
-            if (a.kind < 1.5f) {
+        bool texelTrue = true; // every glyph quad maps its bitmap 1:1
+        for (const engine::UISegment& segment : batch.segments()) {
+            if (segment.texture < engine::kUIFontTexture) {
                 continue;
             }
-            const float minx = std::min({a.position.x, b.position.x, c.position.x});
-            const float maxx = std::max({a.position.x, b.position.x, c.position.x});
-            const float miny = std::min({a.position.y, b.position.y, c.position.y});
-            const float maxy = std::max({a.position.y, b.position.y, c.position.y});
-            const float quadW = std::max(maxx - minx, 1e-5f);
-            const float quadH = std::max(maxy - miny, 1e-5f);
-            const float footprint = std::max((a.uvRect.z - a.uvRect.x) * static_cast<float>(atlas.width) / quadW,
-                                             (a.uvRect.w - a.uvRect.y) * static_cast<float>(atlas.height) / quadH);
-            const float lod = std::log2(std::max(footprint, 1.0f));
-            const int lod0 = static_cast<int>(std::floor(lod));
-            for (int y = std::max(0, static_cast<int>(miny)); y < std::min(kH, static_cast<int>(maxy) + 1); ++y) {
-                for (int x = std::max(0, static_cast<int>(minx)); x < std::min(kW, static_cast<int>(maxx) + 1); ++x) {
-                    const float fu = (static_cast<float>(x) + 0.5f - minx) / quadW;
-                    const float fv = (static_cast<float>(y) + 0.5f - miny) / quadH;
-                    const float u = a.uvRect.x + (a.uvRect.z - a.uvRect.x) * fu;
-                    const float v = a.uvRect.y + (a.uvRect.w - a.uvRect.y) * fv;
-                    const float f = std::clamp(lod - static_cast<float>(lod0), 0.0f, 1.0f);
-                    const float value = sampleLevel(lod0, u, v) * (1.0f - f) + sampleLevel(lod0 + 1, u, v) * f;
-                    float& cell = field[static_cast<size_t>(y) * kW + static_cast<size_t>(x)];
-                    cell = std::max(cell, value);
+            const uint32_t pageIndex = segment.texture - engine::kUIFontTexture;
+            for (uint32_t t = segment.firstIndex; t + 2 < segment.firstIndex + segment.indexCount; t += 3) {
+                const engine::UIVertex& a = verts[idx[t]];
+                const engine::UIVertex& b = verts[idx[t + 1]];
+                const engine::UIVertex& c = verts[idx[t + 2]];
+                if (a.kind < 1.5f) {
+                    continue;
+                }
+                const float minx = std::min({a.position.x, b.position.x, c.position.x});
+                const float maxx = std::max({a.position.x, b.position.x, c.position.x});
+                const float miny = std::min({a.position.y, b.position.y, c.position.y});
+                const float maxy = std::max({a.position.y, b.position.y, c.position.y});
+                const float quadW = std::max(maxx - minx, 1e-5f);
+                const float quadH = std::max(maxy - miny, 1e-5f);
+                texelTrue = texelTrue &&
+                            (a.uvRect.z - a.uvRect.x) * static_cast<float>(pageSize) == quadW &&
+                            (a.uvRect.w - a.uvRect.y) * static_cast<float>(pageSize) == quadH;
+                for (int y = std::max(0, static_cast<int>(miny)); y < std::min(kH, static_cast<int>(maxy) + 1);
+                     ++y) {
+                    for (int x = std::max(0, static_cast<int>(minx));
+                         x < std::min(kW, static_cast<int>(maxx) + 1); ++x) {
+                        const float fu = (static_cast<float>(x) + 0.5f - minx) / quadW;
+                        const float fv = (static_cast<float>(y) + 0.5f - miny) / quadH;
+                        const float u = a.uvRect.x + (a.uvRect.z - a.uvRect.x) * fu;
+                        const float v = a.uvRect.y + (a.uvRect.w - a.uvRect.y) * fv;
+                        const float value = samplePage(pageIndex, u, v);
+                        float& cell = field[static_cast<size_t>(y) * kW + static_cast<size_t>(x)];
+                        cell = std::max(cell, value);
+                    }
                 }
             }
         }
@@ -10548,13 +10687,14 @@ void testPhase36LayoutThemeFont() {
                 }
             }
         }
-        check(ink > 40.0f && ink < 1500.0f, "bitmap editor scale: 'Hello' has real ink at kTextScale through the mip chain");
+        check(texelTrue, "dynamic editor scale: every glyph quad is exactly its bitmap in texels (1:1 sampling)");
+        check(ink > 40.0f && ink < 1500.0f, "dynamic editor scale: 'Hello' has real ink at kTextScale");
         bool allGlyphs = true;
         for (const float band : bandInk) {
             allGlyphs = allGlyphs && band > 0.0f;
         }
-        check(allGlyphs, "bitmap editor scale: every glyph of 'Hello' inks at kTextScale (none missing)");
-        check(fringe < ink * 2.5f, "bitmap editor scale: AA fringe stays a thin edge, not a smear");
+        check(allGlyphs, "dynamic editor scale: every glyph of 'Hello' inks at kTextScale (none missing)");
+        check(fringe < ink * 2.5f, "dynamic editor scale: AA fringe stays a thin edge, not a smear");
     }
 
     // --- (g) Pointer lock contract: engaging capture (the editor's
@@ -10613,6 +10753,7 @@ int main() {
     testSceneTeardown();
     testEditorViewportAndFont();
     testEditorSelectionOutline();
+    testDynamicFont();
     testAsyncAssetPipeline();
     testPhase21CullingAndLighting();
     testPhase22PbrIblPost();

@@ -202,9 +202,9 @@ public:
     // present pass, then cleared.
     [[nodiscard]] UIBatch& uiBatch() { return m_ui.batch(); }
 
-    // The UI font atlas in use (TrueType source name inside), for
-    // startup diagnostics.
-    [[nodiscard]] const FontAtlas& uiFontAtlas() const { return m_ui.fontAtlas(); }
+    // The UI dynamic font in use (TrueType source name inside),
+    // for startup diagnostics.
+    [[nodiscard]] const DynamicFont& uiFont() const { return m_ui.font(); }
 
     void setPostSettings(const PostSettings& settings) { m_postSettings = settings; }
     [[nodiscard]] const PostSettings& postSettings() const { return m_postSettings; }

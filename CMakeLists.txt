@@ -178,7 +178,7 @@ engine_module(EngineGraphics ENGINE_BUILDING_GRAPHICS
     src/Graphics/Buffer.cpp
     src/Graphics/HudFont.cpp
     src/Graphics/HudRenderer.cpp
-    src/Graphics/BitmapFont.cpp
+    src/Graphics/DynamicFont.cpp
     src/Graphics/EditorLayout.cpp
     src/Graphics/UIContext.cpp
     src/Graphics/UIInspector.cpp

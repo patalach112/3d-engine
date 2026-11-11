@@ -2918,3 +2918,45 @@ clean.
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, standalone player headless run
 clean.
+## Maintenance — Dynamic exact-size font cache (crisp text at any size/zoom) ✅
+
+- **Discarded**: the fixed 26 px bitmap bake (`BitmapFont`,
+  `FontAtlas`, plus the GBMF serialized-bake format). A single
+  bake forced every UI scale to resample one bitmap — slightly
+  minified at the editor's 1.8 scale, magnified and blurred at
+  any larger size or zoom, with quad sizes fractional pixels.
+- **DynamicFont** (`Graphics/DynamicFont.h/.cpp`): a TrueType
+  face (system sans first, bundled DejaVu fallback last, the
+  built-in 5×7 font as a synthetic last-resort face) plus a
+  glyph cache keyed by (codepoint, pixel size). Glyphs rasterize
+  with stb_truetype **at the exact pixel size being drawn**
+  (`fontPixelSizeForScale`: whole-pixel em, clamped 6–256), so a
+  glyph quad is exactly its coverage bitmap — texel:pixel is
+  1:1 at every window size, UI scale and zoom level. Nothing is
+  ever magnified or minified, so letters cannot blur, stretch,
+  or distort; each size is cached side by side, so zoom changes
+  never re-rasterize. Coverage alpha still blends linearly
+  (solid 255 interiors, exact-bitmap rects with a 2-texel zero
+  gap, no distance field, no halo).
+- **Snapping**: `UIBatch::drawText` keeps the whole-pixel pen
+  model — fractional advances/kerning accumulate exactly, each
+  quad origin snaps with `std::round`, and quad size is the
+  integer bitmap size, so stems land on pixel boundaries with
+  their computed coverage. `measureText` uses the same quantized
+  size and metrics-only advances, so layout and rendered ink
+  agree to the pixel. Any codepoint the face carries now
+  typesets (UTF-8 decoded); missing codepoints resolve to '?'.
+- **GPU mirror**: glyphs shelf-pack into up to four 2048² R8
+  atlas pages with monotonic revisions; `UIRenderer` mirrors
+  dirty pages into per-page images/descriptor sets (single
+  linear sampler, no mip chain — meaningless at 1:1), synced
+  from `Renderer::recordCommandBuffer` outside the render pass
+  only on frames that rasterized new ink. If the bounded cache
+  ever fills (unreachable in normal editor use), glyphs degrade
+  to '?' for the frame and the cache restarts at the next
+  `UIBatch::begin` — bounded memory, never a corrupt batch.
+
+1227 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, zero warnings, standalone player headless run
+clean.

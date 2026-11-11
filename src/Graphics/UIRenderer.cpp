@@ -35,6 +35,12 @@ void UIBatch::begin(uint32_t viewportWidth, uint32_t viewportHeight) {
     m_viewportWidth = viewportWidth;
     m_viewportHeight = viewportHeight;
     clear();
+    // Frame boundary for the dynamic font: a pending cache restart
+    // (atlas saturated last frame) lands here, before any glyph of
+    // the new frame is emitted, never mid-batch.
+    if (m_font != nullptr) {
+        m_font->beginFrame();
+    }
 }
 
 void UIBatch::clear() {
@@ -111,12 +117,6 @@ uint32_t decodeUtf8(std::string_view text, size_t& index) {
     return static_cast<unsigned char>('?');
 }
 
-// Atlas characters are printable ASCII; everything else (including
-// decoded non-ASCII codepoints) draws as '?', matching glyphFor.
-char atlasChar(uint32_t codepoint) {
-    return codepoint >= kFontFirstChar && codepoint <= kFontLastChar ? static_cast<char>(codepoint) : '?';
-}
-
 } // namespace
 
 void UIBatch::drawText(std::string_view text, float x, float y, float scale, const glm::vec4& color) {
@@ -124,70 +124,80 @@ void UIBatch::drawText(std::string_view text, float x, float y, float scale, con
         return;
     }
     ++m_textItems;
-    if (m_fontAtlas == nullptr || scale <= 0.0f) {
-        return; // accounting stub until a font atlas is set
+    if (m_font == nullptr || scale <= 0.0f) {
+        return; // accounting stub until a font is set
     }
-    const FontAtlas& atlas = *m_fontAtlas;
+    DynamicFont& font = *m_font;
+    // One quantized raster size for the whole run: glyphs bake at
+    // exactly the em pixel height this scale displays, so each
+    // quad below is a 1:1 texel transfer -- never magnified, never
+    // minified, crisp at every window size and zoom level.
+    const int pixelSize = fontPixelSizeForScale(scale);
     float penX = x;
     // (x, y) is the first line's top; the baseline sits one ascent
     // below it, and each glyph quad hangs off the baseline by its
     // own bearing -- capitals rise to it, descenders fall below it.
-    float baselineY = y + atlas.ascent * scale;
-    char previous = '\0';
+    float baselineY = y + font.ascent(pixelSize);
+    uint32_t previous = 0;
     size_t index = 0;
     while (index < text.size()) {
         const uint32_t codepoint = decodeUtf8(text, index);
         if (codepoint == '\n') {
             penX = x;
-            baselineY += atlas.lineHeight * scale;
-            previous = '\0';
+            baselineY += font.lineHeight(pixelSize);
+            previous = 0;
             continue;
         }
         if (codepoint == '\r') {
             continue;
         }
-        const char character = atlasChar(codepoint);
-        if (previous != '\0') {
-            penX += atlas.kernFor(previous, character) * scale;
+        if (previous != 0) {
+            penX += font.kernFor(previous, codepoint, pixelSize);
         }
-        const FontGlyph& glyph = atlas.glyphFor(character);
+        const FontGlyph& glyph = font.glyphFor(codepoint, pixelSize);
         if (glyph.width > 0.0f && glyph.height > 0.0f) {
-            // Snap the quad origin to a whole pixel. The atlas is
-            // baked at the target pixel size, so a stem that starts
-            // on a pixel boundary keeps its rasterized coverage; a
-            // fractional origin would smear half of every thin
-            // stroke into the neighbouring pixel and grey it out.
-            const float quadX = std::round(penX + glyph.bearingX * scale);
-            const float quadY = std::round(baselineY + glyph.bearingY * scale);
-            addQuad(quadX, quadY, glyph.width * scale, glyph.height * scale, UIRectStyle{}, color,
-                    kUITextPrimitive, kUIFontTexture, glm::vec4{glyph.u0, glyph.v0, glyph.u1, glyph.v1});
+            // Snap the quad origin to a whole pixel (std::round:
+            // half away from zero, exact for the negative origins
+            // of scrolled/clipped panels). The glyph was rasterized
+            // at this very size, so a stem that starts on a pixel
+            // boundary keeps its computed coverage; a fractional
+            // origin would smear half of every thin stroke into
+            // the neighbouring pixel and grey it out. Size is the
+            // bitmap's exactly -- integer texels on integer pixels.
+            const float quadX = std::round(penX + glyph.bearingX);
+            const float quadY = std::round(baselineY + glyph.bearingY);
+            addQuad(quadX, quadY, glyph.width, glyph.height, UIRectStyle{}, color, kUITextPrimitive,
+                    kUIFontTexture + glyph.page, glm::vec4{glyph.u0, glyph.v0, glyph.u1, glyph.v1});
         }
-        penX += glyph.advance * scale;
-        previous = character;
+        penX += glyph.advance;
+        previous = codepoint;
     }
 }
 
 float UIBatch::measureText(std::string_view text, float scale) const {
-    if (m_fontAtlas == nullptr || scale <= 0.0f) {
+    if (m_font == nullptr || scale <= 0.0f) {
         return 0.0f;
     }
+    // Same quantized size, same advances and kerning as drawText
+    // (metrics only: measuring never rasterizes ink), so layout
+    // and rendered text agree to the pixel.
+    const int pixelSize = fontPixelSizeForScale(scale);
     float widest = 0.0f;
     float line = 0.0f;
-    char previous = '\0';
+    uint32_t previous = 0;
     size_t index = 0;
     while (index < text.size()) {
         const uint32_t codepoint = decodeUtf8(text, index);
         if (codepoint == '\n') {
             widest = std::max(widest, line);
             line = 0.0f;
-            previous = '\0';
+            previous = 0;
         } else if (codepoint != '\r') {
-            const char character = atlasChar(codepoint);
-            if (previous != '\0') {
-                line += m_fontAtlas->kernFor(previous, character) * scale;
+            if (previous != 0) {
+                line += m_font->kernFor(previous, codepoint, pixelSize);
             }
-            line += m_fontAtlas->glyphFor(character).advance * scale;
-            previous = character;
+            line += m_font->advanceFor(codepoint, pixelSize);
+            previous = codepoint;
         }
     }
     return std::max(widest, line);
@@ -293,32 +303,34 @@ UIRenderer::VertexInput UIRenderer::vertexInput() {
 
 UIRenderer::UIRenderer(VulkanContext& context, const Swapchain& swapchain) : m_context(context) {
     createBuffers();
-    m_fontAtlas = generateFontAtlas();
-    m_batch.setFontAtlas(&m_fontAtlas);
-    createFontAtlasTexture();
-    createPipeline(swapchain);
-    createFontDescriptorSet();
+    m_font = createUiFont();
+    m_batch.setFont(&m_font);
+    createPipeline(swapchain); // also creates the descriptor set layout
+    createFontSamplerAndPool();
+    syncFontTextures(); // page 0 exists from here on, even before ink
 }
 
 UIRenderer::~UIRenderer() {
     const VkDevice device = m_context.device();
+    for (FontPageTexture& page : m_fontPages) {
+        if (page.view != VK_NULL_HANDLE) {
+            vkDestroyImageView(device, page.view, nullptr);
+        }
+        if (page.image != VK_NULL_HANDLE) {
+            vkDestroyImage(device, page.image, nullptr);
+        }
+        if (page.memory != VK_NULL_HANDLE) {
+            vkFreeMemory(device, page.memory, nullptr);
+        }
+    }
+    if (m_fontSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device, m_fontSampler, nullptr);
+    }
     if (m_descriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device, m_descriptorPool, nullptr);
     }
     if (m_setLayout != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device, m_setLayout, nullptr);
-    }
-    if (m_atlasSampler != VK_NULL_HANDLE) {
-        vkDestroySampler(device, m_atlasSampler, nullptr);
-    }
-    if (m_atlasView != VK_NULL_HANDLE) {
-        vkDestroyImageView(device, m_atlasView, nullptr);
-    }
-    if (m_atlasImage != VK_NULL_HANDLE) {
-        vkDestroyImage(device, m_atlasImage, nullptr);
-    }
-    if (m_atlasMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, m_atlasMemory, nullptr);
     }
     if (m_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(device, m_pipeline, nullptr);
@@ -338,17 +350,21 @@ UITextureId UIRenderer::registerTexture(VkDescriptorSet descriptorSet) {
 }
 
 void UIRenderer::unregisterTexture(UITextureId texture) {
-    if (texture > kUIFontTexture) {
+    if (texture >= kUIFontTexture + kFontTexturePages) {
         m_textures.erase(texture);
     }
 }
 
 VkDescriptorSet UIRenderer::resolveDescriptorSet(UITextureId texture) const {
-    if (texture == kUINoTexture || texture == kUIFontTexture) {
-        return m_fontDescriptorSet;
+    // Font pages reserve [kUIFontTexture, +kFontTexturePages).
+    if (texture >= kUIFontTexture && texture < kUIFontTexture + kFontTexturePages) {
+        if (const VkDescriptorSet set = m_fontPages[texture - kUIFontTexture].descriptorSet;
+            set != VK_NULL_HANDLE) {
+            return set;
+        }
     }
     const auto it = m_textures.find(texture);
-    return it != m_textures.end() ? it->second : m_fontDescriptorSet;
+    return it != m_textures.end() ? it->second : m_fontPages[0].descriptorSet;
 }
 
 void UIRenderer::record(VkCommandBuffer commandBuffer, VkExtent2D extent, uint32_t frameIndex) {
@@ -424,128 +440,14 @@ void UIRenderer::createBuffers() {
     }
 }
 
-void UIRenderer::createFontAtlasTexture() {
+void UIRenderer::createFontSamplerAndPool() {
     const VkDevice device = m_context.device();
-    Buffer staging(m_context, static_cast<VkDeviceSize>(m_fontAtlas.pixels.size()),
-                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    staging.map();
-    std::memcpy(staging.mappedData(), m_fontAtlas.pixels.data(), m_fontAtlas.pixels.size());
-    staging.unmap();
 
-    // Editor text is drawn close to (just under) the bake size.
-    // Coverage filters linearly -- each mip level is the
-    // exact area coverage of the next -- so a full mip chain keeps
-    // labels smooth when a small window shrinks them further,
-    // without the threshold wash-out a distance field suffered.
-    // The single-level path stays as the portable fallback.
-    uint32_t mipLevels = 1;
-    {
-        VkFormatProperties properties{};
-        vkGetPhysicalDeviceFormatProperties(m_context.physicalDevice(), VK_FORMAT_R8_UNORM, &properties);
-        const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-                                            VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-        if ((properties.optimalTilingFeatures & needed) == needed && m_fontAtlas.width > 0 &&
-            m_fontAtlas.height > 0) {
-            uint32_t largest = std::max(m_fontAtlas.width, m_fontAtlas.height);
-            mipLevels = 1;
-            while (largest > 1) {
-                largest >>= 1;
-                ++mipLevels;
-            }
-        }
-    }
-    const bool generateMips = mipLevels > 1;
-
-    helpers::createImage(m_context, m_fontAtlas.width, m_fontAtlas.height, VK_FORMAT_R8_UNORM,
-                         VK_IMAGE_TILING_OPTIMAL,
-                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                             VK_IMAGE_USAGE_SAMPLED_BIT,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, m_atlasImage, m_atlasMemory, mipLevels);
-
-    VkCommandBuffer commandBuffer = helpers::beginSingleTimeCommands(m_context);
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = m_atlasImage;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                         0, nullptr, 0, nullptr, 1, &barrier);
-
-    VkBufferImageCopy region{};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {m_fontAtlas.width, m_fontAtlas.height, 1};
-    vkCmdCopyBufferToImage(commandBuffer, staging.handle(), m_atlasImage,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    if (generateMips) {
-        // Vulkan has no generate-mipmaps command: walk the chain
-        // with explicit blits, moving each source level to
-        // TRANSFER_SRC and each fresh level from UNDEFINED to
-        // TRANSFER_DST, and retire every finished level to
-        // SHADER_READ_ONLY as soon as it has been read.
-        int32_t levelWidth = static_cast<int32_t>(m_fontAtlas.width);
-        int32_t levelHeight = static_cast<int32_t>(m_fontAtlas.height);
-        for (uint32_t level = 1; level < mipLevels; ++level) {
-            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barrier.subresourceRange.baseMipLevel = level - 1;
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barrier.subresourceRange.baseMipLevel = level;
-            barrier.srcAccessMask = 0;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-            VkImageBlit blit{};
-            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
-            blit.srcOffsets[1] = {levelWidth, levelHeight, 1};
-            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
-            blit.dstOffsets[1] = {std::max(1, levelWidth / 2), std::max(1, levelHeight / 2), 1};
-            vkCmdBlitImage(commandBuffer, m_atlasImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_atlasImage,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-
-            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            barrier.subresourceRange.baseMipLevel = level - 1;
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-            levelWidth = std::max(1, levelWidth / 2);
-            levelHeight = std::max(1, levelHeight / 2);
-        }
-        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barrier.subresourceRange.baseMipLevel = mipLevels - 1;
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-    } else {
-        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-    }
-    helpers::endSingleTimeCommands(m_context, commandBuffer);
-
-    m_atlasView = helpers::createImageView(m_context, m_atlasImage, VK_FORMAT_R8_UNORM,
-                                           VK_IMAGE_ASPECT_COLOR_BIT, mipLevels);
-
+    // One sampler for every font page. Glyph quads are exactly
+    // their bitmaps on whole pixels (DynamicFont rasterizes at the
+    // drawn size), so sampling is a 1:1 texel transfer: level 0
+    // only, linear filtering as a safety net for the half-texel
+    // interpolation at quad borders, no mip chain to rebuild.
     VkSamplerCreateInfo samplerInfo{};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -555,49 +457,139 @@ void UIRenderer::createFontAtlasTexture() {
     samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     samplerInfo.maxAnisotropy = 1.0f;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = static_cast<float>(mipLevels - 1);
-    if (vkCreateSampler(device, &samplerInfo, nullptr, &m_atlasSampler) != VK_SUCCESS) {
-        throw std::runtime_error("UIRenderer: failed to create font atlas sampler");
+    samplerInfo.maxLod = 0.0f;
+    if (vkCreateSampler(device, &samplerInfo, nullptr, &m_fontSampler) != VK_SUCCESS) {
+        throw std::runtime_error("UIRenderer: failed to create font sampler");
     }
-}
 
-void UIRenderer::createFontDescriptorSet() {
-    const VkDevice device = m_context.device();
     VkDescriptorPoolSize poolSize{};
     poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSize.descriptorCount = 1;
+    poolSize.descriptorCount = kFontTexturePages;
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = kFontTexturePages;
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &m_descriptorPool) != VK_SUCCESS) {
-        throw std::runtime_error("UIRenderer: failed to create descriptor pool");
+        throw std::runtime_error("UIRenderer: failed to create font descriptor pool");
+    }
+}
+
+void UIRenderer::syncFontTextures() {
+    const uint32_t pageSize = m_font.pageSize();
+    const uint32_t cpuPages = m_font.pageCount();
+
+    // Create GPU mirrors for pages that appeared, and note which
+    // pages changed since their last upload. Page 0 is mirrored
+    // unconditionally so a font descriptor set always exists for
+    // the shapes/textures that fall back to it.
+    std::array<bool, kFontTexturePages> dirty{};
+    bool anyDirty = false;
+    for (uint32_t index = 0; index < kFontTexturePages; ++index) {
+        if (index >= cpuPages && index != 0) {
+            continue;
+        }
+        FontPageTexture& page = m_fontPages[index];
+        if (page.image == VK_NULL_HANDLE) {
+            const VkDevice device = m_context.device();
+            helpers::createImage(m_context, pageSize, pageSize, VK_FORMAT_R8_UNORM,
+                                 VK_IMAGE_TILING_OPTIMAL,
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, page.image, page.memory, 1);
+            page.view = helpers::createImageView(m_context, page.image, VK_FORMAT_R8_UNORM,
+                                                 VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            VkDescriptorSetAllocateInfo allocateInfo{};
+            allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocateInfo.descriptorPool = m_descriptorPool;
+            allocateInfo.descriptorSetCount = 1;
+            allocateInfo.pSetLayouts = &m_setLayout;
+            if (vkAllocateDescriptorSets(device, &allocateInfo, &page.descriptorSet) != VK_SUCCESS) {
+                throw std::runtime_error("UIRenderer: failed to allocate font page descriptor set");
+            }
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.sampler = m_fontSampler;
+            imageInfo.imageView = page.view;
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = page.descriptorSet;
+            write.dstBinding = 0;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.descriptorCount = 1;
+            write.pImageInfo = &imageInfo;
+            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+        }
+        if (index < cpuPages && page.uploadedRevision != m_font.pageRevision(index)) {
+            dirty[index] = true;
+            anyDirty = true;
+        }
+    }
+    if (!anyDirty) {
+        return;
     }
 
-    VkDescriptorSetAllocateInfo allocateInfo{};
-    allocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocateInfo.descriptorPool = m_descriptorPool;
-    allocateInfo.descriptorSetCount = 1;
-    allocateInfo.pSetLayouts = &m_setLayout;
-    if (vkAllocateDescriptorSets(device, &allocateInfo, &m_fontDescriptorSet) != VK_SUCCESS) {
-        throw std::runtime_error("UIRenderer: failed to allocate font descriptor set");
+    // One staging buffer per dirty page, one single-time submission
+    // for the whole batch of copies (it waits for completion, so
+    // no in-flight frame can observe a half-updated page).
+    std::vector<Buffer> staging;
+    staging.reserve(kFontTexturePages);
+    for (uint32_t index = 0; index < kFontTexturePages; ++index) {
+        if (!dirty[index]) {
+            continue;
+        }
+        staging.emplace_back(m_context, static_cast<VkDeviceSize>(pageSize) * pageSize,
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        Buffer& buffer = staging.back();
+        buffer.map();
+        std::memcpy(buffer.mappedData(), m_font.pagePixels(index).data(),
+                    static_cast<size_t>(pageSize) * pageSize);
+        buffer.unmap();
     }
 
-    VkDescriptorImageInfo imageInfo{};
-    imageInfo.sampler = m_atlasSampler;
-    imageInfo.imageView = m_atlasView;
-    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = m_fontDescriptorSet;
-    write.dstBinding = 0;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.descriptorCount = 1;
-    write.pImageInfo = &imageInfo;
-    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    VkCommandBuffer commandBuffer = helpers::beginSingleTimeCommands(m_context);
+    size_t stagingIndex = 0;
+    for (uint32_t index = 0; index < kFontTexturePages; ++index) {
+        if (!dirty[index]) {
+            continue;
+        }
+        FontPageTexture& page = m_fontPages[index];
+        const Buffer& buffer = staging[stagingIndex++];
+
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.image = page.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        const bool firstUpload = page.uploadedRevision == 0;
+        barrier.oldLayout = firstUpload ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcAccessMask = firstUpload ? 0 : VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(commandBuffer,
+                             firstUpload ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                         : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {pageSize, pageSize, 1};
+        vkCmdCopyBufferToImage(commandBuffer, buffer.handle(), page.image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &barrier);
+        page.uploadedRevision = m_font.pageRevision(index);
+    }
+    helpers::endSingleTimeCommands(m_context, commandBuffer);
 }
 
 VkShaderModule UIRenderer::createShaderModule(const char* fileName) const {

@@ -6,11 +6,13 @@
 //     ring and anti-aliased coverage; no texture involved.
 //   1 sampled image — texture * tint, clipped by the same SDF so
 //     icons get pixel-perfect rounded corners for free.
-//   2 bitmap text — the font atlas (red channel) stores glyph
-//     coverage baked at the target pixel size; the sampled
-//     coverage is the text alpha directly. Coverage filters
-//     linearly, so thin strokes keep their ink at small sizes
-//     (a thresholded distance field washed them out).
+//   2 dynamic text — the font pages (red channel) store glyph
+//     coverage rasterized at the exact pixel size being drawn;
+//     quads are exactly their bitmaps on whole pixels, so the
+//     sampled coverage is a 1:1 texel transfer and the text
+//     alpha directly. Coverage blends linearly, so thin strokes
+//     keep their ink at every size (a thresholded distance field
+//     washed them out; a fixed off-size bake blurred them).
 // The rect's pixel size is recovered from the uv derivatives (uv
 // spans 0..1 across the quad), keeping radius/border widths in
 // exact pixel units without extra attributes.

@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "Graphics/Buffer.h"
-#include "Graphics/BitmapFont.h"
+#include "Graphics/DynamicFont.h"
 
 namespace engine {
 
@@ -55,7 +55,7 @@ inline constexpr float kUITextPrimitive = 2.0f;
 
 using UITextureId = uint32_t;
 inline constexpr UITextureId kUINoTexture = 0;   // analytic shapes
-inline constexpr UITextureId kUIFontTexture = 1; // UIRenderer's bitmap font atlas
+inline constexpr UITextureId kUIFontTexture = 1; // font atlas page 0 (pages use 1..kFontTexturePages)
 
 struct UIVertex {
     glm::vec2 position{0.0f, 0.0f};     // pixels, top-left origin
@@ -124,10 +124,11 @@ public:
     void begin(uint32_t viewportWidth, uint32_t viewportHeight);
     void clear();
 
-    // Font atlas used by drawText/measureText. Not owned; must
-    // outlive the batch. Survives begin()/clear().
-    void setFontAtlas(const FontAtlas* atlas) { m_fontAtlas = atlas; }
-    [[nodiscard]] const FontAtlas* fontAtlas() const { return m_fontAtlas; }
+    // Dynamic font used by drawText/measureText. Not owned; must
+    // outlive the batch. Survives begin()/clear(). Mutable because
+    // drawing rasterizes glyphs on demand at the drawn size.
+    void setFont(DynamicFont* font) { m_font = font; }
+    [[nodiscard]] DynamicFont* font() const { return m_font; }
 
     void drawRect(float x, float y, float width, float height, const glm::vec4& color);
     void drawRoundedRect(float x, float y, float width, float height, float cornerRadius,
@@ -179,7 +180,7 @@ private:
     std::vector<UIScissorRect> m_scissors{UIScissorRect{}}; // append-only; [0] = viewport
     std::vector<uint32_t> m_scissorStack{0}; // indices into m_scissors
     UIBounds m_bounds;
-    const FontAtlas* m_fontAtlas = nullptr;
+    DynamicFont* m_font = nullptr;
     uint32_t m_viewportWidth = 0;
     uint32_t m_viewportHeight = 0;
     uint32_t m_textItems = 0;
@@ -207,7 +208,14 @@ public:
 
     [[nodiscard]] UIBatch& batch() { return m_batch; }
     [[nodiscard]] const UIBatch& batch() const { return m_batch; }
-    [[nodiscard]] const FontAtlas& fontAtlas() const { return m_fontAtlas; }
+    [[nodiscard]] const DynamicFont& font() const { return m_font; }
+
+    // Mirrors every dirty CPU atlas page of the dynamic font into
+    // its GPU image (creating page images/descriptor sets on first
+    // use). No-op when nothing was rasterized since the last sync.
+    // Must be called OUTSIDE any render pass (uploads transition
+    // image layouts and wait for completion), before record().
+    void syncFontTextures();
 
     // Registers a caller-owned descriptor set (binding 0 must be a
     // combined image sampler compatible with the UI pipeline) for
@@ -235,21 +243,29 @@ public:
 private:
     void createPipeline(const Swapchain& swapchain);
     void createBuffers();
-    void createFontAtlasTexture();
-    void createFontDescriptorSet();
+    void createFontSamplerAndPool();
     [[nodiscard]] VkShaderModule createShaderModule(const char* fileName) const;
     [[nodiscard]] VkDescriptorSet resolveDescriptorSet(UITextureId texture) const;
+
+    // GPU mirror of one CPU atlas page. Glyph quads are exactly
+    // their bitmaps (1:1 texels), so pages need no mip chain: the
+    // sampler reads level 0 only, and a page re-upload is a single
+    // full-page copy on the rare frames that rasterized new ink.
+    struct FontPageTexture {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        uint64_t uploadedRevision = 0;
+    };
 
     VulkanContext& m_context;
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_setLayout = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet m_fontDescriptorSet = VK_NULL_HANDLE;
-    VkImage m_atlasImage = VK_NULL_HANDLE;
-    VkDeviceMemory m_atlasMemory = VK_NULL_HANDLE;
-    VkImageView m_atlasView = VK_NULL_HANDLE;
-    VkSampler m_atlasSampler = VK_NULL_HANDLE;
+    VkSampler m_fontSampler = VK_NULL_HANDLE;
+    std::array<FontPageTexture, kFontTexturePages> m_fontPages;
     // One staging pair per frame slot (Renderer::kMaxFramesInFlight
     // is 2). The batch is re-uploaded from scratch every flush, so a
     // shared pair would let the CPU overwrite vertices a still-in-
@@ -258,10 +274,12 @@ private:
     static constexpr size_t kFrameBufferSlots = 2;
     std::array<Buffer, kFrameBufferSlots> m_vertexBuffers;
     std::array<Buffer, kFrameBufferSlots> m_indexBuffers;
-    FontAtlas m_fontAtlas;
+    DynamicFont m_font;
     UIBatch m_batch;
     std::unordered_map<UITextureId, VkDescriptorSet> m_textures;
-    UITextureId m_nextTexture = kUIFontTexture + 1;
+    // Font pages reserve texture ids [kUIFontTexture,
+    // kUIFontTexture + kFontTexturePages); caller textures follow.
+    UITextureId m_nextTexture = kUIFontTexture + kFontTexturePages;
 };
 
 } // namespace engine

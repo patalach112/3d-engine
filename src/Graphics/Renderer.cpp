@@ -1506,6 +1506,13 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
                                    std::span<const DrawItem> drawItems,
                                    const std::array<glm::mat4, kMaxShadowCascades>& cascadeMatrices,
                                    uint32_t cascadeCount, bool spotShadowEnabled) {
+    // Mirror any glyph pages the UI batch rasterized while it was
+    // being built (new glyphs/sizes) into their GPU images. This
+    // must stay outside every render pass: uploads transition
+    // image layouts and wait for completion. No-op on frames that
+    // rasterized nothing.
+    m_ui.syncFontTextures();
+
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {

@@ -188,10 +188,10 @@ bool UIContext::hitTest(const UIRect& rect) const {
 float UIContext::textTop(const UIRect& rect) const {
     // Centre the font's real line box (ascent-to-descent from the
     // TrueType metrics) in the row; the legacy constant is only the
-    // no-atlas fallback.
+    // no-font fallback.
     float lineHeight = kGlyphBoxHeight * kTextScale;
-    if (m_batch != nullptr && m_batch->fontAtlas() != nullptr) {
-        lineHeight = m_batch->fontAtlas()->lineHeight * kTextScale;
+    if (m_batch != nullptr && m_batch->font() != nullptr) {
+        lineHeight = m_batch->font()->lineHeight(fontPixelSizeForScale(kTextScale));
     }
     return rect.y + 0.5f * (rect.height - lineHeight);
 }
