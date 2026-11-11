@@ -266,7 +266,7 @@ endif()
 engine_module(EngineNet ENGINE_BUILDING_NET
     src/Net/NetProtocol.cpp
     src/Net/ServerConfig.cpp
-    src/Net/FrictionController.cpp
+    src/Net/MovementSystem.cpp
     src/Net/NetTransport.cpp
     src/Net/NetServer.cpp
     src/Net/NetClient.cpp

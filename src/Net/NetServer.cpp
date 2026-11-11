@@ -58,6 +58,7 @@ bool NetServer::start(const ServerSettings& settings) {
     stop();
     m_settings = settings;
     m_settings.clampToValid();
+    m_movement.setSettings(m_settings.move);
 
     LoopConfig loop;
     loop.fixedDeltaSeconds = m_settings.fixedDt();
@@ -187,7 +188,7 @@ void NetServer::handlePacket(std::uint32_t peerId, const std::byte* data, std::s
     case NetPacketType::InputCommand: {
         InputCommand command;
         if (peer->welcomed && InputCommand::deserialize(data, size, command)) {
-            command.input = sanitizeMoveInput(command.input);
+            // No sanitisation here: playerMove() clamps every command into the legal envelope as it consumes it.
             peer->baseline.onAck(command.lastAck);
             if (peer->inputs.size() >= 64)
                 peer->inputs.pop_front();
@@ -349,16 +350,20 @@ void NetServer::simulatePlayers(float dt) {
                 while (!peer.inputs.empty()) {
                     const InputCommand command = peer.inputs.front();
                     peer.inputs.pop_front();
-                    player.lastInput = command.input;
-                    player.lastInputTick = command.tick;
-                    groundMove(player.move, command.input, m_settings.move, dt);
+                    // Sequence discipline: a command at or below the last consumed
+                    // cmd_number is a duplicate/straggler; never simulate it twice.
+                    if (player.lastCmdNumber != 0 && !netTickNewer(command.cmdNumber, player.lastCmdNumber))
+                        continue;
+                    player.lastInput = command.cmd;
+                    player.lastCmdNumber = command.cmdNumber;
+                    m_movement.playerMove(command.cmd, player.move, dt);
                     ++m_stats.inputCommandsConsumed;
                 }
             } else {
                 // Input persistence (Source behaviour): starved of
                 // fresh commands, the server replays the last one —
                 // the same assumption client prediction makes.
-                groundMove(player.move, player.lastInput, m_settings.move, dt);
+                m_movement.playerMove(player.lastInput, player.move, dt);
             }
         } else {
             peer.inputs.clear();
@@ -433,12 +438,12 @@ void NetServer::sendSnapshots() {
     for (PeerSession& peer : m_peers) {
         if (!peer.welcomed)
             continue;
-        std::uint32_t lastInputTick = 0;
+        std::uint32_t lastCmdNumber = 0;
         auto& registry = m_scene.registry();
         if (peer.entity != entt::null && registry.valid(peer.entity) &&
             registry.all_of<NetPlayerComponent>(peer.entity))
-            lastInputTick = registry.get<NetPlayerComponent>(peer.entity).lastInputTick;
-        const Snapshot snapshot = buildSnapshot(m_currentStates, peer.baseline, m_tick, lastInputTick);
+            lastCmdNumber = registry.get<NetPlayerComponent>(peer.entity).lastCmdNumber;
+        const Snapshot snapshot = buildSnapshot(m_currentStates, peer.baseline, m_tick, lastCmdNumber);
         m_stats.snapshotEntitiesSent += snapshot.entities.size();
         m_stats.snapshotEntitiesSkipped += m_currentStates.size() > snapshot.entities.size()
                                                ? m_currentStates.size() - snapshot.entities.size()

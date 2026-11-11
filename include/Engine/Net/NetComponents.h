@@ -1,5 +1,5 @@
 #pragma once
-#include "Net/FrictionController.h"
+#include "Net/MovementSystem.h"
 
 #include <cstdint>
 #include <string>
@@ -31,9 +31,9 @@ struct NetPlayerComponent {
     std::uint32_t peerId = 0;
     std::string playerName;
     glm::vec3 spawnPosition{0.0f};
-    PlayerMoveState move{};          // authoritative position/velocity/grounded
-    PlayerMoveInput lastInput{};     // latest consumed command (input persistence)
-    std::uint32_t lastInputTick = 0; // client tick of lastInput (reconcile anchor)
+    PlayerState move{};              // authoritative position/velocity/grounded
+    InputCmd lastInput{};            // latest consumed command (input persistence)
+    std::uint32_t lastCmdNumber = 0; // cmd_number of lastInput (reconcile anchor)
     std::uint32_t respawnTick = 0;   // server tick at which a dead player respawns
 };
 

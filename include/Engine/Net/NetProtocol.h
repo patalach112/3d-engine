@@ -1,6 +1,6 @@
 #pragma once
 #include "Core/Export.h"
-#include "Net/FrictionController.h"
+#include "Net/MovementSystem.h"
 
 #include <array>
 #include <cstddef>
@@ -156,9 +156,9 @@ struct ServerWelcome {
 };
 
 struct InputCommand {
-    std::uint32_t tick = 0;    // client tick this command belongs to
-    std::uint32_t lastAck = 0; // last snapshot tick the client applied
-    PlayerMoveInput input;
+    std::uint32_t cmdNumber = 0; // == cmd.cmdNumber (reconcile key, echoed for framing)
+    std::uint32_t lastAck = 0;   // last snapshot tick the client applied
+    InputCmd cmd;                // the sequenced movement command
     [[nodiscard]] ENGINE_NET_API std::vector<std::byte> serialize() const;
     [[nodiscard]] static ENGINE_NET_API bool deserialize(const std::byte* data, std::size_t size, InputCommand& out);
 };
@@ -179,7 +179,7 @@ struct EntitySnapshot {
 struct Snapshot {
     std::uint32_t tick = 0;       // server tick this state is authoritative at
     std::uint32_t baseline = 0;   // tick the delta was computed against (ack)
-    std::uint32_t lastInputTick = 0; // last input the server consumed (reconcile)
+    std::uint32_t lastCmdNumber = 0; // last cmd_number the server consumed (reconcile)
     bool full = false;            // true => replace, do not merge
     std::vector<EntitySnapshot> entities;
     std::vector<std::uint32_t> removed; // entities deleted vs baseline

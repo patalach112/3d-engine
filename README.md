@@ -3349,16 +3349,21 @@ runs clean.
   tick rate and the shared movement rules); `max_players` is
   enforced with a polite `server full` disconnect, and lifetimes
   (join/leave/despawn) are fully lifecycle-managed.
-- **Shared movement simulation**: one pure ground-friction
-  controller (Source-style friction bleed + projected
-  accelerate, jump/gravity/ground clamp) runs identically on
-  server and client, so **client-side prediction** has zero
-  input lag and **server reconciliation** (rewind to the last
-  consumed input tick, replay un-acked commands) only cleans up
-  transport drift. Corrections surface as an exponentially
-  decaying visual offset — glides, not snaps; teleports snap.
-  Incoming commands are sanitised server-side (axis/wish-vector
-  clamps, NaN guards): clients can ask, never exceed.
+- **Shared movement simulation**: `MovementSystem::playerMove`
+  is the ONE Source-style movement step (PM_Friction ->
+  PM_Accelerate -> jump/gravity -> integrate) executed
+  bit-identically by client prediction and the 128 Hz server:
+  friction drops `max(speed, stopspeed) * sv_friction * dt`
+  (heavy survival-horror tuning — slow accel ramp, direction
+  reversals must cancel momentum through the projection-capped
+  accelerate budget, never flip), and **air control is strictly
+  zero** (`sv_airaccelerate = 0`): airborne horizontal velocity
+  is bit-frozen, friction is charged on every touchdown before
+  liftoff, so bunny-hopping can neither stack nor preserve
+  speed. Every command carries a `cmd_number`; snapshots report
+  the last consumed number and clients replay the un-acked tail
+  on top of the authoritative state. The envelope is sanitised
+  inside the shared core: clients can ask, never exceed.
 - **Delta-compression snapshots**: per client, the server keeps
   the last acknowledged baseline (acks ride every input packet)
   and transmits only entities whose replicated state changed,
@@ -3393,7 +3398,7 @@ runs clean.
   and rendering state never enters the server binary — client
   mirrors are built one-way via `NetClient::applyToScene`.
 
-1611 passed / 0 failed across all five build configs
+1625 passed / 0 failed across all five build configs
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, `vibe_server --ticks` and
 `game-player --server` smoke runs clean, scripting-demo and

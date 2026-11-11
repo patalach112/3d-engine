@@ -96,12 +96,12 @@ std::vector<std::byte> InputCommand::serialize() const {
     std::vector<std::byte> out;
     out.reserve(22);
     writeHeader(out, NetPacketType::InputCommand);
-    detail::writeU32(out, tick);
+    detail::writeU32(out, cmdNumber);
     detail::writeU32(out, lastAck);
-    detail::writeF32(out, input.forward);
-    detail::writeF32(out, input.strafe);
-    out.push_back(static_cast<std::byte>(input.jump ? 1 : 0));
-    detail::writeF32(out, input.yawDegrees);
+    detail::writeF32(out, cmd.forward);
+    detail::writeF32(out, cmd.strafe);
+    out.push_back(static_cast<std::byte>(cmd.jump ? 1 : 0));
+    detail::writeF32(out, cmd.yawDegrees);
     return out;
 }
 
@@ -109,12 +109,13 @@ bool InputCommand::deserialize(const std::byte* data, std::size_t size, InputCom
     NetReader reader;
     if (!readHeader(data, size, NetPacketType::InputCommand, reader))
         return false;
-    out.tick = reader.u32();
+    out.cmdNumber = reader.u32();
     out.lastAck = reader.u32();
-    out.input.forward = reader.f32();
-    out.input.strafe = reader.f32();
-    out.input.jump = reader.u8() != 0;
-    out.input.yawDegrees = reader.f32();
+    out.cmd.forward = reader.f32();
+    out.cmd.strafe = reader.f32();
+    out.cmd.jump = reader.u8() != 0;
+    out.cmd.yawDegrees = reader.f32();
+    out.cmd.cmdNumber = out.cmdNumber;
     return reader.ok();
 }
 
@@ -126,7 +127,7 @@ std::vector<std::byte> Snapshot::serialize() const {
     writeHeader(out, NetPacketType::Snapshot);
     detail::writeU32(out, tick);
     detail::writeU32(out, baseline);
-    detail::writeU32(out, lastInputTick);
+    detail::writeU32(out, lastCmdNumber);
     out.push_back(static_cast<std::byte>(full ? 1 : 0));
     detail::writeU16(out, static_cast<std::uint16_t>(std::min<std::size_t>(entities.size(), 0xFFFF)));
     for (const EntitySnapshot& entity : entities) {
@@ -158,7 +159,7 @@ bool Snapshot::deserialize(const std::byte* data, std::size_t size, Snapshot& ou
         return false;
     out.tick = reader.u32();
     out.baseline = reader.u32();
-    out.lastInputTick = reader.u32();
+    out.lastCmdNumber = reader.u32();
     out.full = reader.u8() != 0;
     const std::uint16_t count = reader.u16();
     // Every entity record is 35 bytes; reject counts the packet

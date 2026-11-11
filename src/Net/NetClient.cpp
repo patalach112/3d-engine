@@ -15,8 +15,8 @@ constexpr float kMispredictThreshold = 0.01f;  // 1 cm: below this, prediction w
 constexpr float kSnapDistance = 2.0f;          // beyond this, corrections snap (teleports)
 constexpr float kCorrectionDecayRate = 12.0f;  // visual offset decay, per second
 
-PlayerMoveState authoritativeToMoveState(const EntitySnapshot& state, const MoveSettings& settings) {
-    PlayerMoveState move;
+PlayerState authoritativeToState(const EntitySnapshot& state, const MoveSettings& settings) {
+    PlayerState move;
     move.position = state.position;
     move.velocity = state.velocity;
     move.grounded = state.position.y <= settings.groundY + 1e-4f && state.velocity.y <= 0.0f;
@@ -65,7 +65,7 @@ void NetClient::disconnect(const std::string& reason) {
     m_serverPeerId = 0;
 }
 
-void NetClient::tickOnce(const PlayerMoveInput& input) {
+void NetClient::tickOnce(const InputCmd& input) {
     m_transportEvents.clear();
     m_transport.poll(m_transportEvents, 0);
     for (const TransportEvent& event : m_transportEvents)
@@ -82,21 +82,25 @@ void NetClient::tickOnce(const PlayerMoveInput& input) {
         m_visualOffset = glm::vec3{0.0f};
 
     ++m_tick;
-    const PlayerMoveInput clean = sanitizeMoveInput(input);
-    groundMove(m_predicted, clean, m_welcome.move, dt);
-    m_predictedFrames.push_back(PredictedFrame{m_tick, clean, m_predicted});
+    // Stamp the sequence number, then predict through the SAME
+    // MovementSystem the server validates with (it sanitises the
+    // command internally, so prediction sees the legal envelope).
+    InputCmd cmd = input;
+    cmd.cmdNumber = m_tick;
+    m_movement.playerMove(cmd, m_predicted, dt);
+    m_predictedFrames.push_back(PredictedFrame{cmd, m_predicted});
     while (m_predictedFrames.size() > kMaxPredictedFrames)
         m_predictedFrames.pop_front();
 
     InputCommand command;
-    command.tick = m_tick;
+    command.cmdNumber = m_tick;
     command.lastAck = m_lastAckSent;
-    command.input = clean;
+    command.cmd = cmd;
     sendPacket(command.serialize());
     ++m_stats.inputsSent;
 }
 
-std::uint32_t NetClient::update(double realSeconds, const PlayerMoveInput& input) {
+std::uint32_t NetClient::update(double realSeconds, const InputCmd& input) {
     const double dt = m_welcomed && m_welcome.fixedDt > 0.0f ? m_welcome.fixedDt : 1.0 / 128.0;
     m_accumulator += std::min(realSeconds, 0.25);
     std::uint32_t steps = 0;
@@ -146,7 +150,8 @@ void NetClient::handlePacket(const std::byte* data, std::size_t size) {
         if (ServerWelcome::deserialize(data, size, welcome)) {
             m_welcome = welcome;
             m_welcomed = true;
-            m_predicted = PlayerMoveState{};
+            m_movement.setSettings(welcome.move);
+            m_predicted = PlayerState{};
             m_predicted.grounded = true;
             if (m_callbacks.onWelcomed)
                 m_callbacks.onWelcomed(m_welcome);
@@ -218,8 +223,8 @@ void NetClient::reconcile(const Snapshot& snapshot) {
     // snapshot that carried it remains the newest truth available.
     for (const EntitySnapshot& state : snapshot.entities) {
         if (state.entity == localEntityId()) {
-            m_authoritative = authoritativeToMoveState(state, m_welcome.move);
-            m_authoritativeInputTick = snapshot.lastInputTick;
+            m_authoritative = authoritativeToState(state, m_welcome.move);
+            m_authoritativeCmdNumber = snapshot.lastCmdNumber;
             m_hasAuthoritative = true;
         }
     }
@@ -231,12 +236,12 @@ void NetClient::reconcile(const Snapshot& snapshot) {
     glm::vec3 predictedAtAnchor = m_authoritative.position;
     bool haveAnchorPrediction = false;
     for (const PredictedFrame& frame : m_predictedFrames) {
-        if (frame.tick == m_authoritativeInputTick) {
+        if (frame.cmd.cmdNumber == m_authoritativeCmdNumber) {
             predictedAtAnchor = frame.after.position;
             haveAnchorPrediction = true;
             break;
         }
-        if (netTickNewer(frame.tick, m_authoritativeInputTick))
+        if (netTickNewer(frame.cmd.cmdNumber, m_authoritativeCmdNumber))
             break;
     }
     const float error = haveAnchorPrediction ? glm::length(predictedAtAnchor - m_authoritative.position) : 0.0f;
@@ -252,8 +257,8 @@ void NetClient::reconcile(const Snapshot& snapshot) {
     m_predicted = m_authoritative;
     const float dt = m_welcome.fixedDt > 0.0f ? m_welcome.fixedDt : 1.0f / 128.0f;
     for (const PredictedFrame& frame : m_predictedFrames) {
-        if (netTickNewer(frame.tick, m_authoritativeInputTick))
-            groundMove(m_predicted, frame.input, m_welcome.move, dt);
+        if (netTickNewer(frame.cmd.cmdNumber, m_authoritativeCmdNumber))
+            m_movement.playerMove(frame.cmd, m_predicted, dt);
     }
     // Keep the render position continuous: carry the discrepancy
     // as an offset that decays exponentially. Teleports snap.
@@ -262,8 +267,9 @@ void NetClient::reconcile(const Snapshot& snapshot) {
         m_visualOffset = glm::normalize(m_visualOffset);
 
     // Drop history the server has fully consumed.
-    while (!m_predictedFrames.empty() && !netTickNewer(m_predictedFrames.front().tick, m_authoritativeInputTick) &&
-           m_predictedFrames.front().tick != m_authoritativeInputTick)
+    while (!m_predictedFrames.empty() &&
+           !netTickNewer(m_predictedFrames.front().cmd.cmdNumber, m_authoritativeCmdNumber) &&
+           m_predictedFrames.front().cmd.cmdNumber != m_authoritativeCmdNumber)
         m_predictedFrames.pop_front();
 }
 

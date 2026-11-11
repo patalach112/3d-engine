@@ -89,10 +89,10 @@ struct SnapshotBaseline {
 // baseline.recordSent().
 [[nodiscard]] inline Snapshot buildSnapshot(const std::vector<EntitySnapshot>& current,
                                             const SnapshotBaseline& baseline, std::uint32_t tick,
-                                            std::uint32_t lastInputTick) {
+                                            std::uint32_t lastCmdNumber) {
     Snapshot snapshot;
     snapshot.tick = tick;
-    snapshot.lastInputTick = lastInputTick;
+    snapshot.lastCmdNumber = lastCmdNumber;
     snapshot.full = baseline.needsFull(tick);
     snapshot.baseline = snapshot.full ? 0 : baseline.ackTick;
 

@@ -69,7 +69,7 @@
 #include "Scripting/StalkerAISystem.h"
 #include "Graphics/TextEditor.h"
 #include "Net/DedicatedServer.h"
-#include "Net/FrictionController.h"
+#include "Net/MovementSystem.h"
 #include "Net/NetClient.h"
 #include "Net/NetComponents.h"
 #include "Net/NetProtocol.h"
@@ -12446,55 +12446,6 @@ void testNetworking() {
     std::cout << "Networking / Dedicated Server\n";
     const float kDt = 1.0f / 128.0f;
 
-    // --- Ground friction controller: identical math both sides ----
-    {
-        const MoveSettings move;
-        PlayerMoveInput forward;
-        forward.forward = 1.0f;
-        PlayerMoveState a;
-        PlayerMoveState b;
-        a.grounded = b.grounded = true;
-        for (int i = 0; i < 256; ++i) {
-            groundMove(a, forward, move, kDt);
-            groundMove(b, forward, move, kDt);
-        }
-        check(a.position == b.position && a.velocity == b.velocity,
-              "friction controller is deterministic (bit-identical states)");
-        check(nearlyEqual(glm::length(a.velocity), move.maxSpeed, 0.01),
-              "friction controller accelerates to max speed");
-        check(a.position.z < -5.0f, "forward input moves along facing (-Z at yaw 0)");
-        const PlayerMoveInput none;
-        for (int i = 0; i < 256; ++i)
-            groundMove(a, none, move, kDt);
-        check(glm::length(a.velocity) < 1e-3f, "ground friction bleeds speed to a full stop");
-        const float stoppedZ = a.position.z;
-        for (int i = 0; i < 32; ++i)
-            groundMove(a, none, move, kDt);
-        check(nearlyEqual(a.position.z, stoppedZ, 1e-6), "stopped player does not drift");
-
-        PlayerMoveState jumper;
-        jumper.grounded = true;
-        PlayerMoveInput jumpInput;
-        jumpInput.jump = true;
-        float peak = 0.0f;
-        for (int i = 0; i < 256; ++i) {
-            groundMove(jumper, jumpInput, move, kDt);
-            jumpInput.jump = false; // one press
-            peak = std::max(peak, jumper.position.y);
-        }
-        check(peak > 0.5f, "jump leaves the ground");
-        check(jumper.grounded && nearlyEqual(jumper.position.y, 0.0, 1e-6), "jump arc lands back on the ground plane");
-
-        PlayerMoveInput dirty;
-        dirty.forward = 5.0f;
-        dirty.strafe = 5.0f;
-        dirty.yawDegrees = std::numeric_limits<float>::quiet_NaN();
-        const PlayerMoveInput clean = sanitizeMoveInput(dirty);
-        check(clean.forward <= 1.0f && clean.yawDegrees == 0.0f, "sanitizeMoveInput clamps axes and NaN yaw");
-        check(std::sqrt(clean.forward * clean.forward + clean.strafe * clean.strafe) <= 1.001f,
-              "sanitizeMoveInput normalises the wish vector");
-    }
-
     // --- Wire protocol round trips --------------------------------
     {
         ClientHello hello;
@@ -12521,15 +12472,16 @@ void testNetworking() {
               "ServerWelcome round-trips");
 
         InputCommand command;
-        command.tick = 77;
+        command.cmdNumber = 77;
         command.lastAck = 66;
-        command.input.forward = 0.5f;
-        command.input.jump = true;
-        command.input.yawDegrees = 90.0f;
+        command.cmd.forward = 0.5f;
+        command.cmd.jump = true;
+        command.cmd.yawDegrees = 90.0f;
         const std::vector<std::byte> commandBytes = command.serialize();
         InputCommand commandBack;
         check(InputCommand::deserialize(commandBytes.data(), commandBytes.size(), commandBack) &&
-                  commandBack.tick == 77 && commandBack.input.jump && commandBack.input.yawDegrees == 90.0f,
+                  commandBack.cmdNumber == 77 && commandBack.cmd.cmdNumber == 77 && commandBack.cmd.jump &&
+                      commandBack.cmd.yawDegrees == 90.0f,
               "InputCommand round-trips");
 
         Snapshot snapshot;
@@ -12722,7 +12674,7 @@ void testNetworking() {
         alice.setCallbacks(aliceCallbacks);
         check(alice.connect("127.0.0.1", server.port(), "Alice"), "client connects over UDP loopback");
 
-        const auto pump = [&](NetClient& client, const PlayerMoveInput& input, int iterations) {
+        const auto pump = [&](NetClient& client, const InputCmd& input, int iterations) {
             for (int i = 0; i < iterations; ++i) {
                 server.step();
                 client.tickOnce(input);
@@ -12730,9 +12682,11 @@ void testNetworking() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         };
-        const PlayerMoveInput noInput;
+        const InputCmd noInput;
         pump(alice, noInput, 600);
         check(alice.welcomed(), "handshake completes: Welcome assigns an entity");
+        check(alice.welcome().move.airAccelerate == 0.0f,
+              "server ships the anti-bunny-hop air clamp in the Welcome rules");
         check(server.players().size() == 1 && server.players()[0].name == "Alice",
               "server maps the peer to a registry entity");
 
@@ -12785,7 +12739,7 @@ void testNetworking() {
 
         // Movement: predict locally, reconcile against the server.
         const std::uint32_t aliceEntity = alice.localEntityId();
-        PlayerMoveInput forward;
+        InputCmd forward;
         forward.forward = 1.0f;
         pump(alice, forward, 64);
         const auto serverTransformOf = [&server](std::uint32_t entityId) {
@@ -12941,7 +12895,7 @@ void testNetworking() {
         for (int i = 0; i < 800 && !welcomed; ++i) {
             if (!probe.connected())
                 (void)probe.connect("127.0.0.1", 27987, "Probe");
-            probe.tickOnce(PlayerMoveInput{});
+            probe.tickOnce(InputCmd{});
             welcomed = probe.welcomed();
             if (!welcomed)
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -12949,7 +12903,7 @@ void testNetworking() {
         check(welcomed, "vibe_server host accepts a real client");
         probe.requestStatus();
         for (int i = 0; i < 400 && !probe.lastStatus().has_value(); ++i) {
-            probe.tickOnce(PlayerMoveInput{});
+            probe.tickOnce(InputCmd{});
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         check(probe.lastStatus().has_value() && probe.lastStatus()->playerCount == 1,
@@ -12958,6 +12912,223 @@ void testNetworking() {
         stop.store(true);
         serverThread.join();
         check(exitCode == 0, "vibe_server shuts down cleanly on request");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// MovementSystem: the precise Source movement core. Friction /
+// accelerate math, momentum, the strict anti-bunny-hop air clamp,
+// and bit-determinism of the ONE playerMove() that client
+// prediction and the 128 Hz server both execute, sequenced by
+// cmd_number.
+// ---------------------------------------------------------------------------
+void testMovementSystem() {
+    using namespace engine;
+    std::cout << "MovementSystem (Source movement core)\n";
+    const MoveSettings settings; // production survival-horror tuning
+    const MovementSystem movement(settings);
+    const float dt = 1.0f / 128.0f; // the dedicated server's fixed tick
+    const auto hSpeed = [](const PlayerState& state) {
+        return std::sqrt(state.velocity.x * state.velocity.x + state.velocity.z * state.velocity.z);
+    };
+
+    check(settings.airAccelerate == 0.0f, "anti-bunny-hop clamp ships as the default (sv_airaccelerate = 0)");
+
+    // --- Source friction: drop = max(speed, stopspeed) * sv_friction * dt ----
+    {
+        const InputCmd none;
+        PlayerState state;
+        state.velocity = glm::vec3{4.5f, 0.0f, 0.0f};
+        movement.playerMove(none, state, dt);
+        check(nearlyEqual(hSpeed(state), 4.5 - 4.5 * 8.0 / 128.0, 1e-4),
+              "friction: drop = max(speed, stopspeed) * sv_friction * dt");
+        PlayerState slow;
+        slow.velocity = glm::vec3{0.5f, 0.0f, 0.0f};
+        movement.playerMove(none, slow, dt);
+        check(nearlyEqual(hSpeed(slow), 0.5 - 1.0 * 8.0 / 128.0, 1e-4),
+              "friction: stopspeed floors the control speed below 1 m/s");
+        bool monotonic = true;
+        float previous = hSpeed(state);
+        for (int i = 0; i < 256; ++i) {
+            movement.playerMove(none, state, dt);
+            const float speed = hSpeed(state);
+            if (speed > previous + 1e-6f)
+                monotonic = false;
+            previous = speed;
+        }
+        check(monotonic && state.velocity.x == 0.0f, "friction bleeds monotonically to an exact full stop");
+        const float stoppedX = state.position.x;
+        for (int i = 0; i < 32; ++i)
+            movement.playerMove(none, state, dt);
+        check(state.position.x == stoppedX, "a stopped player never drifts");
+    }
+
+    // --- Ground accelerate: deliberate ramp, projection cap -------------------
+    {
+        PlayerState state;
+        InputCmd forward;
+        forward.forward = 1.0f;
+        float speedAt8 = 0.0f;
+        float peak = 0.0f;
+        bool exceeded = false;
+        for (int i = 1; i <= 512; ++i) {
+            movement.playerMove(forward, state, dt);
+            const float speed = hSpeed(state);
+            peak = std::max(peak, speed);
+            if (speed > settings.maxSpeed + 1e-4f)
+                exceeded = true;
+            if (i == 8)
+                speedAt8 = speed;
+        }
+        check(speedAt8 < 0.5f * settings.maxSpeed, "acceleration ramps up deliberately (heavy grounded feel)");
+        check(peak > 0.7f * settings.maxSpeed && !exceeded,
+              "accelerate reaches the friction equilibrium but never exceeds the wish-speed cap");
+        check(state.position.z < -3.0f, "forward input drives -Z at yaw 0");
+    }
+
+    // --- Momentum: reversing direction must cancel, never flip ------------------
+    {
+        PlayerState state;
+        InputCmd forward;
+        forward.forward = 1.0f;
+        for (int i = 0; i < 256; ++i)
+            movement.playerMove(forward, state, dt);
+        const float runSpeed = hSpeed(state);
+        InputCmd backward;
+        backward.forward = -1.0f;
+        bool flipped = false;
+        int ticksToFlip = 0;
+        float minAbsZ = 1e9f;
+        for (int i = 0; i < 256; ++i) {
+            movement.playerMove(backward, state, dt);
+            minAbsZ = std::min(minAbsZ, std::abs(state.velocity.z));
+            if (!flipped && state.velocity.z > 0.0f) {
+                flipped = true;
+                ticksToFlip = i;
+            }
+        }
+        check(flipped && ticksToFlip >= 6, "direction reversal spends momentum first (no instant flip)");
+        check(minAbsZ < 0.35f, "reversal passes through near-zero speed (momentum cancelled, not mirrored)");
+        check(nearlyEqual(hSpeed(state), runSpeed, 0.05), "reverse rebuilds to the same terminal speed");
+    }
+
+    // --- Jump: gravity only, horizontal velocity bit-frozen in air ---------------
+    {
+        PlayerState state;
+        InputCmd forward;
+        forward.forward = 1.0f;
+        for (int i = 0; i < 256; ++i)
+            movement.playerMove(forward, state, dt);
+        InputCmd jumpCmd = forward;
+        jumpCmd.jump = true;
+        movement.playerMove(jumpCmd, state, dt);
+        check(!state.grounded, "jump leaves the ground");
+        check(nearlyEqual(state.velocity.y, settings.jumpSpeed - settings.gravity * dt, 1e-4),
+              "jump sets vertical velocity, then exactly one gravity step applies");
+        const float airVx = state.velocity.x;
+        const float airVz = state.velocity.z;
+        float previousVy = state.velocity.y;
+        float peak = 0.0f;
+        bool frozen = true;
+        bool gravityExact = true;
+        bool landed = false;
+        InputCmd air; // classic air-strafe exploit attempt: strafe + spinning view
+        air.strafe = 1.0f;
+        for (int i = 0; i < 256 && !landed; ++i) {
+            air.yawDegrees = static_cast<float>(i) * 15.0f;
+            movement.playerMove(air, state, dt);
+            peak = std::max(peak, state.position.y);
+            if (!state.grounded) {
+                if (state.velocity.x != airVx || state.velocity.z != airVz)
+                    frozen = false;
+                if (!nearlyEqual(previousVy - state.velocity.y, settings.gravity * dt, 1e-4))
+                    gravityExact = false;
+                previousVy = state.velocity.y;
+            } else {
+                landed = true;
+            }
+        }
+        check(frozen, "air clamp: horizontal velocity is bit-frozen while airborne (no air-strafe gain)");
+        check(gravityExact, "airborne vertical velocity obeys gravity exactly, tick by tick");
+        check(landed && peak > 0.5f, "the jump arc rises and lands back on the ground plane");
+    }
+
+    // --- Anti-bunny-hop: held jump can neither stack nor preserve speed ------------
+    {
+        const InputCmd hop = [] {
+            InputCmd cmd;
+            cmd.forward = 1.0f;
+            cmd.jump = true; // held: re-jumps on every touchdown
+            return cmd;
+        }();
+        PlayerState hopper;
+        float maxSeen = 0.0f;
+        for (int i = 0; i < 640; ++i) {
+            movement.playerMove(hop, hopper, dt);
+            maxSeen = std::max(maxSeen, hSpeed(hopper));
+        }
+        check(maxSeen <= settings.maxSpeed + 1e-4f, "held-jump hopping never stacks velocity beyond max speed");
+        check(hSpeed(hopper) < 2.0f, "landing friction makes hopping strictly slower than running");
+
+        PlayerState runner;
+        InputCmd forward;
+        forward.forward = 1.0f;
+        for (int i = 0; i < 256; ++i)
+            movement.playerMove(forward, runner, dt);
+        const float runSpeed = hSpeed(runner);
+        float hopMax = 0.0f;
+        for (int i = 0; i < 640; ++i) {
+            movement.playerMove(hop, runner, dt);
+            hopMax = std::max(hopMax, hSpeed(runner));
+        }
+        check(hopMax <= runSpeed + 0.01f, "bunny-hopping cannot preserve or grow an existing run's speed");
+    }
+
+    // --- Determinism + cmd_number replay ----------------------------------------------
+    {
+        std::vector<InputCmd> cmds;
+        for (std::uint32_t i = 1; i <= 256; ++i) {
+            InputCmd cmd;
+            cmd.cmdNumber = i;
+            cmd.forward = (i % 3 == 0) ? -0.5f : 1.0f;
+            cmd.strafe = (i % 5 == 0) ? 0.75f : 0.0f;
+            cmd.jump = (i % 64 == 0);
+            cmd.yawDegrees = static_cast<float>(i % 360);
+            cmds.push_back(cmd);
+        }
+        // Two independent instances stand in for client and server:
+        // the same function, the same settings, the same stream.
+        const MovementSystem clientSide(settings);
+        const MovementSystem serverSide(settings);
+        PlayerState predicted;
+        PlayerState authoritative;
+        for (const InputCmd& cmd : cmds)
+            clientSide.playerMove(cmd, predicted, dt);
+        for (const InputCmd& cmd : cmds)
+            serverSide.playerMove(cmd, authoritative, dt);
+        check(predicted.position == authoritative.position && predicted.velocity == authoritative.velocity &&
+                  predicted.grounded == authoritative.grounded,
+              "client prediction and server authority are bit-identical over 256 sequenced commands");
+
+        // Reconciliation: authoritative state at cmd 128, then the
+        // client replays every unacknowledged command (129..256).
+        PlayerState anchor;
+        for (std::size_t i = 0; i < 128; ++i)
+            serverSide.playerMove(cmds[i], anchor, dt);
+        PlayerState replayed = anchor;
+        for (std::size_t i = 128; i < cmds.size(); ++i)
+            clientSide.playerMove(cmds[i], replayed, dt);
+        check(replayed.position == predicted.position && replayed.velocity == predicted.velocity,
+              "replay of unacknowledged commands (cmd_number > anchor) reproduces prediction exactly");
+
+        InputCmd dirty;
+        dirty.cmdNumber = 999;
+        dirty.forward = 42.0f;
+        dirty.yawDegrees = std::numeric_limits<float>::quiet_NaN();
+        const InputCmd clean = sanitizeInputCmd(dirty);
+        check(clean.cmdNumber == 999 && clean.forward == 1.0f && clean.yawDegrees == 0.0f,
+              "sanitizeInputCmd clamps the envelope but always preserves cmd_number");
     }
 }
 
@@ -13033,6 +13204,7 @@ int main() {
     testScriptAnimation();
     testTextEditorUpgrade();
     testNetworking();
+    testMovementSystem();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

@@ -75,11 +75,12 @@ public:
     // welcomed) predict + send one input command. Tests and fixed-
     // rate hosts drive this directly; update() wraps it in an
     // accumulator for render-rate hosts.
-    void tickOnce(const PlayerMoveInput& input);
-    std::uint32_t update(double realSeconds, const PlayerMoveInput& input);
+    // Stamps `input` with the next cmd_number, predicts it, sends it.
+    void tickOnce(const InputCmd& input);
+    std::uint32_t update(double realSeconds, const InputCmd& input);
 
     // Predicted local state (what gameplay-feel uses this frame).
-    [[nodiscard]] const PlayerMoveState& predictedState() const { return m_predicted; }
+    [[nodiscard]] const PlayerState& predictedState() const { return m_predicted; }
     // Render position: predicted + smoothly decaying correction.
     [[nodiscard]] glm::vec3 visualPosition() const;
     [[nodiscard]] float correctionDistance() const { return m_lastCorrectionDistance; }
@@ -120,9 +121,8 @@ public:
 
 private:
     struct PredictedFrame {
-        std::uint32_t tick = 0;
-        PlayerMoveInput input{};
-        PlayerMoveState after{};
+        InputCmd cmd{};    // carries its cmdNumber (the sequence key)
+        PlayerState after{}; // predicted state right after simulating cmd
     };
 
     void handleTransportEvent(const TransportEvent& event);
@@ -146,7 +146,8 @@ private:
     std::uint32_t m_lastSnapshotTick = 0; // staleness guard for unreliable delivery
     double m_accumulator = 0.0;
 
-    PlayerMoveState m_predicted{};
+    MovementSystem m_movement; // settings arrive with the Welcome packet
+    PlayerState m_predicted{};
     glm::vec3 m_visualOffset{0.0f};
     float m_lastCorrectionDistance = 0.0f;
     std::deque<PredictedFrame> m_predictedFrames;
@@ -154,8 +155,8 @@ private:
     // Last authoritative state received for the local player plus
     // the input tick it corresponds to (reconcile anchor).
     bool m_hasAuthoritative = false;
-    PlayerMoveState m_authoritative{};
-    std::uint32_t m_authoritativeInputTick = 0;
+    PlayerState m_authoritative{};
+    std::uint32_t m_authoritativeCmdNumber = 0;
 
     std::vector<NetGameEvent> m_scriptEventQueue; // for forwardEventsToScripts
     std::unordered_map<std::uint32_t, EntitySnapshot> m_world;

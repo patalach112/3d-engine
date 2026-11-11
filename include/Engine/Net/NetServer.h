@@ -145,6 +145,7 @@ private:
     [[nodiscard]] std::optional<ServerPlayerInfo> playerInfo(const PeerSession& peer) const;
 
     ServerSettings m_settings;
+    MovementSystem m_movement; // settings bound at start() from ServerSettings::move
     NetTransport m_transport;
     Scene m_scene;
     EventBus m_eventBus;
