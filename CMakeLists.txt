@@ -214,6 +214,9 @@ engine_module(EngineScene ENGINE_BUILDING_SCENE
     src/Scene/Systems/RotationSystem.cpp
     src/Scene/Systems/RenderSystem.cpp
     src/Scene/Systems/TransformSystem.cpp
+    src/Scripting/DSLParser.cpp
+    src/Scripting/ScriptSystem.cpp
+    src/Scripting/StalkerAISystem.cpp
 )
 target_link_libraries(EngineScene
     PUBLIC EngineFoundation EngineCore EnginePlatform EngineGeometry EngineGraphics EngineAssets
@@ -370,6 +373,24 @@ if(MSVC)
     target_compile_options(game-player PRIVATE /W4 /permissive-)
 else()
     target_compile_options(game-player PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ---------------------------------------------------------------------------
+# Backrooms scripting demo: headless hybrid DSL + native showcase.
+# Builds the Scenario 18 scene (player / almond water / safe room /
+# stalker), runs the DSL ScriptSystem and the native
+# StalkerAISystem in the same frame loop and prints a trace. No
+# window, no Vulkan — safe for CI and for the sandbox.
+# ---------------------------------------------------------------------------
+add_executable(scripting-demo examples/ScriptingDemo.cpp)
+target_link_libraries(scripting-demo
+    PRIVATE EngineScene EngineCore EnginePlatform EngineFoundation
+            Threads::Threads glm::glm EnTT::EnTT)
+engine_copy_runtime_dlls(scripting-demo)
+if(MSVC)
+    target_compile_options(scripting-demo PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(scripting-demo PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # ---------------------------------------------------------------------------

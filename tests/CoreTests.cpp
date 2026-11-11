@@ -59,6 +59,11 @@
 #include "Core/ModuleManager.h"
 #include "Scene/ComponentReflection.h"
 #include "Scene/NativeScript.h"
+#include "Scripting/DSLComponents.h"
+#include "Scripting/DSLParser.h"
+#include "Scripting/Scenario18.h"
+#include "Scripting/ScriptSystem.h"
+#include "Scripting/StalkerAISystem.h"
 #include "SpaceFlightModel.h"
 #include "Platform/DynamicLibrary.h"
 
@@ -10727,6 +10732,209 @@ void testPhase36LayoutThemeFont() {
     }
 }
 
+void testBackroomsScripting() {
+    std::cout << "Backrooms hybrid DSL scripting\n";
+    using namespace engine;
+
+    // -- Parser: Scenario 18 shape --------------------------------
+    const DSLParseResult scenario = parseBackroomsScript(kScenario18Script);
+    check(scenario.ok(), "scenario18: parses clean");
+    check(scenario.program.statements.size() >= 5, "scenario18: top-level statements present");
+    bool sawInteract = false, sawIf = false, sawTouch = false;
+    for (const DSLNode& node : scenario.program.statements) {
+        if (node.kind == DSLNodeKind::EventBlock && node.event == DSLEventKind::Interact) sawInteract = true;
+        if (node.kind == DSLNodeKind::If) sawIf = true;
+        if (node.kind == DSLNodeKind::EventBlock && node.event == DSLEventKind::Touch) sawTouch = true;
+    }
+    check(sawInteract && sawTouch, "scenario18: interact + touch event nodes");
+    check(sawIf, "scenario18: guarded if composition node");
+
+    // -- Parser: expression precedence via the interpreter ---------
+    const DSLParseResult exprScript = parseBackroomsScript("from start() x = 2 + 3 * 4 y = (2 + 3) * 4 z = 10 - 4 - 3 script(end)");
+    check(exprScript.ok(), "expr: script parses");
+    const std::unordered_map<std::string, double> noVars;
+    const std::unordered_map<std::string, std::string> noText;
+    check(ScriptInterpreter::evaluate(exprScript.program.statements[0].expr, noVars, noText) == 14.0, "expr: * binds tighter than +");
+    check(ScriptInterpreter::evaluate(exprScript.program.statements[1].expr, noVars, noText) == 20.0, "expr: parentheses group");
+    check(ScriptInterpreter::evaluate(exprScript.program.statements[2].expr, noVars, noText) == 3.0, "expr: subtraction left-associative");
+
+    // -- Parser: durations and malformed input ----------------------
+    const DSLParseResult dur = parseBackroomsScript("from start() every(500ms) { x = 1 } every(2m) { x = 2 } script(end)");
+    check(dur.ok() && ScriptInterpreter::evaluate(dur.program.statements[0].expr, noVars, noText) == 0.5, "duration: 500ms = 0.5s");
+    check(dur.ok() && ScriptInterpreter::evaluate(dur.program.statements[1].expr, noVars, noText) == 120.0, "duration: 2m = 120s");
+    check(!parseBackroomsScript("from start() x = 1").ok(), "parser: missing script(end) rejected");
+    check(!parseBackroomsScript("start() x = 1 script(end)").ok(), "parser: missing 'from' rejected");
+    check(!parseBackroomsScript("from start() print(\"oops) script(end)").ok(), "parser: unterminated string rejected");
+    check(!parseBackroomsScript("from start() every(1x) { x = 1 } script(end)").ok(), "parser: bad duration rejected");
+
+    // -- Interpreter: variables, part mutation, freeze, sound -------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto lamp = scene.createEntity("lamp");
+        lamp.addComponent<TransformComponent>();
+        lamp.addComponent<PointLightComponent>().intensity = 0.0f;
+        auto crate = scene.createEntity("crate");
+        crate.addComponent<TransformComponent>();
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() hp = 10 hp = hp + 5 part(\"lamp\").intensity = 2.5 part(\"crate\").scale(x) = 4 "
+            "part(\"crate\").freeze() play_sound(\"creak\") print(\"hello\") script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "hp").value_or(0.0) == 15.0, "interp: variable arithmetic persists");
+        check(std::abs(scene.registry().get<PointLightComponent>(lamp.handle()).intensity - 2.5f) < 1e-6f, "interp: part().intensity mutates light");
+        check(scene.registry().get<TransformComponent>(crate.handle()).scale.x == 4.0f, "interp: part().scale(x) mutates transform");
+        check(scene.registry().all_of<FrozenComponent>(crate.handle()), "interp: part().freeze() adds FrozenComponent");
+        check(ctx.sounds.size() == 1 && ctx.sounds[0] == "creak", "interp: play_sound routed to audio sink");
+        {
+            Scene scene2;
+            ScriptSystemContext ctx2;
+            auto brain2 = scene2.createEntity("brain2");
+            brain2.addComponent<ScriptComponent>().source = "from start() emit_sound(\"growl\") script(end)";
+            ScriptSystem::update(scene2, ctx2, 0.1);
+            check(ctx2.sounds.size() == 1 && ctx2.sounds[0] == "growl" &&
+                      scene2.registry().get<AudioComponent>(brain2.handle()).spatial,
+                  "interp: emit_sound is spatial");
+        }
+        check(scene.registry().all_of<AudioComponent>(brain.handle()) && scene.registry().get<AudioComponent>(brain.handle()).playCount == 1,
+              "interp: AudioComponent recorded the sound");
+        check(ctx.log.size() == 1 && ctx.log[0] == "hello", "interp: print routed to log");
+    }
+
+    // -- Interpreter: temporal windows --------------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() ticks = 0 count = 0 every(1s) { ticks = ticks + 1 } for(3s) { every(1s) { count = count + 1 } } script(end)";
+        for (int i = 0; i < 25; ++i) ScriptSystem::update(scene, ctx, 0.2); // 5 s
+        check(ScriptSystem::variable(ctx, brain.handle(), "ticks").value_or(0.0) >= 4.0, "temporal: standalone every keeps ticking");
+        const double count = ScriptSystem::variable(ctx, brain.handle(), "count").value_or(-1.0);
+        check(count >= 2.0 && count <= 3.0, "temporal: for window bounds its inner every");
+        const double ticksLater = ScriptSystem::variable(ctx, brain.handle(), "ticks").value_or(0.0);
+        for (int i = 0; i < 10; ++i) ScriptSystem::update(scene, ctx, 0.2);
+        check(ScriptSystem::variable(ctx, brain.handle(), "count").value_or(0.0) == count, "temporal: window children die with the window");
+        check(ScriptSystem::variable(ctx, brain.handle(), "ticks").value_or(0.0) > ticksLater, "temporal: standalone every outlives windows");
+    }
+
+    // -- Interpreter: input press vs hold, behavior assignment --------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<TransformComponent>();
+        brain.addComponent<ScriptComponent>().source =
+            "from start() pressed = 0 held = 0 behavior = stalker "
+            "on_input(\"LMB\") { pressed = pressed + 1 } on_hold(\"LeftShift\") { held = held + 1 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(scene.registry().all_of<AIBehaviorComponent>(brain.handle()) &&
+                  scene.registry().get<AIBehaviorComponent>(brain.handle()).behavior == AIBehavior::Stalker,
+              "interp: behavior = stalker assigns native AI");
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::postInputEvent(ctx, "LeftShift", true);
+        ScriptSystem::update(scene, ctx, 0.1);
+        ScriptSystem::postInputEvent(ctx, "LeftShift", true);
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "pressed").value_or(0.0) == 1.0, "interp: on_input fires once per press");
+        check(ScriptSystem::variable(ctx, brain.handle(), "held").value_or(0.0) == 2.0, "interp: on_hold fires while held");
+    }
+
+    // -- Interpreter: spatial position guard ---------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto player = scene.createEntity("Player");
+        player.addComponent<TransformComponent>().position = glm::vec3{0.0f, 0.0f, 0.0f};
+        auto zone = scene.createEntity("zone");
+        zone.addComponent<TransformComponent>().position = glm::vec3{10.0f, 0.0f, 0.0f};
+        auto& zoneCollider = zone.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{2.0f, 2.0f, 2.0f}));
+        zoneCollider.isTrigger = true;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source =
+            "from start() inside = 0 position(\"zone\") { inside = 1 } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "inside").value_or(-1.0) == 0.0, "spatial: position(zone) guard false outside");
+        scene.registry().get<TransformComponent>(player.handle()).position = glm::vec3{10.5f, 0.0f, 0.0f};
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::variable(ctx, brain.handle(), "inside").value_or(-1.0) == 1.0, "spatial: position(zone) guard true inside");
+    }
+
+    // -- Interpreter: broken scripts are contained ---------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto brain = scene.createEntity("brain");
+        brain.addComponent<ScriptComponent>().source = "from start() every(banana) { x = } script(end)";
+        ScriptSystem::update(scene, ctx, 0.1);
+        const auto it = ctx.runtimes.find(brain.handle());
+        check(it != ctx.runtimes.end() && !it->second.errors.empty(), "interp: parse errors captured, no crash");
+    }
+
+    // -- Scenario 18 end-to-end -----------------------------------------
+    {
+        Scene scene;
+        ScriptSystemContext ctx;
+        auto player = scene.createEntity("Player");
+        player.addComponent<TransformComponent>().position = glm::vec3{0.0f, 0.0f, 6.0f};
+        auto water = scene.createEntity("almond_water");
+        water.addComponent<TransformComponent>().position = glm::vec3{1.0f, 0.0f, 5.0f};
+        auto room = scene.createEntity("safe_room");
+        room.addComponent<TransformComponent>().position = glm::vec3{0.0f, 0.0f, -6.0f};
+        auto lights = scene.createEntity("safe_lights");
+        lights.addComponent<TransformComponent>();
+        lights.addComponent<PointLightComponent>().intensity = 0.0f;
+        auto stalker = scene.createEntity("stalker");
+        stalker.addComponent<TransformComponent>().position = glm::vec3{9.0f, 0.0f, 9.0f};
+        auto brain = scene.createEntity("Scenario18");
+        brain.addComponent<ScriptComponent>().source = kScenario18Script;
+        const glm::vec3 stalkerSpawn{9.0f, 0.0f, 9.0f};
+        auto var = [&](const char* n) { return ScriptSystem::variable(ctx, brain.handle(), n).value_or(-1.0); };
+
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(var("sanity") == 100.0 && var("health") == 100.0, "scenario18 e2e: init vars");
+        ScriptSystem::postInteract(ctx, "almond_water", player.handle());
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(ScriptSystem::holdsItem(ctx, brain.handle(), "almond_water") && !scene.registry().valid(water.handle()),
+              "scenario18 e2e: pickup holds item and destroys world item");
+        ScriptSystem::postInputEvent(ctx, "LMB", false);
+        ScriptSystem::update(scene, ctx, 0.1);
+        for (int i = 0; i < 25; ++i) ScriptSystem::update(scene, ctx, 0.1); // 2.6 s of regen
+        check(var("health") == 104.0 && var("sanity") == 200.0, "scenario18 e2e: almond regen ticks while held");
+        for (int i = 0; i < 80; ++i) ScriptSystem::update(scene, ctx, 0.1); // expire window
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Touch, "safe_room", room.handle(), player.handle(), room.handle(), player.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(std::abs(scene.registry().get<PointLightComponent>(lights.handle()).intensity - 1.0f) < 1e-6f,
+              "scenario18 e2e: safe room lights up");
+        const double hp = var("health");
+        for (int i = 0; i < 35; ++i) ScriptSystem::update(scene, ctx, 0.1); // 3.5 s: one 3s tick
+        check(var("health") == hp + 2.0, "scenario18 e2e: safe room heals on 3s cadence");
+        ScriptSystem::postEvent(ctx, DSLEvent{DSLEventKind::Collide, "stalker", stalker.handle(), room.handle(), stalker.handle(), room.handle()});
+        ScriptSystem::update(scene, ctx, 0.1);
+        check(glm::distance(scene.registry().get<TransformComponent>(stalker.handle()).position, stalkerSpawn) < 1e-4f,
+              "scenario18 e2e: stalker collision resets its position");
+    }
+
+    // -- Native stalker: registry-native fallback -------------------------
+    {
+        entt::registry registry;
+        const entt::entity player = registry.create();
+        registry.emplace<TagComponent>(player, "Player");
+        registry.emplace<TransformComponent>(player).position = glm::vec3{0.0f, 0.0f, 0.0f};
+        const entt::entity stalker = registry.create();
+        auto& transform = registry.emplace<TransformComponent>(stalker);
+        transform.position = glm::vec3{10.0f, 0.0f, 0.0f};
+        auto& ai = registry.emplace<AIBehaviorComponent>(stalker);
+        ai.behavior = AIBehavior::Stalker;
+        StalkerAISystem::update(registry, 0.1f);
+        check(registry.get<TransformComponent>(stalker).position.x < 10.0f, "stalker: native registry update seeks the player");
+        registry.emplace<FrozenComponent>(stalker);
+        const float frozenX = registry.get<TransformComponent>(stalker).position.x;
+        StalkerAISystem::update(registry, 0.1f);
+        check(registry.get<TransformComponent>(stalker).position.x == frozenX, "stalker: frozen entities do not move");
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -10788,6 +10996,7 @@ int main() {
     testFixedTimestep();
     testTime();
     testGameLoop();
+    testBackroomsScripting();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

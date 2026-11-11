@@ -1,0 +1,63 @@
+#pragma once
+
+#include <entt/entity/entity.hpp>
+#include <glm/vec3.hpp>
+
+#include <cstdint>
+#include <string>
+
+namespace engine {
+
+// ---------------------------------------------------------------------------
+// Scripting components (hybrid DSL + native architecture)
+//
+// The Backrooms DSL attaches to an entity through ScriptComponent
+// (the spec's "ScriptComponent"): it carries the human-readable
+// script source; the parsed AST, variable map and timer instances
+// live in the ScriptRuntime the ScriptSystem owns per entity --
+// the same split NativeScriptComponent uses (name in the
+// component, instance in the system), so components stay plain
+// serializable data.
+// ---------------------------------------------------------------------------
+
+struct ScriptComponent {
+    std::string source;  // DSL program text (from start() .. script(end))
+    bool enabled = true; // disabled components are skipped by ScriptSystem
+    bool started = false; // system-managed: setup statements have run
+};
+
+// High-level AI tag (the DSL's `behavior = stalker`). Written by
+// native code or by a DSL `behavior = ...` assignment; consumed by
+// the native StalkerAISystem, which supplies the raycast/steering
+// obstacle avoidance so scripts never write raw steering math.
+enum class AIBehavior : uint8_t { None = 0, Stalker = 1 };
+
+struct AIBehaviorComponent {
+    AIBehavior behavior = AIBehavior::None;
+    entt::entity target = entt::null; // null = track the entity tagged "Player"
+    float moveSpeed = 2.2f;           // metres per second
+    float stoppingDistance = 1.1f;    // halts this far from the target
+    float avoidanceRadius = 2.6f;     // obstacle sense radius
+    glm::vec3 steering{0.0f};         // last computed velocity (debug/AI viz)
+    bool active = true;
+};
+
+// Spatial audio sink (the DSL's play_sound / emit_sound): a sound
+// request lands here (pendingSound) for an audio backend to
+// consume; playCount lets tests/tools verify requests landed.
+struct AudioComponent {
+    std::string pendingSound; // most recent requested sound id ("" = none)
+    float volume = 1.0f;
+    float range = 14.0f; // attenuation range in metres when spatial
+    bool spatial = true;
+    uint32_t playCount = 0;
+};
+
+// Frozen by a DSL `part("x").freeze()`: gameplay systems honour
+// this tag (the stalker does; physics bodies keep their material
+// state -- freeze is a gameplay gate, not a solver state).
+struct FrozenComponent {
+    bool frozen = true;
+};
+
+} // namespace engine

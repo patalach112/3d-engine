@@ -2960,3 +2960,58 @@ clean.
 (Debug, Release shared/static, hidden-visibility, ASan),
 CTest 1/1, zero warnings, standalone player headless run
 clean.
+
+## Backrooms hybrid scripting — DSL + native ECS ✅
+
+A designer-facing scripting layer for Backrooms-style scenarios,
+built as a hybrid: a small event-driven DSL for spatial /
+temporal / state logic, with all hard behaviour (stalker AI
+steering and avoidance) in native C++ systems that read and
+write the same EnTT scene.
+
+- **Language** (`Engine/Scripting/DSLParser.h`): programs open
+  with `from start()` and close with `script(end)`. Values are
+  numbers, strings, and bare tags; expressions cover arithmetic,
+  comparison, logic, parentheses, and unary operators.
+  Statements include variable assignment (`sanity = sanity +
+  50`), entity mutation through `part("name")` (`.destroy()`,
+  `.freeze()`, `.intensity = 1.0`, `.scale(x) = 5`), inventory
+  via `inhand("item")`, input events `on_input("LMB")` /
+  `on_hold("LeftShift")`, spatial events `on_touch`,
+  `on_collide` (plus `on_collision`), `on_interact`, temporal
+  composition `every(10s)` / `for(10s)` with `s` / `ms` / `m`
+  durations, guarded composition through `if { ... }`,
+  `inhand(...) { ... }`, `position("zone") { ... }`, and
+  `part("x") { ... }` blocks, `position = reset`, `behavior =
+  stalker`, `play_sound`, `emit_sound`, and `print`. Parse
+  problems are collected as `line N: ...` errors — malformed
+  scripts never crash the host. Event blocks nested inside other
+  event blocks latch until recompile; a top-level `for` window
+  is one-shot and dies with its children, while event-triggered
+  windows can be re-triggered by later events.
+- **Runtime** (`ScriptSystem`): one `ScriptSystemContext` per
+  scene (runtimes, timers, event queue, spawn positions, sound
+  and log sinks). `attach()` maps `PhysicsSystem` collision and
+  trigger events to `on_collide` / `on_touch`, matched by
+  `TagComponent` names; the `Application` integrates input by
+  translating real key/mouse edges into DSL input events; and a
+  host can post input, interact, and touch events directly for
+  tools, tests, and console use. Internally, an arming pass,
+  event queue, and time manager compose the delta time — scripts
+  never see raw frame time. State lives in `ScriptComponent`
+  (source), `AIBehaviorComponent`, `AudioComponent`, and
+  `FrozenComponent`, reusing the engine's existing transform,
+  physics, collider/trigger, and light components.
+- **Native fallback** (`StalkerAISystem`): `behavior = stalker`
+  only tags the entity. `StalkerAISystem::update(Scene&, dt)`
+  performs player tracking, steering, raycast obstacle avoidance
+  and wall sliding; `update(entt::registry&, float)` is the raw
+  registry form for native scripts and tests. Frozen entities do
+  not move.
+- **Scenario 18** (`Engine/Scripting/Scenario18.h`,
+  `examples/ScriptingDemo.cpp`): the canonical acceptance script
+  — almond-water pickup, guarded LMB use, overheal windows, the
+  safe-room heal/lights script, and stalker position reset —
+  runs beside the native stalker in one loop. The demo exits
+  nonzero on failure and is exercised by `engine-core-tests`
+  (1267 passing checks) alongside the five-config matrix.

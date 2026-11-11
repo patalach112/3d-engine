@@ -22,6 +22,7 @@
 #include "Platform/Input.h"
 #include "Platform/Window.h"
 #include "Scene/PlaySession.h"
+#include "Scripting/ScriptSystem.h"
 #include "Scene/Scene.h"
 #include "Scene/TransformGizmo.h"
 #include "Scene/UIAssetBrowser.h"
@@ -145,6 +146,9 @@ private:
     EventBus::Subscription m_destroyedLogSubscription;
     PhysicsSystem m_physicsSystem;
     RenderSystem m_renderSystem;
+    // Backrooms hybrid scripting: DSL runtimes + event queue for
+    // every ScriptComponent in the scene (fed by m_eventBus).
+    ScriptSystemContext m_scriptContext;
 
     // Native game module (Phase 23): engine-owned; the scene it
     // drives survives its reloads. Empty [Game] modulePath = unused.

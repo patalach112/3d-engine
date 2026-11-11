@@ -20,6 +20,7 @@
 #include "Scene/Systems/CameraSystem.h"
 #include "Scene/NativeScript.h"
 #include "Scene/Systems/PhysicsSystem.h"
+#include "Scripting/StalkerAISystem.h"
 #include "Scene/Systems/PlayerSystem.h"
 #include "Scene/Systems/RotationSystem.h"
 
@@ -84,6 +85,8 @@ Application::Application(EngineConfig config)
     // turns into an impulse on the picked body.
     m_scene.setEventBus(&m_eventBus);
     m_physicsSystem.setEventBus(&m_eventBus);
+    // DSL scripts consume the same physics events natively.
+    ScriptSystem::attach(m_scriptContext, m_eventBus);
     m_input.bindAction("Impulse", Key::F);
     m_triggerLogSubscription = m_eventBus.subscribeScoped<TriggerEvent>([](const TriggerEvent& event) {
         ENGINE_LOG_INFO("Event: entity #" << entt::to_integral(event.otherEntity)
@@ -566,6 +569,13 @@ void Application::run() {
             // before physics, so script-driven forces are resolved
             // by the same step that produced them.
             NativeScriptSystem::fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
+            // Backrooms DSL scripts tick beside the native ones:
+            // input edges/holds are latched from the real Input,
+            // physics events arrive via the bus subscription, and
+            // the native stalker AI steers whatever the scripts
+            // tagged with `behavior = stalker`.
+            ScriptSystem::update(m_scene, m_scriptContext, m_input, fixedDeltaSeconds);
+            StalkerAISystem::update(m_scene, static_cast<float>(fixedDeltaSeconds));
             // Rigid-body physics is deterministic simulation, so it lives in
             // the fixed step (never the variable/render-rate update). Its
             // parallel phases return at JobSystem barriers before rendering.
@@ -1360,6 +1370,10 @@ void Application::enterPlayMode() {
         // The C-key physics reset targets the pre-play state:
         // capture spawn states against the live handles now.
         m_physicsSystem.captureSpawnStates(m_scene);
+        // DSL scripts restart from their setup state each Play.
+        // (The bus subscriptions capture this member by reference,
+        // so resetting its contents is enough -- never re-attach.)
+        m_scriptContext = ScriptSystemContext{};
     }
 }
 
