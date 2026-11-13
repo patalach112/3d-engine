@@ -192,6 +192,29 @@ public:
     static void update(Scene& scene, ScriptSystemContext& context, double deltaSeconds);
     static void update(Scene& scene, ScriptSystemContext& context, const Input& input, double deltaSeconds);
 
+    // --- Movement variable bridge (.dsla -> character controller) --
+    // Scripts tune the character controller by writing the canonical
+    // movement variables in ANY script attached to the scene:
+    //   sv_maxspeed, sv_sprintspeed, sv_friction, sv_stopspeed,
+    //   sv_accelerate, sv_airaccelerate, sv_gravity, sv_jumpspeed,
+    //   stamina_drain, stamina_regen   (-> MoveSettings fields)
+    //   stamina                          (-> live PlayerState charge)
+    // update() applies them to every CharacterControllerComponent
+    // at the end of the tick, so a runtime write (including a hot-
+    // reloaded .dsla edit or an `over Ns` lerp) changes movement on
+    // the very next playerMove the host ticks. Resolution is
+    // deterministic: the character's own script wins, then the
+    // lowest script entity id. Values are clamped to sane ranges
+    // and non-finite writes are ignored.
+    [[nodiscard]] static bool isMovementVariable(std::string_view name);
+    // Applies every currently-defined movement variable to the
+    // scene's character controllers. Returns true when at least one
+    // variable was applied to at least one controller. update()
+    // calls this automatically; hosts with custom tick orders may
+    // call it explicitly between ScriptSystem::update and
+    // PlayerSystem::update.
+    static bool applyMovementVariables(Scene& scene, const ScriptSystemContext& context);
+
     // Live runtime state for one script entity (null until its
     // first update): the inspector reads compile errors / held
     // items / timer counts from here.

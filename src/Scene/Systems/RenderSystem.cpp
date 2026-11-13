@@ -318,6 +318,10 @@ bool RenderSystem::render(Scene& scene) {
     frameLighting.spotShadowEnabled = frame.lighting.spotShadowEnabled;
     frameLighting.spotShadowViewProj = frame.lighting.spotShadowViewProj;
     frameLighting.spotShadowLightIndex = frame.lighting.spotShadowLightIndex;
+    frameLighting.pointShadowEnabled = frame.lighting.pointShadowEnabled;
+    frameLighting.pointShadowViewProj = frame.lighting.pointShadowViewProj;
+    frameLighting.pointShadowLightIndex = frame.lighting.pointShadowLightIndex;
+    frameLighting.pointShadowFarPlane = frame.lighting.pointShadowFarPlane;
     return m_renderer.drawFrame(frame.view, frame.projection, frame.renderQueue.items(), frameLighting);
 }
 

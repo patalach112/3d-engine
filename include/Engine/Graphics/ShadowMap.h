@@ -103,6 +103,48 @@ inline constexpr uint32_t kSpotShadowMapSize = 1024;
                                                                      float outerConeRadians, float nearPlane,
                                                                      float farPlane);
 
+// ---------------------------------------------------------------------------
+// Point light shadows (cube shadow mapping)
+//
+// A shadow-casting point light renders the scene depth six times,
+// once per 90-degree cube face, into a 6-layer depth array; the
+// fragment shader picks the face by the dominant axis of the
+// fragment-to-light vector and PCF-compares in that face's space —
+// the same reprojection math as the spot path, so dynamic props
+// both cast into and receive from the point's shadow volume. One
+// cube is budgeted (the nearest shadow-casting point wins), at
+// 512px per face: horror scenes light small rooms, and the bounded
+// cost is what keeps shadow rendering micro-stutter-free.
+// ---------------------------------------------------------------------------
+inline constexpr uint32_t kPointShadowMapSize = 512;
+inline constexpr uint32_t kPointShadowFaceCount = 6;
+
+// Push-constant indices the shadow depth pass uses to select its
+// light matrix (shadow.vert): 0..kMaxShadowCascades-1 are the
+// directional cascades, kSpotShadowPushIndex the spot, and
+// kPointShadowPushBase + face the point cube faces.
+inline constexpr uint32_t kSpotShadowPushIndex = 4;
+inline constexpr uint32_t kPointShadowPushBase = 5;
+
+// Soft-shadow filter radius, in shadow-map texels, shared by the
+// cascade / spot / point PCF kernels (12-tap Poisson disk). Larger
+// reads softer (and pricier); 1.6 texels hides the 1024/2048px
+// texel grid without washing contact shadows out.
+inline constexpr float kShadowPcfRadiusTexels = 1.6f;
+
+// World axis each cube face looks along (face order is the classic
+// +X, -X, +Y, -Y, +Z, -Z). Mirrored by cube.frag's face selection.
+[[nodiscard]] ENGINE_GRAPHICS_API glm::vec3 pointShadowFaceDirection(uint32_t face);
+// Which cube face owns a fragment-to-light direction (dominant
+// axis). Mirrored by cube.frag's face selection.
+[[nodiscard]] ENGINE_GRAPHICS_API uint32_t pointShadowFaceIndex(const glm::vec3& direction);
+// One face's light-space view-projection (90-degree perspective).
+[[nodiscard]] ENGINE_GRAPHICS_API glm::mat4 pointShadowViewProjection(const glm::vec3& position, uint32_t face,
+                                                                      float nearPlane, float farPlane);
+// All six face matrices for a point light at `position`.
+[[nodiscard]] ENGINE_GRAPHICS_API std::array<glm::mat4, kPointShadowFaceCount> pointShadowViewProjections(
+    const glm::vec3& position, float nearPlane, float farPlane);
+
 // Fits one light view-projection per cascade around its frustum
 // slice (bounding-sphere fit, texel-snapped against shimmer).
 // cameraUp need not be orthogonal to cameraFront.

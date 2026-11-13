@@ -40,6 +40,7 @@
 #include "Core/HardwareProfile.h"
 #include "Geometry/Cube.h"
 #include "Graphics/PipelineState.h"
+#include "Graphics/PipelineWarmup.h"
 #include "Core/Jobs/JobSystem.h"
 #include "Graphics/VramBudget.h"
 #include "Graphics/EditorLayout.h"
@@ -7008,13 +7009,18 @@ void testPhase21CullingAndLighting() {
         // vec4s (1024) = 1472 (Phase 22 added the environment vec4).
         // Phase 32 appends directionalColor (16) + spot shadow
         // matrix (64) + spotShadowParams (16) at the end, so every
-        // pre-existing offset is unchanged: 1568 total.
-        check(sizeof(engine::UniformBufferObject) == static_cast<size_t>(128 + 256 + 64 + 1024 + 96) &&
+        // pre-existing offset is unchanged: 1568 total. Point
+        // shadows append six cube-face matrices (384) +
+        // pointShadowParams (16) after that: 1968 total, and every
+        // earlier offset still unchanged.
+        check(sizeof(engine::UniformBufferObject) == static_cast<size_t>(128 + 256 + 64 + 1024 + 96 + 400) &&
                   offsetof(engine::UniformBufferObject, environmentParams) == 1456 &&
                   offsetof(engine::UniformBufferObject, directionalColor) == 1472 &&
                   offsetof(engine::UniformBufferObject, spotShadowViewProj) == 1488 &&
-                  offsetof(engine::UniformBufferObject, spotShadowParams) == 1552,
-              "ubo: C++ layout matches the GLSL byte budget (1568 bytes, Phase 32 fields appended)");
+                  offsetof(engine::UniformBufferObject, spotShadowParams) == 1552 &&
+                  offsetof(engine::UniformBufferObject, pointShadowViewProj) == 1568 &&
+                  offsetof(engine::UniformBufferObject, pointShadowParams) == 1952,
+              "ubo: C++ layout matches the GLSL byte budget (1968 bytes, point-shadow fields appended)");
     }
 }
 
@@ -14012,6 +14018,204 @@ void testStartupEventPumping() {
     check(defaulted.interval() == 0.25f && defaulted.pumpCount() == 0, "pump stores its interval");
 }
 
+// ---------------------------------------------------------------------------
+// Refactor wave: async startup warmup queue, character pushing of
+// dynamic rigid bodies, the script->movement variable bridge, and
+// the flashlight / point-light cube shadows.
+// ---------------------------------------------------------------------------
+void testAsyncWarmupPushScriptLighting() {
+    using namespace engine;
+    std::cout << "Async warmup / character push / script movement bridge / flashlight & point shadows\n";
+
+    // --- Pipeline warmup queue: dedup, FIFO, exact budget ----------------------
+    {
+        PipelineWarmupQueue queue;
+        check(queue.enqueue(PipelineWarmupRequest{1, PipelineStateDesc{}, "a.vert.spv", "a.frag.spv"}),
+              "warmup: first plan for a material is accepted");
+        check(!queue.enqueue(PipelineWarmupRequest{1, PipelineStateDesc{}, "a.vert.spv", "a.frag.spv"}) &&
+                  queue.duplicatesRejected() == 1,
+              "warmup: re-planning a material is rejected and counted");
+        check(queue.enqueue(PipelineWarmupRequest{2, PipelineStateDesc{}, "b.vert.spv", "b.frag.spv"}) &&
+                  queue.enqueue(PipelineWarmupRequest{3, PipelineStateDesc{}, "c.vert.spv", "c.frag.spv"}),
+              "warmup: distinct materials queue up");
+        std::vector<PipelineWarmupRequest> drained;
+        check(queue.drain(0, drained) == 0 && drained.empty() && queue.pendingCount() == 3,
+              "warmup: a zero budget drains nothing");
+        check(queue.drain(2, drained) == 2 && drained[0].materialId == 1 && drained[1].materialId == 2 &&
+                  queue.pendingCount() == 1,
+              "warmup: drains strictly FIFO within the frame budget");
+        check(queue.drain(8, drained) == 1 && drained[2].materialId == 3 && queue.complete() && queue.known(1) &&
+                  queue.totalEnqueued() == 3,
+              "warmup: an oversized budget drains the remainder and completes the plan");
+    }
+
+    // --- Character pushes a dynamic crate --------------------------------------
+    {
+        Scene scene;
+        auto floor = scene.createEntity("Floor");
+        floor.addComponent<TransformComponent>(glm::vec3{0.0f, -0.5f, 0.0f});
+        auto& floorBody = floor.addComponent<RigidBodyComponent>();
+        floorBody.setStatic(true);
+        floor.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{30.0f, 0.5f, 30.0f}));
+        auto player = scene.createEntity("Player");
+        player.addComponent<TransformComponent>(glm::vec3{0.0f, 0.75f, 1.6f});
+        auto& camera = player.addComponent<CameraComponent>(CameraConfig{});
+        camera.camera.setOrientation(0.0f, 0.0f);
+        auto& body = player.addComponent<RigidBodyComponent>(80.0f);
+        body.restitution = 0.0f;
+        body.friction = 0.25f;
+        body.setPrincipalInertia(glm::vec3{10000.0f});
+        player.addComponent<ColliderComponent>(
+            ColliderComponent::capsule(PlayerSystem::kCapsuleRadius, PlayerSystem::kCapsuleHalfHeight));
+        auto crate = scene.createEntity("Crate");
+        crate.addComponent<TransformComponent>(glm::vec3{0.0f, 0.5f, 0.0f});
+        auto& crateBody = crate.addComponent<RigidBodyComponent>(5.0f);
+        crateBody.friction = 0.4f;
+        crate.addComponent<ColliderComponent>(ColliderComponent::box(glm::vec3{0.5f, 0.5f, 0.5f}));
+
+        check(PlayerSystem::ensureCharacterController(scene), "push: character controller attaches");
+        PhysicsSettings physicsSettings;
+        PhysicsSystem physics;
+        InputCmd forward;
+        forward.forward = 1.0f;
+        const double dt = 1.0 / 60.0;
+        for (int step = 0; step < 150; ++step) {
+            PlayerSystem::driveCharacter(scene, forward, dt);
+            physics.update(scene, dt, physicsSettings);
+        }
+        const glm::vec3 cratePos = crate.getComponent<TransformComponent>().position;
+        const glm::vec3 playerPos = player.getComponent<TransformComponent>().position;
+        const glm::vec3 playerVel = player.getComponent<RigidBodyComponent>().velocity;
+        check(cratePos.z < -0.4f, "push: the walking capsule shoves the dynamic crate forward");
+        check(cratePos.y > 0.3f && cratePos.y < 0.8f, "push: the crate stays on the floor (no launch)");
+        check(std::abs(playerVel.x) < 6.0f && std::abs(playerVel.y) < 6.0f && std::abs(playerVel.z) < 6.0f,
+              "push: the character is never launched by its own shove");
+        check(playerPos.z < 0.4f, "push: the character keeps advancing behind the crate");
+    }
+
+    // --- Script movement bridge ---------------------------------------------------
+    {
+        Scene scene;
+        auto player = scene.createEntity("Player");
+        auto& controller = player.addComponent<CharacterControllerComponent>();
+        auto brain = scene.createEntity("Brain");
+        ScriptSystemContext ctx;
+        auto& vars = ctx.runtimes[brain.handle()].variables;
+        vars["sv_maxspeed"] = 999.0;   // clamped to 50
+        vars["sv_gravity"] = -5.0;     // clamped to 0
+        vars["sv_friction"] = std::numeric_limits<double>::quiet_NaN(); // ignored
+        vars["stamina"] = 0.0;         // empties the charge, latches exhaustion
+        check(ScriptSystem::isMovementVariable("sv_maxspeed") && ScriptSystem::isMovementVariable("stamina") &&
+                  !ScriptSystem::isMovementVariable("hp"),
+              "bridge: canonical movement variable names are recognised");
+        check(ScriptSystem::applyMovementVariables(scene, ctx), "bridge: defined variables apply");
+        check(controller.settings.maxSpeed == 50.0f && controller.settings.gravity == 0.0f,
+              "bridge: values clamp into their sane ranges");
+        check(controller.settings.friction == 8.0f, "bridge: non-finite writes are ignored");
+        check(controller.state.stamina == 0.0f && controller.state.sprintExhausted,
+              "bridge: stamina=0 empties the charge and latches exhaustion");
+        vars["stamina"] = 0.5;
+        (void)ScriptSystem::applyMovementVariables(scene, ctx);
+        check(controller.state.stamina == 0.5f && !controller.state.sprintExhausted,
+              "bridge: stamina above the 25% resume threshold clears the latch");
+        auto& ownVars = ctx.runtimes[player.handle()].variables;
+        ownVars["sv_maxspeed"] = 7.0;
+        (void)ScriptSystem::applyMovementVariables(scene, ctx);
+        check(controller.settings.maxSpeed == 7.0f,
+              "bridge: the character's own script wins over other scripts");
+    }
+
+    // --- Flashlight + point cube shadow selection --------------------------------
+    {
+        Scene scene;
+        auto cam = scene.createEntity("Cam");
+        cam.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& camComponent = cam.addComponent<CameraComponent>(CameraConfig{});
+        camComponent.camera.setPosition(glm::vec3{0.0f});
+        camComponent.camera.setOrientation(-90.0f, 0.0f);
+        cam.addComponent<FlashlightComponent>();
+        auto nearPoint = scene.createEntity("NearPoint");
+        nearPoint.addComponent<TransformComponent>(glm::vec3{2.0f, 0.0f, 0.0f});
+        auto& nearLight = nearPoint.addComponent<PointLightComponent>();
+        nearLight.castShadow = true;
+        nearLight.range = 12.0f;
+        auto farPoint = scene.createEntity("FarPoint");
+        farPoint.addComponent<TransformComponent>(glm::vec3{10.0f, 0.0f, 0.0f});
+        auto& farLight = farPoint.addComponent<PointLightComponent>();
+        farLight.castShadow = true;
+
+        const SceneLightData data = LightingSystem::gather(scene);
+        check(data.flashlightActive, "flashlight: the camera flashlight is injected");
+        check(data.spotShadowEnabled && data.spotShadowLightIndex == 0,
+              "flashlight: it wins the budgeted spot shadow map");
+        check(data.lightDirectionType[0].w == 1.0f, "flashlight: it packs as a spot light");
+        check(data.pointShadowEnabled && data.pointShadowLightIndex == 1 && data.pointShadowFarPlane == 12.0f,
+              "point shadow: the nearest shadow-casting point owns the cube (far plane = range)");
+        bool facesDistinct = true;
+        for (uint32_t i = 1; i < kPointShadowFaceCount; ++i) {
+            facesDistinct = facesDistinct && data.pointShadowViewProj[i] != data.pointShadowViewProj[0];
+        }
+        check(facesDistinct, "point shadow: all six face matrices are filled and distinct");
+        check(pointShadowFaceIndex(glm::vec3{1.0f, 0.1f, 0.0f}) == 0 &&
+                  pointShadowFaceIndex(glm::vec3{0.0f, 0.0f, -1.0f}) == 5,
+              "point shadow: dominant-axis face selection matches the shader");
+        const glm::vec3 lightPos{2.0f, 0.0f, 0.0f};
+        const glm::vec4 ahead = data.pointShadowViewProj[0] * glm::vec4{lightPos + glm::vec3{2.0f, 0.0f, 0.0f}, 1.0f};
+        const glm::vec3 aheadNdc = glm::vec3{ahead} / ahead.w;
+        check(ahead.w > 0.0f && std::abs(aheadNdc.x) <= 1.0f && std::abs(aheadNdc.y) <= 1.0f && aheadNdc.z > 0.0f &&
+                  aheadNdc.z < 1.0f,
+              "point shadow: geometry ahead of the +X face projects inside its frustum");
+
+        Scene darkScene;
+        auto darkCam = darkScene.createEntity("Cam");
+        darkCam.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& darkCamComponent = darkCam.addComponent<CameraComponent>(CameraConfig{});
+        darkCamComponent.camera.setPosition(glm::vec3{0.0f});
+        darkCamComponent.camera.setOrientation(-90.0f, 0.0f);
+        auto& torch = darkCam.addComponent<FlashlightComponent>();
+        torch.enabled = false;
+        const SceneLightData dark = LightingSystem::gather(darkScene);
+        check(!dark.flashlightActive && !dark.spotShadowEnabled,
+              "flashlight: a disabled torch injects nothing and owns no shadow");
+    }
+
+    // --- GBQ round trip: FLSH section + PLGT v2 castShadow -----------------------
+    {
+        Scene scene;
+        auto lamp = scene.createEntity("Lamp");
+        lamp.addComponent<TransformComponent>(glm::vec3{1.0f, 2.0f, 3.0f});
+        auto& point = lamp.addComponent<PointLightComponent>();
+        point.castShadow = true;
+        point.intensity = 42.0f;
+        auto cam = scene.createEntity("Cam");
+        cam.addComponent<TransformComponent>(glm::vec3{0.0f});
+        auto& torch = cam.addComponent<FlashlightComponent>();
+        torch.intensity = 33.0f;
+        torch.range = 9.0f;
+        torch.enabled = false;
+
+        const std::filesystem::path gbqPath =
+            std::filesystem::temp_directory_path() / "engine_scene_flashlight.gbq";
+        check(serializeScene(scene, gbqPath), "gbq: scene with flashlight serializes");
+        Scene loaded;
+        check(deserializeScene(loaded, gbqPath), "gbq: flashlight scene reloads");
+        bool pointOk = false;
+        bool torchOk = false;
+        for (const entt::entity e : loaded.registry().view<PointLightComponent>()) {
+            const auto& l = loaded.registry().get<PointLightComponent>(e);
+            pointOk = l.castShadow && l.intensity == 42.0f;
+        }
+        for (const entt::entity e : loaded.registry().view<FlashlightComponent>()) {
+            const auto& t = loaded.registry().get<FlashlightComponent>(e);
+            torchOk = t.intensity == 33.0f && t.range == 9.0f && !t.enabled && t.castShadow;
+        }
+        check(pointOk, "gbq: point light castShadow survives the PLGT v2 round trip");
+        check(torchOk, "gbq: flashlight fields survive the FLSH round trip");
+        std::error_code ec;
+        std::filesystem::remove(gbqPath, ec);
+    }
+}
+
 int main() {
     testConfigLoading();
     testPresentationModes();
@@ -14093,6 +14297,7 @@ int main() {
     testUiResolutionScaling();
     testStartupEventPumping();
     testCharacterController();
+    testAsyncWarmupPushScriptLighting();
 
     if (g_failures == 0) {
         std::cout << "All core tests passed.\n";

@@ -83,6 +83,7 @@ SceneLightData LightingSystem::gather(const Scene& scene, float aspectRatio, uin
         glm::vec4 cone{};
         bool isSpot = false;
         bool castShadow = false;       // spots only: wants the shadow map
+        bool isFlashlight = false;     // camera-glued spot: priority + shadows
         float outerConeRadians = 0.0f; // spots only: shadow projection FOV
     };
 
@@ -114,7 +115,7 @@ SceneLightData LightingSystem::gather(const Scene& scene, float aspectRatio, uin
         const WorldTransformComponent* world = scene.registry().try_get<WorldTransformComponent>(entity);
         const glm::mat4 matrix = TransformSystem::effectiveWorldMatrix(transform, world);
         collect(glm::vec3{matrix[3]}, glm::vec3{0.0f}, light.color, light.intensity, light.range, 0.0f, 0.0f,
-                false, false);
+                false, light.castShadow);
     }
     const auto spotView = scene.registry().view<TransformComponent, SpotLightComponent>();
     for (const entt::entity entity : spotView) {
@@ -138,6 +139,31 @@ SceneLightData LightingSystem::gather(const Scene& scene, float aspectRatio, uin
         (void)scale;
         collect(position, direction, light.color, light.intensity, light.range, light.innerConeRadians,
                 light.outerConeRadians, true, light.castShadow);
+    }
+
+    // Player flashlight: a spot glued to the active camera. It is
+    // injected with a negative distance so it always wins a packed
+    // slot AND the budgeted spot shadow map — the beam the player
+    // aims is the light whose shadows matter most.
+    if (activeCamera != nullptr) {
+        const entt::entity cameraEntity = scene.findActiveCameraEntity();
+        const FlashlightComponent* flashlight =
+            cameraEntity != entt::null ? scene.registry().try_get<FlashlightComponent>(cameraEntity) : nullptr;
+        if (flashlight != nullptr && flashlight->enabled && flashlight->intensity > 0.0f) {
+            Candidate candidate;
+            candidate.distanceSquared = -1.0f;
+            candidate.positionRange = glm::vec4{activeCamera->camera.position(), flashlight->range};
+            candidate.colorIntensity = glm::vec4{flashlight->color, flashlight->intensity};
+            candidate.directionType = glm::vec4{glm::normalize(activeCamera->camera.front()), 1.0f};
+            candidate.cone = glm::vec4{std::cos(flashlight->innerConeRadians),
+                                       std::cos(flashlight->outerConeRadians), 0.0f, 0.0f};
+            candidate.isSpot = true;
+            candidate.castShadow = flashlight->castShadow;
+            candidate.outerConeRadians = flashlight->outerConeRadians;
+            candidate.isFlashlight = true;
+            candidates.push_back(candidate);
+            data.flashlightActive = true;
+        }
     }
 
     std::sort(candidates.begin(), candidates.end(),
@@ -173,6 +199,21 @@ SceneLightData LightingSystem::gather(const Scene& scene, float aspectRatio, uin
             data.spotShadowLightIndex = static_cast<int32_t>(i);
             data.spotShadowViewProj = spotShadowViewProjection(position, direction, candidate.outerConeRadians,
                                                                std::max(0.05f, range * 0.01f), range);
+            break;
+        }
+    }
+
+    // One point shadow cube is budgeted the same way: the nearest
+    // packed shadow-casting point light owns the six depth faces.
+    for (size_t i = 0; i < selected; ++i) {
+        const Candidate& candidate = candidates[i];
+        if (!candidate.isSpot && candidate.castShadow) {
+            const glm::vec3 position = glm::vec3{candidate.positionRange};
+            const float range = std::max(candidate.positionRange.w, 0.1f);
+            data.pointShadowEnabled = true;
+            data.pointShadowLightIndex = static_cast<int32_t>(i);
+            data.pointShadowViewProj = pointShadowViewProjections(position, std::max(0.05f, range * 0.01f), range);
+            data.pointShadowFarPlane = range;
             break;
         }
     }

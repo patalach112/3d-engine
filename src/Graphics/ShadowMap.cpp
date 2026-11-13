@@ -1,6 +1,7 @@
 #include "Graphics/ShadowMap.h"
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/trigonometric.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -33,6 +34,50 @@ glm::mat4 spotShadowViewProjection(const glm::vec3& position, const glm::vec3& d
     glm::mat4 projection = glm::perspective(2.0f * halfFov, 1.0f, nearPlane, farPlane);
     projection[1][1] *= -1.0f; // Vulkan clip space (matches Camera)
     return projection * view;
+}
+
+glm::vec3 pointShadowFaceDirection(uint32_t face) {
+    switch (face % kPointShadowFaceCount) {
+    case 0: return glm::vec3{1.0f, 0.0f, 0.0f};  // +X
+    case 1: return glm::vec3{-1.0f, 0.0f, 0.0f}; // -X
+    case 2: return glm::vec3{0.0f, 1.0f, 0.0f};  // +Y
+    case 3: return glm::vec3{0.0f, -1.0f, 0.0f}; // -Y
+    case 4: return glm::vec3{0.0f, 0.0f, 1.0f};  // +Z
+    default: return glm::vec3{0.0f, 0.0f, -1.0f}; // -Z
+    }
+}
+
+uint32_t pointShadowFaceIndex(const glm::vec3& direction) {
+    const glm::vec3 a = glm::abs(direction);
+    if (a.x >= a.y && a.x >= a.z) {
+        return direction.x > 0.0f ? 0u : 1u;
+    }
+    if (a.y >= a.z) {
+        return direction.y > 0.0f ? 2u : 3u;
+    }
+    return direction.z > 0.0f ? 4u : 5u;
+}
+
+glm::mat4 pointShadowViewProjection(const glm::vec3& position, uint32_t face, float nearPlane, float farPlane) {
+    const glm::vec3 direction = pointShadowFaceDirection(face);
+    // Any up not parallel to the face direction; the horizontal
+    // faces look straight up/down, so they take a Z reference.
+    const glm::vec3 up = std::abs(direction.y) > 0.99f ? glm::vec3{0.0f, 0.0f, 1.0f} : glm::vec3{0.0f, 1.0f, 0.0f};
+    const glm::mat4 view = glm::lookAt(position, position + direction, up);
+    // 90-degree faces tile the full sphere with no gaps.
+    glm::mat4 projection = glm::perspective(glm::radians(90.0f), 1.0f, std::max(nearPlane, 0.01f),
+                                            std::max(farPlane, nearPlane + 0.01f));
+    projection[1][1] *= -1.0f; // Vulkan clip space (matches Camera)
+    return projection * view;
+}
+
+std::array<glm::mat4, kPointShadowFaceCount> pointShadowViewProjections(const glm::vec3& position, float nearPlane,
+                                                                        float farPlane) {
+    std::array<glm::mat4, kPointShadowFaceCount> matrices{};
+    for (uint32_t face = 0; face < kPointShadowFaceCount; ++face) {
+        matrices[face] = pointShadowViewProjection(position, face, nearPlane, farPlane);
+    }
+    return matrices;
 }
 
 std::array<float, kMaxShadowCascades> computeCascadeSplits(float nearPlane, float farPlane,

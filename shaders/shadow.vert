@@ -21,6 +21,10 @@ layout(set = 0, binding = 0) uniform UniformBufferObject {
     // Phase 32 appended fields (same offsets as Renderer.h).
     vec4 directionalColor;
     mat4 spotShadowViewProj;
+    vec4 spotShadowParams;
+    // Point-shadow appended fields: six cube-face matrices.
+    mat4 pointShadowViewProj[6];
+    vec4 pointShadowParams;
 } ubo;
 
 // Same 112-byte draw payload as the main pass (only the model matrix

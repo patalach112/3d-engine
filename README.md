@@ -3510,3 +3510,50 @@ prediction/reconciliation convergence, idle-world delta
 silence, authoritative damage/death/respawn, trigger
 republication, status/action queries, the player cap, and
 clean disconnects.
+
+## Refactor wave — async startup, pushable props, script-driven movement, horror lighting ✅
+
+- **Async startup loading**: SPIR-V reads move to JobSystem
+  workers (`GraphicsPipeline::preloadShaderAsync`); pipeline
+  *creation* is planned in the pure-CPU `PipelineWarmupQueue`
+  (per-material dedup, strict FIFO) and drained at most two
+  DISTINCT PSO creations per frame by both hosts, while the
+  window keeps pumping OS events (`WindowStartupPump`). The
+  renderer falls back to the default pipeline for materials
+  whose PSO has not landed yet — startup compilation is spread
+  across the first frames instead of one multi-second stall.
+- **Pushable rigid bodies**: the walking capsule shoves dynamic
+  props with an impulse at the contact point (translation +
+  rotation through the point effective mass), sized by the
+  character's mass but never reacted back onto it; Coulomb
+  friction transfer is clamped to μ·J_n, pushed bodies wake,
+  and the capsule's velocity is clipped relative to the body's
+  post-impulse surface velocity, so pushing can never launch
+  the player. Restitution is suppressed for any contact
+  involving a character-driven body.
+- **Script-driven movement**: `.dsla` scripts tune the character
+  controller through canonical variables — `sv_maxspeed`,
+  `sv_sprintspeed`, `sv_friction`, `sv_stopspeed`,
+  `sv_accelerate`, `sv_airaccelerate`, `sv_gravity`,
+  `sv_jumpspeed`, `stamina_drain`, `stamina_regen`, and the
+  live `stamina` charge (with the 25% exhaustion-resume rule).
+  `ScriptSystem::update` applies them every tick (the
+  character's own script wins, then the lowest script entity
+  id; values are range-clamped, non-finite writes ignored).
+  The standalone player now ticks the DSL system at the fixed
+  rate ahead of the player update.
+- **Survival-horror lighting**: a camera-glued
+  `FlashlightComponent` is injected as a priority spot that
+  always wins a packed light slot and the budgeted spot shadow
+  map (F toggles it in the standalone player); point lights
+  gained `castShadow`, with ONE budgeted cube shadow map
+  (512 px × 6 faces, push indices 5–10) owned by the nearest
+  shadow-casting packed point. Cascade, spot and point shadows
+  share a 12-tap Poisson soft-PCF kernel (1.6 texels). GBQ
+  grows a `FLSH` section and PLGT v2 (`castShadow`, v1 files
+  still load); the UBO stays append-only (1968 bytes).
+
+2177 passed / 0 failed across all five build configs
+(Debug, Release shared/static, hidden-visibility, ASan),
+CTest 1/1, shaders compile clean, standalone player and
+scripting-demo smokes exit 0.

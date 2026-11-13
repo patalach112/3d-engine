@@ -333,13 +333,17 @@ void Application::registerAssets() {
     WindowStartupPump pump(&m_window);
     const auto registerSandboxMaterial = [this, &pump](const MaterialDesc& desc) {
         const MaterialId id = m_assets.registerMaterial(desc);
-        // Deterministic PSO creation per material (deduplicated by
-        // pipeline state + shader pair, accelerated by the VkPipelineCache).
-        // Shader compilation is the slowest part of startup: pump OS
-        // events between materials so the window never looks hung.
+        // Async pipeline warmup: PSO creation (the slowest part of
+        // startup — driver shader compilation) is NOT paid here.
+        // The material's pipeline is queued and created a few per
+        // frame by run()'s warmup drain while the window already
+        // pumps events and renders with the default pipeline; the
+        // SPIR-V bytes themselves are read on JobSystem workers.
         if (const MaterialAsset* material = m_assets.material(id)) {
-            m_pipeline.getOrCreatePipeline(material->id, material->desc.pipeline, material->desc.vertexShader,
-                                           material->desc.fragmentShader, m_swapchain);
+            m_pipeline.queuePipelineWarmup(material->id, material->desc.pipeline, material->desc.vertexShader,
+                                           material->desc.fragmentShader);
+            m_pipeline.preloadShaderAsync(m_jobSystem, material->desc.vertexShader);
+            m_pipeline.preloadShaderAsync(m_jobSystem, material->desc.fragmentShader);
         }
         pump.maybePump();
         return id;
@@ -361,8 +365,8 @@ void Application::registerAssets() {
 
     ENGINE_LOG_INFO("Assets registered: " << m_assets.meshCount() << " mesh(es), " << m_assets.materialCount()
                                           << " material(s), VRAM reserved " << m_assets.reservedVramBytes()
-                                          << " bytes, " << m_pipeline.cachedPipelineCount()
-                                          << " distinct pipeline(s)");
+                                          << " bytes, " << m_pipeline.pendingPipelineWarmupCount()
+                                          << " material pipeline(s) queued for async warmup");
 }
 
 void Application::buildScene() {
@@ -388,6 +392,9 @@ void Application::buildScene() {
     // update) tick the decoupled MovementSystem through
     // PlayerSystem's character path (friction 8 / accelerate 6).
     (void)PlayerSystem::ensureCharacterController(m_scene);
+    // Survival-horror flashlight: glued to the camera by
+    // LightingSystem, owner of the spot shadow map while enabled.
+    player.addComponent<FlashlightComponent>();
 
     if (m_config.physics.demoMode == PhysicsDemoMode::Space) {
         // Zero-G sandbox: the uniform field is disabled for this scene and
@@ -709,6 +716,18 @@ void Application::run() {
         // finished async loads per frame, and poll source files for
         // hot reloads once a second.
         m_assets.processCompletedLoads(8);
+        // Async pipeline warmup drain: at most two DISTINCT PSO
+        // creations per frame (shared states bind for free), so a
+        // cold pipeline cache can never stall one frame for seconds
+        // — startup compilation is spread across the first frames
+        // while window events pump every frame as usual.
+        if (!m_pipeline.pipelineWarmupComplete()) {
+            m_pipeline.processPipelineWarmup(2, m_swapchain);
+            if (m_pipeline.pipelineWarmupComplete()) {
+                ENGINE_LOG_INFO("Pipeline warmup complete: " << m_pipeline.cachedPipelineCount()
+                                                             << " distinct pipeline(s)");
+            }
+        }
         m_secondsSinceAssetPoll += deltaSeconds;
         if (m_secondsSinceAssetPoll >= 1.0) {
             m_secondsSinceAssetPoll = 0.0;
@@ -1147,6 +1166,8 @@ void Application::run() {
                     y = inspectComponentAt<DirectionalLightComponent>(m_uiContext, registry, selected,
                                                                       inspectorX, y, inspectorWidth,
                                                                       inspectorOptions);
+                    y = inspectComponentAt<FlashlightComponent>(m_uiContext, registry, selected, inspectorX, y,
+                                                                inspectorWidth, inspectorOptions);
                     y = inspectScriptAt(inspectorX, y, inspectorWidth, selected);
                     y = inspectAnimationAt(inspectorX, y, inspectorWidth, selected);
                     if (registry.all_of<MeshComponent>(selected)) {

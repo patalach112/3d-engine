@@ -46,6 +46,7 @@ entt::entity UIOutliner::duplicateEntity(Scene& scene, entt::entity source) {
     copyComponent<SpinComponent>(registry, source, target);
     copyComponent<PointLightComponent>(registry, source, target);
     copyComponent<SpotLightComponent>(registry, source, target);
+    copyComponent<FlashlightComponent>(registry, source, target);
     if (const NativeScriptComponent* script = registry.try_get<NativeScriptComponent>(source);
         script != nullptr) {
         registry.emplace<NativeScriptComponent>(target, script->scriptName);

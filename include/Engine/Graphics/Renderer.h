@@ -91,6 +91,12 @@ struct FrameLighting {
     bool spotShadowEnabled = false;
     glm::mat4 spotShadowViewProj{1.0f};
     int32_t spotShadowLightIndex = -1;
+    // Point-light cube shadows: six face matrices for the one
+    // budgeted shadow-casting point light (-1 = none this frame).
+    bool pointShadowEnabled = false;
+    std::array<glm::mat4, kPointShadowFaceCount> pointShadowViewProj{};
+    int32_t pointShadowLightIndex = -1;
+    float pointShadowFarPlane = 0.0f;
 };
 
 // Cinematic post-processing settings (Phase 22), fed from
@@ -138,6 +144,12 @@ struct UniformBufferObject {
     glm::mat4 spotShadowViewProj{1.0f}; // shadow-casting spot's light space
     // x: packed light index owning the spot shadow (-1 = none)
     glm::vec4 spotShadowParams{-1.0f, 0.0f, 0.0f, 0.0f};
+    // Point shadows (appended after Phase 32): the six cube-face
+    // matrices of the budgeted shadow-casting point light.
+    // x: packed light index owning the point cube (-1 = none),
+    // y: far plane (light range), zw unused.
+    std::array<glm::mat4, kPointShadowFaceCount> pointShadowViewProj{};
+    glm::vec4 pointShadowParams{-1.0f, 0.0f, 0.0f, 0.0f};
 };
 
 // ---------------------------------------------------------------------------
@@ -233,10 +245,14 @@ private:
     // Phase 32: the shadow-casting spot renders into its own depth
     // target through the same depth pipeline (push index = kSpotShadowPushIndex).
     void recordSpotShadow(VkCommandBuffer commandBuffer, std::span<const DrawItem> drawItems);
+    // Point-light cube shadows: six depth passes, one per cube
+    // face, through the same depth pipeline (push indices
+    // kPointShadowPushBase + face).
+    void recordPointShadow(VkCommandBuffer commandBuffer, std::span<const DrawItem> drawItems);
     void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
                              std::span<const DrawItem> drawItems,
                              const std::array<glm::mat4, kMaxShadowCascades>& cascadeMatrices,
-                             uint32_t cascadeCount, bool spotShadowEnabled);
+                             uint32_t cascadeCount, bool spotShadowEnabled, bool pointShadowEnabled);
     // m_sceneViewport clamped to the swapchain extent (full extent
     // when unset/degenerate).
     [[nodiscard]] SceneViewportRect effectiveSceneViewport(VkExtent2D extent) const;
@@ -295,6 +311,17 @@ private:
     };
     std::array<ShadowTarget, kMaxShadowCascades> m_shadowTargets{};
     ShadowTarget m_spotShadowTarget{}; // Phase 32 spot shadow depth target (kSpotShadowMapSize)
+    // Point shadow cube: ONE depth image with six array layers,
+    // sampled as a 2D array; each face also gets its own 2D view +
+    // framebuffer for the six depth passes.
+    struct PointShadowTarget {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView arrayView = VK_NULL_HANDLE;
+        std::array<VkImageView, kPointShadowFaceCount> faceViews{};
+        std::array<VkFramebuffer, kPointShadowFaceCount> framebuffers{};
+    };
+    PointShadowTarget m_pointShadowTarget{};
 
     PostSettings m_postSettings;
 

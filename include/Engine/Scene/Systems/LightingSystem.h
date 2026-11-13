@@ -60,6 +60,17 @@ struct SceneLightData {
     bool spotShadowEnabled = false;
     int32_t spotShadowLightIndex = -1;
     glm::mat4 spotShadowViewProj{1.0f};
+    // The single shadow-casting point light (cube shadow map): its
+    // index into the packed light arrays (-1 = none), the six face
+    // matrices, and the far plane (the light's range).
+    bool pointShadowEnabled = false;
+    int32_t pointShadowLightIndex = -1;
+    std::array<glm::mat4, kPointShadowFaceCount> pointShadowViewProj{};
+    float pointShadowFarPlane = 0.0f;
+    // True when this frame's spot shadow belongs to the player's
+    // FlashlightComponent (tools/tests read it; the renderer only
+    // cares about the matrix above).
+    bool flashlightActive = false;
 };
 
 // Smooth windowed inverse-square attenuation, mirrored exactly by

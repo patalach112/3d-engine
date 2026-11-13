@@ -12,6 +12,7 @@ bool registerBuiltinTypes(ReflectionRegistry& registry) {
     registry.registerType(reflect<TransformComponent>());
     registry.registerType(reflect<RigidBodyComponent>());
     registry.registerType(reflect<PointLightComponent>());
+    registry.registerType(reflect<FlashlightComponent>());
     registry.registerType(reflect<SpotLightComponent>());
     registry.registerType(reflect<DirectionalLightComponent>());
     registry.registerType(reflect<SpinComponent>());

@@ -4,13 +4,16 @@
 #include <vulkan/vulkan.h>
 
 #include "Graphics/PipelineState.h"
+#include "Graphics/PipelineWarmup.h"
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
 namespace engine {
 
+class JobSystem;
 class VulkanContext;
 class Swapchain;
 
@@ -49,6 +52,33 @@ public:
                                    const std::string& vertexShaderFile, const std::string& fragmentShaderFile,
                                    const Swapchain& swapchain);
 
+    // --- Async startup warmup --------------------------------------
+    // Queues a material's pipeline for frame-budgeted creation
+    // instead of compiling it on the spot (see PipelineWarmup.h).
+    // Returns false when the material already owns a pipeline or is
+    // already queued. Until the queued creation lands, pipelineFor()
+    // returns VK_NULL_HANDLE and the renderer keeps the default
+    // pipeline bound for that material's draws.
+    bool queuePipelineWarmup(uint32_t materialId, const PipelineStateDesc& state,
+                             const std::string& vertexShaderFile, const std::string& fragmentShaderFile);
+    // Creates up to `maxCreations` DISTINCT pipelines from the
+    // warmup queue (materials sharing an already-created state bind
+    // for free and do not consume the budget). Call once per frame
+    // from the main thread until pipelineWarmupComplete(). Returns
+    // how many distinct pipelines this call created.
+    size_t processPipelineWarmup(size_t maxCreations, const Swapchain& swapchain);
+    [[nodiscard]] size_t pendingPipelineWarmupCount() const { return m_warmup.pendingCount(); }
+    [[nodiscard]] bool pipelineWarmupComplete() const { return m_warmup.complete(); }
+
+    // Reads one SPIR-V file into the shader bytecode cache on a
+    // JobSystem worker, so pipeline creation never blocks the main
+    // thread on disk I/O. Fire-and-forget and idempotent: a file
+    // already cached (or already in flight) is not re-read, and a
+    // failed read simply leaves the cache empty — the main-thread
+    // creation path then reads (and reports) the file itself.
+    void preloadShaderAsync(JobSystem& jobs, const std::string& shaderFile);
+    [[nodiscard]] size_t preloadedShaderCount() const;
+
     // Creates the depth-only shadow-map pipeline (shadow.vert, no
     // fragment stage, front-face culling + depth bias) for the given
     // shadow render pass, sharing this manager's pipeline layout. Owned
@@ -81,7 +111,14 @@ private:
                               const std::string& vertexShaderFile, const std::string& fragmentShaderFile);
     [[nodiscard]] VkShaderModule createShaderModule(const char* fileName) const;
 
+    // SPIR-V bytes read by preloadShaderAsync workers. Shared so a
+    // job that outlives this manager still lands safely (its bytes
+    // are simply never consumed).
+    struct ShaderBytecodeCache;
+    std::shared_ptr<ShaderBytecodeCache> m_shaderCache;
+
     VulkanContext& m_context;
+    PipelineWarmupQueue m_warmup;
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_layout = VK_NULL_HANDLE;
     VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;

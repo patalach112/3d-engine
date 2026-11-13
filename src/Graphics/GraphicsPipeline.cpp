@@ -1,6 +1,7 @@
 #include "Graphics/GraphicsPipeline.h"
 #include "Graphics/ShadowMap.h"
 
+#include "Core/Jobs/JobSystem.h"
 #include "Geometry/Vertex.h"
 #include "Graphics/RenderQueue.h"
 #include "Graphics/Swapchain.h"
@@ -74,7 +75,17 @@ uint64_t pipelineKey(const PipelineStateDesc& state, const std::string& vertexSh
 
 } // namespace
 
-GraphicsPipeline::GraphicsPipeline(VulkanContext& context, const Swapchain& swapchain) : m_context(context) {
+// Thread-safe SPIR-V store filled by preloadShaderAsync workers and
+// consumed by createShaderModule on the main thread. Entries are
+// never erased: the shader set is tiny and fixed at startup.
+struct GraphicsPipeline::ShaderBytecodeCache {
+    std::mutex mutex;
+    std::unordered_map<std::string, std::vector<char>> bytes;
+    std::unordered_set<std::string> inFlight;
+};
+
+GraphicsPipeline::GraphicsPipeline(VulkanContext& context, const Swapchain& swapchain)
+    : m_shaderCache(std::make_shared<ShaderBytecodeCache>()), m_context(context) {
     createDescriptorSetLayout();
     createPipelineCache();
     m_pipeline = createPipeline(swapchain.renderPass(), PipelineStateDesc{}, "cube.vert.spv", "cube.frag.spv");
@@ -144,6 +155,77 @@ VkPipeline GraphicsPipeline::getOrCreatePipeline(uint32_t materialId, const Pipe
     return pipeline;
 }
 
+bool GraphicsPipeline::queuePipelineWarmup(uint32_t materialId, const PipelineStateDesc& state,
+                                           const std::string& vertexShaderFile,
+                                           const std::string& fragmentShaderFile) {
+    if (pipelineFor(materialId) != VK_NULL_HANDLE) {
+        return false; // already compiled: nothing to warm up
+    }
+    return m_warmup.enqueue(
+        PipelineWarmupRequest{materialId, state, vertexShaderFile, fragmentShaderFile});
+}
+
+size_t GraphicsPipeline::processPipelineWarmup(size_t maxCreations, const Swapchain& swapchain) {
+    if (maxCreations == 0 || m_warmup.empty()) {
+        return 0;
+    }
+    size_t created = 0;
+    std::vector<PipelineWarmupRequest> batch;
+    // Drain one request at a time: a request whose state already has
+    // a pipeline binds for free, so the loop only stops once the
+    // DISTINCT-creation budget for this frame is spent.
+    while (!m_warmup.empty()) {
+        batch.clear();
+        m_warmup.drain(1, batch);
+        const PipelineWarmupRequest& request = batch.front();
+        if (pipelineFor(request.materialId) != VK_NULL_HANDLE) {
+            continue; // created synchronously in the meantime
+        }
+        const size_t before = m_distinctPipelines;
+        getOrCreatePipeline(request.materialId, request.state, request.vertexShader, request.fragmentShader,
+                            swapchain);
+        if (m_distinctPipelines > before) {
+            ++created;
+            if (created >= maxCreations) {
+                break;
+            }
+        }
+    }
+    return created;
+}
+
+void GraphicsPipeline::preloadShaderAsync(JobSystem& jobs, const std::string& shaderFile) {
+    const std::shared_ptr<ShaderBytecodeCache> cache = m_shaderCache;
+    {
+        std::lock_guard lock(cache->mutex);
+        if (cache->bytes.find(shaderFile) != cache->bytes.end() ||
+            !cache->inFlight.insert(shaderFile).second) {
+            return; // cached already, or a worker is on it
+        }
+    }
+    const std::string path = std::string(ENGINE_SHADER_DIR) + "/" + shaderFile;
+    jobs.submit([cache, shaderFile, path] {
+        std::vector<char> code;
+        try {
+            code = helpers::readFile(path);
+        } catch (...) {
+            // Leave the cache empty: the main-thread creation path
+            // re-reads the file and reports the failure properly.
+            std::lock_guard lock(cache->mutex);
+            cache->inFlight.erase(shaderFile);
+            return;
+        }
+        std::lock_guard lock(cache->mutex);
+        cache->bytes.emplace(shaderFile, std::move(code));
+        cache->inFlight.erase(shaderFile);
+    });
+}
+
+size_t GraphicsPipeline::preloadedShaderCount() const {
+    std::lock_guard lock(m_shaderCache->mutex);
+    return m_shaderCache->bytes.size();
+}
+
 void GraphicsPipeline::createPipelineCache() {
     VkPipelineCacheCreateInfo cacheInfo{};
     cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
@@ -185,10 +267,11 @@ void GraphicsPipeline::createDescriptorSetLayout() {
         result.pImmutableSamplers = nullptr;
         return result;
     };
-    const std::array<VkDescriptorSetLayoutBinding, 8> bindings = {
+    const std::array<VkDescriptorSetLayoutBinding, 9> bindings = {
         uboBinding, shadowBinding, samplerBinding(2, kMaxMaterialTextures), samplerBinding(3, 1),
         samplerBinding(4, 1),      samplerBinding(5, 1),                    samplerBinding(6, 1),
-        samplerBinding(7, 1)}; // Phase 32: spot shadow map
+        samplerBinding(7, 1), // Phase 32: spot shadow map
+        samplerBinding(8, 1)}; // point shadow cube (2D array of 6 faces)
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -433,7 +516,19 @@ VkPipeline GraphicsPipeline::createSkyboxPipeline(VkRenderPass sceneRenderPass) 
 
 VkShaderModule GraphicsPipeline::createShaderModule(const char* fileName) const {
     const std::string path = std::string(ENGINE_SHADER_DIR) + "/" + fileName;
-    const std::vector<char> code = helpers::readFile(path);
+    // Async preload path: bytes a JobSystem worker already read cost
+    // no main-thread disk I/O here. The fallback read keeps every
+    // synchronous caller (shadow/skybox pipelines, tools) working.
+    std::vector<char> code;
+    {
+        std::lock_guard lock(m_shaderCache->mutex);
+        if (const auto found = m_shaderCache->bytes.find(fileName); found != m_shaderCache->bytes.end()) {
+            code = found->second;
+        }
+    }
+    if (code.empty()) {
+        code = helpers::readFile(path);
+    }
 
     VkShaderModuleCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;

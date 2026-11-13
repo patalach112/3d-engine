@@ -150,6 +150,112 @@ GroundProbeResult probeGroundFan(const Scene& scene, const glm::vec3& capsuleCen
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Character -> dynamic-body push transfer.
+//
+// The capsule sweep stops the character exactly at a dynamic body's
+// surface; without a transfer the body would feel nothing (the
+// solver treats the character as immovable and the sweep has
+// already clipped the approach velocity away). This is the missing
+// half: a point impulse at the contact, sized by the two masses
+// through the body's point effective mass (translation + rotation,
+// the same Jacobian PhysicsSystem's solver uses), plus a Coulomb
+// friction impulse that drags the body with the character's
+// tangential motion. The character is assigned its rigid-body mass
+// as a finite PUSH mass for sizing only — no reaction is ever
+// applied back to the character here: the caller merely matches
+// the capsule velocity to the body's post-impulse surface velocity,
+// so a light prop accelerates away, a heavy or blocked prop stops
+// the character, and nothing in this path can launch the player.
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] glm::vec3 rigidPointVelocity(const RigidBodyComponent& body, const glm::vec3& centerOfMass,
+                                           const glm::vec3& point) {
+    return body.velocity + glm::cross(glm::radians(body.angularVelocity), point - centerOfMass);
+}
+
+[[nodiscard]] glm::mat3 inverseInertiaWorld(const RigidBodyComponent& body, const TransformComponent& transform) {
+    glm::quat orientation{1.0f, 0.0f, 0.0f, 0.0f};
+    if (body.orientationInitialized) {
+        orientation = body.orientation;
+    } else if (transform.useQuaternionOrientation) {
+        orientation = transform.orientation;
+    } else {
+        const glm::vec3 radians = glm::radians(transform.rotationDegrees);
+        orientation = glm::normalize(glm::angleAxis(radians.y, glm::vec3{0.0f, 1.0f, 0.0f}) *
+                                     glm::angleAxis(radians.x, glm::vec3{1.0f, 0.0f, 0.0f}) *
+                                     glm::angleAxis(radians.z, glm::vec3{0.0f, 0.0f, 1.0f}));
+    }
+    const glm::mat3 rotation = glm::mat3_cast(glm::normalize(orientation));
+    return rotation * body.inverseInertiaTensor * glm::transpose(rotation);
+}
+
+[[nodiscard]] float pointEffectiveInverseMass(const RigidBodyComponent& body, const glm::mat3& worldInverseInertia,
+                                              const glm::vec3& radius, const glm::vec3& direction) {
+    const glm::vec3 rCrossDir = glm::cross(radius, direction);
+    return body.inverseMass + glm::dot(direction, glm::cross(worldInverseInertia * rCrossDir, radius));
+}
+
+void applyBodyImpulse(RigidBodyComponent& body, const glm::vec3& centerOfMass, const glm::vec3& point,
+                      const glm::vec3& impulse) {
+    body.velocity += impulse * body.inverseMass;
+    body.angularMomentum += glm::cross(point - centerOfMass, impulse);
+    body.sleeping = false; // a shove always wakes the body
+    body.sleepTimer = 0.0f;
+}
+
+// Applies the push for one capsule impact (surfaceNormal points
+// from the body toward the capsule) and returns the body's surface
+// velocity at the contact point after the impulse.
+[[nodiscard]] glm::vec3 applyCharacterPush(const RigidBodyComponent& characterBody, RigidBodyComponent& otherBody,
+                                           const TransformComponent& otherTransform, const glm::vec3& contactPoint,
+                                           const glm::vec3& surfaceNormal, const glm::vec3& characterVelocity) {
+    const glm::vec3 centerOfMass = otherTransform.position;
+    const glm::vec3 radius = contactPoint - centerOfMass;
+    const glm::mat3 worldInverseInertia = inverseInertiaWorld(otherBody, otherTransform);
+    const glm::vec3 pushDirection = -surfaceNormal; // from the capsule into the body
+    // The character's finite push mass sizes the impulse (an 80 kg
+    // character shoves a 1 kg crate to full speed in one tick but
+    // only nudges a 1 t block); it is never a reaction target.
+    const float characterInverseMass = 1.0f / std::max(characterBody.mass, 1.0f);
+
+    const glm::vec3 approachVelocity = characterVelocity - rigidPointVelocity(otherBody, centerOfMass, contactPoint);
+    const float approach = glm::dot(approachVelocity, pushDirection);
+    float normalImpulse = 0.0f;
+    if (approach > 0.0f) {
+        const float effectiveInverseMass = pointEffectiveInverseMass(otherBody, worldInverseInertia, radius,
+                                                                       surfaceNormal) +
+                                           characterInverseMass;
+        if (effectiveInverseMass > 1e-9f) {
+            normalImpulse = approach / effectiveInverseMass;
+            applyBodyImpulse(otherBody, centerOfMass, contactPoint, pushDirection * normalImpulse);
+        }
+    }
+
+    // Friction transfer: the body's surface must not slide freely
+    // under the capsule — tangential slip is bled by a Coulomb
+    // impulse clamped to mu * normalImpulse (combined friction).
+    if (normalImpulse > 0.0f) {
+        const glm::vec3 relativeVelocity =
+            rigidPointVelocity(otherBody, centerOfMass, contactPoint) - characterVelocity;
+        const glm::vec3 tangentialVelocity = relativeVelocity - surfaceNormal * glm::dot(relativeVelocity, surfaceNormal);
+        const float tangentialSpeed = glm::length(tangentialVelocity);
+        if (tangentialSpeed > 1e-6f) {
+            const glm::vec3 tangent = tangentialVelocity / tangentialSpeed;
+            const float effectiveInverseMass =
+                pointEffectiveInverseMass(otherBody, worldInverseInertia, radius, tangent) + characterInverseMass;
+            if (effectiveInverseMass > 1e-9f) {
+                const float combinedFriction = std::sqrt(std::max(characterBody.friction, 0.0f) *
+                                                         std::max(otherBody.friction, 0.0f));
+                const float frictionImpulse =
+                    std::min(tangentialSpeed / effectiveInverseMass, combinedFriction * normalImpulse);
+                applyBodyImpulse(otherBody, centerOfMass, contactPoint, -tangent * frictionImpulse);
+            }
+        }
+    }
+    return rigidPointVelocity(otherBody, centerOfMass, contactPoint);
+}
+
 } // namespace
 
 bool PlayerSystem::hasPhysicalPlayer(const Scene& scene) {
@@ -425,6 +531,7 @@ bool PlayerSystem::driveCharacter(Scene& scene, const InputCmd& cmd, double delt
             float offset = 0.0f;
         };
         std::vector<TraceBox> boxes;
+        std::vector<entt::entity> boxEntities; // parallel to boxes: push targets
         std::vector<TracePlane> planes;
         // Gather around the path the sweep will actually travel:
         // sweepOrigin -> sweepOrigin + velocity*dt. (controller.
@@ -475,19 +582,43 @@ bool PlayerSystem::driveCharacter(Scene& scene, const InputCmd& cmd, double delt
             box.center = otherTransform.position + box.axes * (other.centerOffset * otherTransform.scale);
             box.halfExtents = glm::abs(other.halfExtents * otherTransform.scale);
             boxes.push_back(box);
+            boxEntities.push_back(entity);
         }
 
         glm::vec3 position = sweepOrigin;
         glm::vec3 velocity = controller.state.velocity;
 
+        // The pushable body behind a swept box, if any: a dynamic
+        // rigid body that is not itself character-driven. Static
+        // geometry and other characters stay pure sweep obstacles.
+        const auto pushTargetFor = [&](int32_t boxIndex) -> RigidBodyComponent* {
+            if (boxIndex < 0 || static_cast<size_t>(boxIndex) >= boxEntities.size()) {
+                return nullptr;
+            }
+            RigidBodyComponent* candidate = registry.try_get<RigidBodyComponent>(boxEntities[boxIndex]);
+            if (candidate == nullptr || !candidate->dynamic() ||
+                registry.all_of<CharacterControllerComponent>(boxEntities[boxIndex])) {
+                return nullptr;
+            }
+            return candidate;
+        };
+
         // Bounded depenetration: at most two shallowest-exit pushes
         // per tick, each capped, so overlap from spawns or shoves
-        // resolves monotonically instead of feeding a solver.
+        // resolves monotonically instead of feeding a solver. A
+        // penetrated DYNAMIC body is also shoved out of the capsule
+        // (impulse below), so the pair separates from both sides.
         for (int pass = 0; pass < 2; ++pass) {
             SweepHit penetration;
             if (!sweepCapsule(position, glm::vec3{0.0f}, capsuleRadius, segmentHalf, boxes, penetration) ||
                 !penetration.startPenetrated) {
                 break;
+            }
+            if (RigidBodyComponent* pushed = pushTargetFor(penetration.boxIndex)) {
+                const TransformComponent& pushedTransform =
+                    registry.get<TransformComponent>(boxEntities[penetration.boxIndex]);
+                (void)applyCharacterPush(body, *pushed, pushedTransform, penetration.point,
+                                         penetration.penetrationNormal, velocity);
             }
             position += penetration.penetrationNormal * std::min(penetration.penetrationDepth, 0.5f);
         }
@@ -534,11 +665,35 @@ bool PlayerSystem::driveCharacter(Scene& scene, const InputCmd& cmd, double delt
             // tolerance leaves the capsule resting at the surface),
             // clip, and re-sweep what is left of the tick.
             position += displacement * bestFraction;
+            // Dynamic-body impact: transfer the push FIRST (impulse
+            // + friction at the contact point), then clip the
+            // capsule velocity RELATIVE to the body's post-impulse
+            // surface velocity. A light prop therefore accelerates
+            // away and the capsule follows it; a heavy or blocked
+            // prop barely moves and the capsule stops against it —
+            // with no reaction impulse ever applied to the capsule.
+            RigidBodyComponent* pushedBody = nullptr;
+            glm::vec3 pushedSurfaceVelocity{0.0f};
+            if (boxHit && hit.fraction <= bestFraction) {
+                pushedBody = pushTargetFor(hit.boxIndex);
+                if (pushedBody != nullptr) {
+                    const TransformComponent& pushedTransform =
+                        registry.get<TransformComponent>(boxEntities[hit.boxIndex]);
+                    pushedSurfaceVelocity = applyCharacterPush(body, *pushedBody, pushedTransform, hit.point,
+                                                               bestNormal, velocity);
+                }
+            }
             if (isWalkableNormal(bestNormal, controller.maxSlopeAngleDegrees) ||
                 isWalkableNormal(-bestNormal, controller.maxSlopeAngleDegrees)) {
-                velocity = clipVelocity(velocity, bestNormal, 1.0f); // floors & ceilings
+                velocity = pushedBody != nullptr
+                               ? clipVelocity(velocity - pushedSurfaceVelocity, bestNormal, 1.0f) +
+                                     pushedSurfaceVelocity
+                               : clipVelocity(velocity, bestNormal, 1.0f); // floors & ceilings
             } else {
-                velocity = clipVelocityHorizontal(velocity, bestNormal, 1.0f); // walls: slide, never lift
+                velocity = pushedBody != nullptr
+                               ? clipVelocityHorizontal(velocity - pushedSurfaceVelocity, bestNormal, 1.0f) +
+                                     pushedSurfaceVelocity
+                               : clipVelocityHorizontal(velocity, bestNormal, 1.0f); // walls: slide, never lift
             }
             timeLeft *= 1.0f - bestFraction;
             if (glm::length(velocity) <= 1e-6f) {

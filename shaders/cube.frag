@@ -24,10 +24,15 @@ layout(set = 0, binding = 0) uniform UniformBufferObject {
     vec4 directionalColor; // rgb key light tint, w cascade shadows on/off
     mat4 spotShadowViewProj; // shadow-casting spot's light space
     vec4 spotShadowParams; // x packed light index owning the spot shadow (-1 none)
+    // Point-shadow appended fields: six cube-face matrices of the
+    // budgeted shadow-casting point light.
+    mat4 pointShadowViewProj[6];
+    vec4 pointShadowParams; // x packed light index owning the cube (-1 none), y far plane
 } ubo;
 
 layout(set = 0, binding = 1) uniform sampler2D shadowMaps[4];
 layout(set = 0, binding = 7) uniform sampler2D spotShadowMap;
+layout(set = 0, binding = 8) uniform sampler2DArray pointShadowMap;
 layout(set = 0, binding = 2) uniform sampler2D materialTextures[32];
 layout(set = 0, binding = 3) uniform samplerCube irradianceMap;
 layout(set = 0, binding = 4) uniform samplerCube prefilteredMap;
@@ -97,6 +102,17 @@ vec3 evaluateDirectLight(vec3 normal, vec3 viewDir, vec3 lightDir, vec3 radiance
     return (diffuseWeight * albedo / PI + specular) * radiance * noL;
 }
 
+// --- Soft shadow filtering ------------------------------------------
+// 12-tap Poisson disk PCF (radius kShadowPcfRadiusTexels = 1.6
+// texels, mirrored by ShadowMap.h): the irregular tap pattern
+// breaks the shadow-map texel grid into soft penumbrae instead of
+// the hard staircase a single tap (or a regular 3x3 grid) leaves.
+const vec2 kPoissonDisk[12] = vec2[12](
+    vec2(-0.94, -0.40), vec2(0.94, 0.40), vec2(-0.58, 0.92), vec2(0.58, -0.92),
+    vec2(-0.31, -0.16), vec2(0.31, 0.16), vec2(-0.14, 0.58), vec2(0.14, -0.58),
+    vec2(-0.78, 0.34), vec2(0.78, -0.34), vec2(-0.45, -0.72), vec2(0.45, 0.72));
+const float kPcfRadiusTexels = 1.6;
+
 // --- Cascaded shadows (Phase 21) ------------------------------------
 int cascadeIndexFor(float depth) {
     if (depth <= ubo.cascadeSplits.x) return 0;
@@ -118,18 +134,18 @@ float shadowFactor(vec3 worldPosition, vec3 normal, vec3 lightDirection, float d
     float receiverDepth = projected.z - bias;
     vec2 texelSize = vec2(1.0) / vec2(textureSize(shadowMaps[cascade], 0));
     float shadow = 0.0;
-    for (int x = -1; x <= 1; ++x) {
-        for (int y = -1; y <= 1; ++y) {
-            float occluderDepth = texture(shadowMaps[cascade], uv + vec2(x, y) * texelSize).r;
-            shadow += receiverDepth > occluderDepth ? 0.0 : 1.0;
-        }
+    for (int i = 0; i < 12; ++i) {
+        float occluderDepth = texture(shadowMaps[cascade], uv + kPoissonDisk[i] * texelSize * kPcfRadiusTexels).r;
+        shadow += receiverDepth > occluderDepth ? 0.0 : 1.0;
     }
-    return shadow / 9.0;
+    return shadow / 12.0;
 }
 
-// --- Spot shadows (Phase 32): perspective reproject + 3x3 PCF --
+// --- Spot shadows: perspective reproject + soft PCF ------------
 // Mirrors the cascade path, but the light space is a perspective
 // frustum (the spot cone), so the divide does the cone falloff.
+// The player's flashlight rides this path: it always owns the spot
+// shadow slot while enabled (LightingSystem gives it priority).
 float spotShadowFactor(vec3 worldPosition, vec3 normal, vec3 lightDirection) {
     vec4 lightPosition = ubo.spotShadowViewProj * vec4(worldPosition + normal * 0.02, 1.0);
     vec3 projected = lightPosition.xyz / lightPosition.w;
@@ -142,13 +158,43 @@ float spotShadowFactor(vec3 worldPosition, vec3 normal, vec3 lightDirection) {
     float receiverDepth = projected.z - bias;
     vec2 texelSize = vec2(1.0) / vec2(textureSize(spotShadowMap, 0));
     float shadow = 0.0;
-    for (int x = -1; x <= 1; ++x) {
-        for (int y = -1; y <= 1; ++y) {
-            float occluderDepth = texture(spotShadowMap, uv + vec2(x, y) * texelSize).r;
-            shadow += receiverDepth > occluderDepth ? 0.0 : 1.0;
-        }
+    for (int i = 0; i < 12; ++i) {
+        float occluderDepth = texture(spotShadowMap, uv + kPoissonDisk[i] * texelSize * kPcfRadiusTexels).r;
+        shadow += receiverDepth > occluderDepth ? 0.0 : 1.0;
     }
-    return shadow / 9.0;
+    return shadow / 12.0;
+}
+
+// --- Point shadows: cube-face reproject + soft PCF -------------
+// Face selection by dominant axis (mirrors ShadowMap.cpp's
+// pointShadowFaceIndex); the fragment is then projected through
+// that face's matrix and compared in its layer of the depth array.
+int pointShadowFace(vec3 direction) {
+    vec3 a = abs(direction);
+    if (a.x >= a.y && a.x >= a.z) return direction.x > 0.0 ? 0 : 1;
+    if (a.y >= a.z) return direction.y > 0.0 ? 2 : 3;
+    return direction.z > 0.0 ? 4 : 5;
+}
+
+float pointShadowFactor(vec3 worldPosition, vec3 normal, vec3 lightPosition, vec3 lightDirection) {
+    int face = pointShadowFace(worldPosition - lightPosition);
+    vec4 lightSpace = ubo.pointShadowViewProj[face] * vec4(worldPosition + normal * 0.02, 1.0);
+    vec3 projected = lightSpace.xyz / lightSpace.w;
+    vec2 uv = projected.xy * 0.5 + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || projected.z > 1.0 || projected.z < 0.0) {
+        return 1.0;
+    }
+    float facing = clamp(dot(normal, lightDirection), 0.0, 1.0);
+    float bias = max(0.002 * (1.0 - facing), 0.0005);
+    float receiverDepth = projected.z - bias;
+    vec2 texelSize = vec2(1.0) / vec2(textureSize(pointShadowMap, 0).xy);
+    float shadow = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        float occluderDepth =
+            texture(pointShadowMap, vec3(uv + kPoissonDisk[i] * texelSize * kPcfRadiusTexels, float(face))).r;
+        shadow += receiverDepth > occluderDepth ? 0.0 : 1.0;
+    }
+    return shadow / 12.0;
 }
 
 // Smooth windowed inverse-square attenuation (mirrors LightingSystem.h).
@@ -236,6 +282,9 @@ void main() {
         vec3 radiance = ubo.lightColorIntensity[i].rgb * (ubo.lightColorIntensity[i].w * falloff * spotFactor);
         if (float(i) == ubo.spotShadowParams.x) {
             radiance *= spotShadowFactor(fragWorldPosition, normal, dirToLight);
+        }
+        if (float(i) == ubo.pointShadowParams.x) {
+            radiance *= pointShadowFactor(fragWorldPosition, normal, lightPosition, dirToLight);
         }
         outgoing += evaluateDirectLight(normal, viewDir, dirToLight, radiance, albedo, metallic, roughness);
     }

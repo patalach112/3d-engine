@@ -2015,8 +2015,15 @@ void PhysicsSystem::prepareWarmStarting(const PhysicsSettings& settings) {
         // the island's other contacts shuffle velocities around: in a
         // stack, re-applying restitution against an already-resting
         // neighbour (backed by an immovable floor) is a launch pump.
-        contact.restitutionTarget =
-            !contact.persistent && vn < -settings.restitutionVelocityThreshold ? -contact.restitution * vn : 0.0f;
+        // Character-driven contacts NEVER restitute: the capsule is
+        // a kinematic pusher, and a bounce target against it would
+        // pump energy into the dynamic partner every sub-step.
+        const bool characterContact =
+            m_bodies[contact.bodyA].characterDriven || m_bodies[contact.bodyB].characterDriven;
+        contact.restitutionTarget = !characterContact && !contact.persistent &&
+                                            vn < -settings.restitutionVelocityThreshold
+                                        ? -contact.restitution * vn
+                                        : 0.0f;
     }
 
     // Phase 3: apply the staged set as one system. Full stored

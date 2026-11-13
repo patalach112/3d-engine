@@ -126,6 +126,10 @@ struct PointLightComponent {
     float intensity = 30.0f; // physical-ish scale for the 1/d^2 term
     float range = 12.0f;     // hard cutoff radius in meters
     bool enabled = true;
+    // Shadow-casting point light: the renderer budgets ONE cube
+    // shadow map (six 90-degree depth faces); the nearest enabled
+    // castShadow point packed into the frame's light slots owns it.
+    bool castShadow = false;
 };
 
 // Dynamic spot light (Phase 21): a cone from the entity's world
@@ -159,6 +163,23 @@ struct DirectionalLightComponent {
     bool enabled = true;
     bool castShadow = true;            // sample the cascade shadow maps
     uint32_t cascadeCount = 4;         // CSM slices, clamped to 1..4
+};
+
+// Player flashlight (survival-horror staple): a shadow-casting
+// spotlight glued to the active camera — positioned at the camera,
+// aimed along its view direction every frame by LightingSystem,
+// and given priority for the budgeted spot shadow map so the beam
+// the player points is always the one that casts real-time shadows
+// onto world geometry and dynamic props. Attach to the camera
+// entity; hosts toggle `enabled` (the F key in the demo hosts).
+struct FlashlightComponent {
+    glm::vec3 color{1.0f, 0.97f, 0.90f};
+    float intensity = 60.0f;
+    float range = 25.0f;            // metres of useful beam
+    float innerConeRadians = 0.32f; // full-intensity cone half-angle
+    float outerConeRadians = 0.52f; // fade to zero here
+    bool enabled = true;
+    bool castShadow = true; // owns the spot shadow map while enabled
 };
 
 // Placeholder for the future asset system: identifies which mesh the

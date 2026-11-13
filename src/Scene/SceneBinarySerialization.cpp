@@ -307,6 +307,7 @@ struct StagedEntity {
     std::optional<ThrusterComponent> thruster;
     std::optional<PointLightComponent> pointLight;
     std::optional<SpotLightComponent> spotLight;
+    std::optional<FlashlightComponent> flashlight;
     std::optional<DirectionalLightComponent> directionalLight;
     std::optional<std::string> script;
     std::optional<ScriptComponent> dslScript;
@@ -353,14 +354,16 @@ bool readComponentSection(const std::vector<std::byte>& bytes, const std::vector
 bool sectionVersionsAcceptable(const std::vector<TocEntry>& toc) {
     static constexpr const char* kKnown[] = {"META", "ENTY", "TAGC", "TRNF", "CAMR", "MESH", "SPIN", "RGBD",
                                              "CLDR", "GRVF", "JONT", "THRS", "PLGT", "SLGT", "NSCR", "DIRL", "DSCR", "RIGD",
-                                             "ANIM", "RGDL"};
+                                             "ANIM", "RGDL", "FLSH"};
     for (const TocEntry& entry : toc) {
         for (const char* known : kKnown) {
             if (std::memcmp(entry.type.data(), known, 4) != 0) {
                 continue;
             }
             const bool isSlgt = std::memcmp(entry.type.data(), "SLGT", 4) == 0;
-            if (entry.version != kGbqVersion && !(isSlgt && entry.version == 2)) {
+            const bool isPlgt = std::memcmp(entry.type.data(), "PLGT", 4) == 0;
+            if (entry.version != kGbqVersion && !(isSlgt && entry.version == 2) &&
+                !(isPlgt && entry.version == 2)) {
                 return false;
             }
         }
@@ -582,13 +585,42 @@ bool parseGbq(const std::vector<std::byte>& bytes, StagedScene& staged) {
                               })) {
         return false;
     }
-    if (!readComponentSection(bytes, toc, "PLGT", entityCount,
+    // Point lights (section v2 appends castShadow; v1 records
+    // load with castShadow = false).
+    if (const TocEntry* section = findSection(toc, "PLGT"); section != nullptr) {
+        ByteReader reader = sectionReader(bytes, *section);
+        uint32_t count = 0;
+        if (!reader.u32(count)) {
+            return false;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t index = 0;
+            if (!reader.u32(index) || index >= entityCount) {
+                return false;
+            }
+            PointLightComponent value;
+            bool ok = reader.vec3(value.color) && reader.f32(value.intensity) && reader.f32(value.range) &&
+                      reader.boolean(value.enabled);
+            if (ok && section->version >= 2) {
+                ok = reader.boolean(value.castShadow);
+            }
+            if (!ok) {
+                return false;
+            }
+            staged.entities[index].pointLight = value;
+        }
+    }
+    // Player flashlights (camera-glued shadow spots).
+    if (!readComponentSection(bytes, toc, "FLSH", entityCount,
                               [&staged](ByteReader& reader, uint32_t index) {
-                                  PointLightComponent value;
+                                  FlashlightComponent value;
                                   const bool ok = reader.vec3(value.color) && reader.f32(value.intensity) &&
-                                                  reader.f32(value.range) && reader.boolean(value.enabled);
+                                                  reader.f32(value.range) &&
+                                                  reader.f32(value.innerConeRadians) &&
+                                                  reader.f32(value.outerConeRadians) &&
+                                                  reader.boolean(value.enabled) && reader.boolean(value.castShadow);
                                   if (ok) {
-                                      staged.entities[index].pointLight = value;
+                                      staged.entities[index].flashlight = value;
                                   }
                                   return ok;
                               })) {
@@ -1027,6 +1059,23 @@ std::vector<std::byte> Scene::saveToGbqBytes() const {
         out.f32(value->intensity);
         out.f32(value->range);
         out.boolean(value->enabled);
+        out.boolean(value->castShadow); // PLGT section version 2
+        return true;
+    },
+                 2);
+    writeSection("FLSH", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
+        const FlashlightComponent* value = m_registry.try_get<FlashlightComponent>(entity);
+        if (value == nullptr) {
+            return false;
+        }
+        out.u32(index);
+        out.vec3(value->color);
+        out.f32(value->intensity);
+        out.f32(value->range);
+        out.f32(value->innerConeRadians);
+        out.f32(value->outerConeRadians);
+        out.boolean(value->enabled);
+        out.boolean(value->castShadow);
         return true;
     });
     writeSection("SLGT", [&](ByteWriter& out, entt::entity entity, uint32_t index) {
@@ -1277,6 +1326,9 @@ bool Scene::loadFromGbqBytes(const std::vector<std::byte>& bytes) {
         }
         if (stagedEntity.spotLight.has_value()) {
             m_registry.emplace<SpotLightComponent>(handle, *stagedEntity.spotLight);
+        }
+        if (stagedEntity.flashlight.has_value()) {
+            m_registry.emplace<FlashlightComponent>(handle, *stagedEntity.flashlight);
         }
         if (stagedEntity.directionalLight.has_value()) {
             m_registry.emplace<DirectionalLightComponent>(handle, *stagedEntity.directionalLight);

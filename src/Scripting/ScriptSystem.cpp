@@ -2,6 +2,7 @@
 
 #include "Core/EventBus.h"
 #include "Core/Logger.h"
+#include "Physics/MovementSystem.h"
 #include "Physics/PhysicsEvents.h"
 #include "Platform/Input.h"
 #include "Scene/Components.h"
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace engine {
@@ -187,6 +189,10 @@ bool applyPartProperty(Scene::Registry& registry, entt::entity target, const std
             registry.get<DirectionalLightComponent>(target).intensity = static_cast<float>(value);
             return true;
         }
+        if (registry.all_of<FlashlightComponent>(target)) {
+            registry.get<FlashlightComponent>(target).intensity = static_cast<float>(value);
+            return true;
+        }
         return false;
     }
     if (property == "scale") {
@@ -237,6 +243,9 @@ bool applyPartProperty(Scene::Registry& registry, entt::entity target, const std
         }
         if (registry.all_of<DirectionalLightComponent>(target)) {
             return registry.get<DirectionalLightComponent>(target).intensity;
+        }
+        if (registry.all_of<FlashlightComponent>(target)) {
+            return registry.get<FlashlightComponent>(target).intensity;
         }
     } else if (property == "scale") {
         if (registry.all_of<TransformComponent>(target)) {
@@ -964,6 +973,108 @@ size_t ScriptSystem::rewriteReferences(Scene& scene, ScriptSystemContext& contex
         }
     }
     return changed;
+}
+
+// ---------------------------------------------------------------------------
+// Movement variable bridge (.dsla -> character controller)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct MovementBinding {
+    const char* name;
+    float MoveSettings::*member;
+    double lowest;
+    double highest;
+};
+
+// The canonical script-visible movement variables. Ranges keep a
+// typo'd script from producing a physically absurd controller
+// (negative gravity, thousand-metre sprint); every write is
+// clamped into [lowest, highest] on application.
+constexpr MovementBinding kMovementBindings[] = {
+    {"sv_maxspeed", &MoveSettings::maxSpeed, 0.0, 50.0},
+    {"sv_sprintspeed", &MoveSettings::sprintSpeed, 0.0, 50.0},
+    {"sv_friction", &MoveSettings::friction, 0.0, 100.0},
+    {"sv_stopspeed", &MoveSettings::stopSpeed, 0.0, 10.0},
+    {"sv_accelerate", &MoveSettings::accelerate, 0.0, 100.0},
+    {"sv_airaccelerate", &MoveSettings::airAccelerate, 0.0, 100.0},
+    {"sv_gravity", &MoveSettings::gravity, 0.0, 100.0},
+    {"sv_jumpspeed", &MoveSettings::jumpSpeed, 0.0, 50.0},
+    {"stamina_drain", &MoveSettings::staminaDrainPerSecond, 0.0, 10.0},
+    {"stamina_regen", &MoveSettings::staminaRegenPerSecond, 0.0, 10.0},
+};
+
+// Resolves one movement variable against all script runtimes: the
+// character's own script wins (a per-player tuning script is the
+// natural owner), otherwise the lowest script entity id — the
+// resolution must never depend on hash-map iteration order.
+[[nodiscard]] std::optional<double> resolveMovementVariable(const ScriptSystemContext& context,
+                                                            entt::entity characterEntity, const char* name) {
+    if (const auto own = context.runtimes.find(characterEntity); own != context.runtimes.end()) {
+        if (const auto var = own->second.variables.find(name); var != own->second.variables.end()) {
+            return var->second;
+        }
+    }
+    std::optional<double> best;
+    uint32_t bestId = std::numeric_limits<uint32_t>::max();
+    for (const auto& [entity, rt] : context.runtimes) {
+        const auto var = rt.variables.find(name);
+        if (var == rt.variables.end()) {
+            continue;
+        }
+        const uint32_t id = entt::to_integral(entity);
+        if (!best.has_value() || id < bestId) {
+            best = var->second;
+            bestId = id;
+        }
+    }
+    return best;
+}
+
+} // namespace
+
+bool ScriptSystem::isMovementVariable(std::string_view name) {
+    if (name == "stamina") {
+        return true;
+    }
+    for (const MovementBinding& binding : kMovementBindings) {
+        if (name == binding.name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ScriptSystem::applyMovementVariables(Scene& scene, const ScriptSystemContext& context) {
+    auto& registry = scene.registry();
+    bool appliedAny = false;
+    for (const entt::entity entity : registry.view<CharacterControllerComponent>()) {
+        CharacterControllerComponent& controller = registry.get<CharacterControllerComponent>(entity);
+        for (const MovementBinding& binding : kMovementBindings) {
+            const std::optional<double> value = resolveMovementVariable(context, entity, binding.name);
+            if (!value.has_value() || !std::isfinite(*value)) {
+                continue;
+            }
+            controller.settings.*(binding.member) =
+                static_cast<float>(std::clamp(*value, binding.lowest, binding.highest));
+            appliedAny = true;
+        }
+        // `stamina` writes the live charge directly (a scripted
+        // adrenaline shot / exhaustion curse); the exhaustion latch
+        // follows the same 25% resume rule playerMove uses.
+        if (const std::optional<double> stamina = resolveMovementVariable(context, entity, "stamina");
+            stamina.has_value() && std::isfinite(*stamina)) {
+            controller.state.stamina = static_cast<float>(std::clamp(*stamina, 0.0, 1.0));
+            if (controller.state.stamina >= 0.25f) {
+                controller.state.sprintExhausted = false;
+            } else if (controller.state.stamina <= 0.0f) {
+                controller.state.sprintExhausted = true;
+            }
+            appliedAny = true;
+        }
+    }
+    return appliedAny;
 }
 
 void ScriptSystem::update(Scene& scene, ScriptSystemContext& context, double deltaSeconds) {

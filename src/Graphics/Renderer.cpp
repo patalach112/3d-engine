@@ -325,6 +325,25 @@ Renderer::~Renderer() {
         destroyShadowTarget(target);
     }
     destroyShadowTarget(m_spotShadowTarget);
+    for (const VkFramebuffer framebuffer : m_pointShadowTarget.framebuffers) {
+        if (framebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        }
+    }
+    for (const VkImageView view : m_pointShadowTarget.faceViews) {
+        if (view != VK_NULL_HANDLE) {
+            vkDestroyImageView(device, view, nullptr);
+        }
+    }
+    if (m_pointShadowTarget.arrayView != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, m_pointShadowTarget.arrayView, nullptr);
+    }
+    if (m_pointShadowTarget.image != VK_NULL_HANDLE) {
+        vkDestroyImage(device, m_pointShadowTarget.image, nullptr);
+    }
+    if (m_pointShadowTarget.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, m_pointShadowTarget.memory, nullptr);
+    }
     if (m_shadowRenderPass != VK_NULL_HANDLE) {
         vkDestroyRenderPass(device, m_shadowRenderPass, nullptr);
     }
@@ -451,6 +470,46 @@ void Renderer::createShadowResources() {
         framebufferInfo.layers = 1;
         if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_spotShadowTarget.framebuffer) != VK_SUCCESS) {
             throw std::runtime_error("Renderer: failed to create spot shadow framebuffer");
+        }
+    }
+
+    // Point shadow cube: one 6-layer depth image. The array view is
+    // what the fragment shader samples (sampler2DArray); each face
+    // gets a single-layer 2D view + framebuffer for its depth pass.
+    createOwnedImage(m_context, kPointShadowMapSize, kPointShadowMapSize, kShadowFormat,
+                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, false,
+                     kPointShadowFaceCount, 1, m_pointShadowTarget.image, m_pointShadowTarget.memory);
+    const auto createDepthView = [this, device](VkImageViewType viewType, uint32_t baseLayer, uint32_t layers) {
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = m_pointShadowTarget.image;
+        viewInfo.viewType = viewType;
+        viewInfo.format = VK_FORMAT_D32_SFLOAT;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = baseLayer;
+        viewInfo.subresourceRange.layerCount = layers;
+        VkImageView view = VK_NULL_HANDLE;
+        if (vkCreateImageView(device, &viewInfo, nullptr, &view) != VK_SUCCESS) {
+            throw std::runtime_error("Renderer: failed to create point shadow view");
+        }
+        return view;
+    };
+    m_pointShadowTarget.arrayView = createDepthView(VK_IMAGE_VIEW_TYPE_2D_ARRAY, 0, kPointShadowFaceCount);
+    for (uint32_t face = 0; face < kPointShadowFaceCount; ++face) {
+        m_pointShadowTarget.faceViews[face] = createDepthView(VK_IMAGE_VIEW_TYPE_2D, face, 1);
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = m_shadowRenderPass;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = &m_pointShadowTarget.faceViews[face];
+        framebufferInfo.width = kPointShadowMapSize;
+        framebufferInfo.height = kPointShadowMapSize;
+        framebufferInfo.layers = 1;
+        if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &m_pointShadowTarget.framebuffers[face]) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("Renderer: failed to create point shadow framebuffer");
         }
     }
 
@@ -1329,8 +1388,12 @@ void Renderer::createDescriptorSets() {
         spotShadowInfo.sampler = m_shadowSampler;
         spotShadowInfo.imageView = m_spotShadowTarget.view;
         spotShadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo pointShadowInfo{};
+        pointShadowInfo.sampler = m_shadowSampler;
+        pointShadowInfo.imageView = m_pointShadowTarget.arrayView;
+        pointShadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        std::array<VkWriteDescriptorSet, 8> writes{};
+        std::array<VkWriteDescriptorSet, 9> writes{};
         const auto bufferWrite = [&writes](uint32_t index, VkDescriptorSet set, const VkDescriptorBufferInfo* info) {
             writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[index].dstSet = set;
@@ -1356,6 +1419,7 @@ void Renderer::createDescriptorSets() {
         imageWrite(5, m_descriptorSets[i], 5, 1, &lutInfo);
         imageWrite(6, m_descriptorSets[i], 6, 1, &environmentInfo);
         imageWrite(7, m_descriptorSets[i], 7, 1, &spotShadowInfo);
+        imageWrite(8, m_descriptorSets[i], 8, 1, &pointShadowInfo);
 
         vkUpdateDescriptorSets(m_context.device(), static_cast<uint32_t>(writes.size()), writes.data(), 0,
                                nullptr);
@@ -1514,10 +1578,70 @@ void Renderer::recordSpotShadow(VkCommandBuffer commandBuffer, std::span<const D
     vkCmdEndRenderPass(commandBuffer);
 }
 
+void Renderer::recordPointShadow(VkCommandBuffer commandBuffer, std::span<const DrawItem> drawItems) {
+    // Six depth-only passes, one per cube face, into the layered
+    // point shadow target. Same pipeline and push block as the
+    // cascades; push index kPointShadowPushBase + face selects the
+    // face matrix (UBO.pointShadowViewProj) in shadow.vert.
+    VkClearValue clearValue{};
+    clearValue.depthStencil = {1.0f, 0};
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.shadowPipeline());
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(kPointShadowMapSize);
+    viewport.height = static_cast<float>(kPointShadowMapSize);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {kPointShadowMapSize, kPointShadowMapSize};
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    const VkBuffer vertexBuffers[] = {m_vertexBuffer.handle()};
+    constexpr VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+    vkCmdBindIndexBuffer(commandBuffer, m_indexBuffer.handle(), 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline.layout(), 0, 1,
+                            &m_descriptorSets[m_currentFrame], 0, nullptr);
+
+    for (uint32_t face = 0; face < kPointShadowFaceCount; ++face) {
+        VkRenderPassBeginInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassInfo.renderPass = m_shadowRenderPass;
+        renderPassInfo.framebuffer = m_pointShadowTarget.framebuffers[face];
+        renderPassInfo.renderArea.offset = {0, 0};
+        renderPassInfo.renderArea.extent = {kPointShadowMapSize, kPointShadowMapSize};
+        renderPassInfo.clearValueCount = 1;
+        renderPassInfo.pClearValues = &clearValue;
+        vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+        for (const DrawItem& item : drawItems) {
+            struct ShadowPush {
+                DrawPushConstants draw;
+                uint32_t cascadeIndex;
+            };
+            const glm::ivec4 textureIndices{item.textureIndices[0], item.textureIndices[1],
+                                            item.textureIndices[2], item.textureIndices[3]};
+            const ShadowPush push{{item.model, item.baseColor, item.pbrParams, textureIndices},
+                                  kPointShadowPushBase + face};
+            vkCmdPushConstants(commandBuffer, m_pipeline.layout(), VK_SHADER_STAGE_VERTEX_BIT, 0,
+                               sizeof(ShadowPush), &push);
+            vkCmdDrawIndexed(commandBuffer, m_indexCount, 1, 0, 0, 0);
+        }
+
+        vkCmdEndRenderPass(commandBuffer);
+    }
+}
+
 void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex,
                                    std::span<const DrawItem> drawItems,
                                    const std::array<glm::mat4, kMaxShadowCascades>& cascadeMatrices,
-                                   uint32_t cascadeCount, bool spotShadowEnabled) {
+                                   uint32_t cascadeCount, bool spotShadowEnabled, bool pointShadowEnabled) {
     // Mirror any glyph pages the UI batch rasterized while it was
     // being built (new glyphs/sizes) into their GPU images. This
     // must stay outside every render pass: uploads transition
@@ -1535,6 +1659,9 @@ void Renderer::recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t image
     recordShadowCascades(commandBuffer, drawItems, cascadeMatrices, cascadeCount);
     if (spotShadowEnabled) {
         recordSpotShadow(commandBuffer, drawItems);
+    }
+    if (pointShadowEnabled) {
+        recordPointShadow(commandBuffer, drawItems);
     }
 
     const VkExtent2D extent = m_swapchain.extent();
@@ -1657,7 +1784,7 @@ bool Renderer::drawFrame(const glm::mat4& view, const glm::mat4& projection,
     VkCommandBuffer commandBuffer = m_commandBuffers[m_currentFrame];
     vkResetCommandBuffer(commandBuffer, 0);
     recordCommandBuffer(commandBuffer, imageIndex, drawItems, lighting.cascades, lighting.cascadeCount,
-                        lighting.spotShadowEnabled);
+                        lighting.spotShadowEnabled, lighting.pointShadowEnabled);
 
     const VkSemaphore waitSemaphores[] = {m_imageAvailableSemaphores[m_currentFrame]};
     const VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};

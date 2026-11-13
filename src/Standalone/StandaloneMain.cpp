@@ -35,6 +35,7 @@
 #include "Scene/SceneBinarySerialization.h"
 #include "Scene/Systems/CameraSystem.h"
 #include "Scene/Systems/PhysicsSystem.h"
+#include "Scripting/ScriptSystem.h"
 #include "Scene/Systems/AnimationSystem.h"
 #include "Scene/Systems/PlayerSystem.h"
 #include "Net/DedicatedServer.h"
@@ -407,18 +408,25 @@ public:
         // PlayerSystem::update — no network wrappers involved.
         (void)engine::PlayerSystem::ensureCharacterController(m_scene);
         m_physicsSystem.captureSpawnStates(m_scene);
-        // Deterministic PSO creation per registered material
-        // (deduplicated by pipeline state + shader pair).
+        // Async pipeline warmup per registered material: PSOs are
+        // queued (deduplicated by pipeline state + shader pair) and
+        // created a few per frame in run()'s warmup drain; SPIR-V
+        // bytes are read on JobSystem workers meanwhile. The window
+        // therefore reaches its first presented frame immediately
+        // instead of blocking on driver shader compilation.
         for (engine::MaterialId id = 1; id <= m_assets.materialCount(); ++id) {
             const engine::MaterialAsset* material = m_assets.material(id);
             if (material == nullptr) {
                 continue;
             }
-            m_pipeline.getOrCreatePipeline(material->id, material->desc.pipeline, material->desc.vertexShader,
-                                           material->desc.fragmentShader, m_swapchain);
+            m_pipeline.queuePipelineWarmup(material->id, material->desc.pipeline, material->desc.vertexShader,
+                                           material->desc.fragmentShader);
+            m_pipeline.preloadShaderAsync(m_jobSystem, material->desc.vertexShader);
+            m_pipeline.preloadShaderAsync(m_jobSystem, material->desc.fragmentShader);
         }
         ENGINE_LOG_INFO("Player: " << m_assets.meshCount() << " mesh(es), " << m_assets.materialCount()
-                                   << " material(s), " << m_pipeline.cachedPipelineCount() << " pipeline(s)");
+                                   << " material(s), " << m_pipeline.pendingPipelineWarmupCount()
+                                   << " pipeline(s) queued for async warmup");
         return true;
     }
 
@@ -439,6 +447,10 @@ public:
                 buildModuleContext(0.0f, static_cast<float>(fixedDeltaSeconds));
             m_moduleManager.fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
             engine::NativeScriptSystem::fixedUpdate(context, static_cast<float>(fixedDeltaSeconds));
+            // .dsla scripts tick before the player so the movement
+            // variable bridge (sv_* / stamina) lands on the very
+            // next playerMove, deterministically at the fixed rate.
+            engine::ScriptSystem::update(m_scene, m_scriptContext, fixedDeltaSeconds);
             // Animation playback + ragdoll transitions tick before
             // physics so exported games animate identically.
             engine::AnimationSystem::update(m_scene, fixedDeltaSeconds);
@@ -449,6 +461,16 @@ public:
             engine::TransformSystem::update(m_scene);
         };
         callbacks.update = [this](double deltaSeconds) {
+            // Async pipeline warmup drain: at most two DISTINCT PSO
+            // creations per frame — startup shader compilation is
+            // spread across frames, never one multi-second stall.
+            if (!m_pipeline.pipelineWarmupComplete()) {
+                m_pipeline.processPipelineWarmup(2, m_swapchain);
+                if (m_pipeline.pipelineWarmupComplete()) {
+                    ENGINE_LOG_INFO("Player: pipeline warmup complete (" << m_pipeline.cachedPipelineCount()
+                                                                          << " distinct pipeline(s))");
+                }
+            }
             m_moduleElapsedSeconds += deltaSeconds;
             ++m_moduleFrameIndex;
             engine::EngineContext context = buildModuleContext(static_cast<float>(deltaSeconds), 0.0f);
@@ -462,6 +484,15 @@ public:
                 }
             }
             handleMouseCapture();
+            // F toggles the player's flashlight (survival-horror
+            // staple): flip every FlashlightComponent in the scene.
+            if (m_input.wasKeyPressed(engine::Key::F)) {
+                for (const entt::entity entity :
+                     m_scene.registry().view<engine::FlashlightComponent>()) {
+                    auto& torch = m_scene.registry().get<engine::FlashlightComponent>(entity);
+                    torch.enabled = !torch.enabled;
+                }
+            }
             engine::CameraSystem::update(m_scene, m_input, deltaSeconds);
         };
         callbacks.render = [this](double interpolationAlpha) {
@@ -523,6 +554,7 @@ private:
     engine::AssetManager m_assets;
     engine::Scene m_scene;
     engine::PhysicsSystem m_physicsSystem;
+    engine::ScriptSystemContext m_scriptContext; // .dsla runtimes (movement bridge)
     engine::RenderSystem m_renderSystem;
     engine::ModuleManager m_moduleManager;
     double m_moduleElapsedSeconds = 0.0;
